@@ -85,7 +85,27 @@ If you cannot read the source, you do not understand the system.
 
 ---
 
-## IV. What Success Looks Like
+## IV. Why Not...
+
+Cortex is not the first project to want durable, composable, debuggable agents. You will reasonably ask why we exist when these do.
+
+**Why not Temporal?**
+Temporal is excellent at durable execution — but its model is *"a human writes a workflow as code; the engine guarantees the code survives crashes."* The decisions are pre-determined by the programmer; the engine just makes them reliable. Cortex's model is different: **the agent makes decisions at runtime, via LLM syscalls.** The decision graph is emergent, not declared. You could absolutely build Cortex on top of Temporal as a persistence backend — that is a driver decision, not an architecture decision.
+
+**Why not LangGraph?**
+LangGraph builds graphs. You declare nodes and edges; it runs them. But the topology is fixed at code time. An agent that decides *"I am going to spawn three sub-agents, wait for them, then merge their findings"* cannot be a static graph — the spawning is itself a runtime decision. Cortex says: there is no graph. There are processes. They spawn each other dynamically. The "graph" is whatever shape the process tree happens to take at runtime.
+
+**Why not Kubernetes?**
+Kubernetes supervises containers, not cognition. It can restart a pod, but it cannot tell you why an agent decided to call a tool. It has no concept of LLM budgets, tool side effects, or reasoning state. You can run Cortex on k8s. Each Cortex kernel becomes a pod. K8s does not know or care what is inside.
+
+**Why not just a library?**
+We *are* a library — TypeScript, installable from npm. The "OS" framing is not about deployment shape. It is about **abstraction discipline**. Syscalls, processes, signals, IPC: these are concepts with fifty years of refinement. We are inheriting that refinement instead of inventing new abstractions. A library that calls itself an OS is making a promise: the abstractions are universal, composable, and small enough to fit in your head. We intend to keep that promise.
+
+**The position nobody has occupied** is the one we are taking: **the first system to treat LLM decisions as first-class schedulable units.** Not as steps in a human-declared workflow. Not as containers in a cluster. As processes — with all the discipline that word implies.
+
+---
+
+## V. What Success Looks Like
 
 **In 12 months.** A hacker in Shenzhen spawns a Cortex daemon to watch her inbox, another to review her PRs, a third to draft her weekly report. They run on a $5 VPS. They survive reboots. They talk to each other through IPC, not through a Slack integration. Total monthly LLM cost: $12. None of them are LangChain agents. She wrote forty lines of TypeScript.
 
@@ -95,7 +115,7 @@ If you cannot read the source, you do not understand the system.
 
 ---
 
-## V. Who Should Join
+## VI. Who Should Join
 
 - Systems people who looked at LangChain and thought *"this is not how computers work."*
 - Agent developers tired of rewriting the same orchestration glue for every project.
@@ -105,16 +125,17 @@ If you cannot read the source, you do not understand the system.
 
 ---
 
-## VI. What Comes Next
+## VII. What Comes Next
 
 This document is the **why**. The next documents are the **how**:
 
 | Document | Purpose | Status |
 |---|---|---|
-| `docs/ABI.md` | The syscall contract, in TypeScript types | drafted |
-| `docs/PROCESS.md` | The agent lifecycle and state machine | drafted |
-| `docs/ARCHITECTURE.md` | Kernel modules and data flow | drafted |
-| `BACKLOG.md` | The first 30 issues, prioritized | live |
+| `docs/STATE.md` | What agent state *is*; fork & checkpoint semantics | **drafted — read this first** |
+| `docs/ABI.md` | The syscall contract, in TypeScript types | pending |
+| `docs/PROCESS.md` | The agent lifecycle and state machine | pending |
+| `docs/ARCHITECTURE.md` | Kernel modules and data flow | pending |
+| `BACKLOG.md` | The first issues, prioritized | live |
 
 Then code.
 

@@ -69,10 +69,12 @@ See **[BACKLOG.md](./BACKLOG.md)** for the first 30 issues, prioritized.
 | Document | What it covers |
 |---|---|
 | [MANIFESTO.md](./MANIFESTO.md) | Why cortex exists. Start here. |
-| [docs/ABI.md](./docs/ABI.md) | Syscall contract, in TypeScript types |
-| [docs/PROCESS.md](./docs/PROCESS.md) | Agent lifecycle and state machine |
-| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow |
-| [BACKLOG.md](./BACKLOG.md) | First 30 issues |
+| [docs/STATE.md](./docs/STATE.md) | **The hard part.** What agent state is, what gets copied on fork, what cannot be copied at all. |
+| [docs/ABI.md](./docs/ABI.md) | Syscall contract, in TypeScript types *(pending)* |
+| [docs/PROCESS.md](./docs/PROCESS.md) | Agent lifecycle and state machine *(pending)* |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow *(pending)* |
+| [docs/CRITIQUE.md](./docs/CRITIQUE.md) | Running log of external critique and what we changed because of it. |
+| [BACKLOG.md](./BACKLOG.md) | First issues, prioritized |
 
 ---
 
