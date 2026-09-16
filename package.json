@@ -1,9 +1,12 @@
 {
-  "name": "cortex",
+  "name": "cortex-os",
   "version": "0.0.1",
   "description": "An operating system for AI agents.",
   "type": "module",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20.0.0"
   },
