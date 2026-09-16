@@ -1,0 +1,68 @@
+{
+  "name": "cortex",
+  "version": "0.0.1",
+  "description": "An operating system for AI agents.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "cortex": "./dist/cli/index.js",
+    "ctx": "./dist/cli/index.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./kernel": {
+      "types": "./dist/kernel/index.d.ts",
+      "import": "./dist/kernel/index.js"
+    },
+    "./drivers": {
+      "types": "./dist/drivers/index.d.ts",
+      "import": "./dist/drivers/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "MANIFESTO.md",
+    "README.md",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "test": "node --test --import tsx tests/**/*.test.ts",
+    "lint": "tsc --noEmit",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "keywords": [
+    "agent",
+    "agents",
+    "llm",
+    "os",
+    "operating-system",
+    "kernel",
+    "process",
+    "syscall",
+    "runtime",
+    "ai"
+  ],
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TBD/cortex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TBD/cortex/issues"
+  },
+  "homepage": "https://github.com/TBD/cortex#readme"
+}
