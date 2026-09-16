@@ -6,7 +6,7 @@ This directory holds the technical specifications. **Read them in this order:**
 
 2. **[PROCESS.md](./PROCESS.md)** — the agent process lifecycle. Eight states, twelve legal transitions, full signal table, scheduling policy, daemon/supervision posture, TypeScript types, seven open questions.
 
-3. **[ABI.md](./ABI.md)** *(pending)* — the syscall contract. The full TypeScript type signatures of every kernel call. If a behavior is not in the ABI, it does not exist.
+3. **[ABI.md](./ABI.md)** — the syscall contract. **Eighteen syscalls**, full TypeScript types, error model, recording format, three driver interfaces (LLM, Tool, Memory), seven open questions. If a behavior is not in the ABI, it does not exist.
 
 4. **[ARCHITECTURE.md](./ARCHITECTURE.md)** *(pending)* — kernel modules and data flow. Scheduler, IPC, recording, checkpointing, drivers.
 
@@ -22,8 +22,8 @@ This directory holds the technical specifications. **Read them in this order:**
 |---|---|
 | STATE.md | **drafted v0** — open questions logged in §8 |
 | PROCESS.md | **drafted v0** — open questions logged in §11 |
-| ABI.md | pending — blocked on STATE.md and PROCESS.md being stable |
-| ARCHITECTURE.md | pending |
+| ABI.md | **drafted v0** — open questions logged in §9 |
+| ARCHITECTURE.md | pending — last design doc before Phase 1 kernel work |
 | CRITIQUE.md | live, 1 entry |
 | HACKING.md | post-v0.1 |
 

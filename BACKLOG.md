@@ -20,7 +20,7 @@ The point of this phase is to lock the abstractions before writing serious code.
 - [x] **#002** Initialize repo skeleton (package.json, tsconfig, dirs) → `8a2bb3c`
 - [x] **#002a** Add "Why Not Temporal / LangGraph / Kubernetes" section to MANIFESTO → this commit
 - [x] **#003** Write `docs/STATE.md` — agent state model, fork taxonomy, irreversible-action doctrine → this commit
-- [ ] **#004** Write `docs/ABI.md` — full syscall contract in TypeScript types
+- [x] **#004** Write `docs/ABI.md` — full syscall contract in TypeScript types → this commit
 - [x] **#005** Write `docs/PROCESS.md` — agent state machine, lifecycle, transitions → this commit
 - [ ] **#006** Write `docs/ARCHITECTURE.md` — kernel modules, data flow, driver model
 - [ ] **#007** Decide driver interface for LLM providers (`ILLMDriver`)

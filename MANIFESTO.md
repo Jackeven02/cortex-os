@@ -133,7 +133,7 @@ This document is the **why**. The next documents are the **how**:
 |---|---|---|
 | `docs/STATE.md` | What agent state *is*; fork & checkpoint semantics | **drafted — read this first** |
 | `docs/PROCESS.md` | The agent lifecycle and state machine | **drafted — 8 states, 12 transitions** |
-| `docs/ABI.md` | The syscall contract, in TypeScript types | pending |
+| `docs/ABI.md` | The syscall contract, in TypeScript types | **drafted — 18 syscalls** |
 | `docs/ARCHITECTURE.md` | Kernel modules and data flow | pending |
 | `BACKLOG.md` | The first issues, prioritized | live |
 
