@@ -4,9 +4,9 @@ This directory holds the technical specifications. **Read them in this order:**
 
 1. **[STATE.md](./STATE.md)** — the agent state model. What gets copied on fork. What cannot be copied at all. The irreversible-action doctrine. **This is the hardest and most important document in the project.** Everything else depends on it.
 
-2. **[ABI.md](./ABI.md)** *(pending)* — the syscall contract. The full TypeScript type signatures of every kernel call. If a behavior is not in the ABI, it does not exist.
+2. **[PROCESS.md](./PROCESS.md)** — the agent process lifecycle. Eight states, twelve legal transitions, full signal table, scheduling policy, daemon/supervision posture, TypeScript types, seven open questions.
 
-3. **[PROCESS.md](./PROCESS.md)** *(pending)* — the agent process lifecycle. States, transitions, what happens on `fork()`, what happens on parent death, how zombies are reaped.
+3. **[ABI.md](./ABI.md)** *(pending)* — the syscall contract. The full TypeScript type signatures of every kernel call. If a behavior is not in the ABI, it does not exist.
 
 4. **[ARCHITECTURE.md](./ARCHITECTURE.md)** *(pending)* — kernel modules and data flow. Scheduler, IPC, recording, checkpointing, drivers.
 
@@ -21,8 +21,8 @@ This directory holds the technical specifications. **Read them in this order:**
 | Document | State |
 |---|---|
 | STATE.md | **drafted v0** — open questions logged in §8 |
-| ABI.md | pending — blocked on STATE.md being stable |
-| PROCESS.md | pending |
+| PROCESS.md | **drafted v0** — open questions logged in §11 |
+| ABI.md | pending — blocked on STATE.md and PROCESS.md being stable |
 | ARCHITECTURE.md | pending |
 | CRITIQUE.md | live, 1 entry |
 | HACKING.md | post-v0.1 |
