@@ -20,3 +20,4 @@ export * from './signals.js';
 export * from './ipc.js';
 export * from './memory.js';
 export * from './checkpoint.js';
+export * from './fork.js';

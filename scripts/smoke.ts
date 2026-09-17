@@ -80,6 +80,12 @@ import {
   type Checkpoint,
   type CognitiveSnapshot,
   type RestoreContext,
+  ForkManager,
+  FORK_ALLOWED_STATES,
+  DEFAULT_FORK_KIND,
+  DEFAULT_BUDGET_POLICY,
+  type ForkResult,
+  type ForkOptions,
 } from '../src/index.js';
 
 let passed = 0;
@@ -2946,8 +2952,480 @@ async function runCheckpointChecks(): Promise<void> {
   await rm(tmp, { recursive: true, force: true });
 }
 
+async function runForkChecks(): Promise<void> {
+  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-fork-'));
+  const tables: ProcessTable[] = [];
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const tick = (ms = 1000) => {
+    fakeNow += ms;
+  };
+
+  async function makeTable(dir = tmp): Promise<ProcessTable> {
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir }),
+    });
+    tables.push(t);
+    return t;
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+
+  async function toRunning(table: ProcessTable, pid: ProcessIdAlias): Promise<void> {
+    await table.setState(pid, 'ready', { trigger: 'init' });
+    tick();
+    await table.setState(pid, 'running', { trigger: 'dispatch' });
+    tick();
+  }
+
+  async function spawnRunning(
+    table: ProcessTable,
+    role = 'worker',
+    memory?: Readonly<Record<string, MemoryRegionPolicy>>,
+    budgets?: { tokens: number; usd: number; wallTimeMs: number },
+  ): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({
+      ppid: null,
+      role,
+      agent,
+      ...(memory !== undefined ? { memory } : {}),
+      ...(budgets !== undefined ? { budgets } : {}),
+    });
+    await toRunning(table, pid);
+    return pid;
+  }
+
+  // --- injected cognitive store + deterministic chain ids -------------------
+  const cognitive = new Map<number, CognitiveSnapshot>();
+  const getCognitive = (pid: ProcessIdAlias): CognitiveSnapshot =>
+    cognitive.get(unbrand(pid)) ?? EMPTY_COGNITIVE;
+  const putCognitive = (pid: ProcessIdAlias, snap: CognitiveSnapshot): void => {
+    cognitive.set(unbrand(pid), snap);
+  };
+
+  let chainCounter = 0;
+  const nextChainId = () => {
+    chainCounter += 1;
+    return asChainId(`fork-chain-${chainCounter}`);
+  };
+
+  function makeFork(
+    table: ProcessTable,
+    opts?: Partial<ConstructorParameters<typeof ForkManager>[0]>,
+  ): { fork: ForkManager; memory: MemoryManager; driver: FakeMemoryDriver } {
+    const driver = new FakeMemoryDriver(clock, KERNEL_ABI_VERSION);
+    const memory = new MemoryManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      drivers: { inmem: driver },
+    });
+    const fork = new ForkManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      nextChainId,
+      memory,
+      cognitiveSource: getCognitive,
+      cognitiveSink: putCognitive,
+      ...opts,
+    });
+    return { fork, memory, driver };
+  }
+
+  const priv: MemoryRegionPolicy = { kind: 'private', backing: 'inmem' };
+  const shared: MemoryRegionPolicy = { kind: 'shared', backing: 'inmem' };
+  const cow: MemoryRegionPolicy = { kind: 'cow', backing: 'inmem' };
+
+  // --- constants ------------------------------------------------------------
+
+  check('fork constants', () => {
+    assert(DEFAULT_FORK_KIND === 'cognitive', 'v0 only ships cognitive fork');
+    assert(DEFAULT_BUDGET_POLICY === 'reset', 'default budget policy is reset');
+    const allowed: readonly string[] = FORK_ALLOWED_STATES;
+    for (const s of ['running', 'blocked', 'stopped', 'suspended']) {
+      assert(allowed.includes(s), `${s} is forkable`);
+    }
+    assert(!allowed.includes('ready'), 'READY is not forkable');
+    assert(!allowed.includes('new'), 'NEW is not forkable');
+  });
+
+  // --- identity / lineage ---------------------------------------------------
+
+  await checkAsync('fork from RUNNING mints a READY child and leaves the parent running', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table, 'researcher');
+    const { fork } = makeFork(table);
+    const res: ForkResult = await fork.fork(pid);
+    assert(unbrand(res.childPid) !== unbrand(pid), 'child gets a fresh pid');
+    const child = table.get(res.childPid)!;
+    assert(child.state === 'ready', 'child lands in READY');
+    assert(unbrand(child.ppid!) === unbrand(pid), 'child ppid points at the forker');
+    assert(child.role === 'researcher', 'role inherited');
+    assert(table.get(pid)!.state === 'running', 'parent unchanged');
+    assert(typeof unbrand(res.childChainId) === 'string', 'child chainId returned');
+    assert(unbrand(res.sharedCausalPast) >= 0, 'shared causal past offset returned');
+    assert(Array.isArray(res.irreversibleInPast), 'irreversible list returned');
+  });
+
+  await checkAsync('fork is allowed from BLOCKED, STOPPED, and SUSPENDED', async () => {
+    // blocked
+    const t1 = await makeTable();
+    const p1 = await spawnRunning(t1);
+    await t1.setState(p1, 'blocked', { trigger: 'recv' });
+    const f1 = makeFork(t1).fork;
+    const r1 = await f1.fork(p1);
+    assert(t1.get(p1)!.state === 'blocked', 'parent stays blocked');
+    assert(t1.get(r1.childPid)!.state === 'ready', 'child ready from blocked parent');
+
+    // stopped
+    const t2 = await makeTable();
+    const p2 = await spawnRunning(t2);
+    await t2.setState(p2, 'stopped', { trigger: 'SIGSTOP' });
+    const r2 = await makeFork(t2).fork.fork(p2);
+    assert(t2.get(p2)!.state === 'stopped', 'parent stays stopped');
+    assert(t2.get(r2.childPid)!.state === 'ready', 'child ready from stopped parent');
+
+    // suspended (reached via the legal running→checkpointing→suspended path)
+    const t3 = await makeTable();
+    const p3 = await spawnRunning(t3);
+    await t3.setState(p3, 'checkpointing', { trigger: 'test' });
+    await t3.setState(p3, 'suspended', { trigger: 'test' });
+    const r3 = await makeFork(t3).fork.fork(p3);
+    assert(t3.get(p3)!.state === 'suspended', 'parent stays suspended');
+    assert(t3.get(r3.childPid)!.state === 'ready', 'child ready from suspended parent');
+  });
+
+  await checkAsync('fork from READY traps ESTATE', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    await table.setState(pid, 'ready', { trigger: 'yield' });
+    const { fork } = makeFork(table);
+    let err: unknown;
+    try {
+      await fork.fork(pid);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ESTATE', 'READY is not a forkable state');
+    assert(table.get(pid)!.state === 'ready', 'parent untouched');
+  });
+
+  await checkAsync('fork from NEW traps ESTATE', async () => {
+    const table = await makeTable();
+    const pid = await table.allocate({ ppid: null, role: 'worker', agent });
+    const { fork } = makeFork(table);
+    let err: unknown;
+    try {
+      await fork.fork(pid);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ESTATE', 'NEW is not a forkable state');
+  });
+
+  await checkAsync('fork of an unknown pid traps ESRCH', async () => {
+    const table = await makeTable();
+    const { fork } = makeFork(table);
+    let err: unknown;
+    try {
+      await fork.fork(asProcessId(9999));
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ESRCH', 'absent parent → ESRCH');
+  });
+
+  await checkAsync("fork with a non-cognitive kind traps EINVAL", async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { fork } = makeFork(table);
+    let err: unknown;
+    try {
+      await fork.fork(pid, { kind: 'sandbox' } as unknown as ForkOptions);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'EINVAL', 'sandbox fork is post-v0');
+  });
+
+  // --- budget policies ------------------------------------------------------
+
+  await checkAsync('budget reset (default) zeroes the child spent counters', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    table.spend(pid, { tokensIn: 100, tokensOut: 50 });
+    const { fork } = makeFork(table);
+    const res = await fork.fork(pid);
+    const child = table.get(res.childPid)!;
+    assert(child.budgetsSpent.tokensIn === 0, 'child spent reset to zero');
+    assert(child.budgetsSpent.tokensOut === 0, 'child spent reset to zero');
+    assert(
+      child.budgetsRemaining.tokens === table.get(pid)!.budgetsRemaining.tokens,
+      'child inherits the remaining envelope',
+    );
+  });
+
+  await checkAsync('budget inherit copies the parent spent counters', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    table.spend(pid, { tokensIn: 100, tokensOut: 50 });
+    const { fork } = makeFork(table);
+    const res = await fork.fork(pid, { budgets: 'inherit' });
+    const child = table.get(res.childPid)!;
+    assert(child.budgetsSpent.tokensIn === 100, 'child remembers parent spend');
+    assert(child.budgetsSpent.tokensOut === 50, 'child remembers parent spend');
+  });
+
+  await checkAsync('budget split halves the remaining envelope between parent and child', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table, 'worker', undefined, {
+      tokens: 1000,
+      usd: 10,
+      wallTimeMs: -1,
+    });
+    const { fork } = makeFork(table);
+    const res = await fork.fork(pid, { budgets: 'split' });
+    const parent = table.get(pid)!;
+    const child = table.get(res.childPid)!;
+    assert(child.budgetsRemaining.tokens === 500, `child tokens 500, got ${child.budgetsRemaining.tokens}`);
+    assert(parent.budgetsRemaining.tokens === 500, `parent tokens 500, got ${parent.budgetsRemaining.tokens}`);
+    assert(child.budgetsRemaining.usd === 5 && parent.budgetsRemaining.usd === 5, 'usd split');
+    assert(
+      child.budgetsRemaining.wallTimeMs === -1 && parent.budgetsRemaining.wallTimeMs === -1,
+      'unlimited stays unlimited',
+    );
+  });
+
+  await checkAsync('fork into an exhausted budget traps EBUDGET', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table, 'worker', undefined, {
+      tokens: 0,
+      usd: -1,
+      wallTimeMs: -1,
+    });
+    const { fork } = makeFork(table);
+    let err: unknown;
+    try {
+      await fork.fork(pid);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'EBUDGET', 'child would be born exhausted');
+  });
+
+  // --- memory copy semantics ------------------------------------------------
+
+  await checkAsync('private region deep-copies and diverges after fork', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table, 'worker', { episodic: priv });
+    const { fork, memory } = makeFork(table);
+    memory.syncFromTable(pid);
+    await memory.write(pid, 'episodic', 'e1', { a: 1 });
+    const res = await fork.fork(pid);
+    const child = res.childPid;
+
+    const before = await memory.read(child, 'episodic', {});
+    assert(before.length === 1 && before[0]!.key === 'e1', 'child inherits the private entry');
+
+    await memory.write(child, 'episodic', 'e2', { b: 2 });
+    const parentAfter = await memory.read(pid, 'episodic', {});
+    const childAfter = await memory.read(child, 'episodic', {});
+    assert(parentAfter.length === 1, 'parent does not see the child write');
+    assert(childAfter.length === 2, 'child sees its own write');
+  });
+
+  await checkAsync('shared region: a child write is visible to the parent', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table, 'worker', { semantic: shared });
+    const { fork, memory } = makeFork(table);
+    memory.syncFromTable(pid);
+    await memory.write(pid, 'semantic', 's1', 'fact');
+    const res = await fork.fork(pid);
+    await memory.write(res.childPid, 'semantic', 's2', 'new-fact');
+    const parentEntries = await memory.read(pid, 'semantic', {});
+    const keys = parentEntries.map((e) => e.key).sort();
+    assert(keys.length === 2 && keys[0] === 's1' && keys[1] === 's2', 'parent sees both shared keys');
+  });
+
+  await checkAsync('cow region shares until the child writes, then diverges', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table, 'worker', { episodic: cow });
+    const { fork, memory } = makeFork(table);
+    memory.syncFromTable(pid);
+    await memory.write(pid, 'episodic', 'e1', { a: 1 });
+    const res = await fork.fork(pid);
+    const child = res.childPid;
+
+    const sharedRead = await memory.read(child, 'episodic', {});
+    assert(sharedRead.length === 1, 'child reads the shared cow page');
+
+    await memory.write(child, 'episodic', 'e2', { b: 2 }); // triggers the copy
+    const parentAfter = await memory.read(pid, 'episodic', {});
+    const childAfter = await memory.read(child, 'episodic', {});
+    assert(parentAfter.length === 1, 'parent keeps only e1 after cow split');
+    assert(childAfter.length === 2, 'child has e1 + e2 after cow split');
+  });
+
+  await checkAsync('memoryOverrides change a region copy semantics on fork', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table, 'worker', { episodic: cow });
+    const { fork, memory } = makeFork(table);
+    memory.syncFromTable(pid);
+    await memory.write(pid, 'episodic', 'e1', { a: 1 });
+    const res = await fork.fork(pid, { memoryOverrides: { episodic: priv } });
+    assert(
+      memory.regionInfo(res.childPid, 'episodic')!.kind === 'private',
+      'override turned cow into private for the child',
+    );
+  });
+
+  // --- cognitive ------------------------------------------------------------
+
+  await checkAsync('cognitive snapshot is deep-copied to the child', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { fork } = makeFork(table);
+    putCognitive(pid, {
+      messages: [{ role: 'user', content: 'explore' }],
+      intent: 'branch',
+      pendingCalls: [],
+    });
+    const res = await fork.fork(pid);
+    const childSnap = getCognitive(res.childPid);
+    assert(childSnap.messages.length === 1 && childSnap.intent === 'branch', 'child got the snapshot');
+    // Mutating the child's copy must not touch the parent's.
+    childSnap.messages[0]!.content = 'mutated';
+    assert(
+      getCognitive(pid).messages[0]!.content === 'explore',
+      'parent cognitive state is independent',
+    );
+  });
+
+  // --- driver state ---------------------------------------------------------
+
+  await checkAsync('closeDriverState runs for both parent and child', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const closed: number[] = [];
+    const { fork } = makeFork(table, {
+      closeDriverState: (p) => {
+        closed.push(unbrand(p));
+      },
+    });
+    const res = await fork.fork(pid);
+    assert(closed.includes(unbrand(pid)), 'parent driver state closed');
+    assert(closed.includes(unbrand(res.childPid)), 'child driver state closed');
+  });
+
+  await checkAsync('a driver that refuses to close traps EDRIVER and aborts the child', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const before = table.pids().length;
+    const { fork } = makeFork(table, {
+      closeDriverState: () => {
+        throw new Error('socket in use');
+      },
+    });
+    let err: unknown;
+    try {
+      await fork.fork(pid);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'EDRIVER', 'driver close failure → EDRIVER');
+    assert(table.get(pid)!.state === 'running', 'parent unchanged');
+    assert(table.pids().length === before + 1, 'a child pid was allocated');
+    const states = table.pids().map((p) => table.get(p)!.state);
+    assert(states.includes('zombie'), 'the half-built child was reaped to ZOMBIE');
+  });
+
+  // --- causal past ----------------------------------------------------------
+
+  await checkAsync('irreversibleInPast surfaces irreversible syscalls from the shared log', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const rec = table.recorderFor(pid)!;
+    await rec.append({
+      timestamp: clock(),
+      pid,
+      syscall: 'send_email',
+      callId: 'email-1',
+      phase: 'exit',
+      stateBefore: 'running',
+      stateAfter: 'running',
+      reversibility: 'irreversible',
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+    });
+    await rec.flush();
+    const { fork } = makeFork(table);
+    const res = await fork.fork(pid);
+    assert(
+      res.irreversibleInPast.includes('send_email'),
+      'both branches remember the irreversible action',
+    );
+    assert(unbrand(res.sharedCausalPast) > 0, 'shared causal past reflects the parent log');
+  });
+
+  // --- recording ------------------------------------------------------------
+
+  await checkAsync('fork records a reversible syscall in both parent and child logs', async () => {
+    const sub = join(tmp, 'fork-records');
+    await mkdir(sub, { recursive: true });
+    const table = await makeTable(sub);
+    const pid = await spawnRunning(table);
+    const { fork } = makeFork(table);
+    const res = await fork.fork(pid, { tag: 'explore-alt' });
+
+    const parentRec = table.recorderFor(pid)!;
+    await parentRec.flush();
+    const parentRecords: SyscallRecord[] = [];
+    for await (const r of readRecords(parentRec.path)) parentRecords.push(r);
+    const pf = parentRecords.filter((r) => r.syscall === 'fork');
+    assert(pf.length === 1, `parent log has 1 fork record, got ${pf.length}`);
+    assert(pf[0]!.reversibility === 'reversible', 'fork is reversible');
+    assert(pf[0]!.phase === 'exit', 'exit phase');
+    const pRes = pf[0]!.result as { childPid: number; childChainId: string };
+    assert(pRes.childPid === unbrand(res.childPid), 'parent record carries child pid');
+    const pArgs = pf[0]!.args as { tag?: string; budgets: string };
+    assert(pArgs.tag === 'explore-alt', 'tag captured');
+    assert(pArgs.budgets === 'reset', 'budget policy captured');
+
+    const childRec = table.recorderFor(res.childPid)!;
+    await childRec.flush();
+    const childRecords: SyscallRecord[] = [];
+    for await (const r of readRecords(childRec.path)) childRecords.push(r);
+    const cf = childRecords.filter((r) => r.syscall === 'fork');
+    assert(cf.length === 1, `child log has 1 fork record, got ${cf.length}`);
+    const cArgs = cf[0]!.args as { origin: string; parentPid: number };
+    assert(cArgs.origin === 'child', 'child record marked as origin child');
+    assert(cArgs.parentPid === unbrand(pid), 'child record carries parent pid');
+    assert(
+      cf[0]!.stateBefore === 'new' && cf[0]!.stateAfter === 'ready',
+      'child record captures NEW → READY',
+    );
+  });
+
+  // --- cleanup --------------------------------------------------------------
+  for (const t of tables) {
+    for (const pid of t.pids()) {
+      const rec = t.recorderFor(pid);
+      if (rec !== null) await rec.close().catch(() => {});
+    }
+  }
+  await rm(tmp, { recursive: true, force: true });
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
+await runForkChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

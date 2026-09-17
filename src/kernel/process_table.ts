@@ -800,6 +800,36 @@ export class ProcessTable {
     return 'ok';
   }
 
+  /**
+   * Directly overwrite a process's remaining budget limits and/or spent
+   * counters. Kernel-internal: used by `fork.ts` to apply budget policies
+   * (`reset` / `inherit` / `split`), which `spend()` cannot express —
+   * `inherit` copies the parent's spent counters onto the child *without*
+   * decrementing the child's remaining, and `split` moves remaining budget
+   * from parent to child without either process "spending" it.
+   *
+   * Records no syscall; the caller (fork) records the chosen policy. Does not
+   * validate budget legality — `checkBudget()` remains the arbiter of whether
+   * a process may keep running.
+   *
+   * @throws CortexError ESRCH if the PID is absent.
+   */
+  setBudgets(
+    pid: ProcessId,
+    patch: {
+      readonly remaining?: Partial<BudgetLimits>;
+      readonly spent?: Partial<BudgetCounters>;
+    },
+  ): void {
+    const entry = this.mustGet(pid, 'setBudgets');
+    if (patch.remaining !== undefined) {
+      entry.budgetsRemaining = { ...entry.budgetsRemaining, ...patch.remaining };
+    }
+    if (patch.spent !== undefined) {
+      entry.budgetsSpent = { ...entry.budgetsSpent, ...patch.spent };
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // §6.7 Checkpoint chain
   // ---------------------------------------------------------------------------
