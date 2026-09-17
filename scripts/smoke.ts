@@ -104,6 +104,29 @@ import {
   type InitAlarm,
   type OnAlarmHook,
   type ShutdownReport,
+  SyscallDispatcher,
+  ProcessExitSignal,
+  isProcessExitSignal,
+  SYSCALL_NAMES,
+  SYSCALL_ALLOWED_STATES,
+  SYSCALL_REVERSIBILITY,
+  SELF_RECORDED_SYSCALLS,
+  UNRECORDED_SYSCALLS,
+  killReversibility,
+  DEFAULT_LLM_TIMEOUT_MS,
+  DEFAULT_TOOL_TIMEOUT_MS,
+  type ResolveLLMHook,
+  type ResolveToolHook,
+  type ILLMDriver,
+  type IToolDriver,
+  type ToolDescriptor,
+  type DriverContext,
+  type StagedAction,
+  type Reversibility,
+  type SignalHandler,
+  type SpawnOptions,
+  type RandomOptions,
+  type BudgetLimits,
 } from '../src/index.js';
 
 let passed = 0;
@@ -4368,11 +4391,935 @@ async function runInitChecks(): Promise<void> {
   await rm(tmp, { recursive: true, force: true });
 }
 
+async function runDispatcherChecks(): Promise<void> {
+  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-disp-'));
+  const tables: ProcessTable[] = [];
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const advance = (ms = 1000) => {
+    fakeNow += ms;
+  };
+
+  async function makeTable(opts: { record?: boolean; dir?: string } = {}): Promise<ProcessTable> {
+    const dir = opts.dir ?? tmp;
+    const record = opts.record ?? false;
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...(record ? { recorderFactory: async (pid) => Recorder.open({ pid, dir }) } : {}),
+    });
+    tables.push(t);
+    return t;
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+  const priv: MemoryRegionPolicy = { kind: 'private', backing: 'inmem' };
+
+  // Fake, manually-driven timers so `sleep` and driver timeouts are testable
+  // without real delays.
+  interface FakeTimerEntry {
+    id: number;
+    cb: () => void;
+    ms: number;
+  }
+  function makeFakeTimers(): {
+    timers: FakeTimerEntry[];
+    setTimeoutFn: (cb: () => void, ms: number) => unknown;
+    clearTimeoutFn: (handle: unknown) => void;
+    fireAll: () => void;
+  } {
+    const timers: FakeTimerEntry[] = [];
+    let nextId = 1;
+    const setTimeoutFn = (cb: () => void, ms: number): unknown => {
+      const id = nextId++;
+      timers.push({ id, cb, ms });
+      return id;
+    };
+    const clearTimeoutFn = (handle: unknown): void => {
+      const id = handle as number;
+      const idx = timers.findIndex((t) => t.id === id);
+      if (idx >= 0) timers.splice(idx, 1);
+    };
+    const fireAll = (): void => {
+      const pending = timers.splice(0, timers.length);
+      for (const t of pending) t.cb();
+    };
+    return { timers, setTimeoutFn, clearTimeoutFn, fireAll };
+  }
+
+  // Let fire-and-forget promises (state recording, SIGXCPU delivery, unpark)
+  // settle on the microtask/macrotask queue.
+  const drain = async (): Promise<void> => {
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+  };
+
+  // --- mock drivers ---------------------------------------------------------
+
+  function fakeLLM(
+    usage: { inputTokens: number; outputTokens: number; cachedTokens: number; usd: number },
+    capture?: { ctx?: DriverContext },
+  ): ILLMDriver {
+    return {
+      name: 'fake-llm',
+      version: '0.0.0',
+      abiCompat: KERNEL_ABI_VERSION,
+      supportedModels: ['fake-model'],
+      async call(_req, ctx) {
+        if (capture !== undefined) capture.ctx = ctx;
+        return {
+          text: 'hello',
+          toolCalls: [],
+          finishReason: 'stop',
+          usage,
+          model: 'fake-model',
+          driverVersion: '0.0.0',
+        };
+      },
+      async close() {
+        /* nothing */
+      },
+    };
+  }
+
+  function fakeTool(reversibility: Reversibility, opts: { staged?: boolean } = {}): {
+    driver: IToolDriver;
+    descriptor: ToolDescriptor;
+  } {
+    const descriptor: ToolDescriptor = {
+      name: 'noop',
+      description: 'a no-op tool',
+      inputSchema: { type: 'object' },
+      reversibility,
+    };
+    const driver: IToolDriver = {
+      name: 'fake-tool',
+      version: '0.0.0',
+      abiCompat: KERNEL_ABI_VERSION,
+      async listTools() {
+        return [descriptor];
+      },
+      async invoke(name, args) {
+        return { output: { name, args }, error: null, durationMs: 0, reversibility };
+      },
+      ...(opts.staged === true
+        ? {
+            async stage(name: string, args: unknown): Promise<StagedAction> {
+              return { id: 'staged-1', tool: name, args, expiresAt: clock() };
+            },
+          }
+        : {}),
+      async close() {
+        /* nothing */
+      },
+    };
+    return { driver, descriptor };
+  }
+
+  // --- kernel wiring --------------------------------------------------------
+
+  interface KernelOpts {
+    record?: boolean;
+    dir?: string;
+    withMemory?: boolean;
+    withIpc?: boolean;
+    withInit?: boolean;
+    withScheduler?: boolean;
+    resolveLLM?: ResolveLLMHook;
+    resolveTool?: ResolveToolHook;
+    setTimeoutFn?: (cb: () => void, ms: number) => unknown;
+    clearTimeoutFn?: (handle: unknown) => void;
+    onBudgetExhausted?: (pid: ProcessIdAlias, kind: 'tokens' | 'usd' | 'wallTime') => void;
+    random?: (opts?: RandomOptions) => number;
+  }
+
+  // Wire the kernel the way boot.ts will: signals <-> init via a deferred ref
+  // (breaks the cycle), dispatcher on top holding every module.
+  async function makeKernel(opts: KernelOpts = {}): Promise<{
+    table: ProcessTable;
+    signals: SignalManager;
+    dispatcher: SyscallDispatcher;
+    init: InitProcess | undefined;
+    scheduler: Scheduler | undefined;
+    memory: MemoryManager | undefined;
+    ipc: IpcManager | undefined;
+  }> {
+    const table = await makeTable({
+      ...(opts.record !== undefined ? { record: opts.record } : {}),
+      ...(opts.dir !== undefined ? { dir: opts.dir } : {}),
+    });
+
+    let initRef: InitProcess | undefined;
+    const signals = new SignalManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...(opts.withInit === true
+        ? { onZombie: (pid, code, reason) => initRef!.handleZombie(pid, code, reason) }
+        : {}),
+    });
+    if (opts.withInit === true) {
+      initRef = new InitProcess({
+        table,
+        signals,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+      });
+    }
+
+    const scheduler =
+      opts.withScheduler === true
+        ? new Scheduler({
+            table,
+            signals,
+            kernelAbiVersion: KERNEL_ABI_VERSION,
+            now: clock,
+            autoReconcile: false,
+          })
+        : undefined;
+
+    const memory =
+      opts.withMemory === true
+        ? new MemoryManager({
+            table,
+            kernelAbiVersion: KERNEL_ABI_VERSION,
+            now: clock,
+            drivers: { inmem: new FakeMemoryDriver(clock, KERNEL_ABI_VERSION) },
+          })
+        : undefined;
+
+    const ipc =
+      opts.withIpc === true
+        ? new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock, signals })
+        : undefined;
+
+    const dispatcher = new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...(initRef !== undefined ? { init: initRef } : {}),
+      ...(scheduler !== undefined ? { scheduler } : {}),
+      ...(memory !== undefined ? { memory } : {}),
+      ...(ipc !== undefined ? { ipc } : {}),
+      ...(opts.resolveLLM !== undefined ? { resolveLLM: opts.resolveLLM } : {}),
+      ...(opts.resolveTool !== undefined ? { resolveTool: opts.resolveTool } : {}),
+      ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
+      ...(opts.clearTimeoutFn !== undefined ? { clearTimeoutFn: opts.clearTimeoutFn } : {}),
+      ...(opts.onBudgetExhausted !== undefined
+        ? { onBudgetExhausted: opts.onBudgetExhausted }
+        : {}),
+      ...(opts.random !== undefined ? { random: opts.random } : {}),
+    });
+
+    return { table, signals, dispatcher, init: initRef, scheduler, memory, ipc };
+  }
+
+  // Allocate a process and drive NEW -> READY -> RUNNING.
+  async function running(
+    table: ProcessTable,
+    opts: {
+      ppid?: ProcessIdAlias | null;
+      role?: string;
+      budgets?: Partial<BudgetLimits>;
+      memory?: Readonly<Record<string, MemoryRegionPolicy>>;
+    } = {},
+  ): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({
+      ppid: opts.ppid === undefined ? null : opts.ppid,
+      role: opts.role ?? 'worker',
+      agent,
+      ...(opts.budgets !== undefined ? { budgets: opts.budgets } : {}),
+      ...(opts.memory !== undefined ? { memory: opts.memory } : {}),
+    });
+    await table.setState(pid, 'ready', { trigger: 'test' });
+    await table.setState(pid, 'running', { trigger: 'test' });
+    advance();
+    return pid;
+  }
+
+  // Drive a child to ZOMBIE without reaping (for the synchronous wait path).
+  async function makeZombie(
+    table: ProcessTable,
+    pid: ProcessIdAlias,
+    code: number,
+    reason: string,
+  ): Promise<void> {
+    await table.setState(pid, 'ready', { trigger: 'test' });
+    await table.setState(pid, 'running', { trigger: 'test' });
+    table.setExitInfo(pid, code, reason, asSyscallOffset(0));
+    await table.setState(pid, 'exiting', { trigger: 'test-exit' });
+    await table.setState(pid, 'zombie', { trigger: 'test-exit' });
+  }
+
+  async function readLog(table: ProcessTable, pid: ProcessIdAlias): Promise<SyscallRecord[]> {
+    const rec = table.recorderFor(pid);
+    if (rec === null) return [];
+    await rec.flush();
+    const out: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) out.push(r);
+    return out;
+  }
+
+  // --- constants / policy tables -------------------------------------------
+
+  check('dispatcher exports 19 syscall names, no duplicates', () => {
+    assert(SYSCALL_NAMES.length === 19, `expected 19 syscalls, got ${SYSCALL_NAMES.length}`);
+    const uniq = new Set(SYSCALL_NAMES);
+    assert(uniq.size === SYSCALL_NAMES.length, 'duplicate syscall names');
+  });
+
+  check('policy tables cover every syscall exactly', () => {
+    const allowedKeys = Object.keys(SYSCALL_ALLOWED_STATES).sort();
+    const revKeys = Object.keys(SYSCALL_REVERSIBILITY).sort();
+    const names = [...SYSCALL_NAMES].sort();
+    assert(
+      JSON.stringify(allowedKeys) === JSON.stringify(names),
+      'SYSCALL_ALLOWED_STATES key set != SYSCALL_NAMES',
+    );
+    assert(
+      JSON.stringify(revKeys) === JSON.stringify(names),
+      'SYSCALL_REVERSIBILITY key set != SYSCALL_NAMES',
+    );
+    for (const n of SYSCALL_NAMES) {
+      const states = SYSCALL_ALLOWED_STATES[n];
+      assert(states.length > 0, `${n} has no allowed states`);
+      const rev = SYSCALL_REVERSIBILITY[n];
+      assert(
+        rev === 'reversible' || rev === 'irreversible' || rev === 'idempotent',
+        `${n} bad reversibility ${rev}`,
+      );
+    }
+  });
+
+  check('self-recorded / unrecorded sets are disjoint subsets of syscalls', () => {
+    const nameSet = new Set<string>(SYSCALL_NAMES);
+    for (const s of SELF_RECORDED_SYSCALLS) assert(nameSet.has(s), `${s} not a syscall`);
+    for (const s of UNRECORDED_SYSCALLS) assert(nameSet.has(s), `${s} not a syscall`);
+    for (const s of UNRECORDED_SYSCALLS) {
+      assert(!SELF_RECORDED_SYSCALLS.has(s), `${s} both self-recorded and unrecorded`);
+    }
+    assert(UNRECORDED_SYSCALLS.has('budget'), 'budget is unrecorded');
+    assert(SELF_RECORDED_SYSCALLS.has('memory_write'), 'memory_write is self-recorded');
+  });
+
+  check('killReversibility maps signals correctly', () => {
+    assert(killReversibility('SIGKILL') === 'irreversible', 'SIGKILL irreversible');
+    assert(killReversibility('SIGTERM') === 'irreversible', 'SIGTERM irreversible');
+    assert(killReversibility('SIGSTOP') === 'irreversible', 'SIGSTOP irreversible');
+    assert(killReversibility('SIGUSR1') === 'reversible', 'SIGUSR1 reversible');
+    assert(killReversibility('SIGUSR2') === 'reversible', 'SIGUSR2 reversible');
+    assert(killReversibility('SIGCONT') === 'reversible', 'SIGCONT reversible');
+  });
+
+  check('ProcessExitSignal + isProcessExitSignal', () => {
+    const sig = new ProcessExitSignal(3, 'bye');
+    assert(sig instanceof Error, 'is an Error');
+    assert(!(sig instanceof CortexError), 'is NOT a CortexError');
+    assert(sig.name === 'ProcessExitSignal', `wrong name ${sig.name}`);
+    assert(sig.exitCode === 3, 'exitCode');
+    assert(sig.exitReason === 'bye', 'exitReason');
+    assert(isProcessExitSignal(sig), 'guard detects it');
+    assert(!isProcessExitSignal(new Error('x')), 'guard rejects plain Error');
+    assert(!isProcessExitSignal(new CortexError('EINVAL', 'x')), 'guard rejects CortexError');
+    assert(!isProcessExitSignal(null), 'guard rejects null');
+  });
+
+  check('dispatcher default timeout constants', () => {
+    assert(DEFAULT_LLM_TIMEOUT_MS === 60_000, 'llm timeout 60s');
+    assert(DEFAULT_TOOL_TIMEOUT_MS === 30_000, 'tool timeout 30s');
+  });
+
+  // --- gates ----------------------------------------------------------------
+
+  await checkAsync('invoke on an unknown pid traps ESRCH', async () => {
+    const { dispatcher } = await makeKernel();
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(asProcessId(9999), 'now');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'ESRCH', `expected ESRCH, got ${caught.errno}`);
+  });
+
+  await checkAsync('state gate traps ESTATE before any side effect', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await table.allocate({ ppid: null, role: 'w', agent }); // NEW
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'ps'); // ps requires RUNNING
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'ESTATE', `expected ESTATE, got ${caught.errno}`);
+    assert(caught.details?.['currentState'] === 'new', 'details carry the current state');
+  });
+
+  await checkAsync('irreversible syscall in a forkable region traps EREVERSIBLE', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await running(table);
+    let caught: unknown;
+    await dispatcher.runForkable(pid, async () => {
+      assert(dispatcher.inForkableRegion(pid), 'inside the region');
+      try {
+        await dispatcher.invoke(pid, 'exit', 0); // exit is irreversible
+      } catch (err) {
+        caught = err;
+      }
+    });
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'EREVERSIBLE', `expected EREVERSIBLE, got ${caught.errno}`);
+    const e = table.get(pid);
+    assert(e !== undefined && e.state === 'running', 'process untouched (trap precedes routing)');
+    assert(!dispatcher.inForkableRegion(pid), 'region closed after runForkable');
+  });
+
+  await checkAsync('forkable regions nest and lift only at the outermost close', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await running(table);
+    assert(!dispatcher.inForkableRegion(pid), 'outside before');
+    await dispatcher.runForkable(pid, async () => {
+      assert(dispatcher.inForkableRegion(pid), 'depth 1');
+      await dispatcher.runForkable(pid, async () => {
+        assert(dispatcher.inForkableRegion(pid), 'depth 2');
+      });
+      assert(dispatcher.inForkableRegion(pid), 'still depth 1');
+    });
+    assert(!dispatcher.inForkableRegion(pid), 'outside after');
+  });
+
+  // --- process control ------------------------------------------------------
+
+  await checkAsync('spawn allocates a READY child parented to the caller', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const parent = await running(table, { role: 'p' });
+    const { pid: child } = await dispatcher.invoke(parent, 'spawn', { role: 'c', agent });
+    const ce = table.get(child);
+    assert(ce !== undefined, 'child exists');
+    assert(ce.state === 'ready', 'child is READY (scheduler adopts it)');
+    assert(ce.ppid !== null && unbrand(ce.ppid) === unbrand(parent), 'child ppid is the caller');
+    assert(ce.role === 'c', 'child role');
+  });
+
+  await checkAsync('spawn enqueues the child when a scheduler is wired', async () => {
+    const { table, dispatcher, scheduler } = await makeKernel({ withScheduler: true });
+    const parent = await running(table);
+    const { pid: child } = await dispatcher.invoke(parent, 'spawn', { role: 'c', agent });
+    assert(scheduler !== undefined, 'scheduler wired');
+    assert(scheduler.isQueued(child), 'child is on the run queue');
+  });
+
+  await checkAsync('spawn without an agent traps EINVAL', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const parent = await running(table);
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(parent, 'spawn', { role: 'x' } as unknown as SpawnOptions);
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'EINVAL', `expected EINVAL, got ${caught.errno}`);
+  });
+
+  await checkAsync('ps lists processes and honours a state filter', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const a = await running(table, { role: 'a' });
+    await table.allocate({ ppid: null, role: 'b', agent }); // stays NEW
+    const all = await dispatcher.invoke(a, 'ps');
+    assert(all.length >= 2, `ps lists >= 2, got ${all.length}`);
+    const news = await dispatcher.invoke(a, 'ps', { state: 'new' });
+    assert(news.length >= 1, 'at least one NEW process');
+    assert(news.every((p) => p.state === 'new'), 'filter returns only NEW');
+  });
+
+  await checkAsync('kill routes to signals (SIGSTOP stops the target)', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const parent = await running(table, { role: 'p' });
+    const child = await running(table, { ppid: parent, role: 'c' });
+    await dispatcher.invoke(parent, 'kill', child, 'SIGSTOP');
+    await drain();
+    const ce = table.get(child);
+    assert(ce !== undefined && ce.state === 'stopped', `child stopped, got ${ce?.state}`);
+  });
+
+  // --- exit + wait ----------------------------------------------------------
+
+  await checkAsync('exit throws ProcessExitSignal and reaps the process', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await running(table);
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'exit', 0, 'done');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isProcessExitSignal(caught), 'throws the exit sentinel');
+    assert(caught.exitCode === 0, 'exit code 0');
+    assert(caught.exitReason === 'done', 'exit reason');
+    assert(table.get(pid) === undefined, 'process reaped after exit');
+  });
+
+  await checkAsync('exit walks NEW/READY up through RUNNING to ZOMBIE', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await table.allocate({ ppid: null, role: 'w', agent });
+    await table.setState(pid, 'ready', { trigger: 'test' });
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'exit', 2, 'bye');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isProcessExitSignal(caught), 'sentinel thrown from READY');
+    assert(caught.exitCode === 2 && caught.exitReason === 'bye', 'code/reason preserved');
+    assert(table.get(pid) === undefined, 'reaped');
+  });
+
+  await checkAsync('exit writes an irreversible exit record before teardown', async () => {
+    const sub = join(tmp, 'rec-exit');
+    await mkdir(sub, { recursive: true });
+    const { table, dispatcher } = await makeKernel({ record: true, dir: sub });
+    const pid = await running(table);
+    const rec = table.recorderFor(pid);
+    assert(rec !== null, 'recorder open');
+    const path = rec.path;
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'exit', 5, 'done');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isProcessExitSignal(caught), 'sentinel thrown');
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(path)) records.push(r);
+    const exitRec = records.find((r) => r.syscall === 'exit' && r.phase === 'exit');
+    assert(exitRec !== undefined, 'an exit record exists');
+    assert((exitRec.result as { code: number }).code === 5, 'exit code recorded');
+    assert(exitRec.reversibility === 'irreversible', 'exit is irreversible');
+  });
+
+  await checkAsync('wait with no children traps ECHILD', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await running(table);
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'wait');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'ECHILD', `expected ECHILD, got ${caught.errno}`);
+  });
+
+  await checkAsync('wait on a non-child traps ESRCH', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const a = await running(table, { role: 'a' });
+    const b = await running(table, { role: 'b' });
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(a, 'wait', b); // b is not a's child
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'ESRCH', `expected ESRCH, got ${caught.errno}`);
+  });
+
+  await checkAsync('wait reaps an already-zombie child synchronously', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const parent = await running(table, { role: 'p' });
+    const child = await table.allocate({ ppid: parent, role: 'c', agent });
+    await makeZombie(table, child, 7, 'boom');
+    const res = await dispatcher.invoke(parent, 'wait', child);
+    assert(res.exitCode === 7, `exit code 7, got ${res.exitCode}`);
+    assert(res.exitReason === 'boom', 'exit reason');
+    assert(table.get(child) === undefined, 'child reaped by wait');
+  });
+
+  await checkAsync('parked wait wakes when the child exits through the dispatcher', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const parent = await running(table, { role: 'p' });
+    const child = await running(table, { ppid: parent, role: 'c' });
+    const waitP = dispatcher.invoke(parent, 'wait', child); // parks (not awaited)
+    await drain(); // let the enter record land and the waiter register
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(child, 'exit', 3, 'crash');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isProcessExitSignal(caught), 'child exit throws the sentinel');
+    const res = await waitP;
+    assert(res.exitCode === 3, `waited exit code 3, got ${res.exitCode}`);
+    await drain();
+    const pe = table.get(parent);
+    assert(pe !== undefined && pe.state !== 'blocked', 'parent unparked from BLOCKED');
+  });
+
+  // --- memory routing -------------------------------------------------------
+
+  await checkAsync('memory_write / memory_read route through the engine', async () => {
+    const { table, dispatcher, memory } = await makeKernel({ withMemory: true });
+    const pid = await running(table, { memory: { scratch: priv } });
+    assert(memory !== undefined, 'memory wired');
+    memory.syncFromTable(pid);
+    await dispatcher.invoke(pid, 'memory_write', 'scratch', 'k1', { v: 1 });
+    const entries = await dispatcher.invoke(pid, 'memory_read', 'scratch', { key: 'k1' });
+    assert(entries.length === 1, `one entry, got ${entries.length}`);
+    assert((entries[0].value as { v: number }).v === 1, 'value round-trips');
+    assert(entries[0].region === 'scratch', 'logical region name preserved');
+  });
+
+  await checkAsync('memory_read with no engine traps EDRIVER', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await running(table);
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'memory_read', 'scratch', { key: 'k' });
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'EDRIVER', `expected EDRIVER, got ${caught.errno}`);
+  });
+
+  await checkAsync('self-recorded memory_write is logged exactly once', async () => {
+    const sub = join(tmp, 'rec-mem');
+    await mkdir(sub, { recursive: true });
+    const { table, dispatcher, memory } = await makeKernel({
+      withMemory: true,
+      record: true,
+      dir: sub,
+    });
+    const pid = await running(table, { memory: { scratch: priv } });
+    assert(memory !== undefined, 'memory wired');
+    memory.syncFromTable(pid);
+    await dispatcher.invoke(pid, 'memory_write', 'scratch', 'k', 1);
+    const records = await readLog(table, pid);
+    const mw = records.filter((r) => r.syscall === 'memory_write');
+    assert(mw.length === 1, `exactly one memory_write record, got ${mw.length}`);
+    assert(mw[0].phase === 'exit', 'memory.ts owns the exit-phase record');
+  });
+
+  // --- ipc routing ----------------------------------------------------------
+
+  await checkAsync('send / recv route through the ipc engine', async () => {
+    const { table, dispatcher } = await makeKernel({ withIpc: true });
+    const a = await running(table, { role: 'a' });
+    const b = await running(table, { role: 'b' });
+    await dispatcher.invoke(a, 'send', b, { hello: 'world' });
+    const msg = await dispatcher.invoke(b, 'recv');
+    assert((msg.body as { hello: string }).hello === 'world', 'body delivered');
+    assert(unbrand(msg.from as ProcessIdAlias) === unbrand(a), 'from is the sender');
+  });
+
+  await checkAsync('send with no ipc engine traps EDRIVER', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const a = await running(table, { role: 'a' });
+    const b = await running(table, { role: 'b' });
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(a, 'send', b, { x: 1 });
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'EDRIVER', `expected EDRIVER, got ${caught.errno}`);
+  });
+
+  // --- llm_call -------------------------------------------------------------
+
+  await checkAsync('llm_call routes to the resolved driver with a context', async () => {
+    const capture: { ctx?: DriverContext } = {};
+    const { table, dispatcher } = await makeKernel({
+      resolveLLM: () => fakeLLM({ inputTokens: 1, outputTokens: 1, cachedTokens: 0, usd: 0 }, capture),
+    });
+    const pid = await running(table);
+    const res = await dispatcher.invoke(pid, 'llm_call', {
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert(res.text === 'hello', 'response text');
+    assert(res.finishReason === 'stop', 'finish reason');
+    assert(capture.ctx !== undefined, 'driver received a context');
+    assert(unbrand(capture.ctx.pid) === unbrand(pid), 'ctx.pid is the caller');
+    assert(typeof capture.ctx.callId === 'string' && capture.ctx.callId.length > 0, 'ctx.callId');
+    assert(capture.ctx.abortSignal instanceof AbortSignal, 'ctx.abortSignal');
+    assert(capture.ctx.kernelAbiVersion === KERNEL_ABI_VERSION, 'ctx abi version');
+  });
+
+  await checkAsync('llm_call with no resolver traps EDRIVER', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await running(table);
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'llm_call', { messages: [] });
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'EDRIVER', `expected EDRIVER, got ${caught.errno}`);
+  });
+
+  // --- tool_call ------------------------------------------------------------
+
+  await checkAsync('tool_call routes to the resolved driver', async () => {
+    const { driver, descriptor } = fakeTool('reversible');
+    const { table, dispatcher } = await makeKernel({
+      resolveTool: (name) => (name === 'noop' ? { driver, descriptor } : undefined),
+    });
+    const pid = await running(table);
+    const res = await dispatcher.invoke(pid, 'tool_call', 'noop', { x: 1 });
+    assert(res.error === null, 'no error');
+    assert((res.output as { name: string }).name === 'noop', 'tool name echoed');
+    assert(res.reversibility === 'reversible', 'reversibility from the driver');
+  });
+
+  await checkAsync('tool_call for an unregistered tool traps ENOENT', async () => {
+    const { driver, descriptor } = fakeTool('reversible');
+    const { table, dispatcher } = await makeKernel({
+      resolveTool: (name) => (name === 'noop' ? { driver, descriptor } : undefined),
+    });
+    const pid = await running(table);
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'tool_call', 'missing', {});
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'ENOENT', `expected ENOENT, got ${caught.errno}`);
+  });
+
+  await checkAsync('tool_call with no resolver traps EDRIVER', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await running(table);
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'tool_call', 'noop', {});
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'EDRIVER', `expected EDRIVER, got ${caught.errno}`);
+  });
+
+  await checkAsync('irreversible tool_call inside a forkable region traps EREVERSIBLE', async () => {
+    const { driver, descriptor } = fakeTool('irreversible');
+    const { table, dispatcher } = await makeKernel({ resolveTool: () => ({ driver, descriptor }) });
+    const pid = await running(table);
+    let caught: unknown;
+    await dispatcher.runForkable(pid, async () => {
+      try {
+        await dispatcher.invoke(pid, 'tool_call', 'noop', {});
+      } catch (err) {
+        caught = err;
+      }
+    });
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'EREVERSIBLE', `expected EREVERSIBLE, got ${caught.errno}`);
+  });
+
+  await checkAsync('tool_call stageOnly returns a staged action', async () => {
+    const { driver, descriptor } = fakeTool('reversible', { staged: true });
+    const { table, dispatcher } = await makeKernel({ resolveTool: () => ({ driver, descriptor }) });
+    const pid = await running(table);
+    const res = await dispatcher.invoke(pid, 'tool_call', 'noop', { x: 1 }, { stageOnly: true });
+    assert((res.output as StagedAction).id === 'staged-1', 'staged action returned');
+  });
+
+  await checkAsync('tool_call stageOnly without driver support traps EINVAL', async () => {
+    const { driver, descriptor } = fakeTool('reversible'); // no stage()
+    const { table, dispatcher } = await makeKernel({ resolveTool: () => ({ driver, descriptor }) });
+    const pid = await running(table);
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'tool_call', 'noop', {}, { stageOnly: true });
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'throws a CortexError');
+    assert(caught.errno === 'EINVAL', `expected EINVAL, got ${caught.errno}`);
+  });
+
+  // --- budgets --------------------------------------------------------------
+
+  await checkAsync('llm_call charges tokens and microdollars to the budget', async () => {
+    const { table, dispatcher } = await makeKernel({
+      resolveLLM: () =>
+        fakeLLM({ inputTokens: 11, outputTokens: 22, cachedTokens: 33, usd: 0.5 }),
+    });
+    const pid = await running(table);
+    await dispatcher.invoke(pid, 'llm_call', { messages: [] });
+    const b = await dispatcher.invoke(pid, 'budget');
+    assert(b.tokensIn === 11, `tokensIn 11, got ${b.tokensIn}`);
+    assert(b.tokensOut === 22, `tokensOut 22, got ${b.tokensOut}`);
+    assert(b.tokensCached === 33, `tokensCached 33, got ${b.tokensCached}`);
+    assert(b.usdSpent === 500_000, `usdSpent 500000 microdollars, got ${b.usdSpent}`);
+    // The budget snapshot is read during routing, before this call is accounted.
+    assert(b.syscallCount === 1, `syscallCount 1 (the llm_call), got ${b.syscallCount}`);
+  });
+
+  await checkAsync('budget exhaustion fires SIGXCPU and the hook', async () => {
+    let alarmed: string | null = null;
+    const { table, dispatcher } = await makeKernel({
+      resolveLLM: () => fakeLLM({ inputTokens: 100, outputTokens: 0, cachedTokens: 0, usd: 0 }),
+      onBudgetExhausted: (_pid, kind) => {
+        alarmed = kind;
+      },
+    });
+    const pid = await running(table, { budgets: { tokens: 10 } });
+    await dispatcher.invoke(pid, 'llm_call', { messages: [] });
+    await drain();
+    assert(alarmed === 'tokens', `onBudgetExhausted fired with tokens, got ${alarmed}`);
+    const e = table.get(pid);
+    assert(e !== undefined && e.state === 'stopped', `SIGXCPU stopped the process, got ${e?.state}`);
+  });
+
+  // --- time / determinism / signals -----------------------------------------
+
+  await checkAsync('now and random serve the injected sources', async () => {
+    const { table, dispatcher } = await makeKernel({ random: () => 0.42 });
+    const pid = await running(table);
+    const t = await dispatcher.invoke(pid, 'now');
+    assert(t === clock(), 'now returns the injected clock');
+    const r = await dispatcher.invoke(pid, 'random');
+    assert(r === 0.42, `random returns the injected value, got ${r}`);
+  });
+
+  await checkAsync('sleep parks on the injected timer and rejects negative ms', async () => {
+    const ft = makeFakeTimers();
+    const { table, dispatcher } = await makeKernel({
+      setTimeoutFn: ft.setTimeoutFn,
+      clearTimeoutFn: ft.clearTimeoutFn,
+    });
+    const pid = await running(table);
+    let done = false;
+    const p = dispatcher.invoke(pid, 'sleep', 5000).then(() => {
+      done = true;
+    });
+    await drain();
+    assert(!done, 'sleep is pending until the timer fires');
+    assert(ft.timers.length === 1, `one timer registered, got ${ft.timers.length}`);
+    assert(ft.timers[0]?.ms === 5000, 'timer carries the requested ms');
+    ft.fireAll();
+    await p;
+    assert(done, 'sleep resolved after the timer fired');
+
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'sleep', -1);
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'negative sleep throws');
+    assert(caught.errno === 'EINVAL', `expected EINVAL, got ${caught.errno}`);
+  });
+
+  await checkAsync('on_signal installs ignore / default / handler dispositions', async () => {
+    const { table, dispatcher } = await makeKernel();
+    const pid = await running(table);
+    await dispatcher.invoke(pid, 'on_signal', 'SIGUSR1', 'ignore');
+    assert(table.getDisposition(pid, 'SIGUSR1').kind === 'ignore', 'ignore disposition');
+    await dispatcher.invoke(pid, 'on_signal', 'SIGUSR1', 'default');
+    assert(table.getDisposition(pid, 'SIGUSR1').kind === 'default', 'default disposition');
+    const handler: SignalHandler = () => {};
+    await dispatcher.invoke(pid, 'on_signal', 'SIGUSR2', handler);
+    assert(table.getDisposition(pid, 'SIGUSR2').kind === 'handler', 'handler disposition');
+  });
+
+  // --- recording ------------------------------------------------------------
+
+  await checkAsync('dispatcher-recorded syscall writes an enter + exit pair', async () => {
+    const sub = join(tmp, 'rec-now');
+    await mkdir(sub, { recursive: true });
+    const { table, dispatcher } = await makeKernel({ record: true, dir: sub });
+    const pid = await running(table);
+    await dispatcher.invoke(pid, 'now');
+    const records = await readLog(table, pid);
+    const nowRecs = records.filter((r) => r.syscall === 'now');
+    const phases = nowRecs.map((r) => r.phase);
+    assert(phases.includes('enter'), 'an enter record exists');
+    assert(phases.includes('exit'), 'an exit record exists');
+    const exitRec = nowRecs.find((r) => r.phase === 'exit');
+    assert(exitRec !== undefined && exitRec.reversibility === 'idempotent', 'now is idempotent');
+  });
+
+  await checkAsync('a routed failure writes a trap record with the errno', async () => {
+    const sub = join(tmp, 'rec-trap');
+    await mkdir(sub, { recursive: true });
+    const { table, dispatcher } = await makeKernel({ record: true, dir: sub }); // no resolveTool
+    const pid = await running(table);
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(pid, 'tool_call', 'noop', {});
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'tool_call traps EDRIVER');
+    const records = await readLog(table, pid);
+    const tc = records.filter((r) => r.syscall === 'tool_call');
+    assert(tc.some((r) => r.phase === 'enter'), 'enter record written before routing');
+    const trapRec = tc.find((r) => r.phase === 'trap');
+    assert(trapRec !== undefined, 'a trap record exists');
+    assert(trapRec.error?.errno === 'EDRIVER', `trap errno EDRIVER, got ${trapRec.error?.errno}`);
+  });
+
+  await checkAsync('budget is never recorded', async () => {
+    const sub = join(tmp, 'rec-budget');
+    await mkdir(sub, { recursive: true });
+    const { table, dispatcher } = await makeKernel({ record: true, dir: sub });
+    const pid = await running(table);
+    await dispatcher.invoke(pid, 'budget');
+    const records = await readLog(table, pid);
+    assert(!records.some((r) => r.syscall === 'budget'), 'no budget record exists');
+  });
+
+  // --- init integration -----------------------------------------------------
+
+  await checkAsync('exit hands off to init.handleZombie without crashing', async () => {
+    const { table, dispatcher, init } = await makeKernel({ withInit: true });
+    assert(init !== undefined, 'init wired');
+    await init.boot();
+    const parent = await running(table, { role: 'p' });
+    const { pid: child } = await dispatcher.invoke(parent, 'spawn', { role: 'c', agent });
+    await table.setState(child, 'running', { trigger: 'test' });
+    let caught: unknown;
+    try {
+      await dispatcher.invoke(child, 'exit', 0, 'done');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isProcessExitSignal(caught), 'sentinel thrown');
+    await drain();
+    assert(table.get(child) === undefined, 'child reaped via the init handoff');
+    assert(table.get(parent) !== undefined, 'parent survives');
+  });
+
+  // --- cleanup --------------------------------------------------------------
+  for (const t of tables) {
+    for (const pid of t.pids()) {
+      const rec = t.recorderFor(pid);
+      if (rec !== null) await rec.close().catch(() => {});
+    }
+  }
+  await rm(tmp, { recursive: true, force: true });
+}
+
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
 await runSchedulerChecks();
 await runInitChecks();
+await runDispatcherChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

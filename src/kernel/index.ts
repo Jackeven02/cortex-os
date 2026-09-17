@@ -23,3 +23,4 @@ export * from './checkpoint.js';
 export * from './fork.js';
 export * from './scheduler.js';
 export * from './init.js';
+export * from './syscall_dispatcher.js';

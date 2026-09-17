@@ -39,11 +39,11 @@ The point of this phase is to lock the abstractions before writing serious code.
 
 Target: a "hello world" agent runs, calls one LLM, checkpoints, restores, exits cleanly. ~1500 lines of TypeScript.
 
-> **Status as of this commit:** 9 of 10 items done. The foundation (`types.ts` + `errors.ts`) plus `recorder.ts`, `process_table.ts`, `signals.ts`, `ipc.ts`, `memory.ts`, `checkpoint.ts`, `fork.ts`, `scheduler.ts`, and `init.ts` have landed; 199 smoke checks green. Only `syscall.ts` (#014) remains — the dispatcher that wires every module together (assertState/ESTATE, enter/exit/trap records, budget counting, reversibility checks; it will call `init.handleZombie` for normal `exit()`).
+> **Status as of this commit:** 10 of 10 items done — **Phase 1 kernel skeleton is complete.** The foundation (`types.ts` + `errors.ts`) plus `recorder.ts`, `process_table.ts`, `signals.ts`, `ipc.ts`, `memory.ts`, `checkpoint.ts`, `fork.ts`, `scheduler.ts`, `init.ts`, and the capstone `syscall_dispatcher.ts` (#014) have landed; 243 smoke checks green. The dispatcher is the single front door: it enforces the state gate (`ESTATE`), the forkable-region rule (`EREVERSIBLE`), enter/exit/trap recording, and budget accounting + `SIGXCPU`, then routes to each module and calls `init.handleZombie` on `exit()`. One honest v0 deviation: `memory.ts` / `ipc.ts` / `fork.ts` / `checkpoint.ts` predate the dispatcher and still write their own records, so it gates and routes those syscalls without re-recording them (collapsing them onto the dispatcher is a documented follow-up). The agent runner (`boot.ts`) and real driver resolvers land in Phase 2/3.
 
 - [x] **#012** `kernel/process.ts` — Process class, PID allocation, state machine → `d339502` (landed as `process_table.ts`)
 - [x] **#013** `kernel/scheduler.ts` — round-robin scheduler with token budgets → this commit
-- [ ] **#014** `kernel/syscall.ts` — syscall dispatcher, registration, logging, reversibility tags
+- [x] **#014** `kernel/syscall.ts` — syscall dispatcher, registration, logging, reversibility tags → this commit (landed as `syscall_dispatcher.ts`)
 - [x] **#015** `kernel/ipc.ts` — channels (`send`, `recv`, blocking and non-blocking) → `6950f40`
 - [x] **#016** `kernel/signals.ts` — `SIGINT`, `SIGTERM`, `SIGKILL`, `SIGUSR1` (reflect), `SIGUSR2` (summarize) → `2ff3be9`
 - [x] **#017** `kernel/checkpoint.ts` — `checkpoint`, `restore`, snapshot serialization (CBOR) → `6e4a851`
