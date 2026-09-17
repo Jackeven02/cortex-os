@@ -21,3 +21,4 @@ export * from './ipc.js';
 export * from './memory.js';
 export * from './checkpoint.js';
 export * from './fork.js';
+export * from './scheduler.js';

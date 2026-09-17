@@ -39,17 +39,17 @@ The point of this phase is to lock the abstractions before writing serious code.
 
 Target: a "hello world" agent runs, calls one LLM, checkpoints, restores, exits cleanly. ~1500 lines of TypeScript.
 
-> **Status as of this commit:** 8 of 10 items done. The foundation (`types.ts` + `errors.ts`) plus `recorder.ts`, `process_table.ts`, `signals.ts`, `ipc.ts`, `memory.ts`, `checkpoint.ts`, and `fork.ts` have landed; 163 smoke checks green. Next: `scheduler.ts` (#013), `init.ts` (#021), and finally `syscall.ts` (#014) which wires everything together.
+> **Status as of this commit:** 9 of 10 items done. The foundation (`types.ts` + `errors.ts`) plus `recorder.ts`, `process_table.ts`, `signals.ts`, `ipc.ts`, `memory.ts`, `checkpoint.ts`, `fork.ts`, and `scheduler.ts` have landed; 178 smoke checks green. Next: `init.ts` (#021), then finally `syscall.ts` (#014) which wires everything together.
 
 - [x] **#012** `kernel/process.ts` — Process class, PID allocation, state machine → `d339502` (landed as `process_table.ts`)
-- [ ] **#013** `kernel/scheduler.ts` — round-robin scheduler with token budgets
+- [x] **#013** `kernel/scheduler.ts` — round-robin scheduler with token budgets → this commit
 - [ ] **#014** `kernel/syscall.ts` — syscall dispatcher, registration, logging, reversibility tags
 - [x] **#015** `kernel/ipc.ts` — channels (`send`, `recv`, blocking and non-blocking) → `6950f40`
 - [x] **#016** `kernel/signals.ts` — `SIGINT`, `SIGTERM`, `SIGKILL`, `SIGUSR1` (reflect), `SIGUSR2` (summarize) → `2ff3be9`
 - [x] **#017** `kernel/checkpoint.ts` — `checkpoint`, `restore`, snapshot serialization (CBOR) → `6e4a851`
 - [x] **#018** `kernel/recorder.ts` — every syscall written to append-only `.crec` log → `c85e697`
 - [x] **#019** `kernel/memory.ts` — virtual memory abstraction with private/shared/cow regions → `a8313e4`
-- [x] **#020** `kernel/fork.ts` — cognitive fork per STATE.md §3.1 → this commit
+- [x] **#020** `kernel/fork.ts` — cognitive fork per STATE.md §3.1 → `f24cd87`
 - [ ] **#021** `kernel/init.ts` — process 1, the supervisor
 
 **Exit criteria:** unit tests cover spawn → llm_call → tool_call → exit; checkpoint → restore round-trips; fork → diverge → diff; signals work; scheduler enforces budgets.

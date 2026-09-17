@@ -86,6 +86,12 @@ import {
   DEFAULT_BUDGET_POLICY,
   type ForkResult,
   type ForkOptions,
+  Scheduler,
+  DEFAULT_IDLE_DELAY_MS,
+  DEFAULT_BUSY_DELAY_MS,
+  type TickOutcome,
+  type DispatchReason,
+  type ResumeFn,
 } from '../src/index.js';
 
 let passed = 0;
@@ -3423,9 +3429,391 @@ async function runForkChecks(): Promise<void> {
   await rm(tmp, { recursive: true, force: true });
 }
 
+async function runSchedulerChecks(): Promise<void> {
+  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-sched-'));
+  const tables: ProcessTable[] = [];
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const advance = (ms = 1000) => {
+    fakeNow += ms;
+  };
+
+  async function makeTable(opts: { record?: boolean; dir?: string } = {}): Promise<ProcessTable> {
+    const dir = opts.dir ?? tmp;
+    const record = opts.record ?? false;
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...(record ? { recorderFactory: async (pid) => Recorder.open({ pid, dir }) } : {}),
+    });
+    tables.push(t);
+    return t;
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+
+  interface SpawnOpts {
+    role?: string;
+    nice?: number;
+    budgets?: { tokens: number; usd: number; wallTimeMs: number };
+  }
+
+  // Allocate and move NEW → READY (the schedulable state).
+  async function spawn(table: ProcessTable, opts: SpawnOpts = {}): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({
+      ppid: null,
+      role: opts.role ?? 'worker',
+      agent,
+      ...(opts.nice !== undefined ? { nice: opts.nice } : {}),
+      ...(opts.budgets !== undefined ? { budgets: opts.budgets } : {}),
+    });
+    await table.setState(pid, 'ready', { trigger: 'init' });
+    advance();
+    return pid;
+  }
+
+  function makeSched(
+    table: ProcessTable,
+    opts: Partial<ConstructorParameters<typeof Scheduler>[0]> = {},
+  ): { sched: Scheduler; signals: SignalManager } {
+    const signals =
+      opts.signals ?? new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const sched = new Scheduler({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...opts,
+    });
+    return { sched, signals };
+  }
+
+  // --- constants ------------------------------------------------------------
+
+  check('scheduler constants', () => {
+    assert(DEFAULT_IDLE_DELAY_MS === 10, 'idle delay defaults to 10ms');
+    assert(DEFAULT_BUSY_DELAY_MS === 0, 'busy delay defaults to 0ms');
+    assert(DEFAULT_BUSY_DELAY_MS < DEFAULT_IDLE_DELAY_MS, 'busy loop is tighter than idle');
+  });
+
+  // --- idle -----------------------------------------------------------------
+
+  await checkAsync('tick on an empty table is idle and fires onIdle', async () => {
+    const table = await makeTable();
+    let idles = 0;
+    const { sched } = makeSched(table, {
+      onIdle: () => {
+        idles++;
+      },
+    });
+    const out: TickOutcome = await sched.tick();
+    assert(out.dispatched === null, 'nothing dispatched');
+    assert(out.reason === 'idle', 'reason is idle');
+    assert(idles === 1, 'onIdle fired once');
+    assert(sched.queueLength === 0, 'run queue empty');
+  });
+
+  // --- dispatch / yield -----------------------------------------------------
+
+  await checkAsync('tick dispatches READY → RUNNING → yields back to READY and re-queues', async () => {
+    const table = await makeTable();
+    const pid = await spawn(table);
+    const seen: ProcessState[] = [];
+    const resume: ResumeFn = async (p) => {
+      seen.push(table.get(p)!.state);
+    };
+    const { sched } = makeSched(table, { resume });
+    const out = await sched.tick();
+    assert(
+      out.dispatched !== null && unbrand(out.dispatched) === unbrand(pid),
+      'dispatched the ready pid',
+    );
+    assert(out.reason === 'yielded', 'a no-op continuation yields');
+    assert(seen.length === 1 && seen[0] === 'running', 'resume ran while RUNNING');
+    assert(table.get(pid)!.state === 'ready', 'back to READY after yield');
+    assert(sched.isQueued(pid), 're-queued for round-robin');
+  });
+
+  // --- priority -------------------------------------------------------------
+
+  await checkAsync('lower nice preempts higher nice', async () => {
+    const table = await makeTable();
+    const low = await spawn(table, { role: 'low', nice: 5 });
+    const high = await spawn(table, { role: 'high', nice: -3 });
+    // high blocks after its first quantum so it leaves the run queue.
+    const resume: ResumeFn = async (p) => {
+      if (unbrand(p) === unbrand(high)) {
+        await table.setState(p, 'blocked', { trigger: 'recv' });
+        table.setBlockedOn(p, { kind: 'lock', resource: 'test' });
+      }
+    };
+    const { sched } = makeSched(table, { resume });
+    const first = await sched.tick();
+    assert(
+      first.dispatched !== null && unbrand(first.dispatched) === unbrand(high),
+      'nice -3 preempts nice 5',
+    );
+    assert(first.reason === 'blocked', 'high blocked itself');
+    const second = await sched.tick();
+    assert(
+      second.dispatched !== null && unbrand(second.dispatched) === unbrand(low),
+      'low runs once high is blocked',
+    );
+  });
+
+  await checkAsync('equal nice is scheduled FIFO by enqueue order', async () => {
+    const table = await makeTable();
+    const a = await spawn(table, { role: 'a' });
+    const b = await spawn(table, { role: 'b' });
+    const resume: ResumeFn = async (p) => {
+      await table.setState(p, 'blocked', { trigger: 'recv' });
+    };
+    const { sched } = makeSched(table, { resume });
+    const first = await sched.tick();
+    const second = await sched.tick();
+    assert(
+      first.dispatched !== null && unbrand(first.dispatched) === unbrand(a),
+      'earlier pid (a) runs first',
+    );
+    assert(
+      second.dispatched !== null && unbrand(second.dispatched) === unbrand(b),
+      'later pid (b) runs second',
+    );
+  });
+
+  await checkAsync('a yielding process goes to the back of its nice band (round-robin)', async () => {
+    const table = await makeTable();
+    const a = await spawn(table, { role: 'a' });
+    const b = await spawn(table, { role: 'b' });
+    const order: number[] = [];
+    const resume: ResumeFn = async (p) => {
+      order.push(unbrand(p));
+    };
+    const { sched } = makeSched(table, { resume });
+    await sched.tick();
+    await sched.tick();
+    await sched.tick();
+    assert(order.length === 3, 'three quanta ran');
+    assert(
+      order[0] === unbrand(a) && order[1] === unbrand(b) && order[2] === unbrand(a),
+      `round-robin order a,b,a — got ${order.join(',')}`,
+    );
+  });
+
+  // --- budgets --------------------------------------------------------------
+
+  await checkAsync('an exhausted READY process is parked, then scheduled after setBudget', async () => {
+    const table = await makeTable();
+    const broke = await spawn(table, { role: 'broke', budgets: { tokens: 0, usd: -1, wallTimeMs: -1 } });
+    const { sched } = makeSched(table);
+    const out = await sched.tick();
+    assert(out.dispatched === null, 'exhausted process is not a candidate');
+    assert(out.reason === 'idle', 'tick reports idle');
+    assert(table.get(broke)!.state === 'ready', 'still READY (parked, not stopped)');
+    assert(sched.isQueued(broke), 'kept in the run queue for later');
+    // Supervisor tops up the budget (PROCESS.md §8.3 recovery path).
+    sched.setBudget(broke, { tokens: 1000, usd: -1, wallTimeMs: -1 });
+    const out2 = await sched.tick();
+    assert(
+      out2.dispatched !== null && unbrand(out2.dispatched) === unbrand(broke),
+      'schedulable after top-up',
+    );
+    assert(out2.reason === 'yielded', 'runs and yields');
+  });
+
+  await checkAsync('budget exhausted during a quantum fires SIGXCPU and STOPs the process', async () => {
+    const table = await makeTable();
+    const pid = await spawn(table, { budgets: { tokens: 100, usd: -1, wallTimeMs: -1 } });
+    // The continuation spends the whole token budget then returns (still RUNNING).
+    const resume: ResumeFn = async (p) => {
+      table.spend(p, { tokensIn: 100 });
+    };
+    const { sched } = makeSched(table, { resume });
+    const out = await sched.tick();
+    assert(out.reason === 'sigxcpu', 'tick reports sigxcpu');
+    assert(table.get(pid)!.state === 'stopped', 'SIGXCPU default action stopped it');
+    assert(!sched.isQueued(pid), 'stopped process is not re-queued');
+    assert(table.checkBudget(pid) !== 'ok', 'budget still exhausted');
+  });
+
+  await checkAsync('SIGXCPU dispatch writes __signal and __sched records', async () => {
+    const sub = join(tmp, 'sched-records');
+    await mkdir(sub, { recursive: true });
+    const table = await makeTable({ record: true, dir: sub });
+    const pid = await spawn(table, { budgets: { tokens: 10, usd: -1, wallTimeMs: -1 } });
+    const resume: ResumeFn = async (p) => {
+      table.spend(p, { tokensIn: 10 });
+    };
+    const { sched } = makeSched(table, { resume });
+    const out = await sched.tick();
+    assert(out.reason === 'sigxcpu', 'sigxcpu fired');
+
+    const rec = table.recorderFor(pid)!;
+    await rec.flush();
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) records.push(r);
+
+    const sig = records.filter((r) => r.syscall === '__signal');
+    assert(
+      sig.some((r) => (r.args as { signal?: string }).signal === 'SIGXCPU'),
+      'a SIGXCPU __signal record exists',
+    );
+    const schedRecs = records.filter((r) => r.syscall === '__sched');
+    const sigx = schedRecs.find((r) => (r.args as { action?: string }).action === 'sigxcpu');
+    assert(sigx !== undefined, 'a __sched sigxcpu record exists');
+    assert(
+      (sigx!.args as { budgetKind?: string }).budgetKind === 'tokens',
+      '__sched records the exhausted budget kind',
+    );
+    assert(
+      schedRecs.some((r) => (r.args as { action?: string }).action === 'sigxcpu'),
+      'sched action recorded',
+    );
+  });
+
+  // --- blocking / waking ----------------------------------------------------
+
+  await checkAsync('a blocked continuation is not re-queued; reconcile re-adopts it on wake', async () => {
+    const table = await makeTable();
+    const pid = await spawn(table);
+    let phase = 0;
+    const resume: ResumeFn = async (p) => {
+      phase++;
+      if (phase === 1) {
+        await table.setState(p, 'blocked', { trigger: 'recv' });
+        table.setBlockedOn(p, { kind: 'recv', channel: asChannelId('test') });
+      }
+    };
+    const { sched } = makeSched(table, { resume });
+    const out1 = await sched.tick();
+    assert(out1.reason === 'blocked', 'first quantum blocks');
+    assert(table.get(pid)!.state === 'blocked', 'process is BLOCKED');
+    assert(!sched.isQueued(pid), 'blocked process left the run queue');
+    const idleOut = await sched.tick();
+    assert(idleOut.reason === 'idle', 'nothing runnable while blocked');
+    // Wake: BLOCKED → READY.
+    await table.setState(pid, 'ready', { trigger: 'wake' });
+    const out2 = await sched.tick();
+    assert(
+      out2.dispatched !== null && unbrand(out2.dispatched) === unbrand(pid),
+      'reconcile re-adopted the woken process',
+    );
+    assert(out2.reason === 'yielded', 'second quantum yields');
+    assert(phase === 2, 'resume ran twice');
+  });
+
+  await checkAsync('a pending signal delivered on dispatch pre-empts the quantum', async () => {
+    const table = await makeTable();
+    const pid = await spawn(table);
+    table.queueSignal(pid, 'SIGSTOP');
+    let resumed = false;
+    const resume: ResumeFn = async () => {
+      resumed = true;
+    };
+    const { sched } = makeSched(table, { resume });
+    const out = await sched.tick();
+    assert(out.reason === 'signal', 'tick reports a signal pre-emption');
+    assert(table.get(pid)!.state === 'stopped', 'queued SIGSTOP stopped it on dispatch');
+    assert(!resumed, 'continuation never ran');
+    assert(!sched.isQueued(pid), 'stopped process not re-queued');
+  });
+
+  // --- explicit run-queue API ----------------------------------------------
+
+  await checkAsync('run-queue API: enqueue is idempotent, dequeue removes', async () => {
+    const table = await makeTable();
+    const a = await spawn(table, { role: 'a' });
+    const b = await spawn(table, { role: 'b' });
+    // autoReconcile off so the explicit queue is the only source of truth.
+    const { sched } = makeSched(table, { autoReconcile: false });
+    sched.enqueue(a);
+    sched.enqueue(a); // idempotent
+    sched.enqueue(b);
+    assert(sched.queueLength === 2, 'two distinct entries');
+    assert(sched.isQueued(a) && sched.isQueued(b), 'both queued');
+    sched.dequeue(a);
+    assert(!sched.isQueued(a), 'a dequeued');
+    assert(sched.queueLength === 1, 'one entry remains');
+    sched.dequeue(a); // idempotent no-op
+    assert(sched.queueLength === 1, 'double dequeue is a no-op');
+    const out = await sched.tick();
+    assert(
+      out.dispatched !== null && unbrand(out.dispatched) === unbrand(b),
+      'only the still-queued b runs',
+    );
+  });
+
+  // --- detach / exit --------------------------------------------------------
+
+  await checkAsync('a continuation that detaches (STOPPED) is left as-is', async () => {
+    const table = await makeTable();
+    const pid = await spawn(table);
+    const resume: ResumeFn = async (p) => {
+      await table.setState(p, 'stopped', { trigger: 'self' });
+    };
+    const { sched } = makeSched(table, { resume });
+    const out = await sched.tick();
+    assert(out.reason === 'detached', 'stopped continuation reports detached');
+    assert(table.get(pid)!.state === 'stopped', 'left stopped');
+    assert(!sched.isQueued(pid), 'not re-queued');
+  });
+
+  await checkAsync('a continuation that exits reports exited', async () => {
+    const table = await makeTable();
+    const pid = await spawn(table);
+    const resume: ResumeFn = async (p) => {
+      await table.setState(p, 'exiting', { trigger: 'exit' });
+      await table.setState(p, 'zombie', { trigger: 'cleanup-done' });
+    };
+    const { sched } = makeSched(table, { resume });
+    const out = await sched.tick();
+    assert(out.reason === 'exited', 'zombie continuation reports exited');
+    assert(table.get(pid)!.state === 'zombie', 'left zombie');
+    assert(!sched.isQueued(pid), 'not re-queued');
+  });
+
+  // --- auto-loop ------------------------------------------------------------
+
+  await checkAsync('start() drives the auto-loop; stop() quiesces it', async () => {
+    const table = await makeTable();
+    await spawn(table);
+    let runs = 0;
+    const resume: ResumeFn = async () => {
+      runs++;
+    };
+    const { sched } = makeSched(table, { resume, idleDelayMs: 1, busyDelayMs: 0 });
+    sched.start();
+    sched.start(); // idempotent
+    assert(sched.running, 'scheduler reports running');
+    await new Promise((r) => setTimeout(r, 40));
+    await sched.stop();
+    assert(!sched.running, 'scheduler stopped');
+    assert(runs > 0, `auto-loop dispatched at least one quantum (runs=${runs})`);
+    const before = runs;
+    await new Promise((r) => setTimeout(r, 25));
+    assert(runs === before, 'no further quanta after stop()');
+    await sched.stop(); // idempotent
+  });
+
+  // --- cleanup --------------------------------------------------------------
+  for (const t of tables) {
+    for (const pid of t.pids()) {
+      const rec = t.recorderFor(pid);
+      if (rec !== null) await rec.close().catch(() => {});
+    }
+  }
+  await rm(tmp, { recursive: true, force: true });
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
+await runSchedulerChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
