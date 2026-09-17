@@ -132,7 +132,19 @@ import {
   parseSemver,
   type DriverManifest,
   type ToolDriverInfo,
+  type ToolCall,
+  type Message,
 } from '../src/index.js';
+
+import {
+  MockLLMDriver,
+  mockLLM,
+  estimateTextTokens,
+  estimateMessageTokens,
+  MOCK_DEFAULTS,
+  MOCK_CHARS_PER_TOKEN,
+  type MockTurn,
+} from '../src/drivers/llm/mock.js';
 
 let passed = 0;
 let failed = 0;
@@ -6041,6 +6053,351 @@ async function runDriverRegistryChecks(): Promise<void> {
   });
 }
 
+async function runMockLLMChecks(): Promise<void> {
+  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-mock-'));
+  const agent = { module: './agents/noop.js' } as const;
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = (): string => new Date(fakeNow).toISOString();
+
+  const userMsg = (content: string): Message => ({ role: 'user', content });
+
+  // --- §1 estimation heuristics --------------------------------------------
+
+  check('estimateTextTokens is ceil(len/4), empty -> 0', () => {
+    assert(estimateTextTokens('') === 0, 'empty -> 0');
+    assert(estimateTextTokens('hi') === 1, '2 chars -> 1');
+    assert(estimateTextTokens('abcd') === 1, '4 chars -> 1');
+    assert(estimateTextTokens('abcde') === 2, '5 chars -> 2');
+    assert(MOCK_CHARS_PER_TOKEN === 4, 'divisor is 4');
+  });
+
+  check('estimateMessageTokens adds 1 framing token per message', () => {
+    assert(estimateMessageTokens([]) === 0, 'no messages -> 0');
+    assert(estimateMessageTokens([userMsg('hi')]) === 2, 'content 1 + framing 1');
+    assert(estimateMessageTokens([userMsg(''), userMsg('')]) === 2, 'empty content still 1 each');
+  });
+
+  // --- §2 driver identity / defaults ---------------------------------------
+
+  check('MockLLMDriver defaults match MOCK_DEFAULTS', () => {
+    const d = new MockLLMDriver();
+    assert(d.name === MOCK_DEFAULTS.name, `name ${d.name}`);
+    assert(d.version === MOCK_DEFAULTS.version, 'version');
+    assert(d.abiCompat === MOCK_DEFAULTS.abiCompat, 'abiCompat');
+    assert(d.supportedModels.includes('mock-1'), 'supportedModels');
+    assert(d.callCount === 0 && d.closed === false, 'fresh driver state');
+  });
+
+  check('mock abiCompat admits the live kernel ABI', () => {
+    const d = mockLLM();
+    assert(satisfiesAbi(KERNEL_ABI_VERSION, d.abiCompat) === true, 'registry would accept it');
+  });
+
+  check('mockLLM() factory honors option overrides', () => {
+    const d = mockLLM({ name: 'm2', defaultModel: 'mock-mini', usdPer1kTokens: 0.01 });
+    assert(d.name === 'm2', 'name override');
+    assert(d.abiCompat === MOCK_DEFAULTS.abiCompat, 'abiCompat default kept');
+  });
+
+  // --- §3 pure echo behaviour ----------------------------------------------
+
+  await checkAsync('call() echoes the last user message deterministically', async () => {
+    const d = mockLLM();
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const res = await d.call({ messages: [userMsg('hi')] }, ctx);
+    assert(res.text === 'mock reply to: hi', `echo text: ${res.text}`);
+    assert(res.finishReason === 'stop', 'stop by default');
+    assert(res.toolCalls.length === 0, 'no tool calls');
+    assert(res.model === 'mock-1', 'default model');
+    assert(res.driverVersion === d.version, 'driverVersion');
+  });
+
+  await checkAsync('call() is a pure function of the request (same in -> same out)', async () => {
+    const d = mockLLM();
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const req = { messages: [userMsg('hello world')] };
+    const a = await d.call(req, ctx);
+    const b = await d.call(req, ctx);
+    assert(a.text === b.text, 'text stable');
+    assert(JSON.stringify(a.usage) === JSON.stringify(b.usage), 'usage stable');
+    assert(a.usage.cachedTokens === 0 && b.usage.cachedTokens === 0, 'no cache by default');
+  });
+
+  await checkAsync('call() anchors on the LAST user message', async () => {
+    const d = mockLLM();
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const res = await d.call(
+      { messages: [userMsg('first'), { role: 'assistant', content: 'reply' }, userMsg('second')] },
+      ctx,
+    );
+    assert(res.text === 'mock reply to: second', `anchored on last user: ${res.text}`);
+  });
+
+  await checkAsync('call() on an empty conversation is still deterministic', async () => {
+    const d = mockLLM();
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const res = await d.call({ messages: [] }, ctx);
+    assert(typeof res.text === 'string' && res.text.includes('(empty)'), `empty reply: ${res.text}`);
+    assert(res.usage.inputTokens === 0, 'no input tokens');
+  });
+
+  await checkAsync('usage heuristics: input/output tokens and zero default usd', async () => {
+    const d = mockLLM();
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const res = await d.call({ messages: [userMsg('hi')] }, ctx);
+    assert(res.usage.inputTokens === 2, `input tokens ${res.usage.inputTokens}`);
+    assert(res.usage.outputTokens === estimateTextTokens('mock reply to: hi'), 'output = text estimate');
+    assert(res.usage.usd === 0, 'free by default');
+  });
+
+  await checkAsync('usdPer1kTokens produces a microdollar-clean price', async () => {
+    const d = mockLLM({ usdPer1kTokens: 0.001 });
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const res = await d.call({ messages: [userMsg('hi')] }, ctx);
+    const total = res.usage.inputTokens + res.usage.outputTokens;
+    assert(res.usage.usd === Math.round((total / 1000) * 0.001 * 1e6) / 1e6, `usd ${res.usage.usd}`);
+  });
+
+  await checkAsync('model resolves from req.model, else the default', async () => {
+    const d = mockLLM();
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const res = await d.call({ messages: [userMsg('hi')], model: 'mock-mini' }, ctx);
+    assert(res.model === 'mock-mini', 'request model wins');
+  });
+
+  // --- §4 scripted mode -----------------------------------------------------
+
+  await checkAsync('scripted turns are consumed in order, then fall back to echo', async () => {
+    const script: MockTurn[] = [{ text: 'one' }, { text: 'two' }];
+    const d = mockLLM({ script });
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    assert((await d.call({ messages: [userMsg('x')] }, ctx)).text === 'one', 'turn 0');
+    assert((await d.call({ messages: [userMsg('x')] }, ctx)).text === 'two', 'turn 1');
+    const third = await d.call({ messages: [userMsg('fallback')] }, ctx);
+    assert(third.text === 'mock reply to: fallback', `exhausted -> echo: ${third.text}`);
+    assert(d.callCount === 3, 'callCount tracks calls');
+  });
+
+  await checkAsync('scripted tool_use turn flips finishReason', async () => {
+    const calls: ToolCall[] = [{ id: 't1', name: 'grep', arguments: { pattern: 'x' } }];
+    const d = mockLLM({ script: [{ text: null, toolCalls: calls }] });
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const res = await d.call({ messages: [userMsg('search')] }, ctx);
+    assert(res.text === null, 'null text');
+    assert(res.toolCalls.length === 1 && res.toolCalls[0].name === 'grep', 'tool call surfaced');
+    assert(res.finishReason === 'tool_use', `finishReason ${res.finishReason}`);
+    assert(res.usage.outputTokens >= 4, 'tool calls add output tokens');
+  });
+
+  await checkAsync('scripted usage / model / finishReason overrides merge', async () => {
+    const d = mockLLM({ script: [{ text: 't', usage: { inputTokens: 99, usd: 1.5 }, model: 'custom', finishReason: 'length' }] });
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const res = await d.call({ messages: [userMsg('hi')] }, ctx);
+    assert(res.usage.inputTokens === 99, 'input override');
+    assert(res.usage.usd === 1.5, 'usd override');
+    assert(res.model === 'custom', 'model override');
+    assert(res.finishReason === 'length', 'finishReason override');
+    assert(res.usage.outputTokens === estimateTextTokens('t'), 'non-overridden field still computed');
+  });
+
+  await checkAsync('reset() rewinds script, callCount, and cache', async () => {
+    const d = mockLLM({ script: [{ text: 'one' }], cacheRepeated: true });
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    await d.call({ messages: [userMsg('hi')] }, ctx);
+    assert(d.callCount === 1, 'one call');
+    d.reset();
+    assert(d.callCount === 0, 'callCount reset');
+    const res = await d.call({ messages: [userMsg('hi')] }, ctx);
+    assert(res.text === 'one', 'script rewound to turn 0');
+  });
+
+  // --- §5 prompt-cache simulation ------------------------------------------
+
+  await checkAsync('cacheRepeated reports cachedTokens on a repeated prompt', async () => {
+    const d = mockLLM({ cacheRepeated: true });
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    const req = { messages: [userMsg('cache me')] };
+    const first = await d.call(req, ctx);
+    const second = await d.call(req, ctx);
+    assert(first.usage.cachedTokens === 0, 'first call not cached');
+    assert(second.usage.cachedTokens === second.usage.inputTokens, 'second call fully cached');
+  });
+
+  // --- §6 optional capabilities + lifecycle --------------------------------
+
+  await checkAsync('countTokens is present and matches the heuristic', async () => {
+    const d = mockLLM();
+    assert(typeof d.countTokens === 'function', 'countTokens present');
+    const n = await d.countTokens!([userMsg('hi')]);
+    assert(n === estimateMessageTokens([userMsg('hi')]), 'count matches estimate');
+  });
+
+  await checkAsync('stream is absent in v0 (post-v0 capability)', async () => {
+    const d = mockLLM();
+    assert(d.stream === undefined, 'no streaming in v0');
+  });
+
+  await checkAsync('close() marks closed and further calls reject', async () => {
+    const d = mockLLM();
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    await d.close();
+    assert(d.closed === true, 'closed flag');
+    let caught: unknown;
+    try {
+      await d.call({ messages: [userMsg('hi')] }, ctx);
+    } catch (err) {
+      caught = err;
+    }
+    assert(caught instanceof Error, 'call after close throws');
+  });
+
+  await checkAsync('latency + pre-aborted signal rejects', async () => {
+    const d = mockLLM({ latencyMs: 1000 });
+    const ac = new AbortController();
+    ac.abort();
+    const ctx = { pid: asProcessId(2), callId: 'c1', deadline: clock(), abortSignal: ac.signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+    let caught: unknown;
+    try {
+      await d.call({ messages: [userMsg('hi')] }, ctx);
+    } catch (err) {
+      caught = err;
+    }
+    assert(caught instanceof Error, 'aborted call rejects');
+  });
+
+  // --- §7 registry integration ---------------------------------------------
+
+  await checkAsync('mock registers into DriverRegistry and surfaces in listAll', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(mockLLM());
+    assert(reg.hasLLM('mock'), 'registered');
+    assert(reg.resolveLLM().name === 'mock', 'resolves as default');
+    const info = reg.listAll().llm.find((d) => d.name === 'mock');
+    assert(info !== undefined && info.isDefault === true, 'is default');
+    assert(info.countsTokens === true && info.streams === false, 'capability flags');
+    await reg.closeAll();
+  });
+
+  // --- §8 end-to-end: registry -> dispatcher -> process --------------------
+
+  const tables: ProcessTable[] = [];
+  async function makeTable(opts: { record?: boolean; dir?: string } = {}): Promise<ProcessTable> {
+    const dir = opts.dir ?? tmp;
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...(opts.record === true ? { recorderFactory: async (pid) => Recorder.open({ pid, dir }) } : {}),
+    });
+    tables.push(t);
+    return t;
+  }
+  async function runningPid(table: ProcessTable, opts: { budgets?: Partial<BudgetLimits> } = {}): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({
+      ppid: null,
+      role: 'worker',
+      agent,
+      ...(opts.budgets !== undefined ? { budgets: opts.budgets } : {}),
+    });
+    await table.setState(pid, 'ready', { trigger: 'test' });
+    await table.setState(pid, 'running', { trigger: 'test' });
+    return pid;
+  }
+  function makeDispatcher(table: ProcessTable, reg: DriverRegistry): SyscallDispatcher {
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    return new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      resolveLLM: reg.llmResolver(),
+      resolveTool: reg.toolResolver(),
+    });
+  }
+
+  await checkAsync('E2E: llm_call through the registry resolver returns the mock reply', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(mockLLM());
+    const table = await makeTable();
+    const dispatcher = makeDispatcher(table, reg);
+    const pid = await runningPid(table);
+    const res = await dispatcher.invoke(pid, 'llm_call', { messages: [userMsg('ping')] });
+    assert(res.text === 'mock reply to: ping', `mock reply via syscall: ${res.text}`);
+    assert(res.usage.inputTokens === 2, 'usage flowed from the driver');
+    await reg.closeAll();
+  });
+
+  await checkAsync('E2E: mock usage drives budget exhaustion -> SIGXCPU stops the process', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(mockLLM());
+    const table = await makeTable();
+    const dispatcher = makeDispatcher(table, reg);
+    const pid = await runningPid(table, { budgets: { tokens: 1 } });
+    await dispatcher.invoke(pid, 'llm_call', { messages: [userMsg('hi')] });
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    const e = table.get(pid);
+    assert(e !== undefined && e.state === 'stopped', `SIGXCPU stopped it, got ${e?.state}`);
+    await reg.closeAll();
+  });
+
+  await checkAsync('E2E: llm_call writes an enter + exit record pair', async () => {
+    const sub = join(tmp, 'rec-mock');
+    await mkdir(sub, { recursive: true });
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(mockLLM());
+    const table = await makeTable({ record: true, dir: sub });
+    const dispatcher = makeDispatcher(table, reg);
+    const pid = await runningPid(table);
+    await dispatcher.invoke(pid, 'llm_call', { messages: [userMsg('record me')] });
+    const rec = table.recorderFor(pid);
+    assert(rec !== null, 'recorder open');
+    await rec!.flush();
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(rec!.path)) records.push(r);
+    const llm = records.filter((r) => r.syscall === 'llm_call');
+    assert(llm.some((r) => r.phase === 'enter'), 'enter recorded');
+    const exit = llm.find((r) => r.phase === 'exit');
+    assert(exit !== undefined, 'exit recorded');
+    assert((exit!.result as { text: string }).text === 'mock reply to: record me', 'result carries the reply');
+    await reg.closeAll();
+  });
+
+  await checkAsync('E2E: full lifecycle spawn -> llm_call -> exit -> reap', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(mockLLM());
+    const table = await makeTable();
+    const dispatcher = makeDispatcher(table, reg);
+    const pid = await runningPid(table);
+    const res = await dispatcher.invoke(pid, 'llm_call', { messages: [userMsg('think')] });
+    assert(res.text === 'mock reply to: think', 'cognition happened');
+    let exitSig: unknown;
+    try {
+      await dispatcher.invoke(pid, 'exit', 0, 'done');
+    } catch (err) {
+      exitSig = err;
+    }
+    assert(isProcessExitSignal(exitSig), 'exit throws the sentinel');
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    assert(table.get(pid) === undefined, 'process reaped after exit');
+    await reg.closeAll();
+  });
+
+  // --- cleanup --------------------------------------------------------------
+  for (const t of tables) {
+    for (const pid of t.pids()) {
+      const rec = t.recorderFor(pid);
+      if (rec !== null) await rec.close().catch(() => {});
+    }
+  }
+  await rm(tmp, { recursive: true, force: true });
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -6048,6 +6405,7 @@ await runSchedulerChecks();
 await runInitChecks();
 await runDispatcherChecks();
 await runDriverRegistryChecks();
+await runMockLLMChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

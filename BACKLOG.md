@@ -63,7 +63,7 @@ Target: a "hello world" agent runs, calls one LLM, checkpoints, restores, exits 
 
 Pluggable backends. Each driver is independently testable.
 
-- [ ] **#022** `drivers/llm/mock.ts` — deterministic mock for tests and CI (build this first; it unblocks everything else)
+- [x] **#022** `drivers/llm/mock.ts` — deterministic mock for tests and CI (build this first; it unblocks everything else) → this commit (first concrete `ILLMDriver`; registers through `driver_registry.ts`, exercised end-to-end via the dispatcher in smoke)
 - [ ] **#023** `drivers/llm/deepseek.ts` — first real LLM driver
 - [ ] **#024** `drivers/llm/openai.ts` — second LLM driver, validates the abstraction
 - [ ] **#025** `drivers/tool/mcp.ts` — MCP client, mounts any MCP server as a tool namespace
