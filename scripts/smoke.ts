@@ -151,6 +151,20 @@ import {
   type MockTurn,
 } from '../src/drivers/llm/mock.js';
 
+import {
+  DeepSeekLLMDriver,
+  deepseekLLM,
+  DEEPSEEK_DEFAULTS,
+  DEEPSEEK_PRICING,
+  DEEPSEEK_CHARS_PER_TOKEN,
+  estimateDeepSeekTokens,
+  estimateDeepSeekMessageTokens,
+  computeUsd,
+  errnoForStatus,
+  type FetchFn,
+  type FetchResponseLike,
+} from '../src/drivers/llm/deepseek.js';
+
 let passed = 0;
 let failed = 0;
 
@@ -6769,6 +6783,348 @@ async function runBootChecks(): Promise<void> {
   await rm(tmp, { recursive: true, force: true });
 }
 
+async function runDeepseekChecks(): Promise<void> {
+  const fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = (): string => new Date(fakeNow).toISOString();
+  const userMsg = (content: string): Message => ({ role: 'user', content });
+
+  const ctx = (over: Record<string, unknown> = {}) => ({
+    pid: asProcessId(2),
+    callId: 'c1',
+    deadline: clock(),
+    abortSignal: new AbortController().signal,
+    kernelAbiVersion: KERNEL_ABI_VERSION,
+    ...over,
+  });
+
+  async function expectErrno(fn: () => Promise<unknown>, errno: string): Promise<void> {
+    let caught: unknown = null;
+    try {
+      await fn();
+    } catch (e) {
+      caught = e;
+    }
+    assert(isCortexError(caught), `expected a CortexError, got ${String(caught)}`);
+    assert(
+      (caught as CortexError).errno === errno,
+      `expected errno ${errno}, got ${(caught as CortexError).errno}: ${(caught as CortexError).message}`,
+    );
+  }
+
+  // --- fake transport -------------------------------------------------------
+
+  function jsonResponse(status: number, body: unknown): FetchResponseLike {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      async json() {
+        return body;
+      },
+      async text() {
+        return JSON.stringify(body);
+      },
+    };
+  }
+
+  function errorResponse(status: number, text: string): FetchResponseLike {
+    return {
+      ok: false,
+      status,
+      async json() {
+        throw new Error('body is not JSON');
+      },
+      async text() {
+        return text;
+      },
+    };
+  }
+
+  function makeFetch(
+    responder: (url: string, init: RequestInit) => FetchResponseLike | Promise<FetchResponseLike>,
+  ): { fn: FetchFn; calls: { url: string; init: RequestInit }[] } {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fn: FetchFn = async (url, init) => {
+      calls.push({ url, init });
+      return responder(url, init);
+    };
+    return { fn, calls };
+  }
+
+  const okBody = {
+    model: 'deepseek-chat',
+    choices: [{ message: { role: 'assistant', content: 'Hello there!' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 10, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 4 } },
+  };
+
+  // --- §1 identity / defaults ----------------------------------------------
+
+  check('DeepSeekLLMDriver defaults match DEEPSEEK_DEFAULTS', () => {
+    const d = new DeepSeekLLMDriver();
+    assert(d.name === DEEPSEEK_DEFAULTS.name, `name ${d.name}`);
+    assert(d.version === DEEPSEEK_DEFAULTS.version, 'version');
+    assert(d.abiCompat === DEEPSEEK_DEFAULTS.abiCompat, 'abiCompat');
+    assert(d.supportedModels.includes('deepseek-chat'), 'chat model claimed');
+    assert(d.supportedModels.includes('deepseek-reasoner'), 'reasoner model claimed');
+    assert(d.closed === false, 'fresh driver is open');
+  });
+
+  check('deepseek abiCompat admits the live kernel ABI', () => {
+    assert(satisfiesAbi(KERNEL_ABI_VERSION, deepseekLLM().abiCompat) === true, 'registry would accept it');
+  });
+
+  check('deepseekLLM() factory honors option overrides', () => {
+    const d = deepseekLLM({ name: 'ds2', defaultModel: 'deepseek-reasoner', baseUrl: 'https://example.test/api/' });
+    assert(d.name === 'ds2', 'name override');
+    assert(d.abiCompat === DEEPSEEK_DEFAULTS.abiCompat, 'abiCompat default kept');
+  });
+
+  // --- §2 errno map ---------------------------------------------------------
+
+  check('errnoForStatus maps HTTP statuses onto stable errnos', () => {
+    assert(errnoForStatus(400) === 'EINVAL', '400 -> EINVAL');
+    assert(errnoForStatus(401) === 'EPERM', '401 -> EPERM');
+    assert(errnoForStatus(403) === 'EPERM', '403 -> EPERM');
+    assert(errnoForStatus(404) === 'ENOENT', '404 -> ENOENT');
+    assert(errnoForStatus(408) === 'ETIMEDOUT', '408 -> ETIMEDOUT');
+    assert(errnoForStatus(429) === 'EAGAIN', '429 -> EAGAIN');
+    assert(errnoForStatus(500) === 'EDRIVER', '500 -> EDRIVER');
+    assert(errnoForStatus(503) === 'EDRIVER', 'unknown -> EDRIVER');
+  });
+
+  // --- §3 token + cost heuristics ------------------------------------------
+
+  check('estimateDeepSeekTokens is CJK-aware', () => {
+    assert(DEEPSEEK_CHARS_PER_TOKEN === 4, 'divisor is 4');
+    assert(estimateDeepSeekTokens('') === 0, 'empty -> 0');
+    assert(estimateDeepSeekTokens('abcd') === 1, '4 latin chars -> 1');
+    assert(estimateDeepSeekTokens('abcde') === 2, '5 latin chars -> 2');
+    assert(estimateDeepSeekTokens('你好') === 2, '2 CJK chars -> 2 tokens');
+    assert(estimateDeepSeekTokens('你好ab') === 3, '2 CJK + ceil(2/4)=1 -> 3');
+  });
+
+  check('estimateDeepSeekMessageTokens adds 1 framing token per message', () => {
+    assert(estimateDeepSeekMessageTokens([]) === 0, 'no messages -> 0');
+    assert(estimateDeepSeekMessageTokens([userMsg('你好')]) === 3, 'content 2 + framing 1');
+  });
+
+  check('computeUsd bills cached input at the discount rate', () => {
+    assert(computeUsd('deepseek-chat', 1_000_000, 0, 0) === 0.14, '1M fresh input -> $0.14');
+    assert(computeUsd('deepseek-chat', 0, 1_000_000, 0) === 0.28, '1M output -> $0.28');
+    assert(computeUsd('deepseek-chat', 1_000_000, 0, 1_000_000) === 0.014, '1M cached input -> $0.014');
+    assert(computeUsd('deepseek-reasoner', 1_000_000, 0, 0) === 0.55, 'reasoner input rate');
+    assert(computeUsd('unknown-model', 1_000_000, 0, 0) === 0.14, 'unknown model falls back to chat rate');
+    assert(DEEPSEEK_PRICING['deepseek-chat'] !== undefined, 'chat pricing present');
+  });
+
+  // --- §4 request shaping ---------------------------------------------------
+
+  await checkAsync('call() POSTs an OpenAI-compatible body with auth + tools', async () => {
+    const { fn, calls } = makeFetch(() => jsonResponse(200, okBody));
+    const d = deepseekLLM({ apiKey: 'sk-test', fetchFn: fn });
+    const tool = { name: 'get_weather', description: 'Get weather', parameters: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } };
+    await d.call(
+      { messages: [userMsg('hi')], tools: [tool], temperature: 0.3, maxTokens: 64, seed: 7, model: 'deepseek-chat' },
+      ctx(),
+    );
+    assert(calls.length === 1, 'exactly one HTTP call');
+    const c = calls[0]!;
+    assert(c.url === 'https://api.deepseek.com/chat/completions', `url ${c.url}`);
+    assert(c.init.method === 'POST', 'POST');
+    const headers = c.init.headers as Record<string, string>;
+    assert(headers['authorization'] === 'Bearer sk-test', 'bearer token sent');
+    assert(headers['content-type'] === 'application/json', 'json content type');
+    const body = JSON.parse(String(c.init.body)) as Record<string, unknown>;
+    assert(body['model'] === 'deepseek-chat', 'model in body');
+    assert(body['stream'] === false, 'stream false in v0');
+    assert(Array.isArray(body['messages']) && (body['messages'] as unknown[]).length === 1, 'messages forwarded');
+    assert(body['temperature'] === 0.3 && body['max_tokens'] === 64 && body['seed'] === 7, 'sampling params forwarded');
+    const tools = body['tools'] as Array<Record<string, unknown>>;
+    assert(tools.length === 1 && tools[0]!['type'] === 'function', 'tool wrapped as a function');
+    const fnShape = tools[0]!['function'] as Record<string, unknown>;
+    assert(fnShape['name'] === 'get_weather', 'tool name forwarded');
+  });
+
+  await checkAsync('call() trims a trailing slash on baseUrl and merges custom headers', async () => {
+    const { fn, calls } = makeFetch(() => jsonResponse(200, okBody));
+    const d = deepseekLLM({ apiKey: 'k', baseUrl: 'https://gw.example.com/v1/', headers: { 'x-proxy': 'on' }, fetchFn: fn });
+    await d.call({ messages: [userMsg('hi')] }, ctx());
+    assert(calls[0]!.url === 'https://gw.example.com/v1/chat/completions', `url ${calls[0]!.url}`);
+    assert((calls[0]!.init.headers as Record<string, string>)['x-proxy'] === 'on', 'custom header merged');
+  });
+
+  await checkAsync('apiKey resolves from the injected env when not passed', async () => {
+    const { fn, calls } = makeFetch(() => jsonResponse(200, okBody));
+    const d = deepseekLLM({ env: { DEEPSEEK_API_KEY: 'sk-env' }, fetchFn: fn });
+    await d.call({ messages: [userMsg('hi')] }, ctx());
+    assert((calls[0]!.init.headers as Record<string, string>)['authorization'] === 'Bearer sk-env', 'env key used');
+  });
+
+  // --- §5 response mapping --------------------------------------------------
+
+  await checkAsync('call() maps a successful completion into an LLMResponse', async () => {
+    const { fn } = makeFetch(() => jsonResponse(200, okBody));
+    const d = deepseekLLM({ apiKey: 'k', fetchFn: fn });
+    const res = await d.call({ messages: [userMsg('hi')] }, ctx());
+    assert(res.text === 'Hello there!', `text ${res.text}`);
+    assert(res.finishReason === 'stop', 'finish stop');
+    assert(res.toolCalls.length === 0, 'no tool calls');
+    assert(res.usage.inputTokens === 10 && res.usage.outputTokens === 5 && res.usage.cachedTokens === 4, 'usage counters mapped');
+    assert(res.usage.usd === computeUsd('deepseek-chat', 10, 5, 4), `usd ${res.usage.usd}`);
+    assert(res.model === 'deepseek-chat', 'response model wins');
+    assert(res.driverVersion === d.version, 'driverVersion stamped');
+  });
+
+  await checkAsync('call() parses tool_calls and maps finish_reason tool_calls -> tool_use', async () => {
+    const toolBody = {
+      model: 'deepseek-chat',
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Shenzhen"}' } }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+      usage: { prompt_tokens: 20, completion_tokens: 8 },
+    };
+    const { fn } = makeFetch(() => jsonResponse(200, toolBody));
+    const d = deepseekLLM({ apiKey: 'k', fetchFn: fn });
+    const res = await d.call({ messages: [userMsg('weather?')] }, ctx());
+    assert(res.text === null, 'null text on a tool-only turn');
+    assert(res.finishReason === 'tool_use', 'tool_calls -> tool_use');
+    assert(res.toolCalls.length === 1, 'one tool call');
+    const tc = res.toolCalls[0]!;
+    assert(tc.id === 'call_1' && tc.name === 'get_weather', 'tool identity');
+    assert(JSON.stringify(tc.arguments) === JSON.stringify({ city: 'Shenzhen' }), 'arguments JSON-parsed');
+    assert(res.usage.cachedTokens === 0, 'absent cached_tokens -> 0');
+  });
+
+  await checkAsync('call() falls back to the requested model when the body omits one', async () => {
+    const body = { choices: [{ message: { role: 'assistant', content: 'x' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } };
+    const { fn } = makeFetch(() => jsonResponse(200, body));
+    const d = deepseekLLM({ apiKey: 'k', fetchFn: fn });
+    const res = await d.call({ messages: [userMsg('hi')], model: 'deepseek-reasoner' }, ctx());
+    assert(res.model === 'deepseek-reasoner', `model ${res.model}`);
+  });
+
+  // --- §6 error translation -------------------------------------------------
+
+  await checkAsync('a missing API key traps EINVAL before any fetch', async () => {
+    const { fn, calls } = makeFetch(() => jsonResponse(200, okBody));
+    const d = deepseekLLM({ env: {}, fetchFn: fn });
+    await expectErrno(() => d.call({ messages: [userMsg('hi')] }, ctx()), 'EINVAL');
+    assert(calls.length === 0, 'no HTTP call without a key');
+  });
+
+  await checkAsync('HTTP error statuses translate to the mapped errno', async () => {
+    const cases: Array<[number, string]> = [[429, 'EAGAIN'], [401, 'EPERM'], [404, 'ENOENT'], [400, 'EINVAL'], [500, 'EDRIVER']];
+    for (const [status, errno] of cases) {
+      const { fn } = makeFetch(() => errorResponse(status, `vendor says ${status}`));
+      const d = deepseekLLM({ apiKey: 'k', fetchFn: fn });
+      await expectErrno(() => d.call({ messages: [userMsg('hi')] }, ctx()), errno);
+    }
+  });
+
+  await checkAsync('an aborted request maps to ETIMEDOUT', async () => {
+    const abortErr = Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    const { fn } = makeFetch(() => {
+      throw abortErr;
+    });
+    const d = deepseekLLM({ apiKey: 'k', fetchFn: fn });
+    await expectErrno(() => d.call({ messages: [userMsg('hi')] }, ctx()), 'ETIMEDOUT');
+  });
+
+  await checkAsync('a generic transport failure wraps to EDRIVER and preserves cause', async () => {
+    const netErr = new Error('ECONNREFUSED');
+    const { fn } = makeFetch(() => {
+      throw netErr;
+    });
+    const d = deepseekLLM({ apiKey: 'k', fetchFn: fn });
+    let caught: unknown = null;
+    try {
+      await d.call({ messages: [userMsg('hi')] }, ctx());
+    } catch (e) {
+      caught = e;
+    }
+    assert(isCortexError(caught), 'is a CortexError');
+    assert((caught as CortexError).errno === 'EDRIVER', `errno ${(caught as CortexError).errno}`);
+    assert((caught as CortexError).cause === netErr, 'original error preserved as cause');
+  });
+
+  await checkAsync('a non-JSON 200 body traps EDRIVER', async () => {
+    const { fn } = makeFetch(() => ({
+      ok: true,
+      status: 200,
+      async json() {
+        throw new Error('unexpected token');
+      },
+      async text() {
+        return '<html>oops</html>';
+      },
+    }));
+    const d = deepseekLLM({ apiKey: 'k', fetchFn: fn });
+    await expectErrno(() => d.call({ messages: [userMsg('hi')] }, ctx()), 'EDRIVER');
+  });
+
+  await checkAsync('a completion with no choices traps EDRIVER', async () => {
+    const { fn } = makeFetch(() => jsonResponse(200, { choices: [], usage: {} }));
+    const d = deepseekLLM({ apiKey: 'k', fetchFn: fn });
+    await expectErrno(() => d.call({ messages: [userMsg('hi')] }, ctx()), 'EDRIVER');
+  });
+
+  await checkAsync('a closed driver traps EDRIVER', async () => {
+    const { fn } = makeFetch(() => jsonResponse(200, okBody));
+    const d = deepseekLLM({ apiKey: 'k', fetchFn: fn });
+    await d.close();
+    assert(d.closed === true, 'closed flag set');
+    await expectErrno(() => d.call({ messages: [userMsg('hi')] }, ctx()), 'EDRIVER');
+  });
+
+  // --- §7 optional surface + registry --------------------------------------
+
+  await checkAsync('countTokens uses the CJK-aware heuristic', async () => {
+    const d = deepseekLLM({ apiKey: 'k' });
+    const n = await d.countTokens([userMsg('你好world')]);
+    assert(n === estimateDeepSeekMessageTokens([userMsg('你好world')]), `countTokens ${n}`);
+  });
+
+  await checkAsync('deepseek registers into DriverRegistry: streams false, countsTokens true', async () => {
+    const { fn } = makeFetch(() => jsonResponse(200, okBody));
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(deepseekLLM({ apiKey: 'k', fetchFn: fn }));
+    assert(reg.hasLLM('deepseek'), 'registered');
+    assert(reg.resolveLLM().name === 'deepseek', 'resolves as default');
+    const info = reg.listAll().llm.find((m) => m.name === 'deepseek');
+    assert(info !== undefined, 'surfaced in listAll');
+    assert(info!.streams === false, 'no stream() in v0');
+    assert(info!.countsTokens === true, 'countTokens present');
+    await reg.closeAll();
+  });
+
+  await checkAsync('E2E: llm_call through the registry resolver reaches deepseek', async () => {
+    const { fn } = makeFetch(() => jsonResponse(200, okBody));
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(deepseekLLM({ apiKey: 'k', fetchFn: fn }));
+    const table = new ProcessTable({ kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const dispatcher = new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      resolveLLM: reg.llmResolver(),
+      resolveTool: reg.toolResolver(),
+    });
+    const pid = await table.allocate({ ppid: null, role: 'worker', agent: { module: './agents/noop.js' } });
+    await table.setState(pid, 'ready', { trigger: 'test' });
+    await table.setState(pid, 'running', { trigger: 'test' });
+    const res = await dispatcher.invoke(pid, 'llm_call', { messages: [userMsg('ping')] });
+    assert(res.text === 'Hello there!', `reply via syscall: ${res.text}`);
+    assert(res.usage.inputTokens === 10, 'usage flowed from the driver');
+    await reg.closeAll();
+  });
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -6777,6 +7133,7 @@ await runInitChecks();
 await runDispatcherChecks();
 await runDriverRegistryChecks();
 await runMockLLMChecks();
+await runDeepseekChecks();
 await runBootChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
