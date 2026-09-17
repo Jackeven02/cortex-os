@@ -25,3 +25,4 @@ export * from './scheduler.js';
 export * from './init.js';
 export * from './syscall_dispatcher.js';
 export * from './driver_registry.js';
+export * from './boot.js';

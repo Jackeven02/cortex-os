@@ -134,6 +134,11 @@ import {
   type ToolDriverInfo,
   type ToolCall,
   type Message,
+  Kernel,
+  bootKernel,
+  PROMPT_AGENT_MAX_TURNS,
+  type AgentFn,
+  type KernelOptions,
 } from '../src/index.js';
 
 import {
@@ -6398,6 +6403,372 @@ async function runMockLLMChecks(): Promise<void> {
   await rm(tmp, { recursive: true, force: true });
 }
 
+async function runBootChecks(): Promise<void> {
+  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  type ProcessIdAlias = ReturnType<typeof asProcessId>;
+  type ChainIdAlias = ReturnType<typeof asChainId>;
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-boot-'));
+
+  const fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = (): string => new Date(fakeNow).toISOString();
+  const userMsg = (content: string): Message => ({ role: 'user', content });
+
+  // Deterministic PRNG so ctx.random() is reproducible across runs.
+  let seed = 0x9e3779b9;
+  const detRandom = (_o?: RandomOptions): number => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 0x100000000;
+  };
+
+  // In-memory agent "modules": the default loader's dynamic import is replaced
+  // by a map lookup, so no filesystem module resolution happens in the smoke.
+  const agentImpls = new Map<string, AgentFn>();
+  const importModule = async (specifier: string): Promise<unknown> => {
+    const fn = agentImpls.get(specifier);
+    if (fn === undefined) throw new Error(`no such agent module: ${specifier}`);
+    return { default: fn };
+  };
+
+  const kernels: Kernel[] = [];
+
+  async function makeKernel(
+    overrides: Partial<KernelOptions> = {},
+    opts: { record?: boolean; sub?: string } = {},
+  ): Promise<{ k: Kernel; mock: MockLLMDriver; procDir: string | null }> {
+    const sub = opts.sub ?? tmp;
+    const record = opts.record === true;
+    let procDir: string | null = null;
+    if (record) {
+      procDir = join(sub, 'processes');
+      await mkdir(procDir, { recursive: true });
+    }
+    let mock: MockLLMDriver | null = null;
+    const k = new Kernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: sub,
+      now: clock,
+      random: detRandom,
+      importModule,
+      autoStart: false,
+      loadDrivers: (reg) => {
+        mock = mockLLM();
+        reg.registerLLM(mock);
+      },
+      ...(record
+        ? { recorderFactory: async (pid: ProcessIdAlias) => Recorder.open({ pid, dir: procDir as string }) }
+        : { recorderFactory: nullRecorderFactory }),
+      ...overrides,
+    });
+    await k.boot();
+    kernels.push(k);
+    return { k, mock: mock as MockLLMDriver, procDir };
+  }
+
+  async function expectErrno(fn: () => Promise<unknown>, errno: string): Promise<void> {
+    let caught: unknown;
+    try {
+      await fn();
+    } catch (e) {
+      caught = e;
+    }
+    assert(isCortexError(caught), `expected CortexError(${errno}), got ${String(caught)}`);
+    assert((caught as CortexError).errno === errno, `expected ${errno}, got ${(caught as CortexError).errno}`);
+  }
+  function expectErrnoSync(fn: () => unknown, errno: string): void {
+    let caught: unknown;
+    try {
+      fn();
+    } catch (e) {
+      caught = e;
+    }
+    assert(isCortexError(caught), `expected CortexError(${errno}), got ${String(caught)}`);
+    assert((caught as CortexError).errno === errno, `expected ${errno}, got ${(caught as CortexError).errno}`);
+  }
+
+  // Recorder.open writes flat `<dir>/<pid>.crec`; read the exit record back.
+  async function readExit(procDir: string, pid: ProcessIdAlias): Promise<{ code: number; reason: string } | undefined> {
+    const path = join(procDir, `${unbrand(pid)}.crec`);
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(path)) records.push(r);
+    const rec = records.find((r) => r.syscall === 'exit' && r.phase === 'exit');
+    return rec === undefined ? undefined : (rec.result as { code: number; reason: string });
+  }
+
+  // --- §1 assembly + boot ---------------------------------------------------
+
+  await checkAsync('boot() constructs every module and brings init to RUNNING', async () => {
+    const { k } = await makeKernel();
+    assert(k.booted === true, 'booted flag set');
+    const mods: unknown[] = [k.table, k.signals, k.ipc, k.memory, k.checkpoint, k.fork, k.scheduler, k.dispatcher, k.registry, k.init];
+    for (const m of mods) assert(m !== undefined && m !== null, 'a kernel module is missing');
+    const init = k.table.get(PID_INIT);
+    assert(init !== undefined && init.state === 'running', `init should be RUNNING, got ${init?.state}`);
+  });
+
+  await checkAsync('a second boot() traps EINVAL', async () => {
+    const { k } = await makeKernel();
+    await expectErrno(() => k.boot(), 'EINVAL');
+  });
+
+  await checkAsync('spawn/start before boot trap ESTATE', async () => {
+    const k = new Kernel({ kernelAbiVersion: KERNEL_ABI_VERSION, dir: tmp, recorderFactory: nullRecorderFactory, now: clock, importModule });
+    kernels.push(k);
+    await expectErrno(() => k.spawn({ role: 'w', agent: { module: './agents/noop.js' } }), 'ESTATE');
+    expectErrnoSync(() => k.start(), 'ESTATE');
+  });
+
+  check('empty kernelAbiVersion or dir traps EINVAL at construction', () => {
+    expectErrnoSync(() => new Kernel({ kernelAbiVersion: '', dir: tmp }), 'EINVAL');
+    expectErrnoSync(() => new Kernel({ kernelAbiVersion: KERNEL_ABI_VERSION, dir: '' }), 'EINVAL');
+  });
+
+  await checkAsync('bootKernel() returns an already-booted kernel', async () => {
+    const k = await bootKernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: tmp,
+      recorderFactory: nullRecorderFactory,
+      now: clock,
+      importModule,
+      loadDrivers: (reg) => reg.registerLLM(mockLLM()),
+    });
+    kernels.push(k);
+    assert(k.booted === true, 'bootKernel boots');
+    assert(k.table.get(PID_INIT)?.state === 'running', 'init running');
+  });
+
+  // --- §2 the §13 milestone: spawn -> llm_call -> exit -> reap --------------
+
+  await checkAsync('§13 milestone: spawn -> llm_call -> exit -> reap', async () => {
+    let reply = '';
+    agentImpls.set('./agents/echo.js', async (ctx) => {
+      const r = await ctx.llm_call({ messages: [userMsg('think')] });
+      reply = r.text ?? '';
+    });
+    const { k, mock } = await makeKernel();
+    const pid = await k.spawn({ role: 'worker', agent: { module: './agents/echo.js' } });
+    assert(k.table.get(pid)?.state === 'ready', 'spawned process is READY before its tick');
+    const outcome = await k.scheduler.tick();
+    assert(reply === 'mock reply to: think', `agent saw the mock reply, got "${reply}"`);
+    assert(mock.callCount === 1, 'exactly one llm_call reached the driver');
+    assert(outcome.dispatched !== null && unbrand(outcome.dispatched) === unbrand(pid), 'the right pid was dispatched');
+    assert(outcome.reason === 'exited', `quantum ended in exit, got ${outcome.reason}`);
+    assert(k.table.get(pid) === undefined, 'process reaped after exit');
+  });
+
+  await checkAsync('a normal return auto-exits with code 0 / "completed"', async () => {
+    agentImpls.set('./agents/ok.js', async () => {
+      /* return cleanly */
+    });
+    const sub = join(tmp, 'rec-ok');
+    const { k, procDir } = await makeKernel({}, { record: true, sub });
+    const pid = await k.spawn({ role: 'worker', agent: { module: './agents/ok.js' } });
+    await k.scheduler.tick();
+    const ex = await readExit(procDir as string, pid);
+    assert(ex !== undefined, 'an exit record was written');
+    assert(ex!.code === 0 && ex!.reason === 'completed', `expected 0/completed, got ${ex!.code}/${ex!.reason}`);
+  });
+
+  await checkAsync('ctx.exit(code, reason) propagates through teardown', async () => {
+    agentImpls.set('./agents/quit.js', async (ctx) => {
+      ctx.exit(7, 'bye');
+    });
+    const sub = join(tmp, 'rec-quit');
+    const { k, procDir } = await makeKernel({}, { record: true, sub });
+    const pid = await k.spawn({ role: 'worker', agent: { module: './agents/quit.js' } });
+    await k.scheduler.tick();
+    const ex = await readExit(procDir as string, pid);
+    assert(ex !== undefined && ex.code === 7 && ex.reason === 'bye', `expected 7/bye, got ${ex?.code}/${ex?.reason}`);
+    assert(k.table.get(pid) === undefined, 'reaped');
+  });
+
+  await checkAsync('an uncaught agent error exits with code 1', async () => {
+    agentImpls.set('./agents/boom.js', async () => {
+      throw new Error('boom');
+    });
+    const sub = join(tmp, 'rec-boom');
+    const { k, procDir } = await makeKernel({}, { record: true, sub });
+    const pid = await k.spawn({ role: 'worker', agent: { module: './agents/boom.js' } });
+    await k.scheduler.tick();
+    const ex = await readExit(procDir as string, pid);
+    assert(ex !== undefined && ex.code === 1, `expected code 1, got ${ex?.code}`);
+    assert(ex!.reason.includes('boom'), `reason carries the message, got "${ex!.reason}"`);
+  });
+
+  await checkAsync('a missing agent module exits with code 127', async () => {
+    const sub = join(tmp, 'rec-missing');
+    const { k, procDir } = await makeKernel({}, { record: true, sub });
+    const pid = await k.spawn({ role: 'worker', agent: { module: './agents/does-not-exist.js' } });
+    await k.scheduler.tick();
+    const ex = await readExit(procDir as string, pid);
+    assert(ex !== undefined && ex.code === 127, `expected 127, got ${ex?.code}`);
+    assert(ex!.reason.includes('agent load failed'), `reason explains the load failure, got "${ex!.reason}"`);
+  });
+
+  // --- §3 the built-in prompt-only agent ------------------------------------
+
+  await checkAsync('a { system } spec runs the built-in prompt agent', async () => {
+    const { k, mock } = await makeKernel();
+    const pid = await k.spawn({ role: 'prompt', agent: { system: 'you are helpful' } });
+    await k.scheduler.tick();
+    assert(mock.callCount === 1, 'the prompt agent called the model once');
+    assert(k.table.get(pid) === undefined, 'and exited cleanly');
+    assert(PROMPT_AGENT_MAX_TURNS === 8, 'turn cap exported');
+  });
+
+  // --- §4 the synchronous syscall seam --------------------------------------
+
+  await checkAsync('ctx.now()/random()/budget() are synchronous and live', async () => {
+    let nowVal = '';
+    let randVal = -1;
+    let budgetIn = -1;
+    agentImpls.set('./agents/sync.js', async (ctx) => {
+      await ctx.llm_call({ messages: [userMsg('spend')] });
+      nowVal = ctx.now();
+      randVal = ctx.random();
+      budgetIn = ctx.budget().tokensIn;
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'worker', agent: { module: './agents/sync.js' } });
+    await k.scheduler.tick();
+    assert(nowVal === clock(), 'now() returns the injected clock');
+    assert(randVal >= 0 && randVal < 1, 'random() in [0,1)');
+    assert(budgetIn > 0, 'budget() reflects the llm_call spend');
+  });
+
+  await checkAsync('sync syscalls replicate the state gate (ESTATE / ESRCH)', async () => {
+    agentImpls.set('./agents/noop.js', async () => {});
+    const { k } = await makeKernel();
+    const pid = await k.spawn({ role: 'worker', agent: { module: './agents/noop.js' } });
+    const ctx = k.context(pid); // READY, not yet dispatched
+    assert(ctx.now() === clock(), 'now() is legal in READY (a live state)');
+    expectErrnoSync(() => ctx.on_signal('SIGTERM', 'ignore'), 'ESTATE'); // on_signal needs RUNNING
+    expectErrnoSync(() => k.context(asProcessId(9999)), 'ESRCH'); // unknown pid
+  });
+
+  await checkAsync('ctx.exit() throws ProcessExitSignal synchronously', async () => {
+    agentImpls.set('./agents/noop2.js', async () => {});
+    const { k } = await makeKernel();
+    const pid = await k.spawn({ role: 'w', agent: { module: './agents/noop2.js' } });
+    const ctx = k.context(pid);
+    let caught: unknown;
+    try {
+      ctx.exit(3, 'x');
+    } catch (e) {
+      caught = e;
+    }
+    assert(isProcessExitSignal(caught), 'exit throws the sentinel');
+    assert((caught as ProcessExitSignal).exitCode === 3, 'carries the code');
+  });
+
+  // --- §5 round-robin scheduling across ticks -------------------------------
+
+  await checkAsync('two READY processes run round-robin, one per tick', async () => {
+    const order: string[] = [];
+    agentImpls.set('./agents/A.js', async () => {
+      order.push('A');
+    });
+    agentImpls.set('./agents/B.js', async () => {
+      order.push('B');
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'a', agent: { module: './agents/A.js' } });
+    await k.spawn({ role: 'b', agent: { module: './agents/B.js' } });
+    const t1 = await k.scheduler.tick();
+    const t2 = await k.scheduler.tick();
+    assert(order.join('') === 'AB', `FIFO round-robin, got "${order.join('')}"`);
+    assert(t1.reason === 'exited' && t2.reason === 'exited', 'both quanta ended in exit');
+    const t3 = await k.scheduler.tick();
+    assert(t3.reason === 'idle', 'nothing left to run');
+  });
+
+  // --- §6 checkpoint -> restore through the kernel --------------------------
+
+  await checkAsync('checkpoint then restore mints a NEW pid with budgets + lineage', async () => {
+    let chainId: ChainIdAlias | null = null;
+    agentImpls.set('./agents/ckpt.js', async (ctx) => {
+      await ctx.llm_call({ messages: [userMsg('remember')] }); // spend tokens
+      const ref = await ctx.checkpoint({ tag: 'snap' });
+      chainId = ref.chainId;
+    });
+    const { k } = await makeKernel();
+    const origPid = await k.spawn({ role: 'worker', agent: { module: './agents/ckpt.js' }, budgets: { tokens: 100000 } });
+    await k.scheduler.tick();
+    assert(chainId !== null, 'the agent captured a chainId');
+    assert(k.table.get(origPid) === undefined, 'original reaped after exit');
+
+    const restored = await k.dispatcher.invoke(PID_INIT, 'restore', chainId as ChainIdAlias);
+    const newPid = restored.pid;
+    assert(unbrand(newPid) !== unbrand(origPid), 'restore allocates a fresh pid');
+    const e = k.table.get(newPid);
+    assert(e !== undefined, 'restored process is in the table');
+    // KNOWN v0 GAP: restoreAs leaves the process in NEW; the scheduler only
+    // dispatches READY, so it does not auto-run. Asserted here, not fixed.
+    assert(e!.state === 'new', `restored state is NEW (documented gap), got ${e!.state}`);
+    assert(e!.budgetsSpent.tokensIn > 0, 'spent budget carried across the checkpoint');
+    assert(e!.checkpointChain.some((c) => unbrand(c) === unbrand(chainId as ChainIdAlias)), 'lineage continues the chain');
+  });
+
+  // --- §7 fork through the kernel -------------------------------------------
+
+  await checkAsync('ctx.fork() mints a child; orphan is reparented to init on parent exit', async () => {
+    let childPid: ProcessIdAlias | null = null;
+    let ppidAtFork: number | null = null;
+    let kernelRef: Kernel | null = null;
+    agentImpls.set('./agents/forker.js', async (ctx) => {
+      const res = await ctx.fork();
+      childPid = res.childPid;
+      // Read the live table at fork time, before the quantum ends and init
+      // reparents the (still-live) orphan.
+      const c = kernelRef?.table.get(res.childPid);
+      ppidAtFork = c?.ppid === null || c?.ppid === undefined ? null : unbrand(c.ppid);
+    });
+    const { k } = await makeKernel();
+    kernelRef = k;
+    const parent = await k.spawn({ role: 'p', agent: { module: './agents/forker.js' } });
+    await k.scheduler.tick();
+    assert(childPid !== null, 'fork returned a child pid');
+    assert(unbrand(childPid as ProcessIdAlias) !== unbrand(parent), 'child has its own pid');
+    assert(ppidAtFork === unbrand(parent), `child was parented to the forker at fork time, got ppid ${ppidAtFork}`);
+    const child = k.table.get(childPid as ProcessIdAlias);
+    assert(child !== undefined, 'child survives its parent');
+    // The forker exited at the end of its quantum, so init reparented the orphan.
+    assert(child!.ppid !== null && unbrand(child!.ppid) === unbrand(PID_INIT), 'orphan reparented to init after the parent exited');
+  });
+
+  // --- §8 shutdown ----------------------------------------------------------
+
+  await checkAsync('shutdown() quiesces children, closes drivers, is idempotent', async () => {
+    agentImpls.set('./agents/idle.js', async () => {});
+    const { k, mock } = await makeKernel();
+    const pid = await k.spawn({ role: 'idle', agent: { module: './agents/idle.js' } });
+    assert(k.table.get(pid)?.state === 'ready', 'child parked READY (never ticked)');
+    const report = await k.shutdown();
+    assert(typeof report.finishedAt === 'string', 'report carries a timestamp');
+    assert(Array.isArray(report.signalled) && Array.isArray(report.reaped), 'report shape');
+    assert(mock.closed === true, 'the LLM driver was closed');
+    const again = await k.shutdown();
+    assert(again === report, 'a second shutdown returns the cached report');
+  });
+
+  // --- cleanup --------------------------------------------------------------
+  for (const k of kernels) {
+    try {
+      await k.shutdown();
+    } catch {
+      /* already down */
+    }
+    for (const pid of k.table.pids()) {
+      const rec = k.table.recorderFor(pid);
+      if (rec !== null) await rec.close().catch(() => {});
+    }
+  }
+  await rm(tmp, { recursive: true, force: true });
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -6406,6 +6777,7 @@ await runInitChecks();
 await runDispatcherChecks();
 await runDriverRegistryChecks();
 await runMockLLMChecks();
+await runBootChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
