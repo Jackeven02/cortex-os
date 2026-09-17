@@ -1,5 +1,6 @@
 /**
- * Phase 1 smoke check — types.ts + errors.ts + recorder.ts runtime sanity.
+ * Phase 1 smoke check — types.ts + errors.ts + recorder.ts + process_table.ts
+ * + signals.ts runtime sanity.
  *
  * Not a real test (no test framework yet, that lands with #012+). This is
  * a "does the module load and do the runtime bits behave" check, run via
@@ -41,6 +42,15 @@ import {
   PID_FIRST_USER,
   type ProcessState,
   type Signal,
+  SignalManager,
+  SIGNAL_NUMBERS,
+  ALL_SIGNALS,
+  UNCATCHABLE_SIGNALS,
+  DEFAULT_ACTIONS,
+  exitCodeForSignal,
+  isImmediateSignal,
+  signalFromNumber,
+  type DeliveryOutcome,
 } from '../src/index.js';
 
 let passed = 0;
@@ -829,6 +839,460 @@ async function runProcessTableChecks(): Promise<void> {
 }
 
 await runProcessTableChecks();
+
+// =============================================================================
+// Async checks (signals)
+// =============================================================================
+
+async function runSignalsChecks(): Promise<void> {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-sig-'));
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const tick = (ms = 1000) => {
+    fakeNow += ms;
+  };
+
+  async function makeTable(): Promise<ProcessTable> {
+    return new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+    });
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+
+  /** Allocate a process and walk it to RUNNING. Returns [table, pid]. */
+  async function spawnRunning(table: ProcessTable, role = 'worker'): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({ ppid: null, role, agent });
+    await table.setState(pid, 'ready', { trigger: 'init' });
+    tick();
+    await table.setState(pid, 'running', { trigger: 'dispatch' });
+    tick();
+    return pid;
+  }
+
+  try {
+    await checkAsync('SIGNAL_NUMBERS has 13 entries with unique numbers', async () => {
+      assert(ALL_SIGNALS.length === 13, `expected 13 signals, got ${ALL_SIGNALS.length}`);
+      const nums = ALL_SIGNALS.map((s) => SIGNAL_NUMBERS[s]);
+      const uniq = new Set(nums);
+      assert(uniq.size === nums.length, 'signal numbers should be unique');
+      // Spot-check a few well-known numbers from PROCESS.md §7.
+      assert(SIGNAL_NUMBERS.SIGHUP === 1, 'SIGHUP should be 1');
+      assert(SIGNAL_NUMBERS.SIGKILL === 9, 'SIGKILL should be 9');
+      assert(SIGNAL_NUMBERS.SIGTERM === 15, 'SIGTERM should be 15');
+      assert(SIGNAL_NUMBERS.SIGSTOP === 17, 'SIGSTOP should be 17');
+      assert(SIGNAL_NUMBERS.SIGCONT === 18, 'SIGCONT should be 18');
+    });
+
+    await checkAsync('signalFromNumber round-trips for every signal', async () => {
+      for (const sig of ALL_SIGNALS) {
+        const n = SIGNAL_NUMBERS[sig];
+        assert(signalFromNumber(n) === sig, `round-trip failed for ${sig} (${n})`);
+      }
+      assert(signalFromNumber(9999) === undefined, 'unknown number should return undefined');
+    });
+
+    await checkAsync('every signal has a default action', async () => {
+      for (const sig of ALL_SIGNALS) {
+        const action = DEFAULT_ACTIONS[sig];
+        assert(
+          action === 'ignore' || action === 'terminate' || action === 'kill' ||
+          action === 'stop' || action === 'continue',
+          `${sig} has invalid default action: ${action}`,
+        );
+      }
+      // Specific values from PROCESS.md §7.
+      assert(DEFAULT_ACTIONS.SIGKILL === 'kill', 'SIGKILL default should be kill');
+      assert(DEFAULT_ACTIONS.SIGTERM === 'terminate', 'SIGTERM default should be terminate');
+      assert(DEFAULT_ACTIONS.SIGSTOP === 'stop', 'SIGSTOP default should be stop');
+      assert(DEFAULT_ACTIONS.SIGCONT === 'continue', 'SIGCONT default should be continue');
+      assert(DEFAULT_ACTIONS.SIGXCPU === 'stop', 'SIGXCPU default should be stop');
+      assert(DEFAULT_ACTIONS.SIGHUP === 'ignore', 'SIGHUP default should be ignore');
+    });
+
+    await checkAsync('UNCATCHABLE_SIGNALS is exactly {SIGKILL, SIGSTOP}', async () => {
+      assert(UNCATCHABLE_SIGNALS.size === 2, `expected 2, got ${UNCATCHABLE_SIGNALS.size}`);
+      assert(UNCATCHABLE_SIGNALS.has('SIGKILL'), 'SIGKILL should be uncatchable');
+      assert(UNCATCHABLE_SIGNALS.has('SIGSTOP'), 'SIGSTOP should be uncatchable');
+      assert(!UNCATCHABLE_SIGNALS.has('SIGTERM'), 'SIGTERM should be catchable');
+    });
+
+    await checkAsync('exitCodeForSignal follows 128+N convention', async () => {
+      assert(exitCodeForSignal('SIGKILL') === 137, `SIGKILL exit should be 137, got ${exitCodeForSignal('SIGKILL')}`);
+      assert(exitCodeForSignal('SIGTERM') === 143, `SIGTERM exit should be 143, got ${exitCodeForSignal('SIGTERM')}`);
+      assert(exitCodeForSignal('SIGINT') === 130, `SIGINT exit should be 130, got ${exitCodeForSignal('SIGINT')}`);
+    });
+
+    await checkAsync('isImmediateSignal flags SIGKILL and SIGCONT only', async () => {
+      assert(isImmediateSignal('SIGKILL'), 'SIGKILL should be immediate');
+      assert(isImmediateSignal('SIGCONT'), 'SIGCONT should be immediate');
+      assert(!isImmediateSignal('SIGTERM'), 'SIGTERM should not be immediate');
+      assert(!isImmediateSignal('SIGSTOP'), 'SIGSTOP should not be immediate (only fires from RUNNING)');
+    });
+
+    await checkAsync('SIGTERM to RUNNING process terminates with exit 143', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const outcome = await mgr.send(pid, 'SIGTERM');
+      assert(outcome === 'delivered', `expected delivered, got ${outcome}`);
+      const info = table.snapshot(pid);
+      assert(info.state === 'zombie', `expected zombie, got ${info.state}`);
+      assert(info.exitCode === 143, `expected exit 143, got ${info.exitCode}`);
+      assert(info.exitReason === 'signal:SIGTERM', `wrong exitReason: ${info.exitReason}`);
+    });
+
+    await checkAsync('SIGKILL from BLOCKED walks blocked->exiting->zombie', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      await table.setState(pid, 'blocked', { trigger: 'llm_call' });
+      table.setBlockedOn(pid, { kind: 'llm', callId: 'call-1' });
+      tick();
+
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const outcome = await mgr.send(pid, 'SIGKILL');
+      assert(outcome === 'delivered', `expected delivered, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'zombie', 'should be zombie after SIGKILL');
+      assert(table.snapshot(pid).exitCode === 137, 'exit code should be 137');
+    });
+
+    await checkAsync('SIGKILL from NEW walks new->ready->running->exiting->zombie', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'fresh', agent });
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const outcome = await mgr.send(pid, 'SIGKILL');
+      assert(outcome === 'delivered', `expected delivered, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'zombie', 'should be zombie');
+    });
+
+    await checkAsync('SIGSTOP from RUNNING transitions to STOPPED', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const outcome = await mgr.send(pid, 'SIGSTOP');
+      assert(outcome === 'delivered', `expected delivered, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'stopped', 'should be stopped');
+    });
+
+    await checkAsync('SIGSTOP from BLOCKED is queued', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      await table.setState(pid, 'blocked');
+      tick();
+
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const outcome = await mgr.send(pid, 'SIGSTOP');
+      assert(outcome === 'queued', `expected queued, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'blocked', 'state should not change');
+      assert(table.snapshot(pid).pendingSignals.includes('SIGSTOP'), 'SIGSTOP should be pending');
+    });
+
+    await checkAsync('SIGCONT from STOPPED transitions to READY', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      await mgr.send(pid, 'SIGSTOP');
+      assert(table.snapshot(pid).state === 'stopped', 'precondition: stopped');
+      const outcome = await mgr.send(pid, 'SIGCONT');
+      assert(outcome === 'delivered', `expected delivered, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'ready', 'should be ready after SIGCONT');
+    });
+
+    await checkAsync('SIGCONT from RUNNING is dropped (no-op)', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const outcome = await mgr.send(pid, 'SIGCONT');
+      assert(outcome === 'dropped', `expected dropped, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'running', 'state should be unchanged');
+    });
+
+    await checkAsync('SIGTERM to BLOCKED process queues until next RUNNING', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      await table.setState(pid, 'blocked');
+      tick();
+
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const queued = await mgr.send(pid, 'SIGTERM');
+      assert(queued === 'queued', `expected queued, got ${queued}`);
+      assert(table.snapshot(pid).state === 'blocked', 'should still be blocked');
+
+      // Wake the process and dispatch.
+      await table.setState(pid, 'ready');
+      tick();
+      await table.setState(pid, 'running');
+      tick();
+
+      const outcomes = await mgr.deliverPending(pid);
+      assert(outcomes.length === 1, `expected 1 delivery, got ${outcomes.length}`);
+      assert(outcomes[0] === 'delivered', `expected delivered, got ${outcomes[0]}`);
+      assert(table.snapshot(pid).state === 'zombie', 'should be zombie after pending SIGTERM');
+    });
+
+    await checkAsync('ignore disposition drops the signal', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      table.setDisposition(pid, 'SIGTERM', { kind: 'ignore' });
+
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const outcome = await mgr.send(pid, 'SIGTERM');
+      assert(outcome === 'dropped', `expected dropped, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'running', 'should still be running');
+    });
+
+    await checkAsync('handler disposition invokes the handlerInvoker', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+
+      const calls: { pid: ProcessIdAlias; signal: Signal }[] = [];
+      const handler = (): void => {
+        /* recorded by the invoker */
+      };
+      table.setDisposition(pid, 'SIGUSR1', { kind: 'handler', handler });
+
+      const mgr = new SignalManager({
+        table,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        handlerInvoker: async (p, s) => {
+          calls.push({ pid: p, signal: s });
+        },
+      });
+
+      const outcome = await mgr.send(pid, 'SIGUSR1');
+      assert(outcome === 'delivered', `expected delivered, got ${outcome}`);
+      assert(calls.length === 1, `handler should be invoked once, got ${calls.length}`);
+      assert(calls[0]!.signal === 'SIGUSR1', 'wrong signal passed to handler');
+      assert(unbrand(calls[0]!.pid) === unbrand(pid), 'wrong pid passed to handler');
+      assert(table.snapshot(pid).state === 'running', 'state should be unchanged');
+    });
+
+    await checkAsync('handler that throws produces failed outcome', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      table.setDisposition(pid, 'SIGUSR1', {
+        kind: 'handler',
+        handler: () => {
+          throw new Error('handler exploded');
+        },
+      });
+
+      const mgr = new SignalManager({
+        table,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        handlerInvoker: async (_p, _s, h) => {
+          await h({} as never); // trigger the throw
+        },
+      });
+
+      const outcome = await mgr.send(pid, 'SIGUSR1');
+      assert(outcome === 'failed', `expected failed, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'running', 'process should survive a failed handler');
+    });
+
+    await checkAsync('handler disposition without invoker traps EINVAL', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      table.setDisposition(pid, 'SIGUSR1', { kind: 'handler', handler: () => {} });
+
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      let caught: unknown;
+      try {
+        await mgr.send(pid, 'SIGUSR1');
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EINVAL', `expected EINVAL, got ${caught.errno}`);
+    });
+
+    await checkAsync('send to absent PID traps ESRCH', async () => {
+      const table = await makeTable();
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      let caught: unknown;
+      try {
+        await mgr.send(asProcessId(9999), 'SIGTERM');
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'ESRCH', `expected ESRCH, got ${caught.errno}`);
+    });
+
+    await checkAsync('send to ZOMBIE traps ESRCH', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      await mgr.send(pid, 'SIGKILL');
+      assert(table.snapshot(pid).state === 'zombie', 'precondition: zombie');
+
+      let caught: unknown;
+      try {
+        await mgr.send(pid, 'SIGTERM');
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'ESRCH', `expected ESRCH, got ${caught.errno}`);
+    });
+
+    await checkAsync('sendGroup delivers to all live members and skips zombies', async () => {
+      const table = await makeTable();
+      const root = await table.allocate({ ppid: null, role: 'root', agent });
+      await table.setState(root, 'ready');
+      await table.setState(root, 'running');
+      const c1 = await table.allocate({ ppid: root, role: 'c1', agent });
+      await table.setState(c1, 'ready');
+      await table.setState(c1, 'running');
+      const c2 = await table.allocate({ ppid: root, role: 'c2', agent });
+      await table.setState(c2, 'ready');
+      await table.setState(c2, 'running');
+
+      // Kill c2 first so it's a zombie when the group signal arrives.
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      await mgr.send(c2, 'SIGKILL');
+      assert(table.snapshot(c2).state === 'zombie', 'c2 should be zombie');
+
+      const outcomes = await mgr.sendGroup(table.snapshot(root).pgid, 'SIGTERM');
+      assert(outcomes.size === 2, `expected 2 outcomes (root + c1), got ${outcomes.size}`);
+      assert(outcomes.get(root) === 'delivered', 'root should be delivered');
+      assert(outcomes.get(c1) === 'delivered', 'c1 should be delivered');
+      assert(!outcomes.has(c2), 'zombie c2 should be skipped');
+      assert(table.snapshot(root).state === 'zombie', 'root should be zombie');
+      assert(table.snapshot(c1).state === 'zombie', 'c1 should be zombie');
+    });
+
+    await checkAsync('SIGXCPU default action stops the process', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const outcome = await mgr.send(pid, 'SIGXCPU');
+      assert(outcome === 'delivered', `expected delivered, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'stopped', 'SIGXCPU should stop the process');
+    });
+
+    await checkAsync('SIGHUP default action is ignore (drop)', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const outcome = await mgr.send(pid, 'SIGHUP');
+      assert(outcome === 'dropped', `expected dropped, got ${outcome}`);
+      assert(table.snapshot(pid).state === 'running', 'state should not change');
+    });
+
+    await checkAsync('coalescing: duplicate SIGUSR1 in queue stays single', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      await table.setState(pid, 'blocked');
+      tick();
+
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      await mgr.send(pid, 'SIGUSR1');
+      await mgr.send(pid, 'SIGUSR1');
+      await mgr.send(pid, 'SIGUSR1');
+      const pending = table.snapshot(pid).pendingSignals;
+      assert(pending.length === 1, `expected coalesced to 1, got ${pending.length}`);
+      assert(pending[0] === 'SIGUSR1', 'wrong signal pending');
+    });
+
+    await checkAsync('__signal records land in the .crec log', async () => {
+      // Use a dedicated subdir so we don't see records from prior checks
+      // (ProcessTable starts PIDs at 2 every time and the recorder appends).
+      const { mkdir } = await import('node:fs/promises');
+      const sub = join(tmp, 'sig-records');
+      await mkdir(sub, { recursive: true });
+      const table = new ProcessTable({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+      });
+      const pid = await spawnRunning(table);
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      await mgr.send(pid, 'SIGHUP'); // dropped, but still recorded
+      await mgr.send(pid, 'SIGTERM'); // delivered
+
+      const rec = table.recorderFor(pid);
+      assert(rec !== null, 'recorder should exist');
+      await rec!.flush();
+
+      const sigRecords: SyscallRecord[] = [];
+      for await (const r of readRecords(rec!.path)) {
+        if (r.syscall === '__signal') sigRecords.push(r);
+      }
+      assert(sigRecords.length === 2, `expected 2 __signal records, got ${sigRecords.length}`);
+
+      const args0 = sigRecords[0]!.args as { signal: string; outcome: string };
+      assert(args0.signal === 'SIGHUP', 'first record should be SIGHUP');
+      assert(args0.outcome === 'dropped', `first outcome should be dropped, got ${args0.outcome}`);
+
+      const args1 = sigRecords[1]!.args as { signal: string; outcome: string };
+      assert(args1.signal === 'SIGTERM', 'second record should be SIGTERM');
+      assert(args1.outcome === 'delivered', `second outcome should be delivered, got ${args1.outcome}`);
+    });
+
+    await checkAsync('onZombie hook fires after terminate', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      const events: { pid: ProcessIdAlias; code: number; reason: string }[] = [];
+      const mgr = new SignalManager({
+        table,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        onZombie: (p, code, reason) => {
+          events.push({ pid: p, code, reason });
+        },
+      });
+      await mgr.send(pid, 'SIGTERM');
+      assert(events.length === 1, `expected 1 onZombie call, got ${events.length}`);
+      assert(events[0]!.code === 143, 'wrong exit code in hook');
+      assert(events[0]!.reason === 'signal:SIGTERM', 'wrong reason in hook');
+    });
+
+    await checkAsync('deliverPending re-queues tail if state changes mid-drain', async () => {
+      const table = await makeTable();
+      const pid = await spawnRunning(table);
+      await table.setState(pid, 'blocked');
+      tick();
+
+      const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      // Queue SIGSTOP first (will move us out of RUNNING), then SIGUSR1.
+      await mgr.send(pid, 'SIGSTOP');
+      await mgr.send(pid, 'SIGUSR1');
+      // Both queued because state is BLOCKED.
+      assert(table.snapshot(pid).pendingSignals.length === 2, 'both should be queued');
+
+      // Wake and dispatch.
+      await table.setState(pid, 'ready');
+      await table.setState(pid, 'running');
+      tick();
+
+      const outcomes = await mgr.deliverPending(pid);
+      assert(outcomes.length === 1, `expected 1 delivery before state change, got ${outcomes.length}`);
+      assert(table.snapshot(pid).state === 'stopped', 'should be stopped after SIGSTOP fires');
+      // SIGUSR1 should have been re-queued for the next RUNNING.
+      assert(
+        table.snapshot(pid).pendingSignals.includes('SIGUSR1'),
+        'SIGUSR1 should be re-queued after SIGSTOP moved us out of RUNNING',
+      );
+    });
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+// Local alias to keep the helper signatures above short.
+type ProcessIdAlias = ReturnType<typeof asProcessId>;
+
+await runSignalsChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
