@@ -51,6 +51,13 @@ import {
   isImmediateSignal,
   signalFromNumber,
   type DeliveryOutcome,
+  IpcManager,
+  pidInboxChannel,
+  isProcessTarget,
+  resolveChannel,
+  DEFAULT_QUEUE_LIMIT,
+  DEFAULT_RECV_TIMEOUT_MS,
+  type ChannelInfo,
 } from '../src/index.js';
 
 let passed = 0;
@@ -494,6 +501,7 @@ async function runProcessTableChecks(): Promise<void> {
   const { join } = await import('node:path');
 
   const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-pt-'));
+  const tables: ProcessTable[] = [];
 
   // Frozen clock so timestamps are deterministic across checks.
   let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
@@ -504,11 +512,13 @@ async function runProcessTableChecks(): Promise<void> {
 
   /** Build a table whose recorders write into the temp dir. */
   async function makeTable(): Promise<ProcessTable> {
-    return new ProcessTable({
+    const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
       recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
     });
+    tables.push(t);
+    return t;
   }
 
   /** Minimal valid agent spec for allocation. */
@@ -834,6 +844,12 @@ async function runProcessTableChecks(): Promise<void> {
       assert(table.snapshot(pid).state === 'ready', 'state should still update');
     });
   } finally {
+    for (const t of tables) {
+      for (const pid of t.pids()) {
+        const rec = t.recorderFor(pid);
+        if (rec !== null) await rec.close().catch(() => {});
+      }
+    }
     await rm(tmp, { recursive: true, force: true });
   }
 }
@@ -850,6 +866,7 @@ async function runSignalsChecks(): Promise<void> {
   const { join } = await import('node:path');
 
   const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-sig-'));
+  const tables: ProcessTable[] = [];
 
   let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
   const clock = () => new Date(fakeNow).toISOString();
@@ -858,11 +875,13 @@ async function runSignalsChecks(): Promise<void> {
   };
 
   async function makeTable(): Promise<ProcessTable> {
-    return new ProcessTable({
+    const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
       recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
     });
+    tables.push(t);
+    return t;
   }
 
   const agent = { module: './agents/noop.js' } as const;
@@ -1215,6 +1234,7 @@ async function runSignalsChecks(): Promise<void> {
         now: clock,
         recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
       });
+      tables.push(table);
       const pid = await spawnRunning(table);
       const mgr = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
       await mgr.send(pid, 'SIGHUP'); // dropped, but still recorded
@@ -1285,6 +1305,12 @@ async function runSignalsChecks(): Promise<void> {
       );
     });
   } finally {
+    for (const t of tables) {
+      for (const pid of t.pids()) {
+        const rec = t.recorderFor(pid);
+        if (rec !== null) await rec.close().catch(() => {});
+      }
+    }
     await rm(tmp, { recursive: true, force: true });
   }
 }
@@ -1293,6 +1319,530 @@ async function runSignalsChecks(): Promise<void> {
 type ProcessIdAlias = ReturnType<typeof asProcessId>;
 
 await runSignalsChecks();
+
+// =============================================================================
+// Async checks (ipc)
+// =============================================================================
+
+async function runIpcChecks(): Promise<void> {
+  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-ipc-'));
+  const tables: ProcessTable[] = [];
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const tick = (ms = 1000) => {
+    fakeNow += ms;
+  };
+
+  async function makeTable(): Promise<ProcessTable> {
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+    });
+    tables.push(t);
+    return t;
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+
+  /** Allocate a process and walk it to RUNNING. */
+  async function spawnRunning(table: ProcessTable, role = 'worker'): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({ ppid: null, role, agent });
+    await table.setState(pid, 'ready', { trigger: 'init' });
+    tick();
+    await table.setState(pid, 'running', { trigger: 'dispatch' });
+    tick();
+    return pid;
+  }
+
+  /**
+   * Controllable timer so the timeout test does not depend on wall-clock.
+   * `fireTimers()` runs every scheduled callback synchronously.
+   */
+  function makeFakeTimer(): {
+    setTimeoutFn: typeof setTimeout;
+    clearTimeoutFn: typeof clearTimeout;
+    fireTimers: () => void;
+    pending: () => number;
+  } {
+    type Entry = { id: number; fn: () => void; cleared: boolean };
+    const entries: Entry[] = [];
+    let nextId = 1;
+    const setTimeoutFn = ((fn: () => void, _ms?: number): unknown => {
+      const entry: Entry = { id: nextId++, fn, cleared: false };
+      entries.push(entry);
+      return entry as unknown as NodeJS.Timeout;
+    }) as typeof setTimeout;
+    const clearTimeoutFn = ((handle: unknown): void => {
+      const entry = handle as Entry;
+      if (entry && typeof entry === 'object') entry.cleared = true;
+    }) as typeof clearTimeout;
+    const fireTimers = (): void => {
+      for (const e of entries.splice(0)) {
+        if (!e.cleared) e.fn();
+      }
+    };
+    const pending = (): number => entries.filter((e) => !e.cleared).length;
+    return { setTimeoutFn, clearTimeoutFn, fireTimers, pending };
+  }
+
+  /**
+   * Poll a predicate until it holds, yielding to the event loop between
+   * checks. Needed because `setState` mutates process state synchronously
+   * but the recorder's file I/O — and the promise executor that registers
+   * a waiter/timer — complete on later ticks. A single setImmediate is not
+   * reliably enough.
+   */
+  async function waitFor(pred: () => boolean, label = 'condition', maxTicks = 200): Promise<void> {
+    for (let i = 0; i < maxTicks; i++) {
+      if (pred()) return;
+      await new Promise((r) => setImmediate(r));
+    }
+    throw new Error(`waitFor timed out: ${label}`);
+  }
+
+  try {
+    await checkAsync('pidInboxChannel produces pid:<n> format', async () => {
+      const id = pidInboxChannel(asProcessId(42));
+      assert(unbrand(id) === 'pid:42', `expected pid:42, got ${unbrand(id)}`);
+    });
+
+    await checkAsync('isProcessTarget discriminates number vs string brands', async () => {
+      assert(isProcessTarget(asProcessId(7)) === true, 'ProcessId should be a process target');
+      assert(isProcessTarget(asChannelId('chan')) === false, 'ChannelId should not be a process target');
+    });
+
+    await checkAsync('resolveChannel routes ProcessId to inbox, ChannelId to itself', async () => {
+      const pid = asProcessId(9);
+      assert(unbrand(resolveChannel(pid)) === 'pid:9', 'ProcessId should resolve to inbox');
+      const chan = asChannelId('named');
+      assert(unbrand(resolveChannel(chan)) === 'named', 'ChannelId should resolve to itself');
+    });
+
+    await checkAsync('DEFAULT_QUEUE_LIMIT is unbounded (-1)', async () => {
+      assert(DEFAULT_QUEUE_LIMIT === -1, `expected -1, got ${DEFAULT_QUEUE_LIMIT}`);
+      assert(DEFAULT_RECV_TIMEOUT_MS === -1, `expected -1, got ${DEFAULT_RECV_TIMEOUT_MS}`);
+    });
+
+    await checkAsync('send implicitly creates the channel', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('auto-created');
+      assert(!mgr.hasChannel(chan), 'channel should not exist yet');
+      await mgr.send(a, chan, { hello: 'world' });
+      assert(mgr.hasChannel(chan), 'channel should exist after send');
+      const info = mgr.getChannel(chan);
+      assert(info !== undefined, 'getChannel should return info');
+      assert(info!.queueDepth === 1, `queue depth should be 1, got ${info!.queueDepth}`);
+      assert(info!.totalSent === 1, 'totalSent should be 1');
+      assert(unbrand(info!.createdBy!) === unbrand(a), 'createdBy should be the sender');
+    });
+
+    await checkAsync('ensureChannel is idempotent', async () => {
+      const table = await makeTable();
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('idem');
+      const first = mgr.ensureChannel(chan);
+      const second = mgr.ensureChannel(chan);
+      assert(first.createdAt === second.createdAt, 'second ensure should not recreate');
+      assert(mgr.listChannels().filter((c) => unbrand(c.id) === 'idem').length === 1, 'should be one channel');
+    });
+
+    await checkAsync('send to ProcessId routes to its inbox channel', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      await mgr.send(a, b, { ping: true });
+      const inbox = pidInboxChannel(b);
+      assert(mgr.hasChannel(inbox), 'inbox channel should exist');
+      const msg = await mgr.recv(b, inbox, { blocking: false });
+      assert((msg.body as { ping: boolean }).ping === true, 'body mismatch');
+      assert(unbrand(msg.from as ProcessIdAlias) === unbrand(a), 'from should be sender');
+    });
+
+    await checkAsync('send to absent process traps ESRCH', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      let caught: unknown;
+      try {
+        await mgr.send(a, asProcessId(9999), 'nope');
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'ESRCH', `expected ESRCH, got ${caught.errno}`);
+    });
+
+    await checkAsync('recv defaults to the process inbox', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      await mgr.send(a, b, { toInbox: 1 });
+      // recv with no source argument should read b's inbox.
+      const msg = await mgr.recv(b, undefined, { blocking: false });
+      assert((msg.body as { toInbox: number }).toInbox === 1, 'should read from inbox');
+    });
+
+    await checkAsync('blocking recv parks in BLOCKED, send wakes to READY', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('blocking-test');
+
+      // Start a blocking recv but don't await it yet.
+      const recvPromise = mgr.recv(b, chan);
+      // Wait until the waiter is actually registered (recorder I/O and the
+      // promise executor complete on later ticks).
+      await waitFor(() => mgr.getChannel(chan)?.waiterCount === 1, 'waiter registered');
+      assert(table.snapshot(b).state === 'blocked', `b should be blocked, got ${table.snapshot(b).state}`);
+      const blockedOn = table.snapshot(b).blockedOn;
+      assert(blockedOn !== null && blockedOn.kind === 'recv', 'blockedOn should be recv');
+
+      // Now send — this should hand off directly and wake b.
+      await mgr.send(a, chan, { woke: true });
+      const msg = await recvPromise;
+      assert((msg.body as { woke: boolean }).woke === true, 'message mismatch');
+      assert(table.snapshot(b).state === 'ready', `b should be ready after wake, got ${table.snapshot(b).state}`);
+    });
+
+    await checkAsync('non-blocking recv on empty queue traps EAGAIN', async () => {
+      const table = await makeTable();
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      let caught: unknown;
+      try {
+        await mgr.recv(b, asChannelId('empty'), { blocking: false });
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EAGAIN', `expected EAGAIN, got ${caught.errno}`);
+      assert(table.snapshot(b).state === 'running', 'state should be unchanged');
+    });
+
+    await checkAsync('recv timeout traps ETIMEDOUT', async () => {
+      const table = await makeTable();
+      const b = await spawnRunning(table, 'b');
+      const timer = makeFakeTimer();
+      const mgr = new IpcManager({
+        table,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        setTimeoutFn: timer.setTimeoutFn,
+        clearTimeoutFn: timer.clearTimeoutFn,
+      });
+
+      const recvPromise = mgr.recv(b, asChannelId('timeout-chan'), { timeoutMs: 500 });
+      await waitFor(() => timer.pending() === 1, 'timer registered');
+      assert(table.snapshot(b).state === 'blocked', 'should be blocked before timeout');
+      assert(timer.pending() === 1, 'one timer should be pending');
+
+      // Fire the timeout.
+      timer.fireTimers();
+      let caught: unknown;
+      try {
+        await recvPromise;
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'ETIMEDOUT', `expected ETIMEDOUT, got ${caught.errno}`);
+      assert(table.snapshot(b).state === 'ready', 'should be pulled back to ready after timeout');
+    });
+
+    await checkAsync('recv from non-RUNNING state traps ESTATE', async () => {
+      const table = await makeTable();
+      const b = await spawnRunning(table, 'b');
+      await table.setState(b, 'blocked');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      let caught: unknown;
+      try {
+        await mgr.recv(b, asChannelId('whatever'), { blocking: false });
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'ESTATE', `expected ESTATE, got ${caught.errno}`);
+    });
+
+    await checkAsync('FIFO ordering across multiple queued messages', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('fifo');
+      await mgr.send(a, chan, 1);
+      await mgr.send(a, chan, 2);
+      await mgr.send(a, chan, 3);
+      // Walk b to RUNNING for each recv (recv requires RUNNING).
+      const got: unknown[] = [];
+      for (let i = 0; i < 3; i++) {
+        if (table.snapshot(b).state !== 'running') {
+          await table.setState(b, 'running');
+        }
+        const m = await mgr.recv(b, chan, { blocking: false });
+        got.push(m.body);
+      }
+      assert(got[0] === 1 && got[1] === 2 && got[2] === 3, `FIFO violated: ${JSON.stringify(got)}`);
+    });
+
+    await checkAsync('direct handoff leaves the queue empty', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('handoff');
+
+      const recvPromise = mgr.recv(b, chan);
+      await waitFor(() => mgr.getChannel(chan)?.waiterCount === 1, 'waiter registered');
+      await mgr.send(a, chan, { direct: true });
+      await recvPromise;
+
+      const info = mgr.getChannel(chan)!;
+      assert(info.queueDepth === 0, `queue should be empty after handoff, got ${info.queueDepth}`);
+      assert(info.totalSent === 1 && info.totalRecv === 1, 'counters should both be 1');
+    });
+
+    await checkAsync('closeChannel rejects parked waiters with EBADF', async () => {
+      const table = await makeTable();
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('close-me');
+
+      const recvPromise = mgr.recv(b, chan);
+      await waitFor(() => mgr.getChannel(chan)?.waiterCount === 1, 'waiter registered');
+      assert(table.snapshot(b).state === 'blocked', 'precondition: blocked');
+
+      mgr.closeChannel(chan);
+      let caught: unknown;
+      try {
+        await recvPromise;
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EBADF', `expected EBADF, got ${caught.errno}`);
+      assert(mgr.getChannel(chan)!.closed === true, 'channel should be marked closed');
+    });
+
+    await checkAsync('closeChannel drops queued messages', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('drop-me');
+      await mgr.send(a, chan, 'msg1');
+      await mgr.send(a, chan, 'msg2');
+      assert(mgr.getChannel(chan)!.queueDepth === 2, 'precondition: 2 queued');
+      mgr.closeChannel(chan);
+      assert(mgr.getChannel(chan)!.queueDepth === 0, 'queue should be dropped on close');
+    });
+
+    await checkAsync('send to closed channel traps EBADF and raises SIGPIPE', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+
+      // Track SIGPIPE delivery via a handler disposition. The SignalManager
+      // needs an invoker to actually run handlers.
+      let sigpipeFired = false;
+      table.setDisposition(a, 'SIGPIPE', {
+        kind: 'handler',
+        handler: () => {
+          sigpipeFired = true;
+        },
+      });
+      const signals = new SignalManager({
+        table,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        handlerInvoker: async (_p, _s, h) => {
+          await h({} as never);
+        },
+      });
+      // A single IpcManager owns the channel map end-to-end.
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock, signals });
+      const chan = asChannelId('closed-chan');
+      mgr.ensureChannel(chan);
+      mgr.closeChannel(chan);
+
+      let caught: unknown;
+      try {
+        await mgr.send(a, chan, 'too late');
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EBADF', `expected EBADF, got ${caught.errno}`);
+      assert(sigpipeFired, 'SIGPIPE handler should have fired');
+    });
+
+    await checkAsync('recv from closed channel traps EBADF', async () => {
+      const table = await makeTable();
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('closed-recv');
+      mgr.ensureChannel(chan);
+      mgr.closeChannel(chan);
+      let caught: unknown;
+      try {
+        await mgr.recv(b, chan, { blocking: false });
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EBADF', `expected EBADF, got ${caught.errno}`);
+    });
+
+    await checkAsync('cancelWaitersFor rejects with EINTR and returns count', async () => {
+      const table = await makeTable();
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const c1 = asChannelId('cancel-1');
+      const c2 = asChannelId('cancel-2');
+
+      const p1 = mgr.recv(b, c1);
+      await waitFor(() => mgr.getChannel(c1)?.waiterCount === 1, 'waiter registered');
+      // b is blocked on c1; to also block on c2 we'd need a second process.
+      // Cancel the one waiter we have.
+      const cancelled = mgr.cancelWaitersFor(b, 'test-cancel');
+      assert(cancelled === 1, `expected 1 cancelled, got ${cancelled}`);
+      let caught: unknown;
+      try {
+        await p1;
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EINTR', `expected EINTR, got ${caught.errno}`);
+      // Cancelling again is a no-op.
+      assert(mgr.cancelWaitersFor(b) === 0, 'second cancel should find nothing');
+      void c2;
+    });
+
+    await checkAsync('queueLimit overflow traps EAGAIN', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const mgr = new IpcManager({
+        table,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        defaultQueueLimit: 2,
+      });
+      const chan = asChannelId('limited');
+      await mgr.send(a, chan, 'one');
+      await mgr.send(a, chan, 'two');
+      let caught: unknown;
+      try {
+        await mgr.send(a, chan, 'three');
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EAGAIN', `expected EAGAIN, got ${caught.errno}`);
+      assert(mgr.getChannel(chan)!.queueDepth === 2, 'queue should stay at limit');
+    });
+
+    await checkAsync('channelsOf tracks membership for senders and receivers', async () => {
+      const table = await makeTable();
+      const a = await spawnRunning(table, 'a');
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('membership');
+      await mgr.send(a, chan, 'hi');
+      await mgr.recv(b, chan, { blocking: false });
+      assert(mgr.channelsOf(a).some((c) => unbrand(c) === 'membership'), 'sender should be a member');
+      assert(mgr.channelsOf(b).some((c) => unbrand(c) === 'membership'), 'receiver should be a member');
+      assert(mgr.channelsOf(asProcessId(9999)).length === 0, 'unknown pid should have no channels');
+    });
+
+    await checkAsync('send/recv records land in .crec with correct reversibility', async () => {
+      const sub = join(tmp, 'ipc-records');
+      await mkdir(sub, { recursive: true });
+      const table = new ProcessTable({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+      });
+      tables.push(table);
+      const a = await spawnRunning(table, 'a');
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('recorded');
+
+      await mgr.send(a, chan, { recorded: true });
+      // Walk b to RUNNING (it already is) and recv.
+      const msg = await mgr.recv(b, chan, { blocking: false });
+      assert((msg.body as { recorded: boolean }).recorded === true, 'body mismatch');
+
+      const recA = table.recorderFor(a)!;
+      const recB = table.recorderFor(b)!;
+      await recA.flush();
+      await recB.flush();
+
+      const sendRecords: SyscallRecord[] = [];
+      for await (const r of readRecords(recA.path)) {
+        if (r.syscall === 'send') sendRecords.push(r);
+      }
+      assert(sendRecords.length === 1, `expected 1 send record, got ${sendRecords.length}`);
+      assert(sendRecords[0]!.reversibility === 'idempotent', 'send should be idempotent');
+      assert(sendRecords[0]!.phase === 'exit', 'send record should be exit phase');
+
+      const recvRecords: SyscallRecord[] = [];
+      for await (const r of readRecords(recB.path)) {
+        if (r.syscall === 'recv') recvRecords.push(r);
+      }
+      assert(recvRecords.length === 1, `expected 1 recv record, got ${recvRecords.length}`);
+      assert(recvRecords[0]!.reversibility === 'irreversible', 'recv should be irreversible');
+      const result = recvRecords[0]!.result as { body: { recorded: boolean } };
+      assert(result.body.recorded === true, 'recv record should capture the message body');
+    });
+
+    await checkAsync('trap records land in .crec on EAGAIN', async () => {
+      const sub = join(tmp, 'ipc-traps');
+      await mkdir(sub, { recursive: true });
+      const table = new ProcessTable({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+      });
+      tables.push(table);
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      try {
+        await mgr.recv(b, asChannelId('trap-chan'), { blocking: false });
+      } catch {
+        /* expected */
+      }
+      const recB = table.recorderFor(b)!;
+      await recB.flush();
+      const traps: SyscallRecord[] = [];
+      for await (const r of readRecords(recB.path)) {
+        if (r.syscall === 'recv' && r.phase === 'trap') traps.push(r);
+      }
+      assert(traps.length === 1, `expected 1 trap record, got ${traps.length}`);
+      assert(traps[0]!.error?.errno === 'EAGAIN', `trap errno should be EAGAIN, got ${traps[0]!.error?.errno}`);
+    });
+  } finally {
+    for (const t of tables) {
+      for (const pid of t.pids()) {
+        const rec = t.recorderFor(pid);
+        if (rec !== null) await rec.close().catch(() => {});
+      }
+    }
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+await runIpcChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

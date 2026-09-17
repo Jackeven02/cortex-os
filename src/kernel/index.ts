@@ -17,3 +17,4 @@ export * from './errors.js';
 export * from './recorder.js';
 export * from './process_table.js';
 export * from './signals.js';
+export * from './ipc.js';
