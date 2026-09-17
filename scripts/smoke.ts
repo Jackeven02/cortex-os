@@ -58,6 +58,17 @@ import {
   DEFAULT_QUEUE_LIMIT,
   DEFAULT_RECV_TIMEOUT_MS,
   type ChannelInfo,
+  MemoryManager,
+  sharedPhysicalKey,
+  serializeValue,
+  hashValue,
+  valueByteSize,
+  DEFAULT_LARGE_VALUE_BYTES,
+  DEFAULT_MAX_REGION_ENTRIES,
+  type IMemoryDriver,
+  type MemoryRegionPolicy,
+  type MemoryQuery,
+  type MemoryEntry,
 } from '../src/index.js';
 
 let passed = 0;
@@ -1843,6 +1854,603 @@ async function runIpcChecks(): Promise<void> {
 }
 
 await runIpcChecks();
+
+// =============================================================================
+// Async checks (memory)
+// =============================================================================
+
+/**
+ * Minimal in-memory `IMemoryDriver` for the smoke checks. Stores
+ * physical-region → key → {value, at}. snapshot/restore JSON-round-trip the
+ * region so COW and fork deep-copies exercise the real code path.
+ */
+class FakeMemoryDriver implements IMemoryDriver {
+  readonly name = 'inmem';
+  readonly version = '0.0.0';
+  readonly abiCompat: string;
+
+  #store = new Map<string, Map<string, { value: unknown; at: string }>>();
+  #now: () => string;
+  snapshotCalls: string[] = [];
+  restoreCalls: string[] = [];
+  failRead = false;
+  failWrite = false;
+
+  constructor(now: () => string, abiCompat: string) {
+    this.#now = now;
+    this.abiCompat = abiCompat;
+  }
+
+  async read(region: string, query: MemoryQuery): Promise<readonly MemoryEntry[]> {
+    if (this.failRead) throw new Error('driver read boom');
+    const m = this.#store.get(region);
+    if (m === undefined) return [];
+    let entries: MemoryEntry[] = [...m.entries()].map(([key, v]) => ({
+      region,
+      key,
+      value: v.value,
+      at: v.at,
+    }));
+    if (query.key !== undefined) entries = entries.filter((e) => e.key === query.key);
+    if (query.prefix !== undefined) {
+      const p = query.prefix;
+      entries = entries.filter((e) => e.key.startsWith(p));
+    }
+    if (query.limit !== undefined) entries = entries.slice(0, query.limit);
+    return entries;
+  }
+
+  async write(region: string, key: string, value: unknown): Promise<void> {
+    if (this.failWrite) throw new Error('driver write boom');
+    let m = this.#store.get(region);
+    if (m === undefined) {
+      m = new Map<string, { value: unknown; at: string }>();
+      this.#store.set(region, m);
+    }
+    m.set(key, { value, at: this.#now() });
+  }
+
+  async delete(region: string, key: string): Promise<void> {
+    this.#store.get(region)?.delete(key);
+  }
+
+  async listRegions(): Promise<readonly string[]> {
+    return [...this.#store.keys()];
+  }
+
+  async snapshotRegion(region: string): Promise<Uint8Array> {
+    this.snapshotCalls.push(region);
+    const m = this.#store.get(region) ?? new Map<string, { value: unknown; at: string }>();
+    const obj = Object.fromEntries([...m.entries()]);
+    return new TextEncoder().encode(JSON.stringify(obj));
+  }
+
+  async restoreRegion(region: string, blob: Uint8Array): Promise<void> {
+    this.restoreCalls.push(region);
+    const obj = JSON.parse(new TextDecoder().decode(blob)) as Record<
+      string,
+      { value: unknown; at: string }
+    >;
+    const m = new Map<string, { value: unknown; at: string }>();
+    for (const [k, v] of Object.entries(obj)) m.set(k, v);
+    this.#store.set(region, m);
+  }
+
+  async close(): Promise<void> {
+    /* nothing to release */
+  }
+}
+
+async function runMemoryChecks(): Promise<void> {
+  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-mem-'));
+  const tables: ProcessTable[] = [];
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const tick = (ms = 1000) => {
+    fakeNow += ms;
+  };
+
+  async function makeTable(): Promise<ProcessTable> {
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+    });
+    tables.push(t);
+    return t;
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+
+  async function spawnRunning(table: ProcessTable, role = 'worker'): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({ ppid: null, role, agent });
+    await table.setState(pid, 'ready', { trigger: 'init' });
+    tick();
+    await table.setState(pid, 'running', { trigger: 'dispatch' });
+    tick();
+    return pid;
+  }
+
+  function makeManager(table: ProcessTable, opts?: Partial<ConstructorParameters<typeof MemoryManager>[0]>): MemoryManager {
+    const driver = new FakeMemoryDriver(clock, KERNEL_ABI_VERSION);
+    const mgr = new MemoryManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      drivers: { inmem: driver },
+      ...opts,
+    });
+    return mgr;
+  }
+
+  const cow: MemoryRegionPolicy = { kind: 'cow', backing: 'inmem' };
+  const priv: MemoryRegionPolicy = { kind: 'private', backing: 'inmem' };
+  const shared: MemoryRegionPolicy = { kind: 'shared', backing: 'inmem' };
+
+  // --- pure helpers ---------------------------------------------------------
+
+  check('sharedPhysicalKey is deterministic', () => {
+    assert(
+      sharedPhysicalKey('inmem', 'semantic') === sharedPhysicalKey('inmem', 'semantic'),
+      'same inputs should yield the same key',
+    );
+    assert(
+      sharedPhysicalKey('inmem', 'a') !== sharedPhysicalKey('inmem', 'b'),
+      'different regions should differ',
+    );
+    assert(sharedPhysicalKey('inmem', 'a').startsWith('sh:'), 'shared keys use the sh: prefix');
+  });
+
+  check('serializeValue / hashValue / valueByteSize behave', () => {
+    assert(serializeValue({ a: 1 }) === '{"a":1}', 'serializes objects');
+    assert(hashValue('x') === hashValue('x'), 'hash is stable');
+    assert(hashValue('x') !== hashValue('y'), 'distinct values hash distinctly');
+    assert(valueByteSize('abc') === 5, 'byte size counts the JSON serialization (quotes included)');
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    assert(typeof serializeValue(circular) === 'string', 'circular falls back without throwing');
+  });
+
+  check('memory defaults are unbounded / 1024 bytes', () => {
+    assert(DEFAULT_MAX_REGION_ENTRIES === -1, 'default region limit is unbounded');
+    assert(DEFAULT_LARGE_VALUE_BYTES === 1024, 'default large-value threshold is 1024');
+  });
+
+  // --- attach / read / write ------------------------------------------------
+
+  await checkAsync('attachRegion derives physical key from kind', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table);
+    const sh = mgr.attachRegion(pid, 'semantic', shared);
+    const pr = mgr.attachRegion(pid, 'procedural', priv);
+    assert(sh.bindingKey === sharedPhysicalKey('inmem', 'semantic'), 'shared uses deterministic key');
+    assert(pr.bindingKey.startsWith('pr:inmem:'), 'private uses a unique owned key');
+    assert(sh.refCount === 1 && pr.refCount === 1, 'fresh bindings have refCount 1');
+  });
+
+  await checkAsync('write then read round-trips', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table);
+    mgr.attachRegion(pid, 'episodic', priv);
+    await mgr.write(pid, 'episodic', 'e1', { hello: 'world' });
+    const entries = await mgr.read(pid, 'episodic', {});
+    assert(entries.length === 1, `expected 1 entry, got ${entries.length}`);
+    assert(entries[0]!.key === 'e1', 'key mismatch');
+    assert((entries[0]!.value as { hello: string }).hello === 'world', 'value mismatch');
+  });
+
+  await checkAsync('read remaps entry.region to the logical name', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table);
+    mgr.attachRegion(pid, 'episodic', priv);
+    await mgr.write(pid, 'episodic', 'e1', 1);
+    const entries = await mgr.read(pid, 'episodic', {});
+    assert(entries[0]!.region === 'episodic', 'agent should never see the physical key');
+  });
+
+  await checkAsync('query key / prefix / limit are honored', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table);
+    mgr.attachRegion(pid, 'kv', priv);
+    await mgr.write(pid, 'kv', 'user:1', 'a');
+    await mgr.write(pid, 'kv', 'user:2', 'b');
+    await mgr.write(pid, 'kv', 'post:1', 'c');
+    const byKey = await mgr.read(pid, 'kv', { key: 'user:1' });
+    assert(byKey.length === 1 && byKey[0]!.value === 'a', 'key lookup');
+    const byPrefix = await mgr.read(pid, 'kv', { prefix: 'user:' });
+    assert(byPrefix.length === 2, `prefix scan expected 2, got ${byPrefix.length}`);
+    const limited = await mgr.read(pid, 'kv', { limit: 1 });
+    assert(limited.length === 1, 'limit caps results');
+  });
+
+  // --- error paths ----------------------------------------------------------
+
+  await checkAsync('read/write on missing region traps ENOENT', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table);
+    let rErr: unknown;
+    try {
+      await mgr.read(pid, 'nope', {});
+    } catch (e) {
+      rErr = e;
+    }
+    assert(isCortexError(rErr) && rErr.errno === 'ENOENT', 'read should trap ENOENT');
+    let wErr: unknown;
+    try {
+      await mgr.write(pid, 'nope', 'k', 1);
+    } catch (e) {
+      wErr = e;
+    }
+    assert(isCortexError(wErr) && wErr.errno === 'ENOENT', 'write should trap ENOENT');
+  });
+
+  await checkAsync('write to readOnly region traps EPERM', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table);
+    mgr.attachRegion(pid, 'ro', { kind: 'private', backing: 'inmem', readOnly: true });
+    let err: unknown;
+    try {
+      await mgr.write(pid, 'ro', 'k', 1);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'EPERM', 'readOnly write should trap EPERM');
+    // Reads still work.
+    const entries = await mgr.read(pid, 'ro', {});
+    assert(entries.length === 0, 'read on empty readOnly region is fine');
+  });
+
+  await checkAsync('missing driver traps EDRIVER', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = new MemoryManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    mgr.attachRegion(pid, 'episodic', { kind: 'private', backing: 'ghost' });
+    let err: unknown;
+    try {
+      await mgr.read(pid, 'episodic', {});
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'EDRIVER', 'absent driver should trap EDRIVER');
+  });
+
+  await checkAsync('driver throw is wrapped as EDRIVER', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const driver = new FakeMemoryDriver(clock, KERNEL_ABI_VERSION);
+    const mgr = new MemoryManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      drivers: { inmem: driver },
+    });
+    mgr.attachRegion(pid, 'episodic', priv);
+    driver.failWrite = true;
+    let err: unknown;
+    try {
+      await mgr.write(pid, 'episodic', 'k', 1);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'EDRIVER', 'driver failure should wrap to EDRIVER');
+  });
+
+  await checkAsync('entry-count ceiling traps ENOMEM', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table, { maxRegionEntries: 1 });
+    mgr.attachRegion(pid, 'small', priv);
+    await mgr.write(pid, 'small', 'k1', 1); // ok, count → 1
+    let err: unknown;
+    try {
+      await mgr.write(pid, 'small', 'k2', 2); // exceeds limit
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ENOMEM', 'over-limit write should trap ENOMEM');
+  });
+
+  // --- shared semantics -----------------------------------------------------
+
+  await checkAsync('shared region: write by one process is visible to another', async () => {
+    const table = await makeTable();
+    const a = await spawnRunning(table, 'a');
+    const b = await spawnRunning(table, 'b');
+    const driver = new FakeMemoryDriver(clock, KERNEL_ABI_VERSION);
+    const mgr = new MemoryManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      drivers: { inmem: driver },
+    });
+    mgr.attachRegion(a, 'semantic', shared);
+    mgr.attachRegion(b, 'semantic', shared);
+    assert(
+      mgr.regionInfo(a, 'semantic')!.bindingKey === mgr.regionInfo(b, 'semantic')!.bindingKey,
+      'shared bindings converge on one physical key',
+    );
+    assert(mgr.regionInfo(a, 'semantic')!.refCount === 2, 'refCount should be 2');
+    await mgr.write(a, 'semantic', 'fact', 'sky is blue');
+    const fromB = await mgr.read(b, 'semantic', { key: 'fact' });
+    assert(fromB.length === 1 && fromB[0]!.value === 'sky is blue', 'B should see A\'s write');
+  });
+
+  // --- private fork ---------------------------------------------------------
+
+  await checkAsync('private fork deep-copies and diverges', async () => {
+    const table = await makeTable();
+    const parent = await spawnRunning(table, 'parent');
+    const mgr = makeManager(table);
+    mgr.attachRegion(parent, 'procedural', priv);
+    await mgr.write(parent, 'procedural', 'skill', 'ride bike');
+
+    const child = await table.allocate({ ppid: parent, role: 'child', agent });
+    await mgr.forkCopy(parent, child);
+
+    assert(
+      mgr.regionInfo(parent, 'procedural')!.bindingKey !==
+        mgr.regionInfo(child, 'procedural')!.bindingKey,
+      'private fork should give the child its own physical key',
+    );
+    const inherited = await mgr.read(child, 'procedural', { key: 'skill' });
+    assert(inherited.length === 1 && inherited[0]!.value === 'ride bike', 'child inherits a deep copy');
+
+    await mgr.write(child, 'procedural', 'skill2', 'swim');
+    const parentView = await mgr.read(parent, 'procedural', { key: 'skill2' });
+    assert(parentView.length === 0, 'parent must NOT see the child\'s post-fork write');
+    await mgr.write(parent, 'procedural', 'skill3', 'fly');
+    const childView = await mgr.read(child, 'procedural', { key: 'skill3' });
+    assert(childView.length === 0, 'child must NOT see the parent\'s post-fork write');
+  });
+
+  // --- cow fork -------------------------------------------------------------
+
+  await checkAsync('cow fork shares until first write, then diverges', async () => {
+    const table = await makeTable();
+    const parent = await spawnRunning(table, 'parent');
+    const driver = new FakeMemoryDriver(clock, KERNEL_ABI_VERSION);
+    const mgr = new MemoryManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      drivers: { inmem: driver },
+    });
+    mgr.attachRegion(parent, 'episodic', cow);
+    await mgr.write(parent, 'episodic', 'base', 'shared past');
+
+    const child = await table.allocate({ ppid: parent, role: 'child', agent });
+    const snapshotsBefore = driver.snapshotCalls.length;
+    await mgr.forkCopy(parent, child);
+    assert(
+      driver.snapshotCalls.length === snapshotsBefore,
+      'cow fork should NOT copy eagerly',
+    );
+    assert(
+      mgr.regionInfo(parent, 'episodic')!.bindingKey ===
+        mgr.regionInfo(child, 'episodic')!.bindingKey,
+      'child shares the parent physical key pre-write',
+    );
+    assert(mgr.regionInfo(parent, 'episodic')!.refCount === 2, 'refCount 2 while shared');
+
+    // Child reads see the shared data.
+    const childRead = await mgr.read(child, 'episodic', { key: 'base' });
+    assert(childRead.length === 1 && childRead[0]!.value === 'shared past', 'child reads shared region');
+
+    // Child's first write triggers duplication.
+    await mgr.write(child, 'episodic', 'branch', 'child only');
+    assert(
+      mgr.regionInfo(parent, 'episodic')!.bindingKey !==
+        mgr.regionInfo(child, 'episodic')!.bindingKey,
+      'child should diverge to a fresh physical key after writing',
+    );
+    assert(mgr.regionInfo(parent, 'episodic')!.refCount === 1, 'parent refCount back to 1');
+    assert(mgr.regionInfo(child, 'episodic')!.refCount === 1, 'child refCount is 1');
+
+    const parentView = await mgr.read(parent, 'episodic', { key: 'branch' });
+    assert(parentView.length === 0, 'parent must NOT see the child branch write');
+    const childBoth = await mgr.read(child, 'episodic', {});
+    assert(childBoth.length === 2, 'child keeps base + its own branch write');
+  });
+
+  await checkAsync('cow divergence is symmetric (parent writes first)', async () => {
+    const table = await makeTable();
+    const parent = await spawnRunning(table, 'parent');
+    const mgr = makeManager(table);
+    mgr.attachRegion(parent, 'episodic', cow);
+    await mgr.write(parent, 'episodic', 'base', 'common');
+    const child = await table.allocate({ ppid: parent, role: 'child', agent });
+    await mgr.forkCopy(parent, child);
+
+    // Parent writes first this time.
+    await mgr.write(parent, 'episodic', 'ponly', 'parent branch');
+    const childView = await mgr.read(child, 'episodic', { key: 'ponly' });
+    assert(childView.length === 0, 'child must NOT see the parent\'s divergent write');
+    const childBase = await mgr.read(child, 'episodic', { key: 'base' });
+    assert(childBase.length === 1 && childBase[0]!.value === 'common', 'child still has the shared past');
+  });
+
+  await checkAsync('forkCopy override changes copy semantics', async () => {
+    const table = await makeTable();
+    const parent = await spawnRunning(table, 'parent');
+    const mgr = makeManager(table);
+    mgr.attachRegion(parent, 'data', priv);
+    await mgr.write(parent, 'data', 'k', 'v');
+    const child = await table.allocate({ ppid: parent, role: 'child', agent });
+    await mgr.forkCopy(parent, child, { data: shared });
+    const info = mgr.regionInfo(child, 'data')!;
+    assert(info.kind === 'shared', 'override should change the child kind');
+    assert(info.bindingKey === sharedPhysicalKey('inmem', 'data'), 'override to shared uses the deterministic key');
+    const seeded = await mgr.read(child, 'data', { key: 'k' });
+    assert(seeded.length === 1 && seeded[0]!.value === 'v', 'shared region seeded from parent content');
+  });
+
+  // --- snapshot / restore ---------------------------------------------------
+
+  await checkAsync('snapshot + restore moves state across processes', async () => {
+    const table = await makeTable();
+    const src = await spawnRunning(table, 'src');
+    const mgr = makeManager(table);
+    mgr.attachRegion(src, 'episodic', priv);
+    await mgr.write(src, 'episodic', 'memory', 'remember me');
+
+    const blobs = await mgr.snapshot(src);
+    assert(blobs.episodic !== undefined, 'snapshot should include the logical region');
+
+    const dst = await table.allocate({ ppid: null, role: 'dst', agent });
+    mgr.attachRegion(dst, 'episodic', priv);
+    await mgr.restore(dst, blobs);
+    const restored = await mgr.read(dst, 'episodic', { key: 'memory' });
+    assert(restored.length === 1 && restored[0]!.value === 'remember me', 'restore should reload the value');
+  });
+
+  // --- detach / sync --------------------------------------------------------
+
+  await checkAsync('detachRegion releases the binding', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table);
+    mgr.attachRegion(pid, 'tmp', priv);
+    assert(mgr.hasRegion(pid, 'tmp'), 'region attached');
+    mgr.detachRegion(pid, 'tmp');
+    assert(!mgr.hasRegion(pid, 'tmp'), 'region detached');
+    assert(mgr.regionsOf(pid).length === 0, 'no regions left');
+    mgr.detachRegion(pid, 'tmp'); // idempotent
+  });
+
+  await checkAsync('syncFromTable attaches declared regions', async () => {
+    const table = await makeTable();
+    const pid = await table.allocate({
+      ppid: null,
+      role: 'worker',
+      agent,
+      memory: { episodic: cow, semantic: shared },
+    });
+    const mgr = makeManager(table);
+    assert(!mgr.hasRegion(pid, 'episodic'), 'not bound before sync');
+    mgr.syncFromTable(pid);
+    assert(mgr.hasRegion(pid, 'episodic') && mgr.hasRegion(pid, 'semantic'), 'both regions bound after sync');
+    assert(mgr.regionInfo(pid, 'episodic')!.kind === 'cow', 'policy preserved');
+  });
+
+  // --- recording ------------------------------------------------------------
+
+  await checkAsync('memory_read / memory_write records land in .crec', async () => {
+    const sub = join(tmp, 'mem-records');
+    await mkdir(sub, { recursive: true });
+    const table = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+    });
+    tables.push(table);
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table);
+    mgr.attachRegion(pid, 'episodic', priv);
+    await mgr.write(pid, 'episodic', 'k', { small: true });
+    await mgr.read(pid, 'episodic', { key: 'k' });
+
+    const rec = table.recorderFor(pid)!;
+    await rec.flush();
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) records.push(r);
+
+    const writes = records.filter((r) => r.syscall === 'memory_write');
+    const reads = records.filter((r) => r.syscall === 'memory_read');
+    assert(writes.length === 1, `expected 1 write record, got ${writes.length}`);
+    assert(reads.length === 1, `expected 1 read record, got ${reads.length}`);
+
+    assert(writes[0]!.reversibility === 'reversible', 'memory_write is reversible');
+    assert(writes[0]!.phase === 'exit', 'write record is exit phase');
+    const wArgs = writes[0]!.args as { region: string; key: string; policyKind: string; value: unknown };
+    assert(wArgs.region === 'episodic' && wArgs.key === 'k', 'write args capture region+key');
+    assert(wArgs.policyKind === 'private', 'write args capture policy kind');
+    assert((wArgs.value as { small: boolean }).small === true, 'small value recorded inline');
+
+    assert(reads[0]!.reversibility === 'idempotent', 'memory_read is idempotent');
+    const rResult = reads[0]!.result as { count: number; valuesHash: string };
+    assert(rResult.count === 1, 'read result captures count');
+    assert(typeof rResult.valuesHash === 'string' && rResult.valuesHash.length === 64, 'read result hashes values');
+  });
+
+  await checkAsync('large values and recordHashOnly log a hash, not the value', async () => {
+    const sub = join(tmp, 'mem-hash');
+    await mkdir(sub, { recursive: true });
+    const table = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+    });
+    tables.push(table);
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table, { largeValueBytes: 8 });
+    mgr.attachRegion(pid, 'big', priv);
+    await mgr.write(pid, 'big', 'huge', 'this value is definitely larger than eight bytes');
+    await mgr.write(pid, 'big', 'small', 1, { recordHashOnly: true });
+
+    const rec = table.recorderFor(pid)!;
+    await rec.flush();
+    const writes: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) {
+      if (r.syscall === 'memory_write') writes.push(r);
+    }
+    assert(writes.length === 2, `expected 2 write records, got ${writes.length}`);
+    for (const w of writes) {
+      const a = w.args as Record<string, unknown>;
+      assert(a.value === undefined, 'hashed write must not record the raw value');
+      assert(typeof a.valueHash === 'string', 'hashed write records a valueHash');
+      assert(typeof a.valueBytes === 'number' && (a.valueBytes as number) > 0, 'hashed write records byte size');
+    }
+  });
+
+  await checkAsync('trap records land in .crec on ENOENT', async () => {
+    const sub = join(tmp, 'mem-traps');
+    await mkdir(sub, { recursive: true });
+    const table = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+    });
+    tables.push(table);
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table);
+    try {
+      await mgr.write(pid, 'ghost', 'k', 1);
+    } catch {
+      /* expected */
+    }
+    const rec = table.recorderFor(pid)!;
+    await rec.flush();
+    const traps: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) {
+      if (r.phase === 'trap') traps.push(r);
+    }
+    assert(traps.length === 1, `expected 1 trap record, got ${traps.length}`);
+    assert(traps[0]!.syscall === 'memory_write', 'trap records the syscall name');
+    assert(traps[0]!.error?.errno === 'ENOENT', `trap errno should be ENOENT, got ${traps[0]!.error?.errno}`);
+  });
+
+  // --- cleanup --------------------------------------------------------------
+  for (const t of tables) {
+    for (const pid of t.pids()) {
+      const rec = t.recorderFor(pid);
+      if (rec !== null) await rec.close().catch(() => {});
+    }
+  }
+  await rm(tmp, { recursive: true, force: true });
+}
+
+await runMemoryChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

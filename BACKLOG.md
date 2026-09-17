@@ -39,16 +39,16 @@ The point of this phase is to lock the abstractions before writing serious code.
 
 Target: a "hello world" agent runs, calls one LLM, checkpoints, restores, exits cleanly. ~1500 lines of TypeScript.
 
-> **Status as of this commit:** 5 of 10 items done. The foundation (`types.ts` + `errors.ts`) plus `recorder.ts`, `process_table.ts`, `signals.ts`, and `ipc.ts` have landed; 100 smoke checks green. Next: `memory.ts` (#019), `checkpoint.ts` (#017), `fork.ts` (#020), `scheduler.ts` (#013), `init.ts` (#021), and finally `syscall.ts` (#014) which wires everything together.
+> **Status as of this commit:** 6 of 10 items done. The foundation (`types.ts` + `errors.ts`) plus `recorder.ts`, `process_table.ts`, `signals.ts`, `ipc.ts`, and `memory.ts` have landed; 123 smoke checks green. Next: `checkpoint.ts` (#017), `fork.ts` (#020), `scheduler.ts` (#013), `init.ts` (#021), and finally `syscall.ts` (#014) which wires everything together.
 
 - [x] **#012** `kernel/process.ts` — Process class, PID allocation, state machine → `d339502` (landed as `process_table.ts`)
 - [ ] **#013** `kernel/scheduler.ts` — round-robin scheduler with token budgets
 - [ ] **#014** `kernel/syscall.ts` — syscall dispatcher, registration, logging, reversibility tags
-- [x] **#015** `kernel/ipc.ts` — channels (`send`, `recv`, blocking and non-blocking) → this commit
+- [x] **#015** `kernel/ipc.ts` — channels (`send`, `recv`, blocking and non-blocking) → `6950f40`
 - [x] **#016** `kernel/signals.ts` — `SIGINT`, `SIGTERM`, `SIGKILL`, `SIGUSR1` (reflect), `SIGUSR2` (summarize) → `2ff3be9`
 - [ ] **#017** `kernel/checkpoint.ts` — `checkpoint`, `restore`, snapshot serialization (CBOR)
 - [x] **#018** `kernel/recorder.ts` — every syscall written to append-only `.crec` log → `c85e697`
-- [ ] **#019** `kernel/memory.ts` — virtual memory abstraction with private/shared/cow regions
+- [x] **#019** `kernel/memory.ts` — virtual memory abstraction with private/shared/cow regions → this commit
 - [ ] **#020** `kernel/fork.ts` — cognitive fork per STATE.md §3.1
 - [ ] **#021** `kernel/init.ts` — process 1, the supervisor
 

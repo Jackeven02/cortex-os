@@ -218,10 +218,17 @@ export type MemoryRegionKind = 'private' | 'shared' | 'cow';
 /**
  * Policy for one memory region. `backing` names the `IMemoryDriver` that
  * stores it (e.g. `'sqlite'`, `'inmem'`, `'qdrant'`).
+ *
+ * `readOnly` marks a region that rejects `memory_write` with `EPERM`
+ * (docs/ABI.md §4.4). Optional and additive — absent means writable.
+ * Note: under `exactOptionalPropertyTypes`, construct with a conditional
+ * spread (`...(ro ? { readOnly: true } : {})`) rather than passing
+ * `readOnly: undefined`.
  */
 export interface MemoryRegionPolicy {
   readonly kind: MemoryRegionKind;
   readonly backing: string;
+  readonly readOnly?: boolean;
 }
 
 /**
