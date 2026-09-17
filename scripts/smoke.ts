@@ -31,6 +31,16 @@ import {
   CREC_MAGIC,
   CREC_MAX_FRAME_SIZE,
   type SyscallRecord,
+  ProcessTable,
+  nullRecorderFactory,
+  isLegalTransition,
+  legalSuccessors,
+  PROCESS_STATES,
+  PID_KERNEL,
+  PID_INIT,
+  PID_FIRST_USER,
+  type ProcessState,
+  type Signal,
 } from '../src/index.js';
 
 let passed = 0;
@@ -463,6 +473,362 @@ async function runRecorderChecks(): Promise<void> {
 }
 
 await runRecorderChecks();
+
+// =============================================================================
+// Async checks (process_table)
+// =============================================================================
+
+async function runProcessTableChecks(): Promise<void> {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-pt-'));
+
+  // Frozen clock so timestamps are deterministic across checks.
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const tick = (ms = 1000) => {
+    fakeNow += ms;
+  };
+
+  /** Build a table whose recorders write into the temp dir. */
+  async function makeTable(): Promise<ProcessTable> {
+    return new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+    });
+  }
+
+  /** Minimal valid agent spec for allocation. */
+  const agent = { module: './agents/noop.js' } as const;
+
+  try {
+    await checkAsync('reserved PID constants are correct', async () => {
+      assert(unbrand(PID_KERNEL) === 0, 'PID_KERNEL should be 0');
+      assert(unbrand(PID_INIT) === 1, 'PID_INIT should be 1');
+      assert(PID_FIRST_USER === 2, 'PID_FIRST_USER should be 2');
+    });
+
+    await checkAsync('PROCESS_STATES has 9 entries (8 live + zombie)', async () => {
+      // docs/PROCESS.md §2 says "eight states" but §3 enumerates nine
+      // (including ZOMBIE). The table is authoritative; §2 prose needs a
+      // doc fix. We assert nine here.
+      assert(PROCESS_STATES.length === 9, `expected 9 states, got ${PROCESS_STATES.length}`);
+    });
+
+    await checkAsync('isLegalTransition matches the §5 table', async () => {
+      assert(isLegalTransition('new', 'ready'), 'new->ready should be legal');
+      assert(isLegalTransition('ready', 'running'), 'ready->running should be legal');
+      assert(isLegalTransition('running', 'blocked'), 'running->blocked should be legal');
+      assert(isLegalTransition('blocked', 'ready'), 'blocked->ready should be legal');
+      assert(isLegalTransition('running', 'exiting'), 'running->exiting should be legal');
+      assert(isLegalTransition('exiting', 'zombie'), 'exiting->zombie should be legal');
+      assert(!isLegalTransition('new', 'running'), 'new->running should be ILLEGAL');
+      assert(!isLegalTransition('zombie', 'ready'), 'zombie->ready should be ILLEGAL');
+      assert(!isLegalTransition('suspended', 'ready'), 'suspended->ready should be ILLEGAL (restore creates new PID)');
+    });
+
+    await checkAsync('legalSuccessors returns reachable states', async () => {
+      const fromRunning = legalSuccessors('running');
+      assert(fromRunning.includes('ready'), 'running should reach ready');
+      assert(fromRunning.includes('blocked'), 'running should reach blocked');
+      assert(fromRunning.includes('exiting'), 'running should reach exiting');
+      assert(fromRunning.includes('stopped'), 'running should reach stopped');
+      assert(fromRunning.includes('checkpointing'), 'running should reach checkpointing');
+      const fromZombie = legalSuccessors('zombie');
+      assert(fromZombie.length === 0, 'zombie should have no successors (reap is terminal)');
+    });
+
+    await checkAsync('allocate assigns monotonic PIDs starting at 2', async () => {
+      const table = await makeTable();
+      const p1 = await table.allocate({ ppid: null, role: 'init', agent });
+      const p2 = await table.allocate({ ppid: p1, role: 'worker', agent });
+      const p3 = await table.allocate({ ppid: p1, role: 'worker', agent });
+      assert(unbrand(p1) === 2, `first PID should be 2, got ${unbrand(p1)}`);
+      assert(unbrand(p2) === 3, `second PID should be 3, got ${unbrand(p2)}`);
+      assert(unbrand(p3) === 4, `third PID should be 4, got ${unbrand(p3)}`);
+      assert(table.size === 3, `table size should be 3, got ${table.size}`);
+    });
+
+    await checkAsync('allocate places process in NEW state', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      const info = table.snapshot(pid);
+      assert(info.state === 'new', `expected state new, got ${info.state}`);
+      assert(info.role === 'init', 'role mismatch');
+      assert(info.ppid === null, 'root process should have null ppid');
+      assert(unbrand(info.pgid) === unbrand(pid), 'root process pgid should equal pid');
+    });
+
+    await checkAsync('allocate with missing parent traps ESRCH', async () => {
+      const table = await makeTable();
+      let caught: unknown;
+      try {
+        await table.allocate({ ppid: asProcessId(9999), role: 'orphan', agent });
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'ESRCH', `expected ESRCH, got ${caught.errno}`);
+    });
+
+    await checkAsync('allocate with duplicate explicit PID traps EINVAL', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      let caught: unknown;
+      try {
+        await table.allocate({ pid, ppid: null, role: 'dupe', agent });
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EINVAL', `expected EINVAL, got ${caught.errno}`);
+    });
+
+    await checkAsync('child inherits parent PGID by default', async () => {
+      const table = await makeTable();
+      const root = await table.allocate({ ppid: null, role: 'root', agent });
+      const child = await table.allocate({ ppid: root, role: 'child', agent });
+      const grandchild = await table.allocate({ ppid: child, role: 'grandchild', agent });
+      assert(unbrand(table.snapshot(child).pgid) === unbrand(root), 'child pgid should equal root pid');
+      assert(unbrand(table.snapshot(grandchild).pgid) === unbrand(root), 'grandchild pgid should equal root pid');
+      const members = table.groupMembers(root);
+      assert(members.length === 3, `group should have 3 members, got ${members.length}`);
+    });
+
+    await checkAsync('legal transition sequence succeeds and records', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      await table.setState(pid, 'ready', { trigger: 'scheduler-init' });
+      tick();
+      await table.setState(pid, 'running', { trigger: 'dispatch' });
+      tick();
+      await table.setState(pid, 'blocked', { trigger: 'llm_call' });
+      table.setBlockedOn(pid, { kind: 'llm', callId: 'call-1' });
+      tick();
+      await table.setState(pid, 'ready', { trigger: 'llm-response' });
+      tick();
+      await table.setState(pid, 'running', { trigger: 'dispatch' });
+      tick();
+      await table.setState(pid, 'exiting', { trigger: 'exit-syscall' });
+      table.setExitInfo(pid, 0, 'normal', asSyscallOffset(0));
+      tick();
+      await table.setState(pid, 'zombie', { trigger: 'cleanup-done' });
+
+      assert(table.snapshot(pid).state === 'zombie', 'final state should be zombie');
+
+      // Verify __state records landed in the .crec log.
+      const rec = table.recorderFor(pid);
+      assert(rec !== null, 'recorder should exist');
+      await rec!.flush();
+      const stateRecords: SyscallRecord[] = [];
+      for await (const r of readRecords(rec!.path)) {
+        if (r.syscall === '__state') stateRecords.push(r);
+      }
+      // 7 transitions: new->ready, ready->running, running->blocked,
+      // blocked->ready, ready->running, running->exiting, exiting->zombie
+      assert(stateRecords.length === 7, `expected 7 __state records, got ${stateRecords.length}`);
+      assert(stateRecords[0]!.args !== undefined, 'first record should carry args');
+      const args0 = stateRecords[0]!.args as { from: string; to: string; trigger: string };
+      assert(args0.from === 'new' && args0.to === 'ready', 'first transition wrong');
+      assert(args0.trigger === 'scheduler-init', 'trigger metadata lost');
+    });
+
+    await checkAsync('illegal transition traps EINVAL with legalSuccessors', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      let caught: unknown;
+      try {
+        await table.setState(pid, 'running'); // NEW -> RUNNING is illegal
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EINVAL', `expected EINVAL, got ${caught.errno}`);
+      const details = caught.details as { from: string; to: string; legalSuccessors: string[] };
+      assert(details.from === 'new', 'details.from wrong');
+      assert(details.to === 'running', 'details.to wrong');
+      assert(details.legalSuccessors.includes('ready'), 'legalSuccessors should include ready');
+    });
+
+    await checkAsync('no-op setState (same state) is allowed and not recorded', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      await table.setState(pid, 'ready');
+      const rec = table.recorderFor(pid)!;
+      await rec.flush();
+      const offsetBefore = rec.currentOffset;
+      await table.setState(pid, 'ready'); // no-op
+      const offsetAfter = rec.currentOffset;
+      assert(offsetBefore === offsetAfter, 'no-op transition should not write a record');
+    });
+
+    await checkAsync('snapshot is an immutable copy', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      const snap1 = table.snapshot(pid);
+      await table.setState(pid, 'ready');
+      const snap2 = table.snapshot(pid);
+      assert(snap1.state === 'new', 'earlier snapshot should not change');
+      assert(snap2.state === 'ready', 'later snapshot should reflect new state');
+      assert(snap1 !== snap2, 'snapshots should be distinct objects');
+    });
+
+    await checkAsync('list with filter narrows results', async () => {
+      const table = await makeTable();
+      const root = await table.allocate({ ppid: null, role: 'init', agent });
+      await table.allocate({ ppid: root, role: 'worker', agent });
+      await table.allocate({ ppid: root, role: 'worker', agent });
+      await table.allocate({ ppid: root, role: 'researcher', agent });
+
+      assert(table.list().length === 4, 'unfiltered list should have 4');
+      assert(table.list({ role: 'worker' }).length === 2, 'role filter should match 2');
+      assert(table.list({ state: 'new' }).length === 4, 'state filter should match 4');
+      assert(table.list({ ppid: root }).length === 3, 'ppid filter should match 3');
+      assert(table.list({ role: 'nonexistent' }).length === 0, 'unknown role should match 0');
+    });
+
+    await checkAsync('children returns direct children in PID order', async () => {
+      const table = await makeTable();
+      const root = await table.allocate({ ppid: null, role: 'init', agent });
+      const c1 = await table.allocate({ ppid: root, role: 'a', agent });
+      const c2 = await table.allocate({ ppid: root, role: 'b', agent });
+      const kids = table.children(root);
+      assert(kids.length === 2, `expected 2 children, got ${kids.length}`);
+      assert(unbrand(kids[0]!) === unbrand(c1), 'children should be PID-ordered');
+      assert(unbrand(kids[1]!) === unbrand(c2), 'children should be PID-ordered');
+    });
+
+    await checkAsync('reap requires ZOMBIE state, traps ESTATE otherwise', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      let caught: unknown;
+      try {
+        await table.reap(pid); // still NEW
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'ESTATE', `expected ESTATE, got ${caught.errno}`);
+    });
+
+    await checkAsync('reap removes entry and PID is never reused', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      await table.setState(pid, 'ready');
+      await table.setState(pid, 'running');
+      await table.setState(pid, 'exiting');
+      table.setExitInfo(pid, 42, 'test-exit', asSyscallOffset(123));
+      await table.setState(pid, 'zombie');
+
+      const result = await table.reap(pid);
+      assert(result.exitCode === 42, `exitCode should be 42, got ${result.exitCode}`);
+      assert(result.exitReason === 'test-exit', 'exitReason mismatch');
+      assert(!table.has(pid), 'entry should be removed after reap');
+      assert(table.recorderFor(pid) === null, 'recorder should be cleared after reap');
+
+      // Next allocation must NOT reuse the reaped PID.
+      const nextPid = await table.allocate({ ppid: null, role: 'fresh', agent });
+      assert(unbrand(nextPid) > unbrand(pid), `new PID ${unbrand(nextPid)} should exceed reaped ${unbrand(pid)}`);
+    });
+
+    await checkAsync('signal queue coalesces duplicates and drains', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      table.queueSignal(pid, 'SIGUSR1');
+      table.queueSignal(pid, 'SIGUSR1'); // duplicate, should coalesce
+      table.queueSignal(pid, 'SIGTERM');
+      table.queueSignal(pid, 'SIGUSR1'); // still pending, coalesce again
+
+      const info = table.snapshot(pid);
+      assert(info.pendingSignals.length === 2, `expected 2 pending, got ${info.pendingSignals.length}`);
+      assert(info.pendingSignals.includes('SIGUSR1'), 'SIGUSR1 should be pending');
+      assert(info.pendingSignals.includes('SIGTERM'), 'SIGTERM should be pending');
+
+      const drained = table.drainSignals(pid);
+      assert(drained.length === 2, `drain should return 2, got ${drained.length}`);
+      assert(table.snapshot(pid).pendingSignals.length === 0, 'queue should be empty after drain');
+    });
+
+    await checkAsync('setDisposition rejects catching SIGKILL/SIGSTOP with EPERM', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+
+      for (const sig of ['SIGKILL', 'SIGSTOP'] as Signal[]) {
+        let caught: unknown;
+        try {
+          table.setDisposition(pid, sig, { kind: 'ignore' });
+        } catch (err) {
+          caught = err;
+        }
+        assert(isCortexError(caught), `${sig}: should throw CortexError`);
+        assert(caught.errno === 'EPERM', `${sig}: expected EPERM, got ${caught.errno}`);
+      }
+
+      // SIGUSR1 CAN be caught.
+      table.setDisposition(pid, 'SIGUSR1', { kind: 'ignore' });
+      assert(table.getDisposition(pid, 'SIGUSR1').kind === 'ignore', 'SIGUSR1 disposition should be set');
+      // Default fallback for unset signals.
+      assert(table.getDisposition(pid, 'SIGHUP').kind === 'default', 'unset signal should default');
+    });
+
+    await checkAsync('budget spend decrements remaining and checkBudget detects exhaustion', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({
+        ppid: null,
+        role: 'init',
+        agent,
+        budgets: { tokens: 1000, usd: 500, wallTimeMs: -1 },
+      });
+
+      assert(table.checkBudget(pid) === 'ok', 'fresh process should be ok');
+
+      table.spend(pid, { tokensIn: 300, tokensOut: 200, usdSpent: 100 });
+      const info = table.snapshot(pid);
+      assert(info.budgetsSpent.tokensIn === 300, 'tokensIn spend wrong');
+      assert(info.budgetsRemaining.tokens === 500, `remaining tokens should be 500, got ${info.budgetsRemaining.tokens}`);
+      assert(info.budgetsRemaining.usd === 400, 'remaining usd wrong');
+      assert(info.budgetsRemaining.wallTimeMs === -1, 'unlimited wallTime should stay -1');
+
+      table.spend(pid, { tokensIn: 500 }); // exhausts tokens
+      assert(table.checkBudget(pid) === 'ok' || (table.checkBudget(pid) as { kind: string }).kind === 'tokens',
+        'tokens should be exhausted');
+      const exhausted = table.checkBudget(pid);
+      assert(exhausted !== 'ok', 'budget should be exhausted');
+      assert((exhausted as { kind: string }).kind === 'tokens', 'exhausted kind should be tokens');
+    });
+
+    await checkAsync('pushCheckpoint appends to chain', async () => {
+      const table = await makeTable();
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      const c1 = asChainId('chain-1');
+      const c2 = asChainId('chain-2');
+      table.pushCheckpoint(pid, c1);
+      table.pushCheckpoint(pid, c2);
+      const chain = table.snapshot(pid).checkpointChain;
+      assert(chain.length === 2, `expected 2 checkpoints, got ${chain.length}`);
+      assert(chain[0] === c1 && chain[1] === c2, 'chain order wrong');
+    });
+
+    await checkAsync('nullRecorderFactory produces a table that does not write', async () => {
+      const table = new ProcessTable({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        recorderFactory: nullRecorderFactory,
+      });
+      const pid = await table.allocate({ ppid: null, role: 'init', agent });
+      await table.setState(pid, 'ready');
+      assert(table.recorderFor(pid) === null, 'recorder should be null');
+      assert(table.snapshot(pid).state === 'ready', 'state should still update');
+    });
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+await runProcessTableChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
