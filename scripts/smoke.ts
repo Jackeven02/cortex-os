@@ -1,10 +1,10 @@
 /**
- * Phase 1 smoke check — types.ts + errors.ts runtime sanity.
+ * Phase 1 smoke check — types.ts + errors.ts + recorder.ts runtime sanity.
  *
  * Not a real test (no test framework yet, that lands with #012+). This is
  * a "does the module load and do the runtime bits behave" check, run via
- * `npx tsx scripts/smoke.ts`. Once Phase 1 has a test runner, this gets
- * absorbed into tests/ and deleted.
+ * `npm run smoke`. Once Phase 1 has a test runner, this gets absorbed into
+ * tests/ and deleted.
  */
 
 import {
@@ -24,6 +24,13 @@ import {
   KERNEL_ABI_VERSION,
   VERSION,
   CODENAME,
+  Recorder,
+  readRecords,
+  effectiveEof,
+  crecPath,
+  CREC_MAGIC,
+  CREC_MAX_FRAME_SIZE,
+  type SyscallRecord,
 } from '../src/index.js';
 
 let passed = 0;
@@ -195,6 +202,267 @@ check('version constants are frozen string literals', () => {
     `KERNEL_ABI_VERSION not semver: ${KERNEL_ABI_VERSION}`,
   );
 });
+
+// =============================================================================
+// Async checks (recorder)
+// =============================================================================
+
+async function checkAsync(label: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+    console.log(`  ok  ${label}`);
+    passed++;
+  } catch (err) {
+    console.error(`  FAIL ${label}`);
+    console.error(`       ${(err as Error).message}`);
+    failed++;
+  }
+}
+
+async function runRecorderChecks(): Promise<void> {
+  const { mkdtemp, rm, writeFile, readFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-'));
+
+  try {
+    await checkAsync('crecPath produces conventional layout', async () => {
+      const p = crecPath('/var/lib/cortex', asProcessId(42));
+      assert(
+        p === join('/var/lib/cortex', 'proc', '42.crec'),
+        `unexpected path: ${p}`,
+      );
+    });
+
+    await checkAsync('Recorder.open creates file with magic', async () => {
+      const rec = await Recorder.open({ pid: asProcessId(100), dir: tmp });
+      assert(rec.currentOffset === asSyscallOffset(8), `expected offset 8, got ${rec.currentOffset}`);
+      const buf = await readFile(rec.path);
+      assert(buf.byteLength === 8, `expected 8-byte file, got ${buf.byteLength}`);
+      assert(buf.equals(Buffer.from(CREC_MAGIC)), 'magic mismatch');
+      await rec.close();
+    });
+
+    await checkAsync('append + readRecords round-trips a record', async () => {
+      const rec = await Recorder.open({ pid: asProcessId(101), dir: tmp });
+      const offset = await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z',
+        pid: asProcessId(101),
+        syscall: 'llm_call',
+        callId: 'call-1',
+        phase: 'enter',
+        args: { messages: [{ role: 'user', content: 'hi' }] },
+        stateBefore: 'running',
+        stateAfter: 'blocked',
+        reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      assert(offset === asSyscallOffset(8), `first record should be at offset 8, got ${offset}`);
+      await rec.flush();
+      await rec.close();
+
+      const records: SyscallRecord[] = [];
+      for await (const r of readRecords(rec.path)) records.push(r);
+      assert(records.length === 1, `expected 1 record, got ${records.length}`);
+      const r0 = records[0]!;
+      assert(r0.syscall === 'llm_call', `wrong syscall: ${r0.syscall}`);
+      assert(r0.phase === 'enter', `wrong phase: ${r0.phase}`);
+      assert(r0.callId === 'call-1', `wrong callId: ${r0.callId}`);
+      assert(r0.byteOffset === 8, `wrong byteOffset: ${r0.byteOffset}`);
+      assert(
+        (r0.args as { messages: { content: string }[] }).messages[0]!.content === 'hi',
+        'args lost in round-trip',
+      );
+    });
+
+    await checkAsync('append serializes concurrent writes (no interleaving)', async () => {
+      const rec = await Recorder.open({ pid: asProcessId(102), dir: tmp });
+      // Fire 50 appends concurrently. If serialization is broken, frames
+      // will interleave and readRecords will fail or produce garbage.
+      const promises = Array.from({ length: 50 }, (_, i) =>
+        rec.append({
+          timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString(),
+          pid: asProcessId(102),
+          syscall: 'now',
+          callId: `call-${i}`,
+          phase: 'exit',
+          result: i,
+          stateBefore: 'running',
+          stateAfter: 'running',
+          reversibility: 'idempotent',
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        }),
+      );
+      const offsets = await Promise.all(promises);
+      // Offsets must be strictly increasing (each frame lands after the previous).
+      for (let i = 1; i < offsets.length; i++) {
+        assert(offsets[i]! > offsets[i - 1]!, `offsets not monotonic at ${i}`);
+      }
+      await rec.flush();
+      await rec.close();
+
+      let count = 0;
+      for await (const r of readRecords(rec.path)) {
+        assert(r.syscall === 'now', `unexpected syscall: ${r.syscall}`);
+        count++;
+      }
+      assert(count === 50, `expected 50 records, got ${count}`);
+    });
+
+    await checkAsync('reopen appends to existing log (kernel restart)', async () => {
+      const pid = asProcessId(103);
+      const rec1 = await Recorder.open({ pid, dir: tmp });
+      await rec1.append({
+        timestamp: '2026-01-01T00:00:00.000Z',
+        pid,
+        syscall: 'spawn',
+        callId: 'c1',
+        phase: 'enter',
+        stateBefore: 'new',
+        stateAfter: 'ready',
+        reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      const offsetAfterFirst = rec1.currentOffset;
+      await rec1.close();
+
+      // Simulate kernel restart: reopen the same file.
+      const rec2 = await Recorder.open({ pid, dir: tmp });
+      assert(
+        rec2.currentOffset === offsetAfterFirst,
+        `reopen should resume at ${offsetAfterFirst}, got ${rec2.currentOffset}`,
+      );
+      await rec2.append({
+        timestamp: '2026-01-01T00:01:00.000Z',
+        pid,
+        syscall: 'exit',
+        callId: 'c2',
+        phase: 'enter',
+        stateBefore: 'running',
+        stateAfter: 'exiting',
+        reversibility: 'irreversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec2.close();
+
+      let count = 0;
+      for await (const _ of readRecords(rec2.path)) count++;
+      assert(count === 2, `expected 2 records after reopen, got ${count}`);
+    });
+
+    await checkAsync('readRecords rejects non-.crec files (magic mismatch)', async () => {
+      const bogus = join(tmp, 'bogus.crec');
+      await writeFile(bogus, Buffer.from('NOTACRECFILE........'));
+      let caught: unknown;
+      try {
+        for await (const _ of readRecords(bogus)) {
+          /* should not yield */
+        }
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EINVAL', `expected EINVAL, got ${caught.errno}`);
+    });
+
+    await checkAsync('readRecords discards torn frame at EOF', async () => {
+      const pid = asProcessId(104);
+      const rec = await Recorder.open({ pid, dir: tmp });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z',
+        pid,
+        syscall: 'now',
+        callId: 'c1',
+        phase: 'exit',
+        result: 1,
+        stateBefore: 'running',
+        stateAfter: 'running',
+        reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      const cleanEof = rec.currentOffset;
+      await rec.close();
+
+      // Append a partial frame header + truncated payload to simulate a
+      // crash mid-write.
+      const { appendFile } = await import('node:fs/promises');
+      const partialHeader = Buffer.alloc(4);
+      partialHeader.writeUInt32BE(1000, 0); // declares 1000 bytes
+      await appendFile(rec.path, partialHeader);
+      await appendFile(rec.path, Buffer.alloc(10)); // but only 10 arrive
+
+      // Reader should yield the one clean record and stop at the torn frame.
+      const records: SyscallRecord[] = [];
+      for await (const r of readRecords(rec.path)) records.push(r);
+      assert(records.length === 1, `expected 1 clean record, got ${records.length}`);
+
+      // effectiveEof should report the offset just past the last complete frame.
+      const eof = await effectiveEof(rec.path);
+      assert(eof === cleanEof, `effectiveEof should be ${cleanEof}, got ${eof}`);
+    });
+
+    await checkAsync('append after close traps with ESTATE', async () => {
+      const rec = await Recorder.open({ pid: asProcessId(105), dir: tmp });
+      await rec.close();
+      let caught: unknown;
+      try {
+        await rec.append({
+          timestamp: '2026-01-01T00:00:00.000Z',
+          pid: asProcessId(105),
+          syscall: 'now',
+          callId: 'c1',
+          phase: 'exit',
+          stateBefore: 'running',
+          stateAfter: 'running',
+          reversibility: 'idempotent',
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'ESTATE', `expected ESTATE, got ${caught.errno}`);
+    });
+
+    await checkAsync('close is idempotent', async () => {
+      const rec = await Recorder.open({ pid: asProcessId(106), dir: tmp });
+      await rec.close();
+      await rec.close(); // should not throw
+      assert(rec.closed === true, 'closed flag not set');
+    });
+
+    await checkAsync('oversized frame traps with EINVAL', async () => {
+      const rec = await Recorder.open({ pid: asProcessId(107), dir: tmp });
+      const huge = 'x'.repeat(CREC_MAX_FRAME_SIZE + 1);
+      let caught: unknown;
+      try {
+        await rec.append({
+          timestamp: '2026-01-01T00:00:00.000Z',
+          pid: asProcessId(107),
+          syscall: 'llm_call',
+          callId: 'c1',
+          phase: 'exit',
+          result: huge,
+          stateBefore: 'running',
+          stateAfter: 'running',
+          reversibility: 'reversible',
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'should throw CortexError');
+      assert(caught.errno === 'EINVAL', `expected EINVAL, got ${caught.errno}`);
+      await rec.close();
+    });
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+await runRecorderChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
