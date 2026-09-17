@@ -6,6 +6,8 @@
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2020%2B-3178c6)](./package.json)
 
+**English** | [简体中文](./README.zh-CN.md)
+
 **Today's agent frameworks treat an agent as a function. Cortex treats it as a process.**
 
 PIDs. Fork. Exec. Signals. IPC. Checkpoint. Restore. Supervision trees. Syscall traces. Token budgets. Process groups. Everything Unix gave to programs in 1975, applied to agents in 2026.

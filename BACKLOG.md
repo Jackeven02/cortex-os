@@ -114,7 +114,10 @@ Three demos that prove the abstraction matters. Each one becomes a GIF in the RE
 - [ ] **#046** `docs/COOKBOOK.md` — common patterns (supervision, pipelines, daemons, fork-and-compare)
 - [ ] **#047** HN launch post draft
 - [ ] **#048** X / V2EX / 即刻 launch post drafts
-- [ ] **#049** Chinese translation of `MANIFESTO.md` and `docs/STATE.md`
+- [ ] **#049** Chinese translations
+  - [x] `README.zh-CN.md` → this commit
+  - [ ] `MANIFESTO.zh-CN.md`
+  - [ ] `docs/STATE.zh-CN.md`
 - [ ] **#050** Logo (something evocative of layers, nuclei, or branching — not a brain clip-art)
 
 ---
