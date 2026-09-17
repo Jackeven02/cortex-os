@@ -127,6 +127,11 @@ import {
   type SpawnOptions,
   type RandomOptions,
   type BudgetLimits,
+  DriverRegistry,
+  satisfiesAbi,
+  parseSemver,
+  type DriverManifest,
+  type ToolDriverInfo,
 } from '../src/index.js';
 
 let passed = 0;
@@ -5314,12 +5319,735 @@ async function runDispatcherChecks(): Promise<void> {
 }
 
 
+async function runDriverRegistryChecks(): Promise<void> {
+  // A fixed clock so any timestamp a driver stamps is deterministic.
+  const clock = (): string => new Date(Date.UTC(2026, 0, 1, 0, 0, 0)).toISOString();
+
+  // --- local fake drivers (configurable names, unlike the module-scope
+  //     FakeMemoryDriver which is hard-named 'inmem') -------------------------
+
+  interface FakeLLMOpts {
+    abiCompat?: string;
+    models?: readonly string[];
+    stream?: boolean;
+    countTokens?: boolean;
+    closeSpy?: { count: number; fail?: boolean };
+  }
+  function fakeLLM(name: string, opts: FakeLLMOpts = {}): ILLMDriver {
+    const closeSpy = opts.closeSpy;
+    const driver: ILLMDriver = {
+      name,
+      version: '1.0.0',
+      abiCompat: opts.abiCompat ?? '^1.0.0',
+      supportedModels: opts.models ?? ['m1'],
+      async call(_req, ctx) {
+        return {
+          text: `from:${name}:${ctx.callId}`,
+          toolCalls: [],
+          finishReason: 'stop',
+          usage: { inputTokens: 1, outputTokens: 2, cachedTokens: 0, usd: 0 },
+          model: (opts.models ?? ['m1'])[0] ?? 'm1',
+          driverVersion: '1.0.0',
+        };
+      },
+      async close() {
+        if (closeSpy !== undefined) {
+          closeSpy.count++;
+          if (closeSpy.fail === true) throw new Error(`${name} close boom`);
+        }
+      },
+    };
+    // Optional capabilities must be *present or absent* to exercise listAll().
+    if (opts.stream === true) {
+      (driver as { stream?: ILLMDriver['stream'] }).stream = async function* () {
+        yield { done: true };
+      };
+    }
+    if (opts.countTokens === true) {
+      (driver as { countTokens?: ILLMDriver['countTokens'] }).countTokens = async () => 42;
+    }
+    return driver;
+  }
+
+  interface FakeToolOpts {
+    abiCompat?: string;
+    tools?: readonly ToolDescriptor[];
+    listToolsFail?: boolean;
+    listToolsNonArray?: boolean;
+    forkable?: boolean;
+    twoPhase?: boolean;
+    closeSpy?: { count: number; fail?: boolean };
+  }
+  function descriptor(toolName: string, reversibility: Reversibility): ToolDescriptor {
+    return {
+      name: toolName,
+      description: `${toolName} tool`,
+      inputSchema: { type: 'object' },
+      reversibility,
+    };
+  }
+  function fakeTool(name: string, opts: FakeToolOpts = {}): IToolDriver {
+    const closeSpy = opts.closeSpy;
+    const tools = opts.tools ?? [descriptor('noop', 'idempotent')];
+    const driver: IToolDriver = {
+      name,
+      version: '1.0.0',
+      abiCompat: opts.abiCompat ?? '^1.0.0',
+      async listTools() {
+        if (opts.listToolsFail === true) throw new Error(`${name} listTools boom`);
+        if (opts.listToolsNonArray === true) return undefined as unknown as ToolDescriptor[];
+        return tools;
+      },
+      async invoke(toolName, args) {
+        return { output: { toolName, args }, error: null, durationMs: 0, reversibility: 'idempotent' };
+      },
+      async close() {
+        if (closeSpy !== undefined) {
+          closeSpy.count++;
+          if (closeSpy.fail === true) throw new Error(`${name} close boom`);
+        }
+      },
+    };
+    if (opts.forkable === true) (driver as { forkable?: boolean }).forkable = true;
+    if (opts.twoPhase === true) {
+      (driver as { stage?: IToolDriver['stage'] }).stage = async (toolName, args) => ({
+        id: 'staged-1',
+        tool: toolName,
+        args,
+        expiresAt: clock(),
+      });
+      (driver as { commit?: IToolDriver['commit'] }).commit = async () => ({
+        output: null,
+        error: null,
+        durationMs: 0,
+        reversibility: 'idempotent',
+      });
+    }
+    return driver;
+  }
+
+  interface FakeMemOpts {
+    abiCompat?: string;
+    closeSpy?: { count: number; fail?: boolean };
+  }
+  function fakeMem(name: string, opts: FakeMemOpts = {}): IMemoryDriver {
+    const closeSpy = opts.closeSpy;
+    const store = new Map<string, unknown>();
+    return {
+      name,
+      version: '1.0.0',
+      abiCompat: opts.abiCompat ?? '^1.0.0',
+      async read() {
+        return [];
+      },
+      async write(_region, key, value) {
+        store.set(key, value);
+      },
+      async delete(_region, key) {
+        store.delete(key);
+      },
+      async listRegions() {
+        return [];
+      },
+      async snapshotRegion() {
+        return new Uint8Array(0);
+      },
+      async restoreRegion() {
+        /* noop */
+      },
+      async close() {
+        if (closeSpy !== undefined) {
+          closeSpy.count++;
+          if (closeSpy.fail === true) throw new Error(`${name} close boom`);
+        }
+      },
+    };
+  }
+
+  function makeRegistry(opts: { defaultLLM?: string; defaultMemory?: string; onCloseError?: (n: string, e: unknown) => void } = {}): DriverRegistry {
+    return new DriverRegistry({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      ...(opts.defaultLLM !== undefined ? { defaultLLM: opts.defaultLLM } : {}),
+      ...(opts.defaultMemory !== undefined ? { defaultMemory: opts.defaultMemory } : {}),
+      ...(opts.onCloseError !== undefined ? { onCloseError: opts.onCloseError } : {}),
+    });
+  }
+
+  // --- §1 semver subset -----------------------------------------------------
+
+  check('parseSemver parses full / partial / leading-v', () => {
+    const a = parseSemver('1.2.3');
+    assert(a !== null && a.major === 1 && a.minor === 2 && a.patch === 3, 'full parse');
+    const b = parseSemver('1.2');
+    assert(b !== null && b.patch === 0, 'partial -> patch 0');
+    const c = parseSemver('2');
+    assert(c !== null && c.minor === 0 && c.patch === 0, 'major-only');
+    const d = parseSemver('v1.0.0');
+    assert(d !== null && d.major === 1, 'leading v');
+    const e = parseSemver('1.0.0-beta.1');
+    assert(e !== null && e.patch === 0, 'prerelease stripped');
+  });
+
+  check('parseSemver returns null on garbage', () => {
+    assert(parseSemver('nope') === null, 'non-numeric -> null');
+    assert(parseSemver('') === null, 'empty -> null');
+  });
+
+  check('satisfiesAbi: exact match', () => {
+    assert(satisfiesAbi('1.0.0', '1.0.0') === true, 'exact hit');
+    assert(satisfiesAbi('1.0.1', '1.0.0') === false, 'exact miss');
+    assert(satisfiesAbi('1.0.0', '=1.0.0') === true, 'explicit =');
+  });
+
+  check('satisfiesAbi: caret within major', () => {
+    assert(satisfiesAbi('1.0.0', '^1.0.0') === true, 'floor');
+    assert(satisfiesAbi('1.9.9', '^1.0.0') === true, 'same major');
+    assert(satisfiesAbi('2.0.0', '^1.0.0') === false, 'next major rejected');
+    assert(satisfiesAbi('0.9.9', '^1.0.0') === false, 'below floor rejected');
+  });
+
+  check('satisfiesAbi: caret 0.x uses minor as the breaking axis', () => {
+    assert(satisfiesAbi('0.2.3', '^0.2.0') === true, 'same minor');
+    assert(satisfiesAbi('0.3.0', '^0.2.0') === false, 'next minor rejected');
+  });
+
+  check('satisfiesAbi: caret 0.0.x uses patch as the breaking axis', () => {
+    assert(satisfiesAbi('0.0.3', '^0.0.3') === true, 'same patch');
+    assert(satisfiesAbi('0.0.4', '^0.0.3') === false, 'next patch rejected');
+  });
+
+  check('satisfiesAbi: tilde within minor', () => {
+    assert(satisfiesAbi('1.2.3', '~1.2.0') === true, 'same minor');
+    assert(satisfiesAbi('1.2.99', '~1.2.0') === true, 'patch floats');
+    assert(satisfiesAbi('1.3.0', '~1.2.0') === false, 'next minor rejected');
+  });
+
+  check('satisfiesAbi: inequality comparators', () => {
+    assert(satisfiesAbi('1.5.0', '>=1.0.0') === true, '>= hit');
+    assert(satisfiesAbi('1.0.0', '>1.0.0') === false, '> strict miss');
+    assert(satisfiesAbi('1.0.1', '>1.0.0') === true, '> hit');
+    assert(satisfiesAbi('1.0.0', '<=1.0.0') === true, '<= hit');
+    assert(satisfiesAbi('0.9.0', '<1.0.0') === true, '< hit');
+  });
+
+  check('satisfiesAbi: wildcard ranges match anything', () => {
+    assert(satisfiesAbi('9.9.9', '*') === true, '* matches');
+    assert(satisfiesAbi('9.9.9', 'x') === true, 'x matches');
+    assert(satisfiesAbi('9.9.9', '') === true, 'empty matches');
+    assert(satisfiesAbi('9.9.9', '   ') === true, 'whitespace matches');
+  });
+
+  check('satisfiesAbi: AND (whitespace) intersects comparators', () => {
+    assert(satisfiesAbi('1.5.0', '>=1.0.0 <2.0.0') === true, 'inside both');
+    assert(satisfiesAbi('2.5.0', '>=1.0.0 <2.0.0') === false, 'outside upper');
+  });
+
+  check('satisfiesAbi: OR (||) unions range sets', () => {
+    assert(satisfiesAbi('1.0.0', '^1.0.0 || ^3.0.0') === true, 'first set');
+    assert(satisfiesAbi('3.1.0', '^1.0.0 || ^3.0.0') === true, 'second set');
+    assert(satisfiesAbi('2.0.0', '^1.0.0 || ^3.0.0') === false, 'neither set');
+  });
+
+  check('satisfiesAbi: unparseable range returns false', () => {
+    assert(satisfiesAbi('1.0.0', 'not-a-range') === false, 'garbage range');
+    assert(satisfiesAbi('1.0.0', '^') === false, 'operator with no version');
+  });
+
+  check('satisfiesAbi admits the live kernel ABI under ^1.0.0', () => {
+    assert(satisfiesAbi(KERNEL_ABI_VERSION, '^1.0.0') === true, 'kernel ABI is 1.x');
+  });
+
+  // --- §2 construction ------------------------------------------------------
+
+  check('constructor rejects an empty kernelAbiVersion (EINVAL)', () => {
+    let caught: unknown;
+    try {
+      new DriverRegistry({ kernelAbiVersion: '' });
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EINVAL', 'expected EINVAL');
+  });
+
+  // --- §3 LLM drivers -------------------------------------------------------
+
+  check('registerLLM + resolveLLM by name', () => {
+    const reg = makeRegistry();
+    reg.registerLLM(fakeLLM('alpha'));
+    assert(reg.resolveLLM('alpha').name === 'alpha', 'resolved by name');
+    assert(reg.hasLLM('alpha') === true, 'hasLLM true');
+    assert(reg.hasLLM('beta') === false, 'hasLLM false');
+  });
+
+  check('first registered LLM becomes the default', () => {
+    const reg = makeRegistry();
+    reg.registerLLM(fakeLLM('alpha'));
+    reg.registerLLM(fakeLLM('beta'));
+    assert(reg.defaultLLM === 'alpha', 'default is the first');
+    assert(reg.resolveLLM().name === 'alpha', 'resolveLLM(undefined) -> default');
+  });
+
+  check('explicit defaultLLM option is honored', () => {
+    const reg = makeRegistry({ defaultLLM: 'beta' });
+    reg.registerLLM(fakeLLM('alpha'));
+    reg.registerLLM(fakeLLM('beta'));
+    assert(reg.defaultLLM === 'beta', 'configured default kept');
+    assert(reg.resolveLLM().name === 'beta', 'resolves configured default');
+  });
+
+  check('registerLLM duplicate name traps EINVAL', () => {
+    const reg = makeRegistry();
+    reg.registerLLM(fakeLLM('alpha'));
+    let caught: unknown;
+    try {
+      reg.registerLLM(fakeLLM('alpha'));
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EINVAL', 'expected EINVAL');
+  });
+
+  check('registerLLM incompatible abiCompat traps EDRIVER', () => {
+    const reg = makeRegistry();
+    let caught: unknown;
+    try {
+      reg.registerLLM(fakeLLM('future', { abiCompat: '^2.0.0' }));
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'expected EDRIVER');
+    assert(reg.hasLLM('future') === false, 'refused driver not registered');
+  });
+
+  check('resolveLLM unknown name traps EDRIVER', () => {
+    const reg = makeRegistry();
+    reg.registerLLM(fakeLLM('alpha'));
+    let caught: unknown;
+    try {
+      reg.resolveLLM('ghost');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'expected EDRIVER');
+  });
+
+  check('resolveLLM with no default and empty registry traps EDRIVER', () => {
+    const reg = makeRegistry();
+    let caught: unknown;
+    try {
+      reg.resolveLLM();
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'expected EDRIVER');
+  });
+
+  check('tryResolveLLM is non-throwing', () => {
+    const reg = makeRegistry();
+    reg.registerLLM(fakeLLM('alpha'));
+    assert(reg.tryResolveLLM('ghost') === undefined, 'unknown -> undefined');
+    assert(reg.tryResolveLLM('alpha')?.name === 'alpha', 'known -> driver');
+    assert(reg.tryResolveLLM()?.name === 'alpha', 'undefined -> default');
+  });
+
+  check('setDefaultLLM validates registration', () => {
+    const reg = makeRegistry();
+    reg.registerLLM(fakeLLM('alpha'));
+    reg.registerLLM(fakeLLM('beta'));
+    let caught: unknown;
+    try {
+      reg.setDefaultLLM('ghost');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EINVAL', 'unregistered default -> EINVAL');
+    reg.setDefaultLLM('beta');
+    assert(reg.resolveLLM().name === 'beta', 'default switched');
+    reg.setDefaultLLM(null);
+    assert(reg.defaultLLM === null, 'default cleared');
+  });
+
+  check('llmResolver() returns a working ResolveLLMHook', () => {
+    const reg = makeRegistry();
+    reg.registerLLM(fakeLLM('alpha'));
+    const hook = reg.llmResolver();
+    assert(typeof hook === 'function', 'hook is a function');
+    assert(hook('alpha').name === 'alpha', 'hook resolves by name');
+    assert(hook(undefined).name === 'alpha', 'hook resolves default');
+  });
+
+  // --- §4 tool drivers ------------------------------------------------------
+
+  await checkAsync('registerTool caches descriptors; resolveTool finds them', async () => {
+    const reg = makeRegistry();
+    await reg.registerTool(
+      fakeTool('fs', { tools: [descriptor('read', 'idempotent'), descriptor('write', 'reversible')] }),
+    );
+    const r = reg.resolveTool('read');
+    assert(r !== undefined, 'read resolved');
+    assert(r.driver.name === 'fs', 'owning driver');
+    assert(r.descriptor.reversibility === 'idempotent', 'descriptor cached');
+    assert(reg.resolveTool('write')?.descriptor.reversibility === 'reversible', 'second tool');
+    assert(reg.hasTool('read') && reg.hasToolDriver('fs'), 'introspection');
+  });
+
+  await checkAsync('resolveTool unknown -> undefined', async () => {
+    const reg = makeRegistry();
+    await reg.registerTool(fakeTool('fs'));
+    assert(reg.resolveTool('nope') === undefined, 'unknown tool');
+  });
+
+  await checkAsync('registerTool duplicate driver name traps EINVAL', async () => {
+    const reg = makeRegistry();
+    await reg.registerTool(fakeTool('fs'));
+    let caught: unknown;
+    try {
+      await reg.registerTool(fakeTool('fs'));
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EINVAL', 'expected EINVAL');
+  });
+
+  await checkAsync('registerTool tool-name collision across drivers traps EINVAL', async () => {
+    const reg = makeRegistry();
+    await reg.registerTool(fakeTool('fs', { tools: [descriptor('read', 'idempotent')] }));
+    let caught: unknown;
+    try {
+      await reg.registerTool(fakeTool('net', { tools: [descriptor('read', 'idempotent')] }));
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EINVAL', 'expected EINVAL');
+    assert(isCortexError(caught) && caught.details?.['registeredBy'] === 'fs', 'names the owner');
+    assert(reg.hasToolDriver('net') === false, 'colliding driver not registered');
+  });
+
+  await checkAsync('registerTool same tool twice within one driver traps EINVAL', async () => {
+    const reg = makeRegistry();
+    let caught: unknown;
+    try {
+      await reg.registerTool(
+        fakeTool('dupe', { tools: [descriptor('x', 'idempotent'), descriptor('x', 'reversible')] }),
+      );
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EINVAL', 'expected EINVAL');
+  });
+
+  await checkAsync('registerTool incompatible abiCompat traps EDRIVER', async () => {
+    const reg = makeRegistry();
+    let caught: unknown;
+    try {
+      await reg.registerTool(fakeTool('fs', { abiCompat: '^2.0.0' }));
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'expected EDRIVER');
+  });
+
+  await checkAsync('registerTool listTools() throwing traps EDRIVER', async () => {
+    const reg = makeRegistry();
+    let caught: unknown;
+    try {
+      await reg.registerTool(fakeTool('broken', { listToolsFail: true }));
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'expected EDRIVER');
+  });
+
+  await checkAsync('registerTool listTools() non-array traps EDRIVER', async () => {
+    const reg = makeRegistry();
+    let caught: unknown;
+    try {
+      await reg.registerTool(fakeTool('broken', { listToolsNonArray: true }));
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'expected EDRIVER');
+  });
+
+  await checkAsync('registerTool malformed descriptor traps EDRIVER', async () => {
+    const reg = makeRegistry();
+    let caught: unknown;
+    try {
+      await reg.registerTool(
+        fakeTool('broken', { tools: [{ name: '', description: '', inputSchema: { type: 'object' }, reversibility: 'idempotent' }] }),
+      );
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'expected EDRIVER');
+  });
+
+  await checkAsync('registerTool is atomic: a collision leaves prior state intact', async () => {
+    const reg = makeRegistry();
+    await reg.registerTool(fakeTool('fs', { tools: [descriptor('read', 'idempotent')] }));
+    try {
+      await reg.registerTool(
+        fakeTool('mixed', { tools: [descriptor('ok', 'idempotent'), descriptor('read', 'idempotent')] }),
+      );
+    } catch {
+      /* expected */
+    }
+    assert(reg.hasToolDriver('mixed') === false, 'failed driver absent');
+    assert(reg.hasTool('ok') === false, 'no partial tool leaked');
+    assert(reg.resolveTool('read')?.driver.name === 'fs', 'pre-existing tool intact');
+  });
+
+  await checkAsync('toolResolver() returns a working ResolveToolHook', async () => {
+    const reg = makeRegistry();
+    await reg.registerTool(fakeTool('fs', { tools: [descriptor('read', 'idempotent')] }));
+    const hook = reg.toolResolver();
+    assert(typeof hook === 'function', 'hook is a function');
+    assert(hook('read')?.driver.name === 'fs', 'hook resolves tool');
+    assert(hook('ghost') === undefined, 'hook returns undefined for unknown');
+  });
+
+  await checkAsync('toolNames / toolDriverNames list registrations', async () => {
+    const reg = makeRegistry();
+    await reg.registerTool(fakeTool('fs', { tools: [descriptor('read', 'idempotent'), descriptor('write', 'reversible')] }));
+    await reg.registerTool(fakeTool('net', { tools: [descriptor('fetch', 'irreversible')] }));
+    const drivers = reg.toolDriverNames();
+    assert(drivers.includes('fs') && drivers.includes('net'), 'both drivers listed');
+    const tools = reg.toolNames();
+    assert(tools.includes('read') && tools.includes('write') && tools.includes('fetch'), 'all tools listed');
+  });
+
+  // --- §5 memory drivers ----------------------------------------------------
+
+  check('registerMemory + resolveMemory by name', () => {
+    const reg = makeRegistry();
+    reg.registerMemory(fakeMem('inmem'));
+    assert(reg.resolveMemory('inmem').name === 'inmem', 'resolved by name');
+    assert(reg.hasMemory('inmem') === true, 'hasMemory');
+  });
+
+  check('first registered memory driver becomes the default', () => {
+    const reg = makeRegistry();
+    reg.registerMemory(fakeMem('inmem'));
+    reg.registerMemory(fakeMem('sqlite'));
+    assert(reg.defaultMemory === 'inmem', 'default is the first');
+    assert(reg.resolveMemory().name === 'inmem', 'resolveMemory(undefined) -> default');
+  });
+
+  check('registerMemory duplicate name traps EINVAL', () => {
+    const reg = makeRegistry();
+    reg.registerMemory(fakeMem('inmem'));
+    let caught: unknown;
+    try {
+      reg.registerMemory(fakeMem('inmem'));
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EINVAL', 'expected EINVAL');
+  });
+
+  check('registerMemory incompatible abiCompat traps EDRIVER', () => {
+    const reg = makeRegistry();
+    let caught: unknown;
+    try {
+      reg.registerMemory(fakeMem('inmem', { abiCompat: '^2.0.0' }));
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'expected EDRIVER');
+  });
+
+  check('resolveMemory unknown traps EDRIVER; tryResolveMemory is soft', () => {
+    const reg = makeRegistry();
+    reg.registerMemory(fakeMem('inmem'));
+    let caught: unknown;
+    try {
+      reg.resolveMemory('ghost');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EDRIVER', 'expected EDRIVER');
+    assert(reg.tryResolveMemory('ghost') === undefined, 'soft unknown');
+    assert(reg.tryResolveMemory('inmem')?.name === 'inmem', 'soft known');
+  });
+
+  check('memoryDrivers() exposes all drivers for boot wiring', () => {
+    const reg = makeRegistry();
+    reg.registerMemory(fakeMem('inmem'));
+    reg.registerMemory(fakeMem('sqlite'));
+    const names = reg.memoryDrivers().map((d) => d.name);
+    assert(names.includes('inmem') && names.includes('sqlite'), 'both returned');
+    assert(reg.memoryNames().length === 2, 'memoryNames matches');
+  });
+
+  check('setDefaultMemory validates registration', () => {
+    const reg = makeRegistry();
+    reg.registerMemory(fakeMem('inmem'));
+    reg.registerMemory(fakeMem('sqlite'));
+    let caught: unknown;
+    try {
+      reg.setDefaultMemory('ghost');
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught) && caught.errno === 'EINVAL', 'unregistered -> EINVAL');
+    reg.setDefaultMemory('sqlite');
+    assert(reg.resolveMemory().name === 'sqlite', 'default switched');
+  });
+
+  // --- §6 listAll manifest --------------------------------------------------
+
+  await checkAsync('listAll reports drivers with capability flags', async () => {
+    const reg = makeRegistry();
+    reg.registerLLM(fakeLLM('alpha', { models: ['m1', 'm2'], stream: true }));
+    reg.registerLLM(fakeLLM('plain'));
+    reg.registerMemory(fakeMem('inmem'));
+    await reg.registerTool(fakeTool('fs', { tools: [descriptor('read', 'idempotent')], forkable: true, twoPhase: true }));
+
+    const manifest: DriverManifest = reg.listAll();
+    assert(manifest.llm.length === 2, 'two llm drivers');
+    const alpha = manifest.llm.find((d) => d.name === 'alpha');
+    assert(alpha !== undefined, 'alpha present');
+    assert(alpha.isDefault === true, 'first llm is default');
+    assert(alpha.supportedModels.includes('m2'), 'models surfaced');
+    assert(alpha.streams === true && alpha.countsTokens === false, 'capability flags');
+    const plain = manifest.llm.find((d) => d.name === 'plain');
+    assert(plain !== undefined && plain.isDefault === false && plain.streams === false, 'plain flags');
+
+    assert(manifest.memory.length === 1 && manifest.memory[0].isDefault === true, 'memory default');
+
+    assert(manifest.tools.length === 1, 'one tool driver');
+    const fs = manifest.tools[0];
+    assert(fs.name === 'fs' && fs.tools.includes('read'), 'tool grouped under driver');
+    assert(fs.forkable === true && fs.twoPhase === true, 'forkable + twoPhase flags');
+  });
+
+  await checkAsync('listAll groups tools under their owning driver', async () => {
+    const reg = makeRegistry();
+    await reg.registerTool(fakeTool('fs', { tools: [descriptor('read', 'idempotent'), descriptor('write', 'reversible')] }));
+    await reg.registerTool(fakeTool('net', { tools: [descriptor('fetch', 'irreversible')] }));
+    const manifest = reg.listAll();
+    const fs = manifest.tools.find((d: ToolDriverInfo) => d.name === 'fs');
+    const net = manifest.tools.find((d: ToolDriverInfo) => d.name === 'net');
+    assert(fs !== undefined && fs.tools.length === 2, 'fs owns two tools');
+    assert(net !== undefined && net.tools.length === 1 && net.tools[0] === 'fetch', 'net owns fetch');
+  });
+
+  // --- §7 unregister --------------------------------------------------------
+
+  await checkAsync('unregisterLLM closes + removes + reassigns default', async () => {
+    const reg = makeRegistry();
+    const spy = { count: 0 };
+    reg.registerLLM(fakeLLM('alpha', { closeSpy: spy }));
+    reg.registerLLM(fakeLLM('beta'));
+    const removed = await reg.unregisterLLM('alpha');
+    assert(removed === true, 'removed true');
+    assert(spy.count === 1, 'close called once');
+    assert(reg.hasLLM('alpha') === false, 'gone');
+    assert(reg.defaultLLM === 'beta', 'default reassigned to a survivor');
+    assert((await reg.unregisterLLM('ghost')) === false, 'unknown -> false');
+  });
+
+  await checkAsync('unregisterTool drops the cached tool descriptors', async () => {
+    const reg = makeRegistry();
+    await reg.registerTool(fakeTool('fs', { tools: [descriptor('read', 'idempotent')] }));
+    assert(reg.resolveTool('read') !== undefined, 'present before');
+    const removed = await reg.unregisterTool('fs');
+    assert(removed === true, 'removed true');
+    assert(reg.resolveTool('read') === undefined, 'tool cache dropped');
+    assert(reg.hasToolDriver('fs') === false, 'driver gone');
+  });
+
+  await checkAsync('unregisterMemory closes + removes + reassigns default', async () => {
+    const reg = makeRegistry();
+    const spy = { count: 0 };
+    reg.registerMemory(fakeMem('inmem', { closeSpy: spy }));
+    reg.registerMemory(fakeMem('sqlite'));
+    assert((await reg.unregisterMemory('inmem')) === true, 'removed');
+    assert(spy.count === 1, 'close called');
+    assert(reg.defaultMemory === 'sqlite', 'default reassigned');
+    assert((await reg.unregisterMemory('ghost')) === false, 'unknown -> false');
+  });
+
+  // --- §8 closeAll ----------------------------------------------------------
+
+  await checkAsync('closeAll closes every driver and empties the registry', async () => {
+    const reg = makeRegistry();
+    const llmSpy = { count: 0 };
+    const toolSpy = { count: 0 };
+    const memSpy = { count: 0 };
+    reg.registerLLM(fakeLLM('alpha', { closeSpy: llmSpy }));
+    await reg.registerTool(fakeTool('fs', { closeSpy: toolSpy }));
+    reg.registerMemory(fakeMem('inmem', { closeSpy: memSpy }));
+
+    await reg.closeAll();
+    assert(llmSpy.count === 1 && toolSpy.count === 1 && memSpy.count === 1, 'all closed');
+    assert(reg.llmNames().length === 0, 'llm cleared');
+    assert(reg.toolDriverNames().length === 0, 'tools cleared');
+    assert(reg.memoryNames().length === 0, 'memory cleared');
+    assert(reg.toolNames().length === 0, 'tool cache cleared');
+    assert(reg.defaultLLM === null && reg.defaultMemory === null, 'defaults cleared');
+    assert(reg.closed === true, 'closed flag set');
+  });
+
+  await checkAsync('closeAll swallows a throwing close but reports it', async () => {
+    const seen: string[] = [];
+    const reg = makeRegistry({ onCloseError: (n) => seen.push(n) });
+    reg.registerLLM(fakeLLM('bad', { closeSpy: { count: 0, fail: true } }));
+    reg.registerLLM(fakeLLM('good'));
+    let threw = false;
+    try {
+      await reg.closeAll();
+    } catch {
+      threw = true;
+    }
+    assert(threw === false, 'closeAll does not reject');
+    assert(seen.includes('bad'), 'onCloseError fired for the bad driver');
+    assert(reg.closed === true, 'still marked closed');
+  });
+
+  await checkAsync('closeAll is idempotent', async () => {
+    const reg = makeRegistry();
+    const spy = { count: 0 };
+    reg.registerLLM(fakeLLM('alpha', { closeSpy: spy }));
+    await reg.closeAll();
+    await reg.closeAll();
+    assert(spy.count === 1, 'close called exactly once across two closeAll calls');
+  });
+
+  await checkAsync('registering after closeAll traps EDRIVER', async () => {
+    const reg = makeRegistry();
+    await reg.closeAll();
+    let caughtLLM: unknown;
+    try {
+      reg.registerLLM(fakeLLM('alpha'));
+    } catch (err) {
+      caughtLLM = err;
+    }
+    assert(isCortexError(caughtLLM) && caughtLLM.errno === 'EDRIVER', 'llm register -> EDRIVER');
+    let caughtMem: unknown;
+    try {
+      reg.registerMemory(fakeMem('inmem'));
+    } catch (err) {
+      caughtMem = err;
+    }
+    assert(isCortexError(caughtMem) && caughtMem.errno === 'EDRIVER', 'memory register -> EDRIVER');
+    let caughtTool: unknown;
+    try {
+      await reg.registerTool(fakeTool('fs'));
+    } catch (err) {
+      caughtTool = err;
+    }
+    assert(isCortexError(caughtTool) && caughtTool.errno === 'EDRIVER', 'tool register -> EDRIVER');
+  });
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
 await runSchedulerChecks();
 await runInitChecks();
 await runDispatcherChecks();
+await runDriverRegistryChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
