@@ -69,6 +69,17 @@ import {
   type MemoryRegionPolicy,
   type MemoryQuery,
   type MemoryEntry,
+  CheckpointManager,
+  CSNAP_MAGIC,
+  CSNAP_MAGIC_STR,
+  CSNAP_HEADER_SIZE,
+  CHECKPOINT_VERSION,
+  SIGNATURE_SIZE,
+  EMPTY_COGNITIVE,
+  safeTimestamp,
+  type Checkpoint,
+  type CognitiveSnapshot,
+  type RestoreContext,
 } from '../src/index.js';
 
 let passed = 0;
@@ -2450,7 +2461,493 @@ async function runMemoryChecks(): Promise<void> {
   await rm(tmp, { recursive: true, force: true });
 }
 
+async function runCheckpointChecks(): Promise<void> {
+  const { mkdtemp, rm, mkdir, readFile, writeFile, stat } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-ckpt-'));
+  const tables: ProcessTable[] = [];
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const tick = (ms = 1000) => {
+    fakeNow += ms;
+  };
+
+  async function makeTable(): Promise<ProcessTable> {
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+    });
+    tables.push(t);
+    return t;
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+
+  async function spawnRunning(table: ProcessTable, role = 'worker'): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({ ppid: null, role, agent });
+    await table.setState(pid, 'ready', { trigger: 'init' });
+    tick();
+    await table.setState(pid, 'running', { trigger: 'dispatch' });
+    tick();
+    return pid;
+  }
+
+  // --- injected cognitive state store + deterministic chain ids -------------
+  const cognitive = new Map<number, CognitiveSnapshot>();
+  const getCognitive = (pid: ProcessIdAlias): CognitiveSnapshot =>
+    cognitive.get(unbrand(pid)) ?? EMPTY_COGNITIVE;
+  const putCognitive = (pid: ProcessIdAlias, snap: CognitiveSnapshot): void => {
+    cognitive.set(unbrand(pid), snap);
+  };
+
+  let chainCounter = 0;
+  const nextChainId = () => {
+    chainCounter += 1;
+    return asChainId(`chain-${chainCounter}`);
+  };
+
+  let dirCounter = 0;
+  const defaultRestoreContext = (): RestoreContext => ({ role: 'worker', agent });
+
+  function makeCkpt(
+    table: ProcessTable,
+    opts?: Partial<ConstructorParameters<typeof CheckpointManager>[0]>,
+  ): { ckpt: CheckpointManager; memory: MemoryManager; driver: FakeMemoryDriver; dir: string } {
+    const driver = new FakeMemoryDriver(clock, KERNEL_ABI_VERSION);
+    const memory = new MemoryManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      drivers: { inmem: driver },
+    });
+    dirCounter += 1;
+    const dir = join(tmp, `csnap-${dirCounter}`);
+    const ckpt = new CheckpointManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir,
+      now: clock,
+      nextChainId,
+      memory,
+      cognitiveSource: getCognitive,
+      cognitiveSink: putCognitive,
+      restoreContext: defaultRestoreContext,
+      defaultMemoryBacking: 'inmem',
+      ...opts,
+    });
+    return { ckpt, memory, driver, dir };
+  }
+
+  const priv: MemoryRegionPolicy = { kind: 'private', backing: 'inmem' };
+  const shared: MemoryRegionPolicy = { kind: 'shared', backing: 'inmem' };
+
+  // --- constants / helpers --------------------------------------------------
+
+  check('checkpoint constants and safeTimestamp', () => {
+    assert(CSNAP_MAGIC_STR === 'CRTX', 'magic string is CRTX');
+    assert(CSNAP_HEADER_SIZE === 4, 'header is 4 bytes');
+    assert(CSNAP_MAGIC.length === CSNAP_HEADER_SIZE, 'magic bytes match header size');
+    assert(SIGNATURE_SIZE === 32, 'sha256 signature is 32 bytes');
+    assert(CHECKPOINT_VERSION === 1, 'checkpoint version is 1');
+    assert(
+      safeTimestamp('2026-01-01T00:00:00.000Z') === '2026-01-01T00-00-00-000Z',
+      'colons and dots are replaced for Windows-safe filenames',
+    );
+    assert(
+      EMPTY_COGNITIVE.messages.length === 0 && EMPTY_COGNITIVE.intent === null,
+      'EMPTY_COGNITIVE is empty',
+    );
+  });
+
+  // --- take -----------------------------------------------------------------
+
+  await checkAsync('take from RUNNING returns to READY and writes a .csnap file', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    assert(table.get(pid)!.state === 'running', 'starts running');
+    const { ckpt, dir } = makeCkpt(table);
+    const { chainId, path } = await ckpt.take(pid);
+    tick();
+    assert(table.get(pid)!.state === 'ready', 'back to READY after take');
+    assert(typeof unbrand(chainId) === 'string' && unbrand(chainId).length > 0, 'chainId returned');
+    assert(path.startsWith(dir), 'file written into the checkpoint dir');
+    const st = await stat(path);
+    assert(
+      st.size > CSNAP_HEADER_SIZE + SIGNATURE_SIZE,
+      'file holds magic + body + signature',
+    );
+    assert(path.endsWith('.csnap'), 'file uses the .csnap extension');
+  });
+
+  await checkAsync('take with detach suspends the process', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table);
+    await ckpt.take(pid, { detach: true });
+    assert(table.get(pid)!.state === 'suspended', 'detach → SUSPENDED');
+  });
+
+  await checkAsync('take from BLOCKED returns to READY', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    await table.setState(pid, 'blocked', { trigger: 'recv' });
+    const { ckpt } = makeCkpt(table);
+    await ckpt.take(pid);
+    assert(table.get(pid)!.state === 'ready', 'blocked → checkpointing → ready');
+  });
+
+  await checkAsync('take from STOPPED traps EINVAL and leaves the process stopped', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    await table.setState(pid, 'stopped', { trigger: 'SIGSTOP' });
+    const { ckpt } = makeCkpt(table);
+    let err: unknown;
+    try {
+      await ckpt.take(pid);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'EINVAL', 'illegal source state → EINVAL');
+    assert(table.get(pid)!.state === 'stopped', 'process left exactly as it was');
+  });
+
+  await checkAsync('take of an unknown pid traps ESRCH', async () => {
+    const table = await makeTable();
+    const { ckpt } = makeCkpt(table);
+    let err: unknown;
+    try {
+      await ckpt.take(asProcessId(9999));
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ESRCH', 'absent pid → ESRCH');
+  });
+
+  await checkAsync('a snapshot-phase failure traps EDRIVER and recovers to READY', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table, {
+      driverStateSource: () => {
+        throw new Error('driver serialize boom');
+      },
+    });
+    let err: unknown;
+    try {
+      await ckpt.take(pid);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'EDRIVER', 'raw throw wrapped as EDRIVER');
+    assert(
+      table.get(pid)!.state === 'ready',
+      'recovered to READY, never stranded in CHECKPOINTING',
+    );
+  });
+
+  // --- load / round-trip ----------------------------------------------------
+
+  await checkAsync('load round-trips header, budgets, and syscall log offset', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    table.spend(pid, { tokensIn: 100, tokensOut: 40, usdSpent: 0.5 });
+    const { ckpt } = makeCkpt(table);
+    const { chainId } = await ckpt.take(pid);
+    const cp = await ckpt.load(chainId);
+    assert(cp.magic === 'CRTX' && cp.version === CHECKPOINT_VERSION, 'magic + version');
+    assert(cp.signature.length === SIGNATURE_SIZE, 'signature is 32 bytes');
+    assert(unbrand(cp.pid) === unbrand(pid), 'pid captured');
+    assert(cp.parentPid === null, 'root parentPid captured as null');
+    assert(cp.budgets.tokensIn === 100 && cp.budgets.tokensOut === 40, 'budgets captured');
+    assert(
+      unbrand(cp.syscallLogOffset) > 0,
+      'syscall log offset reflects prior recorded syscalls',
+    );
+  });
+
+  await checkAsync('cognitive snapshot round-trips through the checkpoint', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table);
+    putCognitive(pid, {
+      messages: [
+        { role: 'user', content: 'remember this' },
+        { role: 'assistant', content: 'ok' },
+      ],
+      intent: 'persist',
+      pendingCalls: [{ id: 'c1', tool: 'lookup', args: { x: 1 }, startedAt: clock() }],
+    });
+    const { chainId } = await ckpt.take(pid);
+    const cp = await ckpt.load(chainId);
+    assert(cp.cognitive.messages.length === 2, 'messages captured');
+    assert(cp.cognitive.messages[0]!.content === 'remember this', 'message content preserved');
+    assert(cp.cognitive.intent === 'persist', 'intent captured');
+    assert(
+      cp.cognitive.pendingCalls.length === 1 && cp.cognitive.pendingCalls[0]!.tool === 'lookup',
+      'pendingCalls captured',
+    );
+  });
+
+  await checkAsync('memoryDelta captures every region entry as a full snapshot', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt, memory } = makeCkpt(table);
+    memory.attachRegion(pid, 'episodic', priv);
+    memory.attachRegion(pid, 'semantic', shared);
+    await memory.write(pid, 'episodic', 'e1', { a: 1 });
+    await memory.write(pid, 'semantic', 's1', 'shared-value');
+    const { chainId } = await ckpt.take(pid);
+    const cp = await ckpt.load(chainId);
+    assert(cp.memoryDelta.baseChainId === null, 'v0 delta is a full snapshot (baseChainId null)');
+    assert(
+      cp.memoryDelta.writes.length === 2,
+      `both entries captured, got ${cp.memoryDelta.writes.length}`,
+    );
+    const regions = new Set(cp.memoryDelta.writes.map((w) => w.region));
+    assert(
+      regions.has('episodic') && regions.has('semantic'),
+      'entries are remapped to logical region names',
+    );
+  });
+
+  await checkAsync('driverStates blobs round-trip as bytes', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const blob = new Uint8Array([1, 2, 3, 250]);
+    const { ckpt } = makeCkpt(table, {
+      driverStateSource: () => ({ mydriver: blob, empty: null }),
+    });
+    const { chainId } = await ckpt.take(pid);
+    const cp = await ckpt.load(chainId);
+    const got = cp.driverStates.mydriver;
+    assert(
+      got instanceof Uint8Array && got.length === 4 && got[3] === 250,
+      'driver byte blob preserved through CBOR',
+    );
+    assert(cp.driverStates.empty === null, 'null driver state preserved');
+  });
+
+  await checkAsync('a tampered checkpoint fails signature verification with EINVAL', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table);
+    const { chainId, path } = await ckpt.take(pid);
+    const bytes = await readFile(path);
+    const orig = bytes[CSNAP_HEADER_SIZE] ?? 0;
+    bytes[CSNAP_HEADER_SIZE] = orig ^ 0xff; // flip a body byte
+    await writeFile(path, bytes);
+    let err: unknown;
+    try {
+      await ckpt.load(chainId);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'EINVAL', 'tampered body → EINVAL');
+  });
+
+  await checkAsync('load of an unknown chainId traps ENOENT', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table);
+    await ckpt.take(pid);
+    let err: unknown;
+    try {
+      await ckpt.load(asChainId('does-not-exist'));
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ENOENT', 'unknown chainId → ENOENT');
+  });
+
+  await checkAsync('load resolves by directory scan when the in-memory index is cold', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt, dir } = makeCkpt(table);
+    const { chainId } = await ckpt.take(pid);
+    // A fresh manager has an empty index and must find the file by scanning.
+    const cold = new CheckpointManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir,
+      now: clock,
+    });
+    const cp = await cold.load(chainId);
+    assert(unbrand(cp.chainId) === unbrand(chainId), 'cold load resolves by scanning the dir');
+  });
+
+  await checkAsync('successive checkpoints link prevInChain; listLineage is oldest→newest', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table);
+    const a = await ckpt.take(pid);
+    tick();
+    await table.setState(pid, 'running', { trigger: 'redispatch' });
+    const b = await ckpt.take(pid);
+
+    const cpA = await ckpt.load(a.chainId);
+    const cpB = await ckpt.load(b.chainId);
+    assert(cpA.prevInChain === null, 'first checkpoint has no predecessor');
+    assert(unbrand(cpB.prevInChain!) === unbrand(a.chainId), 'second links back to first');
+
+    const lineage = await ckpt.listLineage(b.chainId);
+    assert(lineage.length === 2, `lineage has 2 links, got ${lineage.length}`);
+    assert(
+      unbrand(lineage[0]!) === unbrand(a.chainId) && unbrand(lineage[1]!) === unbrand(b.chainId),
+      'lineage ordered oldest → newest',
+    );
+    assert(
+      table.get(pid)!.checkpointChain.length === 2,
+      'process checkpointChain tracks both snapshots',
+    );
+  });
+
+  // --- restoreAs ------------------------------------------------------------
+
+  await checkAsync('restoreAs mints a NEW pid in state NEW, leaving the source untouched', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table);
+    const { chainId } = await ckpt.take(pid);
+    const newPid = await ckpt.restoreAs(chainId);
+    assert(unbrand(newPid) !== unbrand(pid), 'restore allocates a fresh pid');
+    assert(table.get(newPid)!.state === 'new', 'new process starts in NEW');
+    assert(table.get(pid)!.state === 'ready', 'source process is unaffected');
+    assert(
+      table.get(newPid)!.checkpointChain.some((c) => unbrand(c) === unbrand(chainId)),
+      'new process continues the same chain',
+    );
+  });
+
+  await checkAsync('restoreAs preserves spent budgets and re-hydrates memory + cognition', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    table.spend(pid, { tokensIn: 77, tokensOut: 33 });
+    const { ckpt, memory } = makeCkpt(table);
+    memory.attachRegion(pid, 'episodic', priv);
+    await memory.write(pid, 'episodic', 'k1', { v: 1 });
+    putCognitive(pid, {
+      messages: [{ role: 'user', content: 'hi' }],
+      intent: 'resume',
+      pendingCalls: [],
+    });
+    const { chainId } = await ckpt.take(pid);
+    const newPid = await ckpt.restoreAs(chainId);
+
+    assert(table.get(newPid)!.budgetsSpent.tokensIn === 77, 'spent tokensIn preserved');
+    assert(table.get(newPid)!.budgetsSpent.tokensOut === 33, 'spent tokensOut preserved');
+
+    const entries = await memory.read(newPid, 'episodic', {});
+    assert(entries.length === 1 && entries[0]!.key === 'k1', 'memory entry re-hydrated');
+    assert((entries[0]!.value as { v: number }).v === 1, 'memory value preserved');
+
+    const restored = getCognitive(newPid);
+    assert(
+      restored.messages.length === 1 && restored.intent === 'resume',
+      'cognitiveSink received the snapshot',
+    );
+  });
+
+  await checkAsync('restoreAs without a restoreContext provider traps EINVAL', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const { ckpt, dir } = makeCkpt(table);
+    const { chainId } = await ckpt.take(pid);
+    const bare = new CheckpointManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir,
+      now: clock,
+    });
+    let err: unknown;
+    try {
+      await bare.restoreAs(chainId);
+    } catch (e) {
+      err = e;
+    }
+    assert(
+      isCortexError(err) && err.errno === 'EINVAL',
+      'restore needs the agent spec, which the checkpoint does not carry',
+    );
+  });
+
+  // --- recording ------------------------------------------------------------
+
+  await checkAsync('take records an idempotent checkpoint syscall', async () => {
+    const sub = join(tmp, 'ckpt-records');
+    await mkdir(sub, { recursive: true });
+    const table = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+    });
+    tables.push(table);
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table);
+    const { chainId } = await ckpt.take(pid, { tag: 'pre-deploy' });
+    const rec = table.recorderFor(pid)!;
+    await rec.flush();
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) records.push(r);
+    const ck = records.filter((r) => r.syscall === 'checkpoint');
+    assert(ck.length === 1, `expected 1 checkpoint record, got ${ck.length}`);
+    assert(ck[0]!.phase === 'exit', 'exit phase');
+    assert(ck[0]!.reversibility === 'idempotent', 'checkpoint is idempotent');
+    assert(
+      ck[0]!.stateBefore === 'checkpointing' && ck[0]!.stateAfter === 'ready',
+      'state transition recorded',
+    );
+    const res = ck[0]!.result as { chainId: string; byteSize: number; syscallLogOffset: number };
+    assert(res.chainId === unbrand(chainId), 'result carries chainId');
+    assert(typeof res.byteSize === 'number' && res.byteSize > 0, 'result carries byteSize');
+    const args = ck[0]!.args as { tag?: string; detach: boolean };
+    assert(args.tag === 'pre-deploy', 'tag captured in args');
+    assert(args.detach === false, 'detach flag captured');
+  });
+
+  await checkAsync('restoreAs records a reversible restore syscall in the new log', async () => {
+    const sub = join(tmp, 'restore-records');
+    await mkdir(sub, { recursive: true });
+    const table = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+    });
+    tables.push(table);
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table);
+    const { chainId } = await ckpt.take(pid);
+    const newPid = await ckpt.restoreAs(chainId);
+    const rec = table.recorderFor(newPid)!;
+    await rec.flush();
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) records.push(r);
+    const rs = records.filter((r) => r.syscall === 'restore');
+    assert(rs.length === 1, `expected 1 restore record, got ${rs.length}`);
+    assert(rs[0]!.reversibility === 'reversible', 'restore is reversible');
+    assert(
+      rs[0]!.stateBefore === 'new' && rs[0]!.stateAfter === 'new',
+      'new process stays in NEW',
+    );
+    const args = rs[0]!.args as { chainId: string; sourcePid: number };
+    assert(args.chainId === unbrand(chainId), 'restore args carry chainId');
+    assert(args.sourcePid === unbrand(pid), 'restore args carry the source pid');
+  });
+
+  // --- cleanup --------------------------------------------------------------
+  for (const t of tables) {
+    for (const pid of t.pids()) {
+      const rec = t.recorderFor(pid);
+      if (rec !== null) await rec.close().catch(() => {});
+    }
+  }
+  await rm(tmp, { recursive: true, force: true });
+}
+
 await runMemoryChecks();
+await runCheckpointChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

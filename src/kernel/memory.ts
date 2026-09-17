@@ -638,6 +638,46 @@ export class MemoryManager {
     }
   }
 
+  /**
+   * Kernel-internal bulk read of every attached region, returned as flat
+   * `MemoryEntry[]` with logical region names. Used by `checkpoint.ts` to
+   * build a `MemoryDelta`.
+   *
+   * Unlike `read()`, this writes NO syscall records and does not advance the
+   * `.crec` log — a checkpoint must capture the log offset as it stands, not
+   * one perturbed by the act of snapshotting. Traps `EDRIVER` on failure.
+   */
+  async dumpEntries(pid: ProcessId): Promise<readonly MemoryEntry[]> {
+    const map = this.#bindings.get(unbrand(pid));
+    if (map === undefined) return [];
+    const out: MemoryEntry[] = [];
+    for (const [region, binding] of map) {
+      const driver = this.#driverFor(binding.policy.backing, 'dumpEntries');
+      const raw = await driver.read(binding.physical, {});
+      for (const e of raw) out.push({ ...e, region });
+    }
+    return out;
+  }
+
+  /**
+   * Kernel-internal bulk write of entries back into their regions. Used by
+   * `checkpoint.ts` on the restore path. Regions must already be attached
+   * (the restore path attaches policies first); an entry naming an unknown
+   * region traps `ENOENT`.
+   *
+   * Like `dumpEntries`, this writes NO syscall records — the restored
+   * process's fresh log should start clean, not pre-populated with the
+   * replayed writes. Traps `ENOENT` / `EDRIVER` on failure.
+   */
+  async loadEntries(pid: ProcessId, entries: readonly MemoryEntry[]): Promise<void> {
+    for (const entry of entries) {
+      const binding = this.#mustBind(pid, entry.region, 'loadEntries');
+      const driver = this.#driverFor(binding.policy.backing, 'loadEntries');
+      await driver.write(binding.physical, entry.key, entry.value);
+      this.#sizes.set(binding.physical, (this.#sizes.get(binding.physical) ?? 0) + 1);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // §7.6 fork (STATE.md §2.3, §3.1 — driven by fork.ts #020)
   // ---------------------------------------------------------------------------

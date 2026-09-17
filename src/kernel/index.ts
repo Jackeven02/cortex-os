@@ -19,3 +19,4 @@ export * from './process_table.js';
 export * from './signals.js';
 export * from './ipc.js';
 export * from './memory.js';
+export * from './checkpoint.js';
