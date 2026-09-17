@@ -134,10 +134,10 @@ This document is the **why**. The next documents are the **how**:
 | `docs/STATE.md` | What agent state *is*; fork & checkpoint semantics | **drafted — read this first** |
 | `docs/PROCESS.md` | The agent lifecycle and state machine | **drafted — 8 states, 12 transitions** |
 | `docs/ABI.md` | The syscall contract, in TypeScript types | **drafted — 18 syscalls** |
-| `docs/ARCHITECTURE.md` | Kernel modules and data flow | pending |
+| `docs/ARCHITECTURE.md` | Kernel modules and data flow | **drafted — 11 modules, full syscall lifecycle** |
 | `BACKLOG.md` | The first issues, prioritized | live |
 
-Then code.
+Then code. **Phase 0 is design-complete; Phase 1 (kernel skeleton) starts next.**
 
 ---
 

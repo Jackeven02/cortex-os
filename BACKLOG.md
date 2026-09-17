@@ -16,18 +16,20 @@ This document is the source of truth for "what we work on next." When an item is
 
 The point of this phase is to lock the abstractions before writing serious code. A wrong syscall is a thousand rewrites later. A wrong **state model** is a kernel that cannot be implemented at all.
 
+> **Status as of this commit:** 10 of 11 items done. The four core documents (`STATE.md`, `PROCESS.md`, `ABI.md`, `ARCHITECTURE.md`) are drafted v0. `#011` is intentionally rolling — the open questions in each doc's final section will resolve as Phase 1 implementation forces decisions. **Exit criteria are met; Phase 1 is unblocked.**
+
 - [x] **#001** Write `MANIFESTO.md` — the why → `8a2bb3c`
 - [x] **#002** Initialize repo skeleton (package.json, tsconfig, dirs) → `8a2bb3c`
 - [x] **#002a** Add "Why Not Temporal / LangGraph / Kubernetes" section to MANIFESTO → this commit
 - [x] **#003** Write `docs/STATE.md` — agent state model, fork taxonomy, irreversible-action doctrine → this commit
 - [x] **#004** Write `docs/ABI.md` — full syscall contract in TypeScript types → this commit
 - [x] **#005** Write `docs/PROCESS.md` — agent state machine, lifecycle, transitions → this commit
-- [ ] **#006** Write `docs/ARCHITECTURE.md` — kernel modules, data flow, driver model
-- [ ] **#007** Decide driver interface for LLM providers (`ILLMDriver`)
-- [ ] **#008** Decide driver interface for tools (`IToolDriver`, MCP-compatible)
-- [ ] **#009** Decide driver interface for memory backends (`IMemoryDriver`)
-- [ ] **#010** Decide on-disk format details (CBOR vs MessagePack vs JSON for `.csnap`; raw append vs framed for `.crec`)
-- [ ] **#011** Resolve open questions from STATE.md §8 (concurrency, budget split, log branching, intent, GC, driver opt-in, side-effect tagging)
+- [x] **#006** Write `docs/ARCHITECTURE.md` — kernel modules, data flow, driver model → this commit
+- [x] **#007** Decide driver interface for LLM providers (`ILLMDriver`) → ABI.md §7.1
+- [x] **#008** Decide driver interface for tools (`IToolDriver`, MCP-compatible) → ABI.md §7.2 (two-phase stage/commit)
+- [x] **#009** Decide driver interface for memory backends (`IMemoryDriver`) → ABI.md §7.3 (snapshotRegion/restoreRegion)
+- [x] **#010** Decide on-disk format details (CBOR vs MessagePack vs JSON for `.csnap`; raw append vs framed for `.crec`) → STATE.md §4 (CBOR, content-addressed `.csnap` + length-prefixed CBOR `.crec`)
+- [ ] **#011** Resolve open questions from STATE.md §8, PROCESS.md §11, ABI.md §9, ARCHITECTURE.md §12 (concurrency, budget split, log branching, intent, GC, driver opt-in, side-effect tagging, kernel module boundaries)
 
 **Exit criteria:** a stranger reads STATE.md, ABI.md, PROCESS.md, ARCHITECTURE.md and can predict what the kernel does in any scenario we have not yet coded.
 

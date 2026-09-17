@@ -58,9 +58,11 @@ None of this works yet. All of it will.
 
 ## Status
 
-**Phase 0 — Design.** Manifesto, syscall ABI, process model, architecture. No code yet beyond skeletons.
+**Phase 0 — Design (complete).** Four documents drafted v0: `STATE.md` (the hard part), `PROCESS.md` (lifecycle), `ABI.md` (syscall contract), `ARCHITECTURE.md` (kernel modules). Open questions in each doc are logged and resolve as implementation forces decisions.
 
-See **[BACKLOG.md](./BACKLOG.md)** for the first 30 issues, prioritized.
+**Phase 1 — Kernel skeleton (next).** ~1500 lines of TypeScript: process table, scheduler, syscall dispatcher, recorder, checkpoint, fork, IPC, signals, init.
+
+See **[BACKLOG.md](./BACKLOG.md)** for the first 50 issues, prioritized.
 
 ---
 
@@ -72,7 +74,7 @@ See **[BACKLOG.md](./BACKLOG.md)** for the first 30 issues, prioritized.
 | [docs/STATE.md](./docs/STATE.md) | **The hard part.** What agent state is, what gets copied on fork, what cannot be copied at all. |
 | [docs/PROCESS.md](./docs/PROCESS.md) | Agent lifecycle: 8 states, 12 transitions, signals, scheduling |
 | [docs/ABI.md](./docs/ABI.md) | Syscall contract: 18 syscalls, 3 driver interfaces, error model, recording format |
-| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow *(pending)* |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow: 11 modules, syscall lifecycle, persistence layout, concurrency model |
 | [docs/CRITIQUE.md](./docs/CRITIQUE.md) | Running log of external critique and what we changed because of it. |
 | [BACKLOG.md](./BACKLOG.md) | First issues, prioritized |
 

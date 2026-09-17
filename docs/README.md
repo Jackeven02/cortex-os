@@ -8,7 +8,7 @@ This directory holds the technical specifications. **Read them in this order:**
 
 3. **[ABI.md](./ABI.md)** — the syscall contract. **Eighteen syscalls**, full TypeScript types, error model, recording format, three driver interfaces (LLM, Tool, Memory), seven open questions. If a behavior is not in the ABI, it does not exist.
 
-4. **[ARCHITECTURE.md](./ARCHITECTURE.md)** *(pending)* — kernel modules and data flow. Scheduler, IPC, recording, checkpointing, drivers.
+4. **[ARCHITECTURE.md](./ARCHITECTURE.md)** — kernel modules and data flow. **Eleven modules** (recorder, process_table, signals, ipc, memory, checkpoint, fork, scheduler, init, syscall_dispatcher, driver_registry), the full syscall lifecycle trace, driver model, persistence layout (`.cortex/`), boot sequence, concurrency model, file layout, six open questions, and an honest "what we will get wrong" prediction section.
 
 5. **[CRITIQUE.md](./CRITIQUE.md)** — the running log of external critique and what we changed (or didn't) because of it.
 
@@ -23,9 +23,11 @@ This directory holds the technical specifications. **Read them in this order:**
 | STATE.md | **drafted v0** — open questions logged in §8 |
 | PROCESS.md | **drafted v0** — open questions logged in §11 |
 | ABI.md | **drafted v0** — open questions logged in §9 |
-| ARCHITECTURE.md | pending — last design doc before Phase 1 kernel work |
+| ARCHITECTURE.md | **drafted v0** — open questions logged in §12 |
 | CRITIQUE.md | live, 1 entry |
 | HACKING.md | post-v0.1 |
+
+**Phase 0 is design-complete.** The four core documents are drafted v0; open questions in each doc are intentionally rolling — they resolve as Phase 1 implementation forces decisions. Phase 1 (kernel skeleton, ~1500 lines TS) is unblocked.
 
 Track progress in [BACKLOG.md](../BACKLOG.md), Phase 0.
 
