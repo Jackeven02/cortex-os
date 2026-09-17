@@ -34,12 +34,14 @@
     "dist",
     "MANIFESTO.md",
     "README.md",
+    "README.zh-CN.md",
     "docs"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
     "test": "node --test --import tsx tests/**/*.test.ts",
+    "smoke": "tsx scripts/smoke.ts",
     "lint": "tsc --noEmit",
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\""
   },
@@ -62,10 +64,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/TBD/cortex.git"
+    "url": "https://github.com/Jackeven02/cortex-os.git"
   },
   "bugs": {
-    "url": "https://github.com/TBD/cortex/issues"
+    "url": "https://github.com/Jackeven02/cortex-os/issues"
   },
-  "homepage": "https://github.com/TBD/cortex#readme"
+  "homepage": "https://github.com/Jackeven02/cortex-os#readme"
 }
