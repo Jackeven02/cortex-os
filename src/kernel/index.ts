@@ -22,3 +22,4 @@ export * from './memory.js';
 export * from './checkpoint.js';
 export * from './fork.js';
 export * from './scheduler.js';
+export * from './init.js';

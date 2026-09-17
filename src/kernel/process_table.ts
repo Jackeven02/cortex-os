@@ -689,6 +689,37 @@ export class ProcessTable {
     return out.sort((a, b) => unbrand(a) - unbrand(b));
   }
 
+  /**
+   * Reparent every child of `deadPid` to init (PID 1). Called when a process
+   * dies: its children become orphans and init inherits them (docs/PROCESS.md
+   * §4.2, §3 — "when a parent dies, its children are reparented to init").
+   * Mirrors the `reparentOrphans(deadPid)` method sketched in
+   * docs/ARCHITECTURE.md §4.2.
+   *
+   * Works even if `deadPid` itself is already gone (reaped): orphaned children
+   * still carry the dead PID as their `ppid`, so we match on that rather than
+   * requiring the parent entry to exist. Process-group membership (`pgid`) is
+   * preserved — only `ppid` changes, matching Unix (a group outlives its
+   * founder).
+   *
+   * Metadata-only mutation: records nothing itself (init writes the `__init`
+   * event describing the reparent), matching the `setBudgets` precedent.
+   *
+   * @returns The reparented PIDs, in ascending order. Empty if the dead
+   *          process had no children.
+   */
+  reparentOrphans(deadPid: ProcessId): readonly ProcessId[] {
+    const target = unbrand(deadPid);
+    const moved: ProcessId[] = [];
+    for (const entry of this.#entries.values()) {
+      if (entry.ppid !== null && unbrand(entry.ppid) === target) {
+        entry.ppid = PID_INIT;
+        moved.push(entry.pid);
+      }
+    }
+    return moved.sort((a, b) => unbrand(a) - unbrand(b));
+  }
+
   // ---------------------------------------------------------------------------
   // §6.5 Signals (storage only — delivery is signals.ts)
   // ---------------------------------------------------------------------------

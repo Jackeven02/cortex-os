@@ -92,6 +92,18 @@ import {
   type TickOutcome,
   type DispatchReason,
   type ResumeFn,
+  InitProcess,
+  INIT_AGENT_SPEC,
+  DEFAULT_BACKOFF_MS,
+  MAX_BACKOFF_MS,
+  MAX_BACKOFF_EXPONENT,
+  DEFAULT_RESTART_WINDOW_MS,
+  DEFAULT_RESTART_STORM_THRESHOLD,
+  shouldRestartFromCode,
+  type DaemonSpec,
+  type InitAlarm,
+  type OnAlarmHook,
+  type ShutdownReport,
 } from '../src/index.js';
 
 let passed = 0;
@@ -3810,10 +3822,557 @@ async function runSchedulerChecks(): Promise<void> {
   await rm(tmp, { recursive: true, force: true });
 }
 
+async function runInitChecks(): Promise<void> {
+  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-init-'));
+  const tables: ProcessTable[] = [];
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const advance = (ms = 1000) => {
+    fakeNow += ms;
+  };
+
+  async function makeTable(opts: { record?: boolean; dir?: string } = {}): Promise<ProcessTable> {
+    const dir = opts.dir ?? tmp;
+    const record = opts.record ?? false;
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...(record ? { recorderFactory: async (pid) => Recorder.open({ pid, dir }) } : {}),
+    });
+    tables.push(t);
+    return t;
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+
+  // Fake, manually-driven timers for deterministic backoff tests.
+  interface FakeTimerEntry {
+    id: number;
+    cb: () => void;
+    ms: number;
+  }
+  function makeFakeTimers(): {
+    timers: FakeTimerEntry[];
+    setTimeoutFn: (cb: () => void, ms: number) => unknown;
+    clearTimeoutFn: (handle: unknown) => void;
+    fireAll: () => void;
+  } {
+    const timers: FakeTimerEntry[] = [];
+    let nextId = 1;
+    const setTimeoutFn = (cb: () => void, ms: number): unknown => {
+      const id = nextId++;
+      timers.push({ id, cb, ms });
+      return id;
+    };
+    const clearTimeoutFn = (handle: unknown): void => {
+      const id = handle as number;
+      const idx = timers.findIndex((t) => t.id === id);
+      if (idx >= 0) timers.splice(idx, 1);
+    };
+    const fireAll = (): void => {
+      const pending = timers.splice(0, timers.length);
+      for (const t of pending) t.cb();
+    };
+    return { timers, setTimeoutFn, clearTimeoutFn, fireAll };
+  }
+  // Let fire-and-forget restart promises settle (they run on the microtask
+  // queue after the synchronous fake-timer callback returns).
+  const drain = async (): Promise<void> => {
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+  };
+
+  interface KernelOpts {
+    setTimeoutFn?: (cb: () => void, ms: number) => unknown;
+    clearTimeoutFn?: (handle: unknown) => void;
+    onAlarm?: OnAlarmHook;
+    restartStormThreshold?: number;
+  }
+
+  // Wire signals <-> init exactly the way boot.ts will: the SignalManager's
+  // onZombie hook forwards to init.handleZombie via a closure over a ref that
+  // is assigned right after construction (breaks the signals <-> init cycle).
+  function makeKernel(
+    table: ProcessTable,
+    opts: KernelOpts = {},
+  ): { init: InitProcess; signals: SignalManager } {
+    let init!: InitProcess;
+    const signals = new SignalManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      onZombie: (pid, code, reason) => init.handleZombie(pid, code, reason),
+    });
+    init = new InitProcess({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...opts,
+    });
+    return { init, signals };
+  }
+
+  // Allocate a process and move NEW -> READY.
+  async function alloc(
+    table: ProcessTable,
+    opts: { ppid?: ProcessIdAlias | null; role?: string } = {},
+  ): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({
+      ppid: opts.ppid === undefined ? null : opts.ppid,
+      role: opts.role ?? 'worker',
+      agent,
+    });
+    await table.setState(pid, 'ready', { trigger: 'test' });
+    advance();
+    return pid;
+  }
+
+  // Drive a process to ZOMBIE with an explicit exit code, then notify init.
+  // This is exactly what the syscall dispatcher's exit() path will do (#014);
+  // signal deaths reach handleZombie through the onZombie hook instead.
+  async function exitWithCode(
+    init: InitProcess,
+    table: ProcessTable,
+    pid: ProcessIdAlias,
+    code: number,
+    reason = 'exit',
+  ): Promise<void> {
+    const e = table.get(pid)!;
+    if (e.state === 'new') await table.setState(pid, 'ready', { trigger: 'test' });
+    if (e.state === 'ready') await table.setState(pid, 'running', { trigger: 'test' });
+    const rec = table.recorderFor(pid);
+    const off = rec?.currentOffset ?? asSyscallOffset(0);
+    table.setExitInfo(pid, code, reason, off);
+    await table.setState(pid, 'exiting', { trigger: 'test-exit' });
+    await table.setState(pid, 'zombie', { trigger: 'test-exit' });
+    await init.handleZombie(pid, code, reason);
+  }
+
+  // The single living child of init (used right after a synchronous restart).
+  function onlyChild(table: ProcessTable): ProcessIdAlias | undefined {
+    const kids = table.children(PID_INIT);
+    return kids.length === 1 ? kids[0] : undefined;
+  }
+
+  // --- constants ------------------------------------------------------------
+
+  check('init constants', () => {
+    assert(DEFAULT_BACKOFF_MS === 1000, 'default backoff is 1000ms');
+    assert(MAX_BACKOFF_MS === 60_000, 'backoff capped at 60s');
+    assert(MAX_BACKOFF_EXPONENT === 16, 'backoff exponent capped at 16');
+    assert(DEFAULT_RESTART_WINDOW_MS === 60_000, 'default storm window is 1min');
+    assert(DEFAULT_RESTART_STORM_THRESHOLD === 100, 'default storm threshold is 100');
+    assert(
+      'module' in INIT_AGENT_SPEC && INIT_AGENT_SPEC.module === 'cortex:init',
+      'reserved init agent specifier',
+    );
+  });
+
+  check('shouldRestartFromCode policy matrix', () => {
+    assert(shouldRestartFromCode('always', 0) === true, 'always restarts on clean exit');
+    assert(shouldRestartFromCode('always', 1) === true, 'always restarts on failure');
+    assert(shouldRestartFromCode('on-failure', 0) === false, 'on-failure skips clean exit');
+    assert(shouldRestartFromCode('on-failure', 1) === true, 'on-failure restarts on error');
+    assert(
+      shouldRestartFromCode('on-failure', 137) === true,
+      'on-failure restarts on SIGKILL (128+9)',
+    );
+    assert(shouldRestartFromCode('never', 1) === false, 'never restarts');
+  });
+
+  // --- boot -----------------------------------------------------------------
+
+  await checkAsync('boot allocates PID 1 in RUNNING with no parent', async () => {
+    const table = await makeTable();
+    const { init } = makeKernel(table);
+    await init.boot();
+    assert(init.booted, 'init reports booted');
+    const entry = table.get(PID_INIT)!;
+    assert(entry !== undefined, 'PID 1 exists in the table');
+    assert(entry.state === 'running', 'init is RUNNING (hook-driven, never scheduled)');
+    assert(entry.ppid === null, 'init has no parent');
+    assert(entry.role === 'init', 'init role is "init"');
+    assert(unbrand(entry.pgid) === unbrand(PID_INIT), 'init is its own process group');
+  });
+
+  await checkAsync('double boot traps EINVAL', async () => {
+    const table = await makeTable();
+    const { init } = makeKernel(table);
+    await init.boot();
+    let caught: unknown;
+    try {
+      await init.boot();
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'second boot throws a CortexError');
+    assert(caught.errno === 'EINVAL', `expected EINVAL, got ${caught.errno}`);
+  });
+
+  await checkAsync('registerDaemon before boot traps ESTATE', async () => {
+    const table = await makeTable();
+    const { init } = makeKernel(table);
+    let caught: unknown;
+    try {
+      await init.registerDaemon({ role: 'd', agent });
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'registerDaemon before boot throws');
+    assert(caught.errno === 'ESTATE', `expected ESTATE, got ${caught.errno}`);
+  });
+
+  // --- daemon registration --------------------------------------------------
+
+  await checkAsync('registerDaemon allocates a READY child of init (daemon + autoReap)', async () => {
+    const table = await makeTable();
+    const { init } = makeKernel(table);
+    await init.boot();
+    const spec: DaemonSpec = { role: 'inbox-watcher', agent, restart: { kind: 'on-failure' } };
+    const pid = await init.registerDaemon(spec);
+    assert(unbrand(pid) !== unbrand(PID_INIT), 'daemon is not PID 1');
+    const entry = table.get(pid)!;
+    assert(entry.state === 'ready', 'daemon left READY for the scheduler');
+    assert(entry.ppid !== null && unbrand(entry.ppid) === unbrand(PID_INIT), 'parent is init');
+    assert(entry.daemon === true, 'marked as a daemon');
+    assert(entry.autoReap === true, 'init auto-reaps its daemons');
+    assert(init.daemonCount === 1, 'one logical daemon registered');
+  });
+
+  // --- reaping and reparenting ---------------------------------------------
+
+  await checkAsync('a zombie with a live parent is retained for wait()', async () => {
+    const table = await makeTable();
+    const { init, signals } = makeKernel(table);
+    await init.boot();
+    const parent = await alloc(table, { ppid: PID_INIT, role: 'parent' });
+    const child = await alloc(table, { ppid: parent, role: 'child' });
+    await signals.send(child, 'SIGKILL', PID_KERNEL);
+    assert(table.has(child), 'child not reaped — a live parent will wait() for it');
+    assert(table.get(child)!.state === 'zombie', 'child is a zombie');
+    assert(table.has(parent), 'parent still alive');
+  });
+
+  await checkAsync('init reaps an inherited orphan-zombie immediately (no double-zombie)', async () => {
+    const table = await makeTable();
+    const { init, signals } = makeKernel(table);
+    await init.boot();
+    const parent = await alloc(table, { ppid: PID_INIT, role: 'parent' });
+    const child = await alloc(table, { ppid: parent, role: 'child' });
+    await signals.send(child, 'SIGKILL', PID_KERNEL); // child becomes a retained zombie
+    assert(table.get(child)!.state === 'zombie', 'child zombied first');
+    await signals.send(parent, 'SIGKILL', PID_KERNEL); // parent dies; init inherits child
+    assert(!table.has(parent), 'parent reaped (child of init)');
+    assert(!table.has(child), 'inherited zombie child reaped immediately by init');
+  });
+
+  await checkAsync('init reparents a LIVE orphan to PID 1 when its parent dies', async () => {
+    const table = await makeTable();
+    const { init, signals } = makeKernel(table);
+    await init.boot();
+    const parent = await alloc(table, { ppid: PID_INIT, role: 'parent' });
+    const child = await alloc(table, { ppid: parent, role: 'child' });
+    await signals.send(parent, 'SIGKILL', PID_KERNEL);
+    assert(!table.has(parent), 'parent reaped');
+    assert(table.has(child), 'live orphan survives');
+    const c = table.get(child)!;
+    assert(c.ppid !== null && unbrand(c.ppid) === unbrand(PID_INIT), 'orphan reparented to init');
+    assert(c.state === 'ready', 'orphan still runnable');
+  });
+
+  await checkAsync('SIGCHLD is sent to the parent when a child zombifies', async () => {
+    const table = await makeTable();
+    const { init, signals } = makeKernel(table);
+    await init.boot();
+    const sent: Array<{ pid: number; signal: Signal }> = [];
+    const origSend = signals.send.bind(signals);
+    (signals as { send: typeof signals.send }).send = async (pid, signal, from) => {
+      sent.push({ pid: unbrand(pid), signal });
+      return origSend(pid, signal, from);
+    };
+    const parent = await alloc(table, { ppid: PID_INIT, role: 'parent' });
+    const child = await alloc(table, { ppid: parent, role: 'child' });
+    await signals.send(child, 'SIGKILL', PID_KERNEL);
+    assert(
+      sent.some((s) => s.signal === 'SIGCHLD' && s.pid === unbrand(parent)),
+      'init delivered SIGCHLD to the parent',
+    );
+  });
+
+  // --- restart policy -------------------------------------------------------
+
+  await checkAsync('restart "always" re-spawns a killed daemon (fresh PID, READY)', async () => {
+    const table = await makeTable();
+    const { init, signals } = makeKernel(table);
+    await init.boot();
+    const d1 = await init.registerDaemon({
+      role: 'd',
+      agent,
+      restart: { kind: 'always', backoffMs: 0 },
+    });
+    await signals.send(d1, 'SIGKILL', PID_KERNEL);
+    assert(!table.has(d1), 'old daemon reaped');
+    const d2 = onlyChild(table);
+    assert(d2 !== undefined, 'exactly one daemon child after restart');
+    assert(unbrand(d2!) !== unbrand(d1), 'restart mints a fresh PID');
+    const e = table.get(d2!)!;
+    assert(e.state === 'ready', 'restarted daemon is READY');
+    assert(e.role === 'd', 'restarted daemon keeps its role');
+    assert(init.daemonCount === 1, 'still one logical daemon');
+  });
+
+  await checkAsync('restart "on-failure" skips clean exit but restarts on error', async () => {
+    const table = await makeTable();
+    const { init } = makeKernel(table);
+    await init.boot();
+    const a = await init.registerDaemon({
+      role: 'A',
+      agent,
+      restart: { kind: 'on-failure', backoffMs: 0 },
+    });
+    const b = await init.registerDaemon({
+      role: 'B',
+      agent,
+      restart: { kind: 'on-failure', backoffMs: 0 },
+    });
+    await exitWithCode(init, table, a, 0, 'clean'); // success -> no restart
+    await exitWithCode(init, table, b, 1, 'boom'); // failure -> restart
+    assert(!table.has(a), 'A reaped');
+    const kids = table.children(PID_INIT);
+    assert(kids.length === 1, `only B restarted (got ${kids.length} children)`);
+    assert(table.get(kids[0]!)!.role === 'B', 'the surviving child is B');
+    assert(init.daemonCount === 2, 'two logical daemons remain registered');
+  });
+
+  await checkAsync('restart "never" does not re-spawn', async () => {
+    const table = await makeTable();
+    const { init, signals } = makeKernel(table);
+    await init.boot();
+    const d = await init.registerDaemon({ role: 'd', agent, restart: { kind: 'never' } });
+    await signals.send(d, 'SIGKILL', PID_KERNEL);
+    assert(!table.has(d), 'daemon reaped');
+    assert(table.children(PID_INIT).length === 0, 'no restart under policy "never"');
+    assert(init.daemonCount === 1, 'logical daemon record persists');
+  });
+
+  await checkAsync('maxRestarts caps total restarts and alarms', async () => {
+    const table = await makeTable();
+    const alarms: InitAlarm[] = [];
+    const { init, signals } = makeKernel(table, { onAlarm: (a) => alarms.push(a) });
+    await init.boot();
+    let cur = await init.registerDaemon({
+      role: 'd',
+      agent,
+      restart: { kind: 'always', backoffMs: 0, maxRestarts: 2 },
+    });
+    // Two restarts succeed...
+    for (let i = 0; i < 2; i++) {
+      await signals.send(cur, 'SIGKILL', PID_KERNEL);
+      const next = onlyChild(table);
+      assert(next !== undefined, `restart ${i + 1} happened`);
+      cur = next!;
+    }
+    // ...the third death hits the cap.
+    await signals.send(cur, 'SIGKILL', PID_KERNEL);
+    assert(table.children(PID_INIT).length === 0, 'gave up after maxRestarts');
+    const alarm = alarms.find((x) => x.kind === 'max-restarts');
+    assert(alarm !== undefined, 'a max-restarts alarm fired');
+    assert(
+      alarm!.kind === 'max-restarts' && alarm!.restartCount === 2,
+      'alarm reports the cap was reached at 2 restarts',
+    );
+  });
+
+  await checkAsync('restart storm inside the window alarms and gives up', async () => {
+    const table = await makeTable();
+    const alarms: InitAlarm[] = [];
+    const { init, signals } = makeKernel(table, {
+      onAlarm: (a) => alarms.push(a),
+      restartStormThreshold: 3,
+    });
+    await init.boot();
+    let cur = await init.registerDaemon({
+      role: 'd',
+      agent,
+      restart: { kind: 'always', backoffMs: 0 },
+    });
+    // Frozen clock: every restart lands in the same window. Threshold 3 means
+    // the 4th death (3 already-recorded restarts in-window) trips the storm.
+    for (let i = 0; i < 3; i++) {
+      await signals.send(cur, 'SIGKILL', PID_KERNEL);
+      const next = onlyChild(table);
+      assert(next !== undefined, `restart ${i + 1} happened`);
+      cur = next!;
+    }
+    await signals.send(cur, 'SIGKILL', PID_KERNEL);
+    assert(table.children(PID_INIT).length === 0, 'storm gave up');
+    assert(
+      alarms.some((x) => x.kind === 'restart-storm'),
+      'a restart-storm alarm fired',
+    );
+  });
+
+  await checkAsync('storm window prunes old restarts (no false alarm)', async () => {
+    const table = await makeTable();
+    const alarms: InitAlarm[] = [];
+    const { init, signals } = makeKernel(table, {
+      onAlarm: (a) => alarms.push(a),
+      restartStormThreshold: 3,
+    });
+    await init.boot();
+    let cur = await init.registerDaemon({
+      role: 'd',
+      agent,
+      restart: { kind: 'always', backoffMs: 0, windowMs: 1000 },
+    });
+    // Advance beyond the 1s window between each death so the sliding window
+    // never accumulates 3 restarts.
+    for (let i = 0; i < 4; i++) {
+      await signals.send(cur, 'SIGKILL', PID_KERNEL);
+      const next = onlyChild(table);
+      assert(next !== undefined, `restart ${i + 1} happened despite prior deaths`);
+      cur = next!;
+      advance(2000);
+    }
+    assert(
+      !alarms.some((x) => x.kind === 'restart-storm'),
+      'no storm alarm when restarts are spread outside the window',
+    );
+  });
+
+  await checkAsync('non-zero backoff defers the restart to a timer (exponential)', async () => {
+    const table = await makeTable();
+    const ft = makeFakeTimers();
+    const { init, signals } = makeKernel(table, {
+      setTimeoutFn: ft.setTimeoutFn,
+      clearTimeoutFn: ft.clearTimeoutFn,
+    });
+    await init.boot();
+    const d1 = await init.registerDaemon({
+      role: 'd',
+      agent,
+      restart: { kind: 'always', backoffMs: 500 },
+    });
+    await signals.send(d1, 'SIGKILL', PID_KERNEL);
+    assert(!table.has(d1), 'old daemon reaped');
+    assert(table.children(PID_INIT).length === 0, 'restart not spawned yet (backoff pending)');
+    assert(ft.timers.length === 1, 'one backoff timer armed');
+    assert(ft.timers[0]!.ms === 500, `first backoff is 500ms (got ${ft.timers[0]!.ms})`);
+
+    ft.fireAll();
+    await drain();
+    const d2 = onlyChild(table);
+    assert(d2 !== undefined, 'daemon respawned after the timer fired');
+    assert(table.get(d2!)!.state === 'ready', 'respawned daemon is READY');
+    assert(ft.timers.length === 0, 'timer consumed');
+
+    // Second death -> exponential growth: 500 * 2^1 = 1000ms.
+    await signals.send(d2!, 'SIGKILL', PID_KERNEL);
+    assert(ft.timers.length === 1, 'second backoff timer armed');
+    assert(ft.timers[0]!.ms === 1000, `second backoff doubles to 1000ms (got ${ft.timers[0]!.ms})`);
+  });
+
+  // --- shutdown -------------------------------------------------------------
+
+  await checkAsync('shutdown terminates living children; init stays RUNNING', async () => {
+    const table = await makeTable();
+    const { init } = makeKernel(table);
+    await init.boot();
+    const d = await init.registerDaemon({ role: 'd', agent, restart: { kind: 'never' } });
+    const manual = await alloc(table, { ppid: PID_INIT, role: 'manual' });
+    const report: ShutdownReport = await init.shutdown();
+    assert(init.shuttingDown, 'init reports shutting down');
+    assert(report.signalled.includes(unbrand(d)), 'daemon was signalled');
+    assert(report.signalled.includes(unbrand(manual)), 'manual child was signalled');
+    assert(!table.has(d), 'daemon terminated and reaped');
+    assert(!table.has(manual), 'manual child terminated and reaped');
+    assert(report.remaining.length === 0, 'no children remain');
+    assert(table.get(PID_INIT)!.state === 'running', 'init itself never exits');
+  });
+
+  await checkAsync('shutdown cancels a pending restart timer', async () => {
+    const table = await makeTable();
+    const ft = makeFakeTimers();
+    const { init, signals } = makeKernel(table, {
+      setTimeoutFn: ft.setTimeoutFn,
+      clearTimeoutFn: ft.clearTimeoutFn,
+    });
+    await init.boot();
+    const d = await init.registerDaemon({
+      role: 'd',
+      agent,
+      restart: { kind: 'always', backoffMs: 500 },
+    });
+    await signals.send(d, 'SIGKILL', PID_KERNEL); // arms a backoff timer
+    assert(ft.timers.length === 1, 'a restart timer is pending');
+    const report = await init.shutdown();
+    assert(report.restartsCancelled === 1, 'shutdown cancelled the pending restart');
+    assert(ft.timers.length === 0, 'timer cleared');
+  });
+
+  await checkAsync('shutdown is idempotent', async () => {
+    const table = await makeTable();
+    const { init } = makeKernel(table);
+    await init.boot();
+    await init.registerDaemon({ role: 'd', agent, restart: { kind: 'never' } });
+    await init.shutdown();
+    const second = await init.shutdown();
+    assert(second.signalled.length === 0, 'second shutdown signals nothing');
+    assert(init.shuttingDown, 'still shutting down');
+  });
+
+  // --- audit trail ----------------------------------------------------------
+
+  await checkAsync('init writes __init audit records (boot/register/reap/restart)', async () => {
+    const sub = join(tmp, 'init-records');
+    await mkdir(sub, { recursive: true });
+    const table = await makeTable({ record: true, dir: sub });
+    const { init, signals } = makeKernel(table);
+    await init.boot();
+    const d = await init.registerDaemon({
+      role: 'd',
+      agent,
+      restart: { kind: 'always', backoffMs: 0 },
+    });
+    await signals.send(d, 'SIGKILL', PID_KERNEL);
+
+    const rec = table.recorderFor(PID_INIT)!;
+    await rec.flush();
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) records.push(r);
+    const initRecs = records.filter((r) => r.syscall === '__init');
+    const actions = initRecs.map((r) => (r.args as { action?: string }).action);
+    assert(actions.includes('boot'), 'a boot record exists');
+    assert(actions.includes('register-daemon'), 'a register-daemon record exists');
+    assert(actions.includes('reap'), 'a reap record exists');
+    assert(actions.includes('restart'), 'a restart record exists');
+    assert(
+      initRecs.every((r) => unbrand(r.pid) === unbrand(PID_INIT)),
+      'all __init records are on PID 1 log',
+    );
+  });
+
+  // --- cleanup --------------------------------------------------------------
+  for (const t of tables) {
+    for (const pid of t.pids()) {
+      const rec = t.recorderFor(pid);
+      if (rec !== null) await rec.close().catch(() => {});
+    }
+  }
+  await rm(tmp, { recursive: true, force: true });
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
 await runSchedulerChecks();
+await runInitChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
