@@ -137,8 +137,10 @@ Three demos that prove the abstraction matters. Each one becomes a GIF in the RE
 ## Phase 5 — Polish & launch
 
 - [ ] **#044** Landing page (`cortex.sh` or similar — domain to be checked)
-- [ ] **#045** `docs/HACKING.md` — how to contribute, how to write a driver
-- [ ] **#046** `docs/COOKBOOK.md` — common patterns (supervision, pipelines, daemons, fork-and-compare)
+- [x] **#045** `docs/HACKING.md` — how to contribute, how to write a driver
+  - Covers: dev setup (`tsc` + `tsx scripts/smoke.ts`, with an explicit note that `npm test` is *not* the suite and `tests/` is intentionally empty); project layout; the "documents are the contract" rule; the four coding conventions (branded ids, `exactOptionalPropertyTypes` conditional-spread, errno errors / `ProcessExitSignal`, zero runtime deps); how to write each of the three drivers (`ILLMDriver`/`IToolDriver`/`IMemoryDriver`) with a minimal echo-driver example and the reversibility/forkable discipline; how to write an agent + the four gotchas (absolute module path, per-process memory regions, fork/restore re-runs from the top, `--driver` only applies to prompt agents); how to add a syscall (the five files to touch together); and the testing/submitting conventions. Grounded in the real interfaces, not invented.
+- [x] **#046** `docs/COOKBOOK.md` — common patterns (supervision, pipelines, daemons, fork-and-compare)
+  - Nine runnable recipes: supervision tree (`spawn`/`wait(timeoutMs)`/`kill`/respawn), pause-across-reboots (`checkpoint detach` + `restore` + memory-marker idempotency), fork-and-compare (`fork` before writing the marker + `cortex diff`), long-running daemon (`daemon install/run` + restart policy), budgets/limits, tools + the `forkable` reversibility gate (+ MCP mount), IPC (`send`/`recv`), time/determinism (`now`/`random`/`sleep`), and testing an agent against the mock driver. Every snippet mirrors a real `examples/` module and the real syscall surface.
 - [ ] **#047** HN launch post draft
 - [ ] **#048** X / V2EX / 即刻 launch post drafts
 - [ ] **#049** Chinese translations
