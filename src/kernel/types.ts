@@ -456,7 +456,15 @@ export interface WaitResult {
  */
 export type AgentSpec =
   | { readonly module: string; readonly args?: Readonly<Record<string, unknown>> }
-  | { readonly system: string; readonly tools?: readonly string[] };
+  | {
+      readonly system: string;
+      readonly tools?: readonly string[];
+      /** Per-agent LLM request defaults forwarded to the prompt agent's llm_call. */
+      readonly driver?: string;
+      readonly model?: string;
+      readonly maxTokens?: number;
+      readonly temperature?: number;
+    };
 
 /**
  * When and how init should restart a daemon.

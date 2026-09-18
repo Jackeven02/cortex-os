@@ -41,10 +41,10 @@ import { deepseekLLM } from '../drivers/llm/deepseek.js';
 import { openaiLLM } from '../drivers/llm/openai.js';
 import { fsTool } from '../drivers/tool/fs.js';
 import { inmemMemory } from '../drivers/memory/inmem.js';
-import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec } from '../kernel/types.js';
+import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type MemoryRegionPolicy } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
 import { crecPath } from '../kernel/recorder.js';
-import { readAllMetas, readMeta, writeMeta, maxPidOnDisk, type ProcessMeta } from './process_store.js';
+import { readAllMetas, readMeta, writeMeta, maxPidOnDisk, readExitRecord, type ProcessMeta } from './process_store.js';
 
 import { cmdSpawn } from './commands/spawn.js';
 import { cmdPs } from './commands/ps.js';
@@ -192,16 +192,58 @@ export function ensureKernelDirs(dir: string): void {
  * Boot a kernel with default settings for CLI use. The caller is responsible
  * for shutting it down.
  */
+/** Memory driver every CLI-spawned region is backed by. */
+export const DEFAULT_MEMORY_BACKING = 'inmem';
+
+/**
+ * The three standard memory regions every spawned/restored agent gets, with
+ * their documented default copy semantics (docs/STATE.md §2.3): episodic=cow,
+ * semantic=shared, procedural=private. Shared by `spawn` (declares them on the
+ * new process) and by the disk-backed `restoreContext` below (re-declares them
+ * on a restored process so memory_write does not trap ENOENT/EDRIVER).
+ */
+export const DEFAULT_MEMORY_REGIONS: Readonly<Record<string, MemoryRegionPolicy>> = {
+  episodic: { kind: 'cow', backing: DEFAULT_MEMORY_BACKING },
+  semantic: { kind: 'shared', backing: DEFAULT_MEMORY_BACKING },
+  procedural: { kind: 'private', backing: DEFAULT_MEMORY_BACKING },
+};
+
 export async function bootCliKernel(dir: string): Promise<Kernel> {
   ensureKernelDirs(dir);
-  return bootKernel({
+  const kernel = await bootKernel({
     kernelAbiVersion: KERNEL_ABI_VERSION,
     dir,
     loadDrivers: defaultLoadDrivers,
     defaultLLM: defaultLLMName(),
-    defaultMemory: 'inmem',
+    defaultMemory: DEFAULT_MEMORY_BACKING,
+    defaultMemoryBacking: DEFAULT_MEMORY_BACKING,
     autoStart: true,
+    // The kernel's default restoreContext reads an in-memory per-PID map that
+    // is empty in a fresh CLI invocation, so cross-invocation `cortex restore`
+    // would trap EINVAL ("no agent metadata"). The `.csnap` body deliberately
+    // does not carry role/agent — but the CLI persists them in <pid>.meta.json.
+    // Rebuild the RestoreContext from disk, keyed on the checkpoint's pid.
+    restoreContext: (cp) => {
+      const meta = readMeta(dir, cp.pid);
+      if (meta === undefined) {
+        throw new Error(
+          `cortex restore: no on-disk meta for pid ${unbrand(cp.pid)} — ` +
+          `cannot rebuild the agent spec (was it spawned in this cortex home?)`,
+        );
+      }
+      return {
+        role: meta.role,
+        agent: meta.agent,
+        memory: DEFAULT_MEMORY_REGIONS,
+        ppid: cp.parentPid,
+      };
+    },
   });
+  // Seed the PID counter past anything already persisted, so this invocation
+  // never reuses a PID (which would collide on <pid>.crec / <pid>.meta.json —
+  // most visibly when `restore` re-mints the suspended original's PID).
+  kernel.table.advancePidCounterTo(maxPidOnDisk(dir) + 1);
+  return kernel;
 }
 
 /**
@@ -220,19 +262,21 @@ export function parsePid(s: string): ProcessId {
 // =============================================================================
 
 export { unbrand, asProcessId };
-export { readAllMetas, readMeta, writeMeta, maxPidOnDisk, type ProcessMeta };
+export { readAllMetas, readMeta, writeMeta, maxPidOnDisk, readExitRecord, type ProcessMeta };
 export { crecPath };
 
 // =============================================================================
 // Module entry
 // =============================================================================
 
-// Check if this is the main module. Use a robust check that works across
-// node, tsx, and Windows/Unix path separators.
+// Check if this is the main module. pathToFileURL() normalizes Windows
+// backslashes to forward slashes, so entryUrl is isomorphic to import.meta.url
+// and a strict === comparison is reliable. Do NOT add endsWith() fallbacks:
+// they match this module's own URL unconditionally, which would auto-run
+// main() + process.exit() whenever cli/index.ts is imported as a library
+// (e.g. by the smoke suite or a future daemon).
 const entryUrl = pathToFileURL(process.argv[1] ?? '').href;
-const isMain = import.meta.url === entryUrl
-  || import.meta.url.endsWith('cli/index.js')
-  || import.meta.url.endsWith('cli/index.ts');
+const isMain = import.meta.url === entryUrl;
 
 if (isMain) {
   main(process.argv).then((code) => {

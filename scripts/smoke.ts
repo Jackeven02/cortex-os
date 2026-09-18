@@ -201,6 +201,8 @@ import {
   readAllMetas,
   maxPidOnDisk,
   metaPath,
+  readExitRecord,
+  findCheckpointByTag,
   type ProcessMeta,
 } from '../src/cli/process_store.js';
 
@@ -7721,6 +7723,88 @@ async function runCliChecks(): Promise<void> {
     check('crecPath uses processes/ not proc/', () => {
       const p = crecPath(tmp, asProcessId(42));
       assert(p === join(tmp, 'processes', '42.crec'), `path: ${p}`);
+    });
+
+    check('advancePidCounterTo prevents PID reuse across invocations', () => {
+      const clock = (): Timestamp => '2026-01-01T00:00:00.000Z';
+      const table = new ProcessTable({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        recorderFactory: nullRecorderFactory,
+      });
+      // A fresh table starts at PID_FIRST_USER (2).
+      assert(unbrand(table.pidCounter) === 2, `fresh counter should be 2, got ${unbrand(table.pidCounter)}`);
+      // Seeding past an on-disk max of 7 must push the next allocation to 8.
+      table.advancePidCounterTo(8);
+      assert(unbrand(table.pidCounter) === 8, `counter should be 8 after advance, got ${unbrand(table.pidCounter)}`);
+      // A lower value is a no-op (never rewinds the counter).
+      table.advancePidCounterTo(3);
+      assert(unbrand(table.pidCounter) === 8, `counter must not rewind, got ${unbrand(table.pidCounter)}`);
+    });
+
+    await checkAsync('readExitRecord recovers the real exit code from .crec', async () => {
+      const rec = await Recorder.open({ pid: asProcessId(501), dir: join(tmp, 'processes') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z',
+        pid: asProcessId(501),
+        syscall: 'exit',
+        callId: 'exit-1',
+        phase: 'exit',
+        result: { code: 3, reason: 'agent decided to fail' },
+        stateBefore: 'running',
+        stateAfter: 'exiting',
+        reversibility: 'irreversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+      const exit = await readExitRecord(tmp, asProcessId(501));
+      assert(exit !== undefined, 'exit record should be found');
+      assert(exit!.code === 3, `real code 3, got ${exit!.code}`);
+      assert(exit!.reason === 'agent decided to fail', `real reason, got ${exit!.reason}`);
+    });
+
+    await checkAsync('readExitRecord returns undefined when no exit was recorded', async () => {
+      const rec = await Recorder.open({ pid: asProcessId(502), dir: join(tmp, 'processes') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z',
+        pid: asProcessId(502),
+        syscall: 'llm_call',
+        callId: 'c-1',
+        phase: 'trap',
+        error: { errno: 'EDRIVER', message: 'boom' },
+        stateBefore: 'running',
+        stateAfter: 'running',
+        reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+      const exit = await readExitRecord(tmp, asProcessId(502));
+      assert(exit === undefined, 'no exit record => undefined (must NOT be treated as success)');
+    });
+
+    await checkAsync('findCheckpointByTag resolves tag -> chainId from .crec', async () => {
+      const rec = await Recorder.open({ pid: asProcessId(503), dir: join(tmp, 'processes') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z',
+        pid: asProcessId(503),
+        syscall: 'checkpoint',
+        callId: 'ckpt-1',
+        phase: 'exit',
+        args: { tag: 'before-risky', detach: true },
+        result: { chainId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', byteSize: 128 },
+        stateBefore: 'checkpointing',
+        stateAfter: 'suspended',
+        reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+      const chain = await findCheckpointByTag(tmp, 'before-risky');
+      assert(chain === 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', `resolved chainId, got ${chain}`);
+      const missing = await findCheckpointByTag(tmp, 'no-such-tag');
+      assert(missing === undefined, 'unknown tag => undefined');
     });
   } finally {
     rmSync(tmp, { recursive: true, force: true });

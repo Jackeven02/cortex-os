@@ -34,7 +34,8 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec } from '../kernel/types.js';
+import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState } from '../kernel/types.js';
+import { readRecords, crecPath } from '../kernel/recorder.js';
 
 // =============================================================================
 // Types
@@ -45,7 +46,7 @@ export interface ProcessMeta {
   readonly ppid: number | null;
   readonly pgid: number;
   readonly role: string;
-  readonly state: string;
+  readonly state: ProcessState;
   readonly exitCode: number | null;
   readonly exitReason: string | null;
   readonly startedAt: string;
@@ -134,19 +135,73 @@ export function maxPidOnDisk(dir: string): number {
 }
 
 /**
- * Find a checkpoint by tag. Scans the checkpoints directory for a filename
- * containing the tag. Returns the chain ID if found.
+ * Recover a reaped process's REAL exit status from its `.crec` log.
+ *
+ * Once the process table reaps an entry, the in-memory `exitCode` is gone.
+ * The `exit` syscall record (`phase: 'exit'`, `result: { code, reason }`) is
+ * the durable source of truth. `spawn` uses this so it never reports a
+ * failed/crashed run as `code 0: completed`.
+ *
+ * Returns `undefined` when the log is missing or carries no exit record —
+ * e.g. the agent crashed before recording, or was killed by a signal that
+ * never routed through the dispatcher's `exit` path. Callers should treat
+ * `undefined` as "unknown / abnormal", NOT as success.
  */
-export function findCheckpointByTag(dir: string, tag: string): string | undefined {
-  const cpDir = join(dir, 'checkpoints');
-  if (!existsSync(cpDir)) return undefined;
-  for (const file of readdirSync(cpDir)) {
-    if (file.includes(tag) && file.endsWith('.csnap')) {
-      const match = file.match(/_([0-9a-f-]{36})\.csnap$/);
-      if (match) return match[1];
+export async function readExitRecord(
+  dir: string,
+  pid: ProcessId,
+): Promise<{ code: number; reason: string } | undefined> {
+  const file = crecPath(dir, pid);
+  if (!existsSync(file)) return undefined;
+  let found: { code: number; reason: string } | undefined;
+  try {
+    for await (const rec of readRecords(file)) {
+      if (rec.syscall === 'exit' && rec.phase === 'exit' && rec.result !== undefined) {
+        const r = rec.result as { code?: unknown; reason?: unknown };
+        found = {
+          code: typeof r.code === 'number' ? r.code : 0,
+          reason: typeof r.reason === 'string' ? r.reason : 'exit',
+        };
+      }
+    }
+  } catch {
+    // A torn trailing frame is silently dropped by readRecords; any other read
+    // error still yields whatever exit record we already saw (possibly none).
+    return found;
+  }
+  return found;
+}
+
+/**
+ * Resolve a checkpoint tag to its chain ID.
+ *
+ * The tag is NOT in the `.csnap` filename or body — it is recorded in the
+ * checkpointing process's `.crec` (`syscall: 'checkpoint'`, `args.tag`,
+ * `result.chainId`). So we scan every process log and return the chain ID of
+ * the most recent checkpoint whose tag matches. Returns `undefined` if none.
+ */
+export async function findCheckpointByTag(dir: string, tag: string): Promise<string | undefined> {
+  const procDir = processesDir(dir);
+  if (!existsSync(procDir)) return undefined;
+  let latest: { chainId: string; at: string } | undefined;
+  for (const file of readdirSync(procDir)) {
+    if (!file.endsWith('.crec')) continue;
+    try {
+      for await (const rec of readRecords(join(procDir, file))) {
+        if (rec.syscall !== 'checkpoint' || rec.phase !== 'exit') continue;
+        const args = rec.args as { tag?: unknown } | undefined;
+        const result = rec.result as { chainId?: unknown } | undefined;
+        if (args?.tag === tag && typeof result?.chainId === 'string') {
+          if (latest === undefined || rec.timestamp > latest.at) {
+            latest = { chainId: result.chainId, at: rec.timestamp };
+          }
+        }
+      }
+    } catch {
+      // Skip unreadable / torn logs.
     }
   }
-  return undefined;
+  return latest?.chainId;
 }
 
 /**

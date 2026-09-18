@@ -282,11 +282,23 @@ export interface KernelOptions {
  * advertised in v0 (the registry resolution of `ToolSchema` lands with the tool
  * drivers); a model that wants tools must already know them.
  */
-function makePromptAgent(system: string): AgentFn {
+function makePromptAgent(spec: {
+  readonly system: string;
+  readonly driver?: string;
+  readonly model?: string;
+  readonly maxTokens?: number;
+  readonly temperature?: number;
+}): AgentFn {
   return async (ctx: CortexContext): Promise<void> => {
-    const messages: Message[] = [{ role: 'system', content: system }];
+    const messages: Message[] = [{ role: 'system', content: spec.system }];
     for (let turn = 0; turn < PROMPT_AGENT_MAX_TURNS; turn++) {
-      const resp: LLMResponse = await ctx.llm_call({ messages });
+      const resp: LLMResponse = await ctx.llm_call({
+        messages,
+        ...(spec.driver !== undefined ? { driver: spec.driver } : {}),
+        ...(spec.model !== undefined ? { model: spec.model } : {}),
+        ...(spec.maxTokens !== undefined ? { maxTokens: spec.maxTokens } : {}),
+        ...(spec.temperature !== undefined ? { temperature: spec.temperature } : {}),
+      });
       messages.push({ role: 'assistant', content: resp.text ?? '' });
       if (resp.toolCalls.length === 0) return;
       for (const tc of resp.toolCalls) {
@@ -785,6 +797,14 @@ export class Kernel {
    * other error propagates.
    */
   async #driveExit(pid: ProcessId, code: number, reason: string): Promise<void> {
+    // An agent that checkpointed itself with detach:true is now SUSPENDED (or
+    // transiently CHECKPOINTING) and awaiting a future restore. There is no
+    // legal suspended->exiting edge, so driving an exit would only record a
+    // spurious trap. Leave it suspended.
+    const cur = this.table.get(pid);
+    if (cur !== undefined && (cur.state === 'suspended' || cur.state === 'checkpointing')) {
+      return;
+    }
     try {
       await this.dispatcher.invoke(pid, 'exit', code, reason);
     } catch (err) {
@@ -816,7 +836,7 @@ export class Kernel {
       return candidate as AgentFn;
     }
     // `{ system, tools? }` — the built-in prompt-only agent.
-    return makePromptAgent(spec.system);
+    return makePromptAgent(spec);
   }
 
   // ---------------------------------------------------------------------------

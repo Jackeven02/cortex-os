@@ -20,7 +20,7 @@
  */
 
 import { parseArgs } from 'node:util';
-import { defaultKernelDir, parsePid, readMeta, writeMeta } from '../index.js';
+import { defaultKernelDir, parsePid, readMeta, writeMeta, type ProcessMeta } from '../index.js';
 import { type Signal } from '../../kernel/types.js';
 
 const VALID_SIGNALS = new Set([
@@ -104,7 +104,7 @@ EXAMPLES
 
   // Mark as killed.
   const exitCode = SIGNAL_EXIT_CODES[signal] ?? 1;
-  const updatedMeta = {
+  const updatedMeta: ProcessMeta = {
     ...meta,
     state: 'zombie',
     exitCode,

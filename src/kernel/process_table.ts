@@ -351,6 +351,22 @@ export class ProcessTable {
     return asProcessId(this.#nextPid);
   }
 
+  /**
+   * Advance the PID counter so the next allocation is at least `minNext`.
+   * No-op when the counter is already >= `minNext`.
+   *
+   * Used by the CLI to seed a freshly-booted kernel past the highest PID
+   * already persisted on disk (`maxPidOnDisk`). Without this, every new
+   * invocation restarts the counter at PID_FIRST_USER and reuses PIDs,
+   * colliding on `<pid>.crec` / `<pid>.meta.json` — most visibly when
+   * `restore` re-mints the same PID the suspended original already owns.
+   */
+  advancePidCounterTo(minNext: number): void {
+    if (minNext > this.#nextPid) {
+      this.#nextPid = minNext;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // §6.2 Lifecycle: allocate / get / reap
   // ---------------------------------------------------------------------------

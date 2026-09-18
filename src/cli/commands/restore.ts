@@ -59,7 +59,7 @@ EXAMPLES
   let chainId = values.chain !== undefined ? asChainId(values.chain) : undefined;
 
   if (chainId === undefined && values.tag !== undefined) {
-    const found = findCheckpointByTag(dir, values.tag);
+    const found = await findCheckpointByTag(dir, values.tag);
     if (found === undefined) {
       console.error(`cortex restore: no checkpoint found with tag '${values.tag}'`);
       // Show available checkpoints.
