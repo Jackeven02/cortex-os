@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 160" width="620" height="160" role="img" aria-labelledby="cortex-wordmark-title">
+  <title id="cortex-wordmark-title">Cortex</title>
+  <g transform="translate(16,16) scale(1.25)">
+    <g fill="none" stroke="#2C2C2A" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="64" cy="64" r="48" stroke-width="10" stroke-dasharray="242.9 58.7" stroke-dashoffset="12.57"/>
+      <circle cx="64" cy="64" r="34" stroke-width="7" stroke-dasharray="172.1 41.5" stroke-dashoffset="8.9"/>
+      <path d="M68.8 58.3 L80.7 44.1 L74.9 23.4 M80.7 44.1 L102.1 46.3" stroke-width="7"/>
+    </g>
+    <g fill="#0F6E56">
+      <circle cx="74.9" cy="23.4" r="6"/>
+      <circle cx="102.1" cy="46.3" r="6"/>
+      <circle cx="64" cy="64" r="8"/>
+    </g>
+  </g>
+  <text x="180" y="114" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="96" font-weight="500" letter-spacing="-2" fill="#2C2C2A">cortex</text>
+</svg>

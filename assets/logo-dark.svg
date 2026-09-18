@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-labelledby="cortex-logo-dark-title">
+  <title id="cortex-logo-dark-title">Cortex</title>
+  <g fill="none" stroke="#F1EFE8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="64" cy="64" r="48" stroke-width="10" stroke-dasharray="242.9 58.7" stroke-dashoffset="12.57"/>
+    <circle cx="64" cy="64" r="34" stroke-width="7" stroke-dasharray="172.1 41.5" stroke-dashoffset="8.9"/>
+    <path d="M68.8 58.3 L80.7 44.1 L74.9 23.4 M80.7 44.1 L102.1 46.3" stroke-width="7"/>
+  </g>
+  <g fill="#5DCAA5">
+    <circle cx="74.9" cy="23.4" r="6"/>
+    <circle cx="102.1" cy="46.3" r="6"/>
+    <circle cx="64" cy="64" r="8"/>
+  </g>
+</svg>

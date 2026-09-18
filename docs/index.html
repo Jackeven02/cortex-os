@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>cortex — an operating system for AI agents</title>
 <meta name="description" content="Today's agent frameworks treat an agent as a function. Cortex treats it as a process: PIDs, fork, signals, IPC, checkpoint/restore, supervision trees, syscall traces, token budgets." />
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='13' fill='none' stroke='%23ff6b5b' stroke-width='4'/><circle cx='16' cy='16' r='5' fill='%23ff6b5b'/></svg>" />
+<link rel="icon" type="image/svg+xml" href="../assets/favicon.svg" />
 <style>
   :root {
     --bg: #0a0c10;
@@ -186,6 +186,7 @@
 
 <main id="top">
   <div class="wrap hero">
+    <div class="hero-mark" role="img" aria-label="The Cortex mark: layered arcs opening into a forked process tree"><svg viewBox="0 0 128 128" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="64" cy="64" r="48" stroke-width="10" stroke-dasharray="242.9 58.7" stroke-dashoffset="12.57"/><circle cx="64" cy="64" r="34" stroke-width="7" stroke-dasharray="172.1 41.5" stroke-dashoffset="8.9"/><path d="M68.8 58.3 L80.7 44.1 L74.9 23.4 M80.7 44.1 L102.1 46.3" stroke-width="7"/></g><g fill="var(--accent)"><circle cx="74.9" cy="23.4" r="6"/><circle cx="102.1" cy="46.3" r="6"/><circle cx="64" cy="64" r="8"/></g></svg></div>
     <span class="pill">v0 · Phase 0–4 complete · TypeScript / Node 22+</span>
     <h1>An operating system<br />for <span class="grad">AI agents</span>.</h1>
     <p class="lede">
@@ -362,7 +363,7 @@ npx tsx src/cli/index.ts diff 2 3</pre>
 <footer>
   <div class="wrap fin">
     <div>
-      <span class="brand" style="font-size:15px"><span class="dot" style="width:12px;height:12px;border-width:2.5px"></span>cortex</span>
+      <span class="brand" style="font-size:15px;display:inline-flex;vertical-align:middle"><svg viewBox="0 0 128 128" style="width:17px;height:17px" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="64" cy="64" r="48" stroke-width="10" stroke-dasharray="242.9 58.7" stroke-dashoffset="12.57"/><circle cx="64" cy="64" r="34" stroke-width="7" stroke-dasharray="172.1 41.5" stroke-dashoffset="8.9"/><path d="M68.8 58.3 L80.7 44.1 L74.9 23.4 M80.7 44.1 L102.1 46.3" stroke-width="7"/></g><g fill="var(--accent)"><circle cx="74.9" cy="23.4" r="6"/><circle cx="102.1" cy="46.3" r="6"/><circle cx="64" cy="64" r="8"/></g></svg>cortex</span>
       &nbsp;· MIT licensed · Design lineage: Plan 9, Erlang/OTP, MINIX, seL4.
     </div>
     <div style="display:flex;gap:20px;flex-wrap:wrap">

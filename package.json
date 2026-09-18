@@ -33,8 +33,10 @@
   "files": [
     "dist",
     "MANIFESTO.md",
+    "MANIFESTO.zh-CN.md",
     "README.md",
     "README.zh-CN.md",
+    "assets",
     "docs"
   ],
   "scripts": {
