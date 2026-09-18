@@ -107,6 +107,48 @@ Pass it inline on headless/agent runs:
 npm publish --otp=123456
 ```
 
+### If the npm website shows a bot check
+
+`www.npmjs.com` sits behind Cloudflare, and a **proxy/VPN exit IP** is the single
+most common reason it refuses you. The interstitial lists three possible causes
+— abnormal browsing speed, JavaScript blocked, or *"your IP address is the same
+as a network robot"* — and when you are on a shared proxy, the third one is the
+real one. Datacenter and VPN IPs are shared with a lot of scrapers, so they score
+as high risk. You can confirm it from the machine:
+
+```bash
+curl -s https://ipinfo.io/<the-ip-in-the-message>/json
+```
+
+If `org` comes back as a hosting/VPN company rather than a residential ISP, that
+is your answer. Fixes, in order of how well they work:
+
+1. **Turn the proxy off and register from your real connection.** Residential IPs
+   are barely challenged. `registry.npmjs.org` is reachable from China without a
+   proxy — it is only slow, not blocked — and installs go through the mirror
+   anyway, so nothing else in your workflow needs the proxy.
+2. **Use mobile data.** A phone hotspot is a different IP and usually passes.
+3. **Register from the CLI instead of the website.** The challenge guards the
+   *website*; the registry API is a different path:
+   ```bash
+   npm login --auth-type=legacy --registry https://registry.npmjs.org
+   ```
+   `--auth-type=legacy` skips the browser hand-off and talks to the registry API
+   directly, so there is no HTML captcha to get stuck on.
+4. A "residential" egress node from your provider will pass where a shared one
+   will not — but this is the expensive option, and 1 or 2 are usually enough.
+
+Diagnose before you retry, because the two plausible causes need opposite fixes.
+If the page never even renders the form, it is the **IP** (reason 3) — and no
+amount of browser switching helps, since incognito does not change your IP. If the
+form renders and *then* the challenge loops, suspect reason 2 instead: a script
+blocker or ad-blocker eating the JS, which a clean browser profile or a different
+browser genuinely does fix. And **do not retry rapidly** either way — the
+challenge is rate-limited and tightens.
+
+Also remember that signup alone is not enough: you must click the **verification
+link in the email** before the registry will accept a publish.
+
 ---
 
 ## Publish
