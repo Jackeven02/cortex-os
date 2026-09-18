@@ -27,6 +27,7 @@ COMMANDS
   send         Send an IPC message to a process or channel
   limit        Set or show resource budgets per process
   audit        Surface tools untagged for reversibility
+  daemon       Register/run long-lived supervised agents (install/list/uninstall/run)
   help         Show this help
 
 GLOBAL OPTIONS

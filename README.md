@@ -58,9 +58,16 @@ $ cortex kill 1234
 # ... next day ...
 $ cortex restore --tag "before risky edit"
 [restored as pid 1502]
+
+# Register a long-running agent to start on boot, and supervise it
+$ cortex daemon install inbox-watcher --role inbox-watcher \
+    --module ./examples/checkpoint-agent.ts --restart on-failure
+[daemon inbox-watcher] installed (role=inbox-watcher, restart=on-failure)
+$ cortex daemon run inbox-watcher
+[daemon inbox-watcher pid 2] running (restart=on-failure)
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit` and `audit` are implemented and covered by the smoke suite. `attach` is a read-only, disk-based follow-mode syscall trace in v0 (it tails the on-disk `.crec`, not a live in-memory process — see its honest caveat in [BACKLOG.md](./BACKLOG.md) #031); the interactive send-half lands with `cortex daemon install` (#039). All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a read-only, disk-based follow-mode syscall trace in v0 (it tails the on-disk `.crec`, not a live in-memory process — see its honest caveat in [BACKLOG.md](./BACKLOG.md) #031); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039). All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 
@@ -70,7 +77,7 @@ Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `di
 
 **Phases 1–3 — largely complete.** The kernel boots; all ten kernel modules plus the driver registry are in; all seven drivers ship (mock / deepseek / openai LLM, MCP and filesystem tools, inmem and sqlite memory); most of the CLI works. `cortex spawn → llm_call → exit → reap` runs, and checkpoint/restore survives across separate CLI invocations. Known v0 gaps are recorded honestly in [BACKLOG.md](./BACKLOG.md), not hidden.
 
-**Phase 4 — Killer demos.** All three are polished and captured as replays. Demo A (supervision tree): coders each generate one section of a README for a fictional library (see `examples/supervision-tree.ts`, [`docs/demo-a.html`](./docs/demo-a.html), `docs/demo-a.gif`). Demo B (pause across reboots): an inbox-watcher classifies tickets, checkpoints mid-run, and resumes after a reboot (see `examples/checkpoint-agent.ts`, [`docs/demo-b.html`](./docs/demo-b.html), `docs/demo-b.gif`). Demo C (fork and compare): a coder forks to explore two dedup strategies in parallel, then `cortex diff` lines up the branches so you keep the winner (see `examples/fork-compare-agent.ts`, [`docs/demo-c.html`](./docs/demo-c.html), `docs/demo-c.gif`). `cortex attach` now ships as a follow-mode syscall trace (BACKLOG #031). Still pending: `cortex daemon install` (#039) — the long-running agent that makes `attach`'s interactive send-half real.
+**Phase 4 — Killer demos.** All three are polished and captured as replays. Demo A (supervision tree): coders each generate one section of a README for a fictional library (see `examples/supervision-tree.ts`, [`docs/demo-a.html`](./docs/demo-a.html), `docs/demo-a.gif`). Demo B (pause across reboots): an inbox-watcher classifies tickets, checkpoints mid-run, and resumes after a reboot (see `examples/checkpoint-agent.ts`, [`docs/demo-b.html`](./docs/demo-b.html), `docs/demo-b.gif`). Demo C (fork and compare): a coder forks to explore two dedup strategies in parallel, then `cortex diff` lines up the branches so you keep the winner (see `examples/fork-compare-agent.ts`, [`docs/demo-c.html`](./docs/demo-c.html), `docs/demo-c.gif`). `cortex attach` ships as a follow-mode syscall trace (BACKLOG #031), and `cortex daemon install/run` registers and supervises long-lived agents, the piece that makes `attach`'s interactive send-half possible (BACKLOG #039). **Phase 3 is now complete** — every command in the demo above works.
 
 Demo A is worth calling out because it changed the kernel: agents used to run to completion inside the quantum that dispatched them, so a parent parked in `wait()` held its own tick and its children could never run — `wait()` deadlocked by construction, and a supervision tree could not be written at all. The continuation is now cooperative (see PROCESS.md §8.2), so this works with no orchestrator:
 

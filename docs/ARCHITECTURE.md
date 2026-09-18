@@ -481,6 +481,9 @@ For v0, **only install drivers you trust**. Same advice as npm packages generall
 │   └── inmem/                        # serialized on checkpoint only
 ├── channels/
 │   └── <channelid>.json              # persisted IPC queues (post-v0)
+├── units/                            # generated OS service units (daemon install)
+│   ├── cortex-<name>.service         # systemd (linux)
+│   └── sh.cortex.daemon.<name>.plist # launchd (darwin)
 └── daemons.json                      # registered daemon specs
 ```
 

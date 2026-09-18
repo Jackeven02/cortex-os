@@ -219,6 +219,18 @@ import {
 import { cmdDiff } from '../src/cli/commands/diff.js';
 import { cmdTrace } from '../src/cli/commands/trace.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
+import {
+  listDaemons,
+  readDaemon,
+  writeDaemon,
+  deleteDaemon,
+} from '../src/cli/daemon_store.js';
+import {
+  cmdDaemon,
+  generateServiceUnit,
+  enableCommand,
+  unitPathFor,
+} from '../src/cli/commands/daemon.js';
 
 import {
   InMemMemoryDriver,
@@ -8999,6 +9011,133 @@ async function runCliChecks(): Promise<void> {
     rmSync(tmp, { recursive: true, force: true });
   }
 }
+
+// =============================================================================
+// CLI daemon checks (#039)
+// =============================================================================
+
+async function runDaemonChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-daemon-'));
+  mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevLog = console.log;
+  const prevErr = console.error;
+
+  try {
+    process.env['CORTEX_HOME'] = tmp;
+
+    await checkAsync('cortex daemon install persists a DaemonSpec to daemons.json', async () => {
+      const modulePath = join(tmp, 'crash-agent.ts');
+      writeFileSync(modulePath, `export default async function crashAgent(ctx: any): Promise<void> { ctx.exit(1, 'boom'); }\n`);
+      console.log = prevLog; console.error = prevErr;
+      const code = await cmdDaemon(['install', 'watcher', '--role', 'inbox-watcher', '--module', modulePath, '--restart', 'on-failure', '--max-restarts', '5', '--backoff-ms', '10']);
+      assert(code === 0, `exit 0, got ${code}`);
+      const stored = readDaemon(tmp, 'watcher');
+      assert(stored !== undefined, 'daemon registered');
+      assert(stored!.spec.role === 'inbox-watcher', `role, got ${stored!.spec.role}`);
+      assert(stored!.spec.restart?.kind === 'on-failure', 'restart kind');
+      assert(stored!.spec.restart?.maxRestarts === 5, 'maxRestarts');
+      assert(stored!.spec.restart?.backoffMs === 10, 'backoffMs');
+      assert('module' in stored!.spec.agent, 'agent is a module spec');
+      assert(existsSync(join(tmp, 'daemons.json')), 'daemons.json written');
+    });
+
+    await checkAsync('cortex daemon install rejects a bad name and a bad restart kind', async () => {
+      console.log = prevLog; console.error = prevErr;
+      const badName = await cmdDaemon(['install', 'has space', '--role', 'x', '--system', 'y']);
+      assert(badName === 1, `bad name exit 1, got ${badName}`);
+      const badRestart = await cmdDaemon(['install', 'ok', '--role', 'x', '--system', 'y', '--restart', 'sometimes']);
+      assert(badRestart === 1, `bad restart exit 1, got ${badRestart}`);
+    });
+
+    await checkAsync('cortex daemon list shows the registered daemon', async () => {
+      console.log = prevLog; console.error = prevErr;
+      let out = '';
+      console.log = (...parts: unknown[]): void => { out += parts.map((p) => String(p)).join(' ') + '\n'; };
+      const code = await cmdDaemon(['list']);
+      console.log = prevLog;
+      assert(code === 0, `exit 0, got ${code}`);
+      assert(out.includes('watcher'), 'name listed');
+      assert(out.includes('inbox-watcher'), 'role listed');
+      assert(out.includes('on-failure'), 'restart policy listed');
+    });
+
+    await checkAsync('cortex daemon uninstall removes the spec (and the unit file)', async () => {
+      console.log = prevLog; console.error = prevErr;
+      // Create the unit at the path uninstall will look for (platform-dependent;
+      // on win32 this is undefined and there is no unit file to remove).
+      const unit = unitPathFor(process.platform, 'watcher', tmp);
+      if (unit !== undefined) {
+        mkdirSync(join(tmp, 'units'), { recursive: true });
+        writeFileSync(unit, '[Unit]\n');
+        assert(existsSync(unit), 'unit pre-existing');
+      }
+      const code = await cmdDaemon(['uninstall', 'watcher']);
+      assert(code === 0, `exit 0, got ${code}`);
+      assert(readDaemon(tmp, 'watcher') === undefined, 'spec removed');
+      if (unit !== undefined) assert(!existsSync(unit), 'unit file removed');
+    });
+
+    await checkAsync('generateServiceUnit renders linux + darwin units; win32 has no file', () => {
+      const linux = generateServiceUnit('linux', 'watcher', 'node /x/cli/index.ts', tmp, 'on-failure');
+      assert(linux.path.includes('units') && linux.path.includes('cortex-watcher.service'), `linux path, got ${linux.path}`);
+      assert(linux.contents.includes('[Unit]'), 'has [Unit]');
+      assert(linux.contents.includes('ExecStart=node /x/cli/index.ts daemon run watcher'), 'exec start');
+      assert(linux.contents.includes('Restart=on-failure'), 'restart kind');
+      const darwin = generateServiceUnit('darwin', 'watcher', 'node /x/cli/index.ts', tmp, 'always');
+      assert(darwin.path.includes('units') && darwin.path.includes('sh.cortex.daemon.watcher.plist'), 'darwin path');
+      assert(darwin.contents.includes('<plist'), 'plist');
+      assert(darwin.contents.includes('<string>daemon</string>'), 'argv has daemon');
+      assert(darwin.contents.includes('<string>run</string>'), 'argv has run');
+      assert(darwin.contents.includes('RestartSec') === false, 'launchd uses KeepAlive not RestartSec');
+      assert(unitPathFor('win32', 'watcher', tmp) === undefined, 'win32 has no unit file path');
+    });
+
+    await checkAsync('enableCommand is correct per platform', () => {
+      assert(enableCommand('linux', 'watcher', '/u/cortex-watcher.service') === 'systemctl --user enable --now cortex-watcher.service', 'linux');
+      assert(enableCommand('darwin', 'watcher', '/u/sh.cortex.daemon.watcher.plist') === 'launchctl load "/u/sh.cortex.daemon.watcher.plist"', 'darwin');
+      assert(enableCommand('win32', 'watcher', '').includes('schtasks'), 'windows schtasks');
+    });
+
+    await checkAsync('cortex daemon run supervises a crashing agent (restart policy fires)', async () => {
+      // Re-register the crash agent with a tiny backoff so restarts are visible
+      // within a short --max-runtime-ms window.
+      const modulePath = join(tmp, 'crash-agent.ts');
+      writeFileSync(modulePath, `export default async function crashAgent(ctx: any): Promise<void> { ctx.exit(1, 'boom'); }\n`);
+      console.log = prevLog; console.error = prevErr;
+      writeDaemon(tmp, {
+        name: 'crasher',
+        spec: {
+          role: 'crasher',
+          agent: { module: `file://${modulePath}` },
+          restart: { kind: 'on-failure', maxRestarts: 50, backoffMs: 10 },
+          memory: undefined,
+        },
+        installedAt: new Date().toISOString(),
+      });
+      const code = await cmdDaemon(['run', 'crasher', '--max-runtime-ms', '500']);
+      assert(code === 0, `run exit 0, got ${code}`);
+      const crecs = readdirSync(join(tmp, 'processes')).filter((f) => f.endsWith('.crec'));
+      assert(crecs.length >= 2, `restart produced >= 2 .crec files (got ${crecs.length})`);
+    });
+
+    await checkAsync('cortex daemon run with an unknown name fails', async () => {
+      console.log = prevLog; console.error = prevErr;
+      const code = await cmdDaemon(['run', 'ghost', '--max-runtime-ms', '100']);
+      assert(code === 1, `exit 1, got ${code}`);
+    });
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -9015,6 +9154,7 @@ await runDiffChecks();
 await runInMemChecks();
 await runSqliteChecks();
 await runCliChecks();
+await runDaemonChecks();
 await runBootChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
