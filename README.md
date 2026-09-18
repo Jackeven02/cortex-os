@@ -71,6 +71,38 @@ Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `di
 
 ---
 
+## Install
+
+```bash
+npm i -g cortex-agent-os     # puts `cortex` and `ctx` on your PATH
+cortex help
+```
+
+Or without installing anything:
+
+```bash
+npx cortex-agent-os help
+```
+
+Requires **Node 22+**. One runtime dependency (`cborg`, for the syscall log), and
+no API key is needed to try it — the mock driver is deterministic and offline.
+
+Working on Cortex itself instead? Clone it and run the suite:
+
+```bash
+git clone https://github.com/Jackeven02/cortex-os
+cd cortex-os && npm install
+unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
+npx tsx scripts/smoke.ts                # 479 assertions, 0 failures
+```
+
+> **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
+> shorter name as too similar to the already-registered `cortexos` — the two are
+> identical once punctuation is stripped. The repository name did not change, and
+> neither did the binaries: you still type `cortex`.
+
+---
+
 ## Status
 
 **Released as [`v0.1.1`](./CHANGELOG.md)** (2026-09-19) — a one-defect patch on `v0.1.0`, the first tagged release, which covers Phases 0–5. The `0.x` is honest: the syscall ABI is not frozen until `1.0.0`, so a minor bump may carry a breaking change to the ABI or the state model. If you build against Cortex today, pin the exact version. (Phases are build milestones; the versions are the releases.)

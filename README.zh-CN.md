@@ -71,6 +71,34 @@ $ cortex daemon run inbox-watcher
 
 ---
 
+## 安装
+
+```bash
+npm i -g cortex-agent-os     # 把 `cortex` 和 `ctx` 装到 PATH 上
+cortex help
+```
+
+不想安装也可以直接跑：
+
+```bash
+npx cortex-agent-os help
+```
+
+要求 **Node 22+**。只有一个运行时依赖（`cborg`，用于 syscall 日志）。想试一下**不需要任何 API key** —— mock 驱动是确定性的、完全离线。
+
+想改 Cortex 本身？克隆下来跑测试套件：
+
+```bash
+git clone https://github.com/Jackeven02/cortex-os
+cd cortex-os && npm install
+unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
+npx tsx scripts/smoke.ts                # 479 项断言，0 失败
+```
+
+> **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
+
+---
+
 ## 当前状态
 
 **已发布 [`v0.1.1`](./CHANGELOG.md)**（2026-09-19）—— 在 `v0.1.0`（第一个打 tag 的版本，覆盖 Phase 0–5）之上的单缺陷补丁。这个 `0.x` 是诚实的：syscall ABI 到 `1.0.0` 才冻结，所以小版本号提升可能带着 ABI 或状态模型的破坏性变更。今天要基于 Cortex 开发的话，请锁死确切版本。（Phase 是建设阶段，版本号才是发布。）
