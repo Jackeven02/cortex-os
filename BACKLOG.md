@@ -148,10 +148,11 @@ Three demos that prove the abstraction matters. Each one becomes a GIF in the RE
   - `docs/launch/x.md` — an 8-post thread (each ≤280 chars): thesis, primitive list, the reboot demo, a supervisor code block (`wait(pid, {timeoutMs})` + `kill`), fork-as-search, "why did it do that?" recording, an honest-gaps post, and the repo.
   - `docs/launch/v2ex.md` — `[分享创造]` post in Chinese; same thesis, written for a skeptical dev audience (node-tag friendly, honest gaps up front, a ready-made "vs Temporal / Erlang" section, and a note to reflow code fences since V2EX's GFM support is limited).
   - `docs/launch/jike.md` — three short 即刻 posts staggered over time, leading with the intuition (not syscall names), then the reboot demo, then fork + the honest caveats; notes on copy-pasteable repo link and Demo B GIF.
-- [ ] **#049** Chinese translations
-  - [x] `README.zh-CN.md` → this commit
-  - [ ] `MANIFESTO.zh-CN.md`
-  - [ ] `docs/STATE.zh-CN.md`
+- [x] **#049** Chinese translations
+  - [x] `README.zh-CN.md` — refreshed to mirror the current English README (it was stuck at "Phase 0 / design phase", still claimed "这些现在都跑不了" and "18 syscalls", and had no HACKING/COOKBOOK rows). Now: Phase 0–4 status, the demo A/B/C transcripts, the `daemon` example, the 19-syscall doc table, and a Contributing section pointing at HACKING.md.
+  - [x] `MANIFESTO.zh-CN.md` — full translation of the manifesto, linked both ways with the English original. Status line kept in sync (Phases 0–4 complete, 19 syscalls).
+  - [x] `docs/STATE.zh-CN.md` — full translation of the state contract (the seven state categories, fork taxonomy, checkpoint format, the irreversible-action doctrine, open questions), code blocks and type signatures left verbatim. Linked both ways.
+  - While translating, found and fixed three stale claims in the **English** sources (documents-are-contract): `STATE.md` §7 said the types "will live in `src/kernel/state.ts`" and showed `ProcessId = number` — they live in `src/kernel/types.ts` and the three id types are branded; `README.md` badges said "design phase" / "Node 20+" and the ABI row said "18 syscalls".
 - [ ] **#050** Logo (something evocative of layers, nuclei, or branching — not a brain clip-art)
 
 ---

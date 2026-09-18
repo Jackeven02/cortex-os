@@ -2,9 +2,9 @@
 
 > An operating system for AI agents.
 
-[![status](https://img.shields.io/badge/status-design%20phase-orange)](./MANIFESTO.md)
+[![status](https://img.shields.io/badge/status-v0%20%C2%B7%20phases%200%E2%80%934%20complete-brightgreen)](./MANIFESTO.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
-[![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2020%2B-3178c6)](./package.json)
+[![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
 **English** | [简体中文](./README.zh-CN.md)
 

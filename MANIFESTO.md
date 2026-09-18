@@ -4,6 +4,8 @@
 
 > **Status:** v0. Phases 0–4 are built — the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. This document is the *why*, and it has not changed.
 
+**English** | [简体中文](./MANIFESTO.zh-CN.md)
+
 ---
 
 ## I. The Batch Era

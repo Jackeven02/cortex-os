@@ -2,6 +2,8 @@
 
 > The hardest document in cortex. Everything else is plumbing.
 
+**English** | [简体中文](./STATE.zh-CN.md)
+
 ---
 
 ## 1. Why this document exists
@@ -287,12 +289,17 @@ Full state machine in `PROCESS.md`. Quick summary:
 
 ## 7. TypeScript types
 
-The kernel-side contract. These types will live in `src/kernel/state.ts` and be re-exported from `cortex-os`.
+The kernel-side contract. These types live in `src/kernel/types.ts` (the
+compiler-enforced form of the ABI) and are re-exported from `cortex-os`. The
+three id types are **branded** — `Brand<T, B>` — so a `ChainId` can never be
+passed where a `ProcessId` is expected; construct them with the kernel's
+`asProcessId()` / `asChainId()` / `asSyscallOffset()` and strip the brand with
+`unbrand()` at the kernel↔driver boundary.
 
 ```typescript
-export type ProcessId = number;
-export type ChainId = string;        // UUID linking checkpoints
-export type SyscallOffset = number;  // byte offset in .crec log
+export type ProcessId = Brand<number, 'ProcessId'>;
+export type ChainId = Brand<string, 'ChainId'>;        // UUID linking checkpoints
+export type SyscallOffset = Brand<number, 'SyscallOffset'>;  // byte offset in .crec log
 
 export type Reversibility = 'reversible' | 'idempotent' | 'irreversible';
 
