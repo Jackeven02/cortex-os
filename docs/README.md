@@ -6,7 +6,7 @@ This directory holds the technical specifications. **Read them in this order:**
 
 2. **[PROCESS.md](./PROCESS.md)** — the agent process lifecycle. Eight states, twelve legal transitions, full signal table, scheduling policy, daemon/supervision posture, TypeScript types, seven open questions.
 
-3. **[ABI.md](./ABI.md)** — the syscall contract. **Eighteen syscalls**, full TypeScript types, error model, recording format, three driver interfaces (LLM, Tool, Memory), seven open questions. If a behavior is not in the ABI, it does not exist.
+3. **[ABI.md](./ABI.md)** — the syscall contract. **Nineteen syscalls**, full TypeScript types, error model, recording format, three driver interfaces (LLM, Tool, Memory), seven open questions. If a behavior is not in the ABI, it does not exist.
 
 4. **[ARCHITECTURE.md](./ARCHITECTURE.md)** — kernel modules and data flow. **Eleven modules** (recorder, process_table, signals, ipc, memory, checkpoint, fork, scheduler, init, syscall_dispatcher, driver_registry), the full syscall lifecycle trace, driver model, persistence layout (`.cortex/`), boot sequence, concurrency model, file layout, six open questions, and an honest "what we will get wrong" prediction section.
 

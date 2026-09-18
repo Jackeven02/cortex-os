@@ -2,7 +2,7 @@
 
 *An operating system for AI agents.*
 
-> **Status:** v0 design phase. Nothing here works yet. Everything here is the point.
+> **Status:** v0. Phases 0–4 are built — the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. This document is the *why*, and it has not changed.
 
 ---
 
@@ -131,13 +131,15 @@ This document is the **why**. The next documents are the **how**:
 
 | Document | Purpose | Status |
 |---|---|---|
-| `docs/STATE.md` | What agent state *is*; fork & checkpoint semantics | **drafted — read this first** |
-| `docs/PROCESS.md` | The agent lifecycle and state machine | **drafted — 8 states, 12 transitions** |
-| `docs/ABI.md` | The syscall contract, in TypeScript types | **drafted — 18 syscalls** |
-| `docs/ARCHITECTURE.md` | Kernel modules and data flow | **drafted — 11 modules, full syscall lifecycle** |
+| `docs/STATE.md` | What agent state *is*; fork & checkpoint semantics | **implemented — read this first** |
+| `docs/PROCESS.md` | The agent lifecycle and state machine | **implemented — 8 states, 12 transitions** |
+| `docs/ABI.md` | The syscall contract, in TypeScript types | **implemented — 19 syscalls** |
+| `docs/ARCHITECTURE.md` | Kernel modules and data flow | **implemented — 11 modules, full syscall lifecycle** |
+| `docs/HACKING.md` | How to contribute, how to write a driver | **done** |
+| `docs/COOKBOOK.md` | Recipes: supervision, pause/resume, fork, daemons | **done** |
 | `BACKLOG.md` | The first issues, prioritized | live |
 
-Then code. **Phase 0 is design-complete; Phase 1 (kernel skeleton) starts next.**
+Then code — and the code is written. **Phases 0–4 are complete**; Phase 5 (launch) is in progress.
 
 ---
 

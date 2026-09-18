@@ -124,7 +124,7 @@ import type { SyscallRecordInput } from './recorder.js';
 // =============================================================================
 
 /**
- * The eighteen v0 syscalls (docs/ABI.md §4). `forkable()` is a structured
+ * The nineteen v0 syscalls (docs/ABI.md §4). `forkable()` is a structured
  * wrapper, not a syscall, and is exposed separately as `runForkable`.
  */
 export type SyscallName =

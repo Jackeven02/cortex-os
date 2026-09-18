@@ -91,8 +91,10 @@ changes deserve an issue first (they are hard to reverse).
   `trap('ESTATE', 'op', { message })`. `exit()` is *not* an error — it throws a
   `ProcessExitSignal` (a control-flow signal).
 
-- **No runtime dependencies.** Only `cborg`. Adding a dependency needs a very
-  good reason.
+- **Exactly one runtime dependency: `cborg`** (the CBOR codec for the append-only
+  syscall log). Everything else is a devDependency, and `scripts/smoke.ts` runs
+  on `node --test`-free plain assertions rather than pulling in a framework.
+  Adding a second runtime dependency needs a very good reason.
 
 ---
 

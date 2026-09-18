@@ -12,7 +12,7 @@ Read [`STATE.md`](./STATE.md) and [`PROCESS.md`](./PROCESS.md) first. This docum
 
 Every OS lives or dies by its syscall ABI. POSIX is ~300 syscalls and fifty years of compatibility. Plan 9 fit the whole world into ~30. seL4 fits a verifiable kernel into ~20.
 
-Cortex aims for **eighteen** in v0. Not because eighteen is magic, but because every syscall we add is one more thing every driver, every test, every recording, every replay engine has to handle. Syscalls are forever. We pick carefully.
+Cortex aims for **nineteen** in v0. Not because nineteen is magic, but because every syscall we add is one more thing every driver, every test, every recording, every replay engine has to handle. Syscalls are forever. We pick carefully.
 
 This document is the contract. The kernel implements it. Agents depend on it. Drivers conform to it. The recording format encodes it. If we get it right, third parties can build cortex-compatible tooling without ever talking to us. If we get it wrong, we will spend years apologizing.
 
@@ -108,7 +108,7 @@ The distinction matters for replay. Traps are deterministic. Return-with-errors 
 
 ## 4. The syscalls
 
-Eighteen syscalls, grouped by purpose.
+Nineteen syscalls, grouped by purpose.
 
 ### 4.1 Process control
 
@@ -601,7 +601,7 @@ export interface CortexContext {
 }
 ```
 
-**Eighteen syscalls.** Plus identity properties. Plus `forkable()` as a structured wrapper around the reversibility enforcement.
+**Nineteen syscalls.** Plus identity properties. Plus `forkable()` as a structured wrapper around the reversibility enforcement.
 
 That is the whole kernel surface. Anything else lives in user space.
 
