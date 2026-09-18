@@ -22,6 +22,7 @@ COMMANDS
   checkpoint   Snapshot a process to disk
   restore      Restore a process from a checkpoint
   fork         Clone a running process at its current state
+  diff         Compare two forked branches' syscall logs
   send         Send an IPC message to a process or channel
   limit        Set or show resource budgets per process
   audit        Surface tools untagged for reversibility
@@ -39,13 +40,17 @@ EXAMPLES
   cortex checkpoint 1234 --tag "before risky edit"
   cortex restore --tag "before risky edit"
   cortex fork 1234
+  cortex diff 1234 1240
   cortex limit 1234 --tokens 10000
   cortex audit
 
 ENVIRONMENT
-  CORTEX_HOME        Kernel state directory (default: ./.cortex)
-  DEEPSEEK_API_KEY   If set, the deepseek LLM driver is registered
-  OPENAI_API_KEY     If set, the openai LLM driver is registered
+  CORTEX_HOME          Kernel state directory (default: ./.cortex)
+  DEEPSEEK_API_KEY     If set, the deepseek LLM driver is registered
+  OPENAI_API_KEY       If set, the openai LLM driver is registered
+  CORTEX_MCP_COMMAND   Mount an MCP server as a tool namespace, e.g. npx
+  CORTEX_MCP_ARGS      Whitespace-separated args for that server
+  CORTEX_MCP_NAMESPACE Tool-name prefix for MCP tools (default: mcp)
 
 DOCUMENTATION
   MANIFESTO.md         Why cortex exists

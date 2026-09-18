@@ -24,44 +24,49 @@
  * exercises it end to end.
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * The execution model: run-to-completion (v0)
+ * The execution model: a cooperative continuation
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * The scheduler (docs/ARCHITECTURE.md §4.8) dispatches **one** process per
- * `tick()`, moves it READY → RUNNING, `await`s the `resume` continuation, and
- * then inspects the table: still RUNNING ⇒ the continuation *yielded* (re-queue
- * round-robin); BLOCKED ⇒ parked; EXITING/ZOMBIE ⇒ gone. That contract forces
- * the continuation to be the unit of CPU time.
+ * `tick()`, moves it READY → RUNNING, calls the `resume` continuation, and then
+ * inspects the table: BLOCKED ⇒ parked; EXITING/ZOMBIE ⇒ gone; still RUNNING ⇒
+ * the body either yielded (re-queue round-robin) or is still live inside its
+ * own Promise (report `parked`, leave it RUNNING, do not re-queue).
  *
- * v0 implements the simplest continuation that satisfies it: **run the agent
- * function to completion inside one quantum.** The agent's `await`s still yield
- * to Node's event loop (so timers, driver I/O, and other kernels' work
- * progress), but the scheduler does not pre-empt mid-agent — a process runs
- * start-to-finish in the single tick that dispatched it, then exits. Across
- * ticks this is fair at *process* granularity (round-robin over READY
- * processes), just not time-sliced within a process.
+ * `resume` **starts** the agent body and returns. It does not run it to
+ * completion: the body keeps running on the Node event loop while the scheduler
+ * moves on to other processes. This is what makes a process tree possible — a
+ * parent parked in `wait()` is not holding the CPU, so its children get
+ * dispatched in later ticks, and the parent resumes where it left off when the
+ * kernel wakes it.
  *
- * docs/ARCHITECTURE.md §13 predicts "the scheduler's 'resume the Promise' trick
- * will be the source of subtle bugs … we will write three implementations before
- * one feels right." This is implementation #1, and it is intentionally naive.
- * True cooperative suspension — where `resume` returns at a yield point and the
- * agent is later *continued* rather than restarted — is the post-v0 rework. Two
- * consequences are accepted and documented here rather than hidden:
+ * Three details carry that design, and all three are load-bearing:
  *
- *   • **`wait()` on a not-yet-run child hangs the quantum.** A parent that
- *     spawns a child and then `wait()`s for it parks inside its own `resume`;
- *     the child is not dispatched until that `resume` returns, which it never
- *     does. v0 agents must be leaves or spawn-and-detach. (The dispatcher's
- *     `wait` parking logic is correct; it is the run-to-completion continuation
- *     that cannot interleave a parent with its own child.)
- *   • **`sleep()` blocks the quantum.** `dispatcher.#sleep` awaits a real timer
- *     without the RUNNING → BLOCKED → READY dance (its own header defers that to
- *     boot.ts). With real timers the quantum simply takes `ms` longer and then
- *     completes correctly; the BLOCKED bookkeeping is the deferred piece.
+ *   • **The wake gate** (`wake_gate.ts`). When a parked `wait()`/`recv()` is
+ *     satisfied, the process is made READY but the Promise is *not* resolved
+ *     inline — the resolution is deferred and released on the next dispatch.
+ *     Otherwise the body resumes while the process is still BLOCKED (or merely
+ *     READY) and its next syscall traps `ESTATE`.
+ *   • **`isLive`** (`Scheduler` option). A still-RUNNING process whose body has
+ *     not finished is reported `parked` and left out of the run queue;
+ *     re-queueing it would re-enter the agent mid-`await`.
+ *   • **`settle()`** (§4.4b). "Run to quiescence" for hosts and tests, since
+ *     one `tick()` no longer means one finished agent.
  *
- * Everything else — `llm_call`, `tool_call`, `memory_*`, `send`, `fork`,
- * `checkpoint`, `kill`, `ps` — runs to completion without parking and is fully
- * supported.
+ * The previous implementation ran the body to completion inside its quantum
+ * ("run-to-completion"). It was simpler and it passed every test we had, but it
+ * made `wait()` on a child deadlock by construction: the child could not be
+ * dispatched until the parent's `resume` returned, and that never happened, so
+ * v0 agents had to be leaves or spawn-and-detach and supervision trees were
+ * unwritable. docs/ARCHITECTURE.md §13 predicted "the scheduler's 'resume the
+ * Promise' trick will be the source of subtle bugs … we will write three
+ * implementations before one feels right." This is implementation #2.
+ *
+ * One accepted gap remains: **`sleep()` does not park.** `dispatcher.#sleep`
+ * awaits a real timer without the RUNNING → BLOCKED → READY dance (its own
+ * header defers that to boot.ts). The process stays RUNNING for the duration,
+ * so `ps` shows it as runnable rather than blocked on a timer. Correct, just
+ * not yet honest in the audit log.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * The sync/async seam
@@ -98,6 +103,7 @@ import { join } from 'node:path';
 
 import {
   type AgentSpec,
+  asProcessId,
   type BudgetCounters,
   type ChainId,
   type ChannelId,
@@ -123,6 +129,7 @@ import {
   type SpawnOptions,
   type Timestamp,
   type ToolCallOptions,
+  type WaitOptions,
   type ToolResult,
   unbrand,
 } from './types.js';
@@ -135,6 +142,7 @@ import { MemoryManager } from './memory.js';
 import { CheckpointManager, type RestoreContext } from './checkpoint.js';
 import { ForkManager } from './fork.js';
 import { Scheduler } from './scheduler.js';
+import { WakeGate } from './wake_gate.js';
 import {
   InitProcess,
   type DaemonSpec,
@@ -160,8 +168,22 @@ import { DriverRegistry } from './driver_registry.js';
  * "Agent modules are ES modules with a default-exported async function
  * `(ctx) => Promise<void> | void`"). It receives the kernel surface and runs
  * until it returns (clean exit, code 0) or calls `ctx.exit()` (which throws).
+ *
+ * `args` is the second parameter: whatever `AgentSpec.args` carried when the
+ * process was spawned (`{ module: '...', args: { seed: 7 } }` →
+ * `agent(ctx, { seed: 7 })`). The field has always been part of `AgentSpec`
+ * (docs/ABI.md §9.2) but v0's loader dropped it on the floor, which forced
+ * agent authors to smuggle configuration through `ctx.role`. Passing it through
+ * is the difference between "a module can be parameterised" and "you need one
+ * file per configuration" — supervision trees need the former.
+ *
+ * A function that takes only `ctx` still assignable here; existing agents keep
+ * compiling unchanged.
  */
-export type AgentFn = (ctx: CortexContext) => Promise<void> | void;
+export type AgentFn = (
+  ctx: CortexContext,
+  args: Readonly<Record<string, unknown>>,
+) => Promise<void> | void;
 
 /**
  * Resolves an `AgentSpec` to a runnable `AgentFn`. Injectable so tests (and a
@@ -282,6 +304,13 @@ export interface KernelOptions {
  * advertised in v0 (the registry resolution of `ToolSchema` lands with the tool
  * drivers); a model that wants tools must already know them.
  */
+/** Hand one turn to the Node event loop. Injected so tests can stay deterministic. */
+function defaultYield(): Promise<void> {
+  return new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
 function makePromptAgent(spec: {
   readonly system: string;
   readonly driver?: string;
@@ -349,6 +378,13 @@ export class Kernel {
 
   #opts: KernelOptions;
   #processesDir: string;
+  /**
+   * The kernel's wake gate: shared by the syscall dispatcher (`wait`) and the
+   * IPC engine (`recv`), released here when a live body is re-dispatched. See
+   * `wake_gate.ts` — without it a woken agent resumes mid-`await` in a state
+   * its next syscall will reject.
+   */
+  #gate = new WakeGate();
   #now: () => Timestamp;
   #random: (opts?: RandomOptions) => number;
   #importModule: (specifier: string) => Promise<unknown>;
@@ -358,8 +394,14 @@ export class Kernel {
   #contexts = new Map<number, CortexContext>();
   /** pid → resolved agent function (loaded once). */
   #agents = new Map<number, AgentFn>();
-  /** pids whose quantum has finished; guards against a double-dispatch re-run. */
+  /** pids whose agent body has finished; guards against a double-dispatch re-run. */
   #done = new Set<number>();
+  /**
+   * pids whose agent body has been *started*. Distinct from `#done`: once
+   * launched, the agent lives in its own Promise and later dispatches must not
+   * start it again (and must not block on it) — see the class doc comment.
+   */
+  #launched = new Set<number>();
   /** pid → spec metadata, surviving reap, so `restore` can rebuild an agent. */
   #processMeta = new Map<number, ProcessMeta>();
 
@@ -451,6 +493,7 @@ export class Kernel {
       kernelAbiVersion: this.kernelAbiVersion,
       now: this.#now,
       signals: this.signals,
+      wakeGate: this.#gate,
     });
 
     // --- checkpoint ---------------------------------------------------------
@@ -505,6 +548,10 @@ export class Kernel {
       kernelAbiVersion: this.kernelAbiVersion,
       now: this.#now,
       resume: (pid: ProcessId) => this.#runQuantum(pid),
+      // A live agent body is suspended somewhere inside its own Promise, not
+      // parked READY. Tell the scheduler so it does not re-queue (and thus
+      // re-enter) it: the body resumes on a wake, or drives its own exit.
+      isLive: (pid: ProcessId) => this.#isLiveBody(pid),
       ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
       ...(opts.clearTimeoutFn !== undefined ? { clearTimeoutFn: opts.clearTimeoutFn } : {}),
     });
@@ -528,6 +575,7 @@ export class Kernel {
       ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
       ...(opts.clearTimeoutFn !== undefined ? { clearTimeoutFn: opts.clearTimeoutFn } : {}),
       ...(opts.onBudgetExhausted !== undefined ? { onBudgetExhausted: opts.onBudgetExhausted } : {}),
+      wakeGate: this.#gate,
     });
   }
 
@@ -645,7 +693,7 @@ export class Kernel {
 
       // §4.1 Process control
       spawn: (o: SpawnOptions) => d.invoke(pid, 'spawn', o),
-      wait: (p?: ProcessId) => d.invoke(pid, 'wait', p),
+      wait: (p?: ProcessId, o?: WaitOptions) => d.invoke(pid, 'wait', p, o),
       exit: (code: number, reason?: string): never => {
         // Synchronous throw honouring `never`; the agent runner catches it and
         // drives the real, recorded teardown through the dispatcher.
@@ -730,17 +778,27 @@ export class Kernel {
   // ---------------------------------------------------------------------------
 
   /**
-   * Run one process's quantum to completion (see "The execution model"). Called
-   * by the scheduler while the process is RUNNING. Loads the agent (once),
-   * builds its context, runs it, then drives exit:
+   * Run one process's quantum (see "The execution model"). Called by the
+   * scheduler while the process is RUNNING — once to *start* the agent, and
+   * again each time the kernel wakes it.
+   *
+   * The agent body is deliberately **not** awaited here. It is started as an
+   * independent Promise (`#runAgentBody`), which drives its own exit:
    *
    *   • normal return        → exit(0, 'completed')
    *   • `ProcessExitSignal`  → exit(code, reason)  (the agent called ctx.exit())
    *   • any other throw      → exit(1, message)    (an uncaught agent error)
    *
-   * The exit is routed through `dispatcher.invoke('exit', …)` so it is recorded,
-   * walks the legal states to ZOMBIE, and hands off to init for reaping — the
-   * §13 "exits, gets reaped" half of the milestone.
+   * Every exit is routed through `dispatcher.invoke('exit', …)` so it is
+   * recorded, walks the legal states to ZOMBIE, and hands off to init for
+   * reaping — the §13 "exits, gets reaped" half of the milestone.
+   *
+   * On a *re*-dispatch of a body that is still live this method does exactly one
+   * thing: release the wake gate. The process has just been put back in RUNNING,
+   * so any `wait()`/`recv()` the kernel owes it may resume — and it resumes
+   * *here*, inside a quantum, with a state its next syscall accepts. Starting a
+   * second copy of the body instead would interleave two executions of one
+   * process, which is what the gate exists to prevent.
    */
   async #runQuantum(pid: ProcessId): Promise<void> {
     const key = unbrand(pid);
@@ -751,6 +809,11 @@ export class Kernel {
 
     const entry = this.table.get(pid);
     if (entry === undefined) return;
+
+    if (this.#launched.has(key)) {
+      this.#gate.release(pid);
+      return;
+    }
 
     // Remember the spec so a later `restore` of this process's checkpoints can
     // rebuild it (the `.csnap` body does not carry role/agent).
@@ -774,18 +837,49 @@ export class Kernel {
       }
     }
 
+    // Start the body and let the quantum end. The body keeps running on the
+    // event loop across later ticks, which is what makes `wait()` on a child
+    // (and every other inter-process interleaving) work.
     const ctx = this.context(pid);
+    const args = 'args' in entry.agent ? entry.agent.args ?? {} : {};
+    this.#launched.add(key);
+    void this.#runAgentBody(pid, agentFn, ctx, args);
+  }
+
+  /**
+   * The agent body's own continuation. Runs outside any quantum: it may park on
+   * a `wait()`, a driver call, or a timer, and it resumes when the kernel wakes
+   * it (see `#runQuantum`). It settles `#done` exactly once, and drives the
+   * recorded exit.
+   *
+   * A rejection here is a bug in *our* plumbing, not in the agent — every agent
+   * outcome (return, `exit()`, throw) is converted into an exit above. It is
+   * logged rather than swallowed so a broken continuation is never silent.
+   */
+  async #runAgentBody(
+    pid: ProcessId,
+    agentFn: AgentFn,
+    ctx: CortexContext,
+    args: Record<string, unknown>,
+  ): Promise<void> {
     try {
-      await agentFn(ctx);
-      await this.#driveExit(pid, 0, 'completed');
-    } catch (err) {
-      if (isProcessExitSignal(err)) {
-        await this.#driveExit(pid, err.exitCode, err.exitReason);
-      } else {
-        await this.#driveExit(pid, 1, errorMessage(err));
+      try {
+        await agentFn(ctx, args);
+        await this.#driveExit(pid, 0, 'completed');
+      } catch (err) {
+        if (isProcessExitSignal(err)) {
+          await this.#driveExit(pid, err.exitCode, err.exitReason);
+        } else {
+          await this.#driveExit(pid, 1, errorMessage(err));
+        }
       }
+    } catch (err) {
+      // #driveExit itself failed (a recorder/state-machine fault). The process
+      // is likely already gone; mark the body done so `settle()` can return.
+      // eslint-disable-next-line no-console
+      console.error(`cortex: agent body for pid ${unbrand(pid)} failed to exit cleanly`, err);
     } finally {
-      this.#done.add(key);
+      this.#done.add(unbrand(pid));
     }
   }
 
@@ -817,6 +911,85 @@ export class Kernel {
   /** The `HandlerInvoker` wired into signals: run a handler with the agent's ctx. */
   async #invokeHandler(pid: ProcessId, _signal: Signal, handler: SignalHandler): Promise<void> {
     await handler(this.context(pid));
+  }
+
+  // ---------------------------------------------------------------------------
+  // §4.4b Settling (a "run to quiescence" primitive for hosts and tests)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Whether `pid`'s agent body is currently suspended inside its own Promise.
+   *
+   * The scheduler asks this immediately after a quantum, and only when the
+   * process is still RUNNING: a live body must be left alone (reported
+   * `parked`), not re-queued — re-queueing would re-enter the agent
+   * mid-`await`. The process state is therefore irrelevant here; "started and
+   * not finished" is the whole answer.
+   */
+  #isLiveBody(pid: ProcessId): boolean {
+    const key = unbrand(pid);
+    return this.#launched.has(key) && !this.#done.has(key);
+  }
+
+  /**
+   * Agent bodies that have been started but have not yet finished.
+   *
+   * A body whose process has already been reaped is excluded: it can no longer
+   * drive a meaningful exit, and waiting on it would hold `settle()` open for a
+   * wake that cannot arrive.
+   */
+  get busyAgents(): number {
+    let n = 0;
+    for (const key of this.#launched) {
+      if (this.#done.has(key)) continue;
+      if (this.table.get(asProcessId(key)) === undefined) continue;
+      n++;
+    }
+    return n;
+  }
+
+  /**
+   * Drive the scheduler until every launched agent body has finished.
+   *
+   * Necessary because the continuation no longer runs an agent to completion
+   * inside one quantum (see the class doc comment): `tick()` gives one process
+   * one dispatch, and a body parked on `wait()`, a driver call, or a timer needs
+   * both later ticks *and* the Node event loop to make progress. `settle()` is
+   * the "let the system run to quiescence" primitive for hosts and tests that
+   * want synchronous-looking results from an asynchronous kernel.
+   *
+   * **Caveat — it does not wait out wall-clock timers.** The default `yieldFn`
+   * is `setImmediate`, so a full 2000-tick budget can elapse in microseconds,
+   * i.e. *before* a pending `setTimeout` fires. That is the right default for
+   * deterministic tests, but a test (or host) whose agents park on real time
+   * — `ctx.sleep(ms)`, `wait({ timeoutMs })`, a driver timeout — must pass a
+   * yield that lets the timer queue run, e.g.
+   * `settle(200, () => new Promise(r => setTimeout(r, 5)))`.
+   *
+   * @returns the number of ticks actually run.
+   */
+  async settle(
+    maxTicks = 2000,
+    yieldFn: () => Promise<void> = defaultYield,
+  ): Promise<number> {
+    let ticks = 0;
+    for (;;) {
+      if (ticks >= maxTicks) break;
+      const outcome = await this.scheduler.tick();
+      // Hand control to the Node event loop so pending agent Promises (driver
+      // calls, timers, IPC wakes) can actually advance.
+      await yieldFn();
+      ticks++;
+      // Stop when the scheduler found nothing to dispatch AND no agent body is
+      // still parked. Checking only `busyAgents` would exit immediately on a
+      // freshly spawned process that has not had its first quantum yet.
+      if (outcome.dispatched === null && this.busyAgents === 0) break;
+    }
+    // Let post-exit bookkeeping (reap → recorder close) settle, then flush
+    // everything still open so the host can read the `.crec` logs right away.
+    await yieldFn();
+    await this.table.flushAll();
+    return ticks;
   }
 
   // ---------------------------------------------------------------------------

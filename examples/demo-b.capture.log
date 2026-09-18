@@ -1,0 +1,23 @@
+[pid 2]
+[inbox-watcher pid 2] inbox-watcher up — 6 tickets in queue
+[inbox-watcher pid 2] #T-1180 App crashes on launch after the 2.3 update -> bug; reply drafted
+[inbox-watcher pid 2] #T-1181 Can I export my data to CSV? -> feature; reply drafted
+[inbox-watcher pid 2] #T-1182 How do I reset my password? -> question; reply drafted
+[inbox-watcher pid 2] 3/6 handled — checkpointing (tag 'inbox-watcher') before shutdown
+[inbox-watcher pid 2] suspended at bf9a81b1-debe-4f02-8d04-6f716adcd7d7 — resume after reboot: cortex restore --tag inbox-watcher
+process suspended at checkpoint after 1191ms
+  chain: bf9a81b1-debe-4f02-8d04-6f716adcd7d7
+  resume with: cortex restore --chain bf9a81b1-debe-4f02-8d04-6f716adcd7d7
+tokens: 0 (in 0, out 0)
+###  laptop reboots - kernel torn down, .csnap persists on disk  ###
+restored as pid 3 (chain bf9a81b1-debe-4f02-8d04-6f716adcd7d7)
+[inbox-watcher pid 3] inbox-watcher up — 6 tickets in queue
+[inbox-watcher pid 3] recovered 3 processed ticket(s) from memory
+[inbox-watcher pid 3] skip T-1180 (already handled)
+[inbox-watcher pid 3] skip T-1181 (already handled)
+[inbox-watcher pid 3] skip T-1182 (already handled)
+[inbox-watcher pid 3] #T-1183 Dark mode flickers on Windows 11 -> bug; reply drafted
+[inbox-watcher pid 3] #T-1184 Please add keyboard shortcuts for navigation -> feature; reply drafted
+[inbox-watcher pid 3] #T-1185 I was charged twice this month -> bug; reply drafted
+[inbox-watcher pid 3] inbox cleared (6/6)
+process exited (code 0: inbox cleared)

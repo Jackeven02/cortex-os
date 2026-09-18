@@ -34,5 +34,6 @@ export {
   errnoForStatus as openaiErrnoForStatus,
 } from './llm/openai.js';
 export * from './tool/fs.js';
+export * from './tool/mcp.js';
 export * from './memory/inmem.js';
 export * from './memory/sqlite.js';

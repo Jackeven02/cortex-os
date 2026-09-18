@@ -185,6 +185,40 @@ import {
 } from '../src/drivers/tool/fs.js';
 
 import {
+  McpToolDriver,
+  mcpTool,
+  MCP_DEFAULTS,
+  StdioMcpTransport,
+  mapCallResult,
+  errnoForRpcError,
+  isMcpToolDriver,
+  type McpTransport,
+  type JsonRpcMessage,
+  type JsonRpcRequest,
+  type JsonRpcNotification,
+  type JsonRpcResponse,
+} from '../src/drivers/tool/mcp.js';
+
+import type { ToolInvokeContext } from '../src/kernel/types.js';
+
+import {
+  diffRecords,
+  findDivergence,
+  splitAtOffset,
+  summarize,
+  filterStateRecords,
+  recordSignature,
+  recordDetail,
+  formatMs,
+  clockOf,
+  stableJson,
+  MAX_LCS_CELLS,
+  type DiffLine,
+} from '../src/cli/diff_core.js';
+
+import { cmdDiff } from '../src/cli/commands/diff.js';
+
+import {
   InMemMemoryDriver,
   inmemMemory,
 } from '../src/drivers/memory/inmem.js';
@@ -3818,6 +3852,42 @@ async function runSchedulerChecks(): Promise<void> {
     assert(phase === 2, 'resume ran twice');
   });
 
+  await checkAsync('a process dropped from the run queue while queued can be enqueued again', async () => {
+    // Regression. `#selectNext` drops stale nodes (gone, or no longer in the
+    // schedulable set) from `#queue` but used to leave the PID in the
+    // membership mirror, so `enqueue()` — which is idempotent *by checking that
+    // mirror* — became a permanent no-op for it. The process then sat READY
+    // forever, dispatched by nobody. Nothing in the run-to-completion model
+    // could reach that state; a cooperative body can: it is enqueued when the
+    // kernel wakes it, and it blocks again on its next `wait()` while still
+    // queued. That is exactly how the supervision tree deadlocked.
+    const table = await makeTable();
+    const pid = await spawn(table); // lands READY
+    const { sched } = makeSched(table, { autoReconcile: false });
+    sched.enqueue(pid);
+    assert(sched.isQueued(pid) && sched.queueLength === 1, 'queued while READY');
+
+    // It leaves the schedulable set while still queued (here: it got the CPU by
+    // another path — in the kernel it is a woken body that blocks again on its
+    // next `wait()` before the scheduler reaches it). Either way the queue node
+    // is now stale.
+    await table.setState(pid, 'running', { trigger: 'test' });
+    const stale = await sched.tick();
+    assert(stale.dispatched === null, 'a non-READY process is not dispatched');
+    assert(sched.queueLength === 0, 'its stale queue entry is dropped');
+    assert(!sched.isQueued(pid), 'and it is dropped from the membership mirror too');
+
+    // …then it wakes up again and must be schedulable once more.
+    await table.setState(pid, 'ready', { trigger: 'wake' });
+    sched.enqueue(pid);
+    assert(sched.queueLength === 1, 'enqueue() re-adds it');
+    const out = await sched.tick();
+    assert(
+      out.dispatched !== null && unbrand(out.dispatched) === unbrand(pid),
+      'and it is dispatched again',
+    );
+  });
+
   await checkAsync('a pending signal delivered on dispatch pre-empts the quantum', async () => {
     const table = await makeTable();
     const pid = await spawn(table);
@@ -6605,11 +6675,13 @@ async function runBootChecks(): Promise<void> {
     const { k, mock } = await makeKernel();
     const pid = await k.spawn({ role: 'worker', agent: { module: './agents/echo.js' } });
     assert(k.table.get(pid)?.state === 'ready', 'spawned process is READY before its tick');
+    // One tick hands the process a quantum; the agent's `await llm_call` then
+    // needs the event loop to progress. `settle()` drives it to completion.
     const outcome = await k.scheduler.tick();
+    assert(outcome.dispatched !== null && unbrand(outcome.dispatched) === unbrand(pid), 'the right pid was dispatched');
+    await k.settle();
     assert(reply === 'mock reply to: think', `agent saw the mock reply, got "${reply}"`);
     assert(mock.callCount === 1, 'exactly one llm_call reached the driver');
-    assert(outcome.dispatched !== null && unbrand(outcome.dispatched) === unbrand(pid), 'the right pid was dispatched');
-    assert(outcome.reason === 'exited', `quantum ended in exit, got ${outcome.reason}`);
     assert(k.table.get(pid) === undefined, 'process reaped after exit');
   });
 
@@ -6620,7 +6692,7 @@ async function runBootChecks(): Promise<void> {
     const sub = join(tmp, 'rec-ok');
     const { k, procDir } = await makeKernel({}, { record: true, sub });
     const pid = await k.spawn({ role: 'worker', agent: { module: './agents/ok.js' } });
-    await k.scheduler.tick();
+    await k.settle();
     const ex = await readExit(procDir as string, pid);
     assert(ex !== undefined, 'an exit record was written');
     assert(ex!.code === 0 && ex!.reason === 'completed', `expected 0/completed, got ${ex!.code}/${ex!.reason}`);
@@ -6633,7 +6705,7 @@ async function runBootChecks(): Promise<void> {
     const sub = join(tmp, 'rec-quit');
     const { k, procDir } = await makeKernel({}, { record: true, sub });
     const pid = await k.spawn({ role: 'worker', agent: { module: './agents/quit.js' } });
-    await k.scheduler.tick();
+    await k.settle();
     const ex = await readExit(procDir as string, pid);
     assert(ex !== undefined && ex.code === 7 && ex.reason === 'bye', `expected 7/bye, got ${ex?.code}/${ex?.reason}`);
     assert(k.table.get(pid) === undefined, 'reaped');
@@ -6646,7 +6718,7 @@ async function runBootChecks(): Promise<void> {
     const sub = join(tmp, 'rec-boom');
     const { k, procDir } = await makeKernel({}, { record: true, sub });
     const pid = await k.spawn({ role: 'worker', agent: { module: './agents/boom.js' } });
-    await k.scheduler.tick();
+    await k.settle();
     const ex = await readExit(procDir as string, pid);
     assert(ex !== undefined && ex.code === 1, `expected code 1, got ${ex?.code}`);
     assert(ex!.reason.includes('boom'), `reason carries the message, got "${ex!.reason}"`);
@@ -6656,7 +6728,7 @@ async function runBootChecks(): Promise<void> {
     const sub = join(tmp, 'rec-missing');
     const { k, procDir } = await makeKernel({}, { record: true, sub });
     const pid = await k.spawn({ role: 'worker', agent: { module: './agents/does-not-exist.js' } });
-    await k.scheduler.tick();
+    await k.settle();
     const ex = await readExit(procDir as string, pid);
     assert(ex !== undefined && ex.code === 127, `expected 127, got ${ex?.code}`);
     assert(ex!.reason.includes('agent load failed'), `reason explains the load failure, got "${ex!.reason}"`);
@@ -6667,7 +6739,7 @@ async function runBootChecks(): Promise<void> {
   await checkAsync('a { system } spec runs the built-in prompt agent', async () => {
     const { k, mock } = await makeKernel();
     const pid = await k.spawn({ role: 'prompt', agent: { system: 'you are helpful' } });
-    await k.scheduler.tick();
+    await k.settle();
     assert(mock.callCount === 1, 'the prompt agent called the model once');
     assert(k.table.get(pid) === undefined, 'and exited cleanly');
     assert(PROMPT_AGENT_MAX_TURNS === 8, 'turn cap exported');
@@ -6687,7 +6759,7 @@ async function runBootChecks(): Promise<void> {
     });
     const { k } = await makeKernel();
     await k.spawn({ role: 'worker', agent: { module: './agents/sync.js' } });
-    await k.scheduler.tick();
+    await k.settle();
     assert(nowVal === clock(), 'now() returns the injected clock');
     assert(randVal >= 0 && randVal < 1, 'random() in [0,1)');
     assert(budgetIn > 0, 'budget() reflects the llm_call spend');
@@ -6731,10 +6803,14 @@ async function runBootChecks(): Promise<void> {
     const { k } = await makeKernel();
     await k.spawn({ role: 'a', agent: { module: './agents/A.js' } });
     await k.spawn({ role: 'b', agent: { module: './agents/B.js' } });
+    // Each tick dispatches ONE process. Its agent body finishes on the event
+    // loop afterwards, so yield between ticks to observe the real ordering.
     const t1 = await k.scheduler.tick();
+    await yieldOnce();
     const t2 = await k.scheduler.tick();
+    await yieldOnce();
     assert(order.join('') === 'AB', `FIFO round-robin, got "${order.join('')}"`);
-    assert(t1.reason === 'exited' && t2.reason === 'exited', 'both quanta ended in exit');
+    assert(t1.dispatched !== null && t2.dispatched !== null, 'both processes got a quantum');
     const t3 = await k.scheduler.tick();
     assert(t3.reason === 'idle', 'nothing left to run');
   });
@@ -6750,7 +6826,7 @@ async function runBootChecks(): Promise<void> {
     });
     const { k } = await makeKernel();
     const origPid = await k.spawn({ role: 'worker', agent: { module: './agents/ckpt.js' }, budgets: { tokens: 100000 } });
-    await k.scheduler.tick();
+    await k.settle();
     assert(chainId !== null, 'the agent captured a chainId');
     assert(k.table.get(origPid) === undefined, 'original reaped after exit');
 
@@ -6783,14 +6859,163 @@ async function runBootChecks(): Promise<void> {
     const { k } = await makeKernel();
     kernelRef = k;
     const parent = await k.spawn({ role: 'p', agent: { module: './agents/forker.js' } });
+    // Deliberately ONE tick, not `settle()`: the fork child inherits the forker's
+    // agent, so scheduling it would fork again — and again — until the tick cap.
+    // The point of this check is the fork itself plus orphan reparenting, so the
+    // child stays READY (never dispatched) and therefore survives its parent.
     await k.scheduler.tick();
+    await yieldOnce();
     assert(childPid !== null, 'fork returned a child pid');
     assert(unbrand(childPid as ProcessIdAlias) !== unbrand(parent), 'child has its own pid');
-    assert(ppidAtFork === unbrand(parent), `child was parented to the forker at fork time, got ppid ${ppidAtFork}`);
+    assert(ppidAtFork === unbrand(parent), `child was parented to the forker at fork time, got ppid ${ppidAtFork} parent=${unbrand(parent)} child=${unbrand(childPid as ProcessIdAlias)} init=${unbrand(PID_INIT)}`);
     const child = k.table.get(childPid as ProcessIdAlias);
     assert(child !== undefined, 'child survives its parent');
     // The forker exited at the end of its quantum, so init reparented the orphan.
     assert(child!.ppid !== null && unbrand(child!.ppid) === unbrand(PID_INIT), 'orphan reparented to init after the parent exited');
+  });
+
+  // --- §7b the cooperative continuation (boot.ts "The execution model") ------
+
+  await checkAsync('wait() on a spawned child returns its exit code (no deadlock)', async () => {
+    const order: string[] = [];
+    let waited: { code: number; reason: string } | null = null;
+    agentImpls.set('./agents/leaf.js', async (ctx) => {
+      order.push(`child:${unbrand(ctx.pid)}`);
+      await ctx.llm_call({ messages: [userMsg('work')] });
+      ctx.exit(3, 'leaf done');
+    });
+    agentImpls.set('./agents/sup.js', async (ctx) => {
+      order.push(`parent:${unbrand(ctx.pid)}`);
+      const { pid } = await ctx.spawn({ role: 'leaf', agent: { module: './agents/leaf.js' } });
+      const res = await ctx.wait(pid);
+      waited = { code: res.exitCode, reason: res.exitReason };
+      order.push('parent:woke');
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'sup', agent: { module: './agents/sup.js' } });
+    await k.settle();
+    // The headline: with the cooperative continuation the child is dispatched
+    // *between* the parent's spawn and its wake. Run-to-completion could never
+    // produce this interleaving — it deadlocked instead.
+    assert(order.join(' > ') === 'parent:2 > child:3 > parent:woke',
+      `expected parent > child > parent-woke, got "${order.join(' > ')}"`);
+    assert(waited !== null && (waited as { code: number }).code === 3,
+      `wait() saw the child's exit code, got ${JSON.stringify(waited)}`);
+    assert((waited as { reason: string }).reason === 'leaf done', 'and its exit reason');
+  });
+
+  await checkAsync('a woken parent resumes inside a quantum: syscalls after wait() are legal', async () => {
+    // The wake-gate guarantee (kernel/wake_gate.ts). Resolving the parked
+    // `wait()` inline would let the body run its next syscall while the process
+    // is still BLOCKED/READY — and llm_call/tool_call/send are ['running']-only,
+    // so it would trap ESTATE.
+    let afterWait = '';
+    agentImpls.set('./agents/leaf2.js', async (ctx) => {
+      await ctx.llm_call({ messages: [userMsg('leaf work')] });
+    });
+    agentImpls.set('./agents/sup2.js', async (ctx) => {
+      const { pid } = await ctx.spawn({ role: 'leaf', agent: { module: './agents/leaf2.js' } });
+      await ctx.wait(pid);
+      const r = await ctx.llm_call({ messages: [userMsg('after wait')] });
+      afterWait = r.content;
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'sup', agent: { module: './agents/sup2.js' } });
+    await k.settle();
+    assert(afterWait !== '', 'the parent completed an llm_call after wait() returned');
+  });
+
+  await checkAsync('a supervisor waits for several children in sequence', async () => {
+    const codes: number[] = [];
+    agentImpls.set('./agents/worker.js', async (ctx, args) => {
+      await ctx.llm_call({ messages: [userMsg('task')] });
+      ctx.exit((args['code'] as number | undefined) ?? 0, 'finished');
+    });
+    agentImpls.set('./agents/tree.js', async (ctx) => {
+      const a = await ctx.spawn({ role: 'w', agent: { module: './agents/worker.js', args: { code: 0 } } });
+      const b = await ctx.spawn({ role: 'w', agent: { module: './agents/worker.js', args: { code: 5 } } });
+      codes.push((await ctx.wait(a.pid)).exitCode);
+      codes.push((await ctx.wait(b.pid)).exitCode);
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'sup', agent: { module: './agents/tree.js' } });
+    await k.settle();
+    assert(codes.join(',') === '0,5', `a supervision tree reaps both children, got [${codes.join(',')}]`);
+  });
+
+  await checkAsync('wait(pid, { timeoutMs }) traps ETIMEDOUT: a supervisor can bound a child', async () => {
+    const log: string[] = [];
+    agentImpls.set('./agents/slow.js', async (ctx) => {
+      await ctx.sleep(80); // "hung" from the planner's point of view
+    });
+    agentImpls.set('./agents/quick.js', async (ctx) => {
+      await ctx.llm_call({ messages: [userMsg('fast')] });
+    });
+    agentImpls.set('./agents/planner.js', async (ctx) => {
+      const { pid } = await ctx.spawn({ role: 'slow', agent: { module: './agents/slow.js' } });
+      try {
+        await ctx.wait(pid, { timeoutMs: 10 });
+        log.push('returned');
+      } catch (err) {
+        log.push(isCortexError(err) ? (err as CortexError).errno : `other:${String(err)}`);
+      }
+      // The timeout deliberately does NOT kill the child — that is the
+      // supervisor's decision, and `kill()` is its own syscall.
+      await ctx.kill(pid, 'SIGKILL');
+      log.push('killed');
+      const repl = await ctx.spawn({ role: 'quick', agent: { module: './agents/quick.js' } });
+      const res = await ctx.wait(repl.pid);
+      log.push(`replacement:${res.exitCode}`);
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'planner', agent: { module: './agents/planner.js' } });
+    await k.settle(200, timerYield);
+    assert(log.join(',') === 'ETIMEDOUT,killed,replacement:0',
+      `expected timeout → kill → replacement, got "${log.join(',')}"`);
+  });
+
+  await checkAsync('wait(pid, { timeoutMs: 0 }) polls instead of parking', async () => {
+    let first = '';
+    let second = '';
+    agentImpls.set('./agents/nap.js', async (ctx) => {
+      await ctx.sleep(40);
+    });
+    agentImpls.set('./agents/poller.js', async (ctx) => {
+      const { pid } = await ctx.spawn({ role: 'nap', agent: { module: './agents/nap.js' } });
+      try {
+        await ctx.wait(pid, { timeoutMs: 0 });
+        first = 'returned';
+      } catch (err) {
+        first = isCortexError(err) ? (err as CortexError).errno : `other:${String(err)}`;
+      }
+      // Still RUNNING here: a poll never parks, so there was no BLOCKED →
+      // wake round trip to come back from.
+      second = (await ctx.ps({ pid: ctx.pid }))[0]?.state ?? 'gone';
+      await ctx.wait(pid);
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'poller', agent: { module: './agents/poller.js' } });
+    await k.settle(200, timerYield);
+    assert(first === 'ETIMEDOUT', `a poll on a live child times out at once, got "${first}"`);
+    assert(second === 'running', `the poller never left RUNNING, got "${second}"`);
+  });
+
+  await checkAsync('an agent body is never started twice across dispatches', async () => {
+    let starts = 0;
+    agentImpls.set('./agents/leaf3.js', async (ctx) => {
+      starts++;
+      await ctx.llm_call({ messages: [userMsg('once')] });
+    });
+    agentImpls.set('./agents/sup3.js', async (ctx) => {
+      const { pid } = await ctx.spawn({ role: 'leaf', agent: { module: './agents/leaf3.js' } });
+      await ctx.wait(pid);
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'sup', agent: { module: './agents/sup3.js' } });
+    await k.settle();
+    // The child is dispatched once to start its body; every later dispatch of a
+    // live process must release its wake, not re-enter the agent.
+    assert(starts === 1, `the leaf's body ran exactly once, got ${starts}`);
   });
 
   // --- §8 shutdown ----------------------------------------------------------
@@ -7453,8 +7678,798 @@ async function runFsChecks(): Promise<void> {
 }
 
 // =============================================================================
-// InMem memory driver checks
+// MCP tool driver checks (#025)
 // =============================================================================
+
+interface FakeMcpToolDef {
+  readonly name: string;
+  readonly description?: string;
+  readonly inputSchema?: unknown;
+  readonly call?: (args: unknown) => {
+    readonly content?: ReadonlyArray<{ readonly type: string; readonly text?: string }>;
+    readonly text?: string;
+    readonly isError?: boolean;
+    readonly structured?: unknown;
+  };
+  readonly rpcError?: { readonly code: number; readonly message: string };
+}
+
+interface FakeMcpServerOptions {
+  readonly initializeError?: { readonly code: number; readonly message: string };
+  /** Methods the server accepts and then never answers — drives timeout tests. */
+  readonly silence?: readonly string[];
+  readonly protocolVersion?: string;
+}
+
+/**
+ * An in-memory MCP server implementing the transport seam, so the whole
+ * protocol path (handshake → tools/list → tools/call → error mapping) is
+ * exercised without spawning a subprocess. Same trick as the injectable
+ * `fetchFn` in the deepseek/openai drivers.
+ */
+class FakeMcpServer implements McpTransport {
+  readonly received: JsonRpcMessage[] = [];
+  closed = false;
+  readonly #tools: readonly FakeMcpToolDef[];
+  readonly #opts: FakeMcpServerOptions;
+  #client: ((m: JsonRpcMessage) => void) | null = null;
+
+  constructor(tools: readonly FakeMcpToolDef[] = [], opts: FakeMcpServerOptions = {}) {
+    this.#tools = tools;
+    this.#opts = opts;
+  }
+
+  send(msg: JsonRpcRequest | JsonRpcNotification): void {
+    this.received.push(msg as JsonRpcMessage);
+    if (!('id' in msg)) return;
+    const req = msg as JsonRpcRequest;
+    if (this.#opts.silence !== undefined && this.#opts.silence.includes(req.method)) {
+      return;
+    }
+    const reply = this.#respond(req);
+    // Async delivery: a real server never answers synchronously, and replying
+    // inline would let the driver's await resolve before it registered pending.
+    setTimeout(() => this.#client?.(reply), 0);
+  }
+
+  onMessage(handler: (msg: JsonRpcMessage) => void): void {
+    this.#client = handler;
+  }
+
+  async close(): Promise<void> {
+    this.closed = true;
+  }
+
+  #respond(req: JsonRpcRequest): JsonRpcMessage {
+    if (req.method === 'initialize') {
+      if (this.#opts.initializeError !== undefined) {
+        return { jsonrpc: '2.0', id: req.id, error: this.#opts.initializeError };
+      }
+      return {
+        jsonrpc: '2.0',
+        id: req.id,
+        result: {
+          protocolVersion: this.#opts.protocolVersion ?? '2025-06-18',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'fake', version: '1.0.0' },
+        },
+      };
+    }
+    if (req.method === 'tools/list') {
+      return { jsonrpc: '2.0', id: req.id, result: { tools: this.#tools } };
+    }
+    if (req.method === 'tools/call') {
+      const params = req.params as { name?: string; arguments?: unknown };
+      const tool = this.#tools.find((t) => t.name === params?.name);
+      if (tool === undefined) {
+        return {
+          jsonrpc: '2.0',
+          id: req.id,
+          error: { code: -32601, message: `no such tool: ${String(params?.name)}` },
+        };
+      }
+      if (tool.rpcError !== undefined) {
+        return { jsonrpc: '2.0', id: req.id, error: tool.rpcError };
+      }
+      const r = tool.call?.(params?.arguments) ?? {};
+      const content =
+        r.content ?? (r.text !== undefined ? [{ type: 'text', text: r.text }] : []);
+      return {
+        jsonrpc: '2.0',
+        id: req.id,
+        result: {
+          content,
+          ...(r.structured !== undefined ? { structuredContent: r.structured } : {}),
+          ...(r.isError !== undefined ? { isError: r.isError } : {}),
+        },
+      };
+    }
+    return {
+      jsonrpc: '2.0',
+      id: req.id,
+      error: { code: -32601, message: `method not found: ${req.method}` },
+    };
+  }
+}
+
+function mcpCtx(over: Partial<ToolInvokeContext> = {}): ToolInvokeContext {
+  return {
+    pid: asProcessId(2),
+    callId: 'mcp-1',
+    deadline: '',
+    abortSignal: new AbortController().signal,
+    kernelAbiVersion: KERNEL_ABI_VERSION,
+    ...over,
+  };
+}
+
+/**
+ * A minimal real MCP server, run as a subprocess over stdio. Proves the
+ * StdioMcpTransport framing (newline-delimited JSON, not LSP headers) actually
+ * works — the fake server above cannot cover that.
+ */
+const MCP_ECHO_SERVER = `
+let buf = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', function (c) {
+  buf += c;
+  var i = buf.indexOf('\\n');
+  while (i >= 0) {
+    var line = buf.slice(0, i).trim();
+    buf = buf.slice(i + 1);
+    i = buf.indexOf('\\n');
+    if (line.length === 0) continue;
+    var m; try { m = JSON.parse(line); } catch (e) { continue; }
+    handle(m);
+  }
+});
+function send(o) { process.stdout.write(JSON.stringify(o) + '\\n'); }
+function handle(m) {
+  if (m.method === 'initialize') {
+    send({ jsonrpc: '2.0', id: m.id, result: { protocolVersion: '2025-06-18', capabilities: {}, serverInfo: { name: 'echo', version: '1.0.0' } } });
+    return;
+  }
+  if (m.method === 'notifications/initialized') { return; }
+  if (m.method === 'tools/list') {
+    send({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'echo', description: 'Echo a message back.', inputSchema: { type: 'object', properties: { message: { type: 'string' } }, required: ['message'] } }] } });
+    return;
+  }
+  if (m.method === 'tools/call') {
+    var msg = (m.params && m.params.arguments && m.params.arguments.message) || '';
+    send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: 'echo: ' + String(msg) }], isError: false } });
+    return;
+  }
+  send({ jsonrpc: '2.0', id: m.id, error: { code: -32601, message: 'method not found' } });
+}
+`;
+
+function fakeServer(): FakeMcpServer {
+  return new FakeMcpServer(
+    [
+      {
+        name: 'read_file',
+        description: 'Read a file.',
+        inputSchema: { type: 'object', properties: { path: { type: 'string' } } },
+        call: () => ({ text: 'file contents' }),
+      },
+      {
+        name: 'send_email',
+        description: 'Send an email to someone.',
+        call: () => ({ text: 'sent' }),
+      },
+      {
+        name: 'boom',
+        description: 'Always fails as a tool error.',
+        call: () => ({ text: 'it did not work', isError: true }),
+      },
+      {
+        name: 'broken',
+        description: 'Fails at the protocol level.',
+        rpcError: { code: -32000, message: 'server exploded' },
+      },
+    ],
+    {},
+  );
+}
+
+async function runMcpChecks(): Promise<void> {
+  check('McpToolDriver defaults match MCP_DEFAULTS', () => {
+    const d = new McpToolDriver({ transport: fakeServer() });
+    assert(d.name === MCP_DEFAULTS.name, `name ${d.name}`);
+    assert(d.version === MCP_DEFAULTS.version, 'version');
+    assert(d.abiCompat === MCP_DEFAULTS.abiCompat, 'abiCompat');
+    assert(d.closed === false, 'fresh driver is open');
+  });
+
+  check('mcp abiCompat admits the live kernel ABI', () => {
+    assert(satisfiesAbi(KERNEL_ABI_VERSION, mcpTool({ transport: fakeServer() }).abiCompat) === true, 'registry would accept it');
+  });
+
+  check('mcpTool() without command or transport traps EINVAL', () => {
+    let caught: unknown = null;
+    try { mcpTool({}); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EINVAL', `EINVAL, got ${(caught as CortexError).errno}`);
+  });
+
+  check('forkable is false — a live subprocess cannot cross a cognitive fork', () => {
+    // STATE.md §8.6: the kernel should not trust a driver's fork claim. We do
+    // not make one.
+    assert(mcpTool({ transport: fakeServer() }).forkable === false, 'forkable must be false');
+  });
+
+  await checkAsync('handshake sends initialize then notifications/initialized', async () => {
+    const server = fakeServer();
+    const d = mcpTool({ transport: server, namespace: 'demo' });
+    await d.listTools();
+    const methods = server.received.map((m) => m.method);
+    assert(methods[0] === 'initialize', `first is initialize, got ${methods[0]}`);
+    assert(methods.includes('notifications/initialized'), 'initialized notification sent');
+    assert(d.serverProtocolVersion === '2025-06-18', `negotiated version, got ${d.serverProtocolVersion}`);
+  });
+
+  await checkAsync('listTools maps MCP tools with a namespace prefix', async () => {
+    const d = mcpTool({ transport: fakeServer(), namespace: 'demo' });
+    const tools = await d.listTools();
+    assert(tools.length === 4, `4 tools, got ${tools.length}`);
+    assert(tools[0]!.name === 'demo/read_file', `namespaced, got ${tools[0]!.name}`);
+    assert(tools[0]!.description === 'Read a file.', 'description passed through');
+    assert(tools[0]!.reversibility === 'irreversible', `untagged defaults to irreversible, got ${tools[0]!.reversibility}`);
+  });
+
+  await checkAsync('namespace "" exposes raw MCP tool names', async () => {
+    const d = mcpTool({ transport: fakeServer(), namespace: '' });
+    const tools = await d.listTools();
+    assert(tools[0]!.name === 'read_file', `raw name, got ${tools[0]!.name}`);
+  });
+
+  await checkAsync('invoke calls the namespaced tool and unwraps text content', async () => {
+    const server = fakeServer();
+    const d = mcpTool({ transport: server, namespace: 'demo' });
+    await d.listTools();
+    const res = await d.invoke('demo/read_file', { path: '/tmp/a' }, mcpCtx());
+    const output = res.output as { text: string | null; content: unknown[] };
+    assert(output.text === 'file contents', `text: ${output.text}`);
+    assert(output.content.length === 1, 'one content block');
+    assert(res.error === null, 'no error');
+    // The server must see the UN-namespaced name.
+    const call = server.received.find((m) => m.method === 'tools/call') as JsonRpcRequest;
+    assert((call.params as { name: string }).name === 'read_file', 'server saw raw name');
+  });
+
+  await checkAsync('reversibility override applies per server tool name', async () => {
+    const d = mcpTool({
+      transport: fakeServer(),
+      namespace: 'demo',
+      defaultReversibility: 'idempotent',
+      reversibility: { send_email: 'irreversible', read_file: 'idempotent' },
+    });
+    const tools = await d.listTools();
+    const byName = new Map(tools.map((t) => [t.name, t]));
+    assert(byName.get('demo/send_email')!.reversibility === 'irreversible', 'explicit override wins');
+    assert(byName.get('demo/read_file')!.reversibility === 'idempotent', 'explicit override wins');
+    assert(byName.get('demo/boom')!.reversibility === 'idempotent', 'untagged falls back to defaultReversibility');
+  });
+
+  await checkAsync('declaredReversibility distinguishes declared from defaulted', async () => {
+    const d = mcpTool({
+      transport: fakeServer(),
+      namespace: 'demo',
+      reversibility: { send_email: 'irreversible' },
+    });
+    await d.listTools();
+    assert(d.declaredReversibility['demo/send_email'] === true, 'send_email was declared');
+    assert(d.declaredReversibility['demo/read_file'] === false, 'read_file was defaulted');
+    assert(isMcpToolDriver(d) === true, 'type guard recognises the driver');
+  });
+
+  await checkAsync('isError:true becomes a return-with-error, not a trap', async () => {
+    const d = mcpTool({ transport: fakeServer(), namespace: 'demo' });
+    await d.listTools();
+    const res = await d.invoke('demo/boom', {}, mcpCtx());
+    // Not thrown — per docs/ABI.md §3 the tool RAN and reported failure.
+    assert(res.error !== null, 'error is set');
+    assert(res.error!.code === 'MCP_TOOL_ERROR', `code, got ${res.error!.code}`);
+    assert(res.error!.message === 'it did not work', `message, got ${res.error!.message}`);
+    assert(res.reversibility === 'irreversible', 'reversibility still reported');
+  });
+
+  await checkAsync('unknown tool traps ENOENT before hitting the server', async () => {
+    const server = fakeServer();
+    const d = mcpTool({ transport: server, namespace: 'demo' });
+    await d.listTools();
+    let caught: unknown = null;
+    try { await d.invoke('demo/nope', {}, mcpCtx()); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'ENOENT', `ENOENT, got ${(caught as CortexError).errno}`);
+    assert(server.received.filter((m) => m.method === 'tools/call').length === 0, 'no network round-trip');
+  });
+
+  await checkAsync('JSON-RPC errors map to cortex errnos', async () => {
+    const d = mcpTool({ transport: fakeServer(), namespace: 'demo' });
+    await d.listTools();
+    let caught: unknown = null;
+    try { await d.invoke('demo/broken', {}, mcpCtx()); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EDRIVER', `-32000 => EDRIVER, got ${(caught as CortexError).errno}`);
+  });
+
+  await checkAsync('a failed initialize handshake traps EDRIVER', async () => {
+    const server = new FakeMcpServer([], { initializeError: { code: -32000, message: 'nope' } });
+    const d = mcpTool({ transport: server, namespace: 'demo' });
+    let caught: unknown = null;
+    try { await d.listTools(); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EDRIVER', `EDRIVER, got ${(caught as CortexError).errno}`);
+  });
+
+  await checkAsync('an unanswered call traps ETIMEDOUT', async () => {
+    const server = new FakeMcpServer(
+      [{ name: 'slow', call: () => ({ text: 'too late' }) }],
+      { silence: ['tools/call'] },
+    );
+    const d = mcpTool({ transport: server, namespace: 'demo', timeoutMs: 60 });
+    await d.listTools();
+    let caught: unknown = null;
+    try { await d.invoke('demo/slow', {}, mcpCtx()); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'ETIMEDOUT', `ETIMEDOUT, got ${(caught as CortexError).errno}`);
+  });
+
+  await checkAsync('an aborted signal traps EINTR', async () => {
+    const server = new FakeMcpServer(
+      [{ name: 'slow', call: () => ({ text: 'never' }) }],
+      { silence: ['tools/call'] },
+    );
+    const d = mcpTool({ transport: server, namespace: 'demo', timeoutMs: 5000 });
+    await d.listTools();
+    const ac = new AbortController();
+    const pending = d.invoke('demo/slow', {}, mcpCtx({ abortSignal: ac.signal }));
+    ac.abort();
+    let caught: unknown = null;
+    try { await pending; } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EINTR', `EINTR, got ${(caught as CortexError).errno}`);
+  });
+
+  await checkAsync('closed driver traps EDRIVER', async () => {
+    const d = mcpTool({ transport: fakeServer(), namespace: 'demo' });
+    await d.listTools();
+    await d.close();
+    let caught: unknown = null;
+    try { await d.invoke('demo/read_file', {}, mcpCtx()); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EDRIVER', `EDRIVER, got ${(caught as CortexError).errno}`);
+  });
+
+  await checkAsync('serializeState returns null (subprocess state is not ours)', async () => {
+    const d = mcpTool({ transport: fakeServer(), namespace: 'demo' });
+    assert((await d.serializeState()) === null, 'null');
+  });
+
+  check('mapCallResult joins text blocks and passes structuredContent through', () => {
+    const r = mapCallResult({
+      content: [{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }, { type: 'image', data: 'x' }],
+      structuredContent: { n: 1 },
+    });
+    const out = r.output as { text: string; content: unknown[]; structured: unknown };
+    assert(out.text === 'a\nb', `joined, got ${out.text}`);
+    assert(out.content.length === 3, 'all blocks kept');
+    assert(r.error === null, 'no error');
+  });
+
+  check('mapCallResult on a non-object yields null text and no error', () => {
+    const r = mapCallResult('garbage');
+    const out = r.output as { text: null };
+    assert(out.text === null, 'null text');
+    assert(r.error === null, 'no error');
+  });
+
+  check('errnoForRpcError maps the codes we care about', () => {
+    assert(errnoForRpcError(-32601) === 'ENOENT', 'method not found => ENOENT');
+    assert(errnoForRpcError(-32602) === 'EINVAL', 'invalid params => EINVAL');
+    assert(errnoForRpcError(-32600) === 'EINVAL', 'invalid request => EINVAL');
+    assert(errnoForRpcError(-32000) === 'EDRIVER', 'server error => EDRIVER');
+  });
+
+  await checkAsync('registry accepts the MCP driver and resolves namespaced tools', async () => {
+    // The load-bearing claim: MCP is a transport detail, not a kernel change.
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    await reg.registerTool(
+      mcpTool({ transport: fakeServer(), name: 'demo-mcp', namespace: 'demo' }),
+    );
+    const resolved = reg.resolveTool('demo/read_file');
+    assert(resolved !== undefined, 'tool resolved through the registry');
+    assert(resolved!.driver.name === 'demo-mcp', `owner, got ${resolved!.driver.name}`);
+    assert(resolved!.descriptor.reversibility === 'irreversible', 'descriptor cached');
+    assert(reg.resolveTool('read_file') === undefined, 'raw name is NOT exposed');
+  });
+
+  await checkAsync('two MCP servers coexist without a tool-name collision', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    await reg.registerTool(
+      mcpTool({ transport: fakeServer(), name: 'mcp-a', namespace: 'a' }),
+    );
+    await reg.registerTool(
+      mcpTool({ transport: fakeServer(), name: 'mcp-b', namespace: 'b' }),
+    );
+    assert(reg.resolveTool('a/read_file') !== undefined, 'namespace a');
+    assert(reg.resolveTool('b/read_file') !== undefined, 'namespace b');
+  });
+
+  await checkAsync('real stdio MCP server round-trips end to end', async () => {
+    const d = mcpTool({
+      command: process.execPath,
+      args: ['-e', MCP_ECHO_SERVER],
+      namespace: 'echo',
+      timeoutMs: 10_000,
+      handshakeTimeoutMs: 10_000,
+    });
+    try {
+      const tools = await d.listTools();
+      assert(tools.length === 1, `1 tool, got ${tools.length}`);
+      assert(tools[0]!.name === 'echo/echo', `namespaced, got ${tools[0]!.name}`);
+      assert(d.serverProtocolVersion === '2025-06-18', 'handshake negotiated');
+      const res = await d.invoke('echo/echo', { message: 'hi' }, mcpCtx());
+      const output = res.output as { text: string | null };
+      assert(output.text === 'echo: hi', `text: ${output.text}`);
+    } finally {
+      await d.close();
+    }
+  });
+
+  await checkAsync('a server that dies on startup fails fast, not at the timeout', async () => {
+    const deadline = 5000;
+    const d = mcpTool({
+      command: process.execPath,
+      args: ['-e', 'process.exit(1)'],
+      namespace: 'dead',
+      timeoutMs: deadline,
+      handshakeTimeoutMs: deadline,
+    });
+    const start = Date.now();
+    let caught: unknown = null;
+    try { await d.listTools(); } catch (e) { caught = e; }
+    const elapsed = Date.now() - start;
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EDRIVER', `EDRIVER, got ${(caught as CortexError).errno}`);
+    // The whole point of onClose: don't make the operator wait 5s for a server
+    // that was never alive.
+    assert(elapsed < deadline - 1000, `failed fast in ${elapsed}ms, should not approach the ${deadline}ms timeout`);
+    await d.close().catch(() => {});
+  });
+
+  await checkAsync('StdioMcpTransport spawns and is closeable', async () => {
+    const t = StdioMcpTransport.spawn({
+      command: process.execPath,
+      args: ['-e', MCP_ECHO_SERVER],
+    });
+    let got: JsonRpcMessage | null = null;
+    await new Promise<void>((resolve) => {
+      t.onMessage((m) => { got = m; resolve(); });
+      t.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'cortex', version: '1.0.0' } } });
+    });
+    assert(got !== null, 'got a response');
+    assert((got as unknown as JsonRpcResponse).id === 1, 'matching id');
+    await t.close();
+    assert(t.closed === true, 'closed');
+  });
+}
+
+// =============================================================================
+// cortex diff checks (#038)
+// =============================================================================
+
+/** Hand one turn to the Node event loop so pending agent Promises progress. */
+/**
+ * A `settle()` yield that lets real timers fire. The default yield is
+ * `setImmediate`, which can burn the whole tick budget before a pending
+ * `setTimeout` elapses — see `Kernel.settle()`'s caveat. Tests that park agents
+ * on wall-clock time (`sleep`, `wait({ timeoutMs })`) must use this.
+ */
+const timerYield = (): Promise<void> => new Promise<void>((resolve) => {
+  setTimeout(resolve, 5);
+});
+
+const yieldOnce = (): Promise<void> =>
+  new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+
+let recSeq = 0;
+
+/** Minimal SyscallRecord factory. `n` drives byteOffset so splitAtOffset works. */
+function srec(
+  n: number,
+  syscall: string,
+  phase: 'enter' | 'exit' | 'trap',
+  extra: Partial<SyscallRecord> = {},
+): SyscallRecord {
+  recSeq++;
+  return {
+    byteOffset: asSyscallOffset(n * 100),
+    timestamp: `2026-01-01T00:00:0${n % 10}.000Z`,
+    pid: asProcessId(2),
+    syscall,
+    callId: `c${recSeq}`,
+    phase,
+    stateBefore: 'running',
+    stateAfter: 'running',
+    reversibility: 'reversible',
+    kernelAbiVersion: KERNEL_ABI_VERSION,
+    ...extra,
+  };
+}
+
+async function runDiffChecks(): Promise<void> {
+  check('stableJson sorts object keys recursively', () => {
+    const a = stableJson({ b: 1, a: { d: 2, c: 3 } });
+    const b = stableJson({ a: { c: 3, d: 2 }, b: 1 });
+    assert(JSON.stringify(a) === JSON.stringify(b), 'same serialization regardless of insertion order');
+  });
+
+  check('recordSignature ignores timestamp, duration and callId', () => {
+    // Two branches make the same call at different times, taking different
+    // durations. They must compare equal or every line becomes a difference.
+    const a = srec(1, 'llm_call', 'exit', {
+      timestamp: '2026-01-01T00:00:01.000Z',
+      durationMs: 10,
+      callId: 'x1',
+      result: { text: 'same' },
+    });
+    const b = srec(2, 'llm_call', 'exit', {
+      timestamp: '2026-01-01T00:00:09.000Z',
+      durationMs: 900,
+      callId: 'x2',
+      result: { text: 'same' },
+    });
+    assert(recordSignature(a) === recordSignature(b), 'identical signatures');
+  });
+
+  check('recordSignature distinguishes different results', () => {
+    const a = srec(1, 'llm_call', 'exit', { result: { text: 'A' } });
+    const b = srec(1, 'llm_call', 'exit', { result: { text: 'B' } });
+    assert(recordSignature(a) !== recordSignature(b), 'different signatures');
+  });
+
+  check('diffRecords on identical sequences yields all "same"', () => {
+    const seq = [srec(1, 'llm_call', 'enter'), srec(2, 'llm_call', 'exit')];
+    const { lines, degenerate } = diffRecords(seq, seq);
+    assert(degenerate === false, 'not degenerate');
+    assert(lines.length === 2, `2 lines, got ${lines.length}`);
+    assert(lines.every((l) => l.kind === 'same'), 'all same');
+  });
+
+  check('diffRecords reports one insertion, not a cascade', () => {
+    // This is why LCS beats a positional compare: B inserts one call in the
+    // middle and everything after it still lines up.
+    const a = [srec(1, 'x', 'enter'), srec(2, 'y', 'enter'), srec(3, 'z', 'enter')];
+    const b = [
+      srec(1, 'x', 'enter'),
+      srec(2, 'inserted', 'enter'),
+      srec(3, 'y', 'enter'),
+      srec(4, 'z', 'enter'),
+    ];
+    const { lines } = diffRecords(a, b);
+    const kinds = lines.map((l) => l.kind);
+    assert(kinds.filter((k) => k === 'b-only').length === 1, `exactly 1 insertion, got ${kinds.join(',')}`);
+    assert(kinds.filter((k) => k === 'same').length === 3, '3 matched through');
+    assert(kinds.filter((k) => k === 'a-only').length === 0, 'no deletions');
+  });
+
+  check('diffRecords finds re-convergence after divergence', () => {
+    // Branches that split and then meet again: both exit the same way.
+    const a = [srec(1, 'x', 'enter'), srec(2, 'branchA', 'enter'), srec(3, 'exit', 'exit', { result: { code: 0 } })];
+    const b = [srec(1, 'x', 'enter'), srec(2, 'branchB', 'enter'), srec(3, 'exit', 'exit', { result: { code: 0 } })];
+    const { lines } = diffRecords(a, b);
+    const kinds = lines.map((l) => l.kind);
+    assert(kinds[0] === 'same', 'shared head');
+    assert(kinds.includes('a-only') && kinds.includes('b-only'), 'one divergent call each');
+    assert(kinds[kinds.length - 1] === 'same', 're-converged on exit — a prefix compare would miss this');
+  });
+
+  check('diffRecords against an empty log marks everything a-only', () => {
+    const { lines } = diffRecords([srec(1, 'x', 'enter')], []);
+    assert(lines.length === 1, '1 line');
+    assert(lines[0]!.kind === 'a-only', 'a-only');
+    assert(lines[0]!.b === null, 'b is null');
+  });
+
+  check('diffRecords falls back to a prefix compare on huge logs', () => {
+    // Beyond MAX_LCS_CELLS we must not attempt the O(n*m) table.
+    const n = 3000;
+    const m = Math.ceil((MAX_LCS_CELLS + 10) / n);
+    const a: SyscallRecord[] = [];
+    const b: SyscallRecord[] = [];
+    for (let i = 0; i < n; i++) a.push(srec(i, 'same', 'enter'));
+    for (let i = 0; i < m; i++) b.push(srec(i, 'same', 'enter'));
+    assert(a.length * b.length > MAX_LCS_CELLS, 'over the threshold');
+    const { degenerate } = diffRecords(a, b);
+    assert(degenerate === true, 'degenerate flag set so the CLI can say so');
+  });
+
+  check('splitAtOffset cuts the shared causal past off the front', () => {
+    const logs = [srec(1, 'a', 'enter'), srec(2, 'b', 'enter'), srec(3, 'c', 'enter'), srec(4, 'd', 'enter')];
+    const { shared, tail } = splitAtOffset(logs, 250);
+    assert(shared.length === 2, `2 before offset 250, got ${shared.length}`);
+    assert(tail.length === 2, `2 after, got ${tail.length}`);
+    assert(tail[0]!.syscall === 'c', 'tail starts at c');
+  });
+
+  check('splitAtOffset at 0 puts everything in the tail', () => {
+    const { shared, tail } = splitAtOffset([srec(1, 'a', 'enter')], 0);
+    assert(shared.length === 0, 'nothing shared');
+    assert(tail.length === 1, 'all tail');
+  });
+
+  check('findDivergence reads sharedCausalPast out of the fork record', () => {
+    const parent = [
+      srec(1, 'llm_call', 'enter'),
+      srec(2, 'llm_call', 'exit'),
+      srec(3, 'fork', 'exit', {
+        result: { childPid: 7, sharedCausalPast: 250, irreversibleInPast: ['fs_write'] },
+      }),
+    ];
+    const child = [srec(1, 'llm_call', 'enter')];
+    const d = findDivergence(2, parent, 7, child, 0);
+    assert(d.source === 'fork-record', `fork-record, got ${d.source}`);
+    assert(d.forkFromPid === 2 && d.forkChildPid === 7, 'parent/child identified');
+    assert(d.byteOffset === 250, `offset, got ${d.byteOffset}`);
+    assert(d.sharedSyscalls === 2, `2 shared, got ${d.sharedSyscalls}`);
+    assert(d.irreversibleInPast.join() === 'fs_write', 'irreversible history surfaced');
+  });
+
+  check('findDivergence works when the child is listed first', () => {
+    const parent = [srec(3, 'fork', 'exit', { result: { childPid: 7, sharedCausalPast: 150 } })];
+    const child = [srec(1, 'x', 'enter')];
+    const d = findDivergence(7, child, 2, parent, 0);
+    assert(d.source === 'fork-record', 'still found');
+    assert(d.forkFromPid === 2, `parent is 2, got ${d.forkFromPid}`);
+  });
+
+  check('findDivergence falls back to the LCS count when no fork links them', () => {
+    const a = [srec(1, 'x', 'enter')];
+    const b = [srec(1, 'x', 'enter'), srec(2, 'y', 'enter')];
+    const d = findDivergence(2, a, 3, b, 1);
+    assert(d.source === 'inferred', `inferred, got ${d.source}`);
+    assert(d.byteOffset === null, 'no authoritative offset');
+    assert(d.sharedSyscalls === 1, 'fallback value passed through');
+  });
+
+  check('summarize pulls exit code, last llm text and trap count', () => {
+    const s = summarize([
+      srec(1, 'llm_call', 'exit', { result: { text: 'first' } }),
+      srec(2, 'tool_call', 'trap', { error: { errno: 'EPERM', message: 'denied' } }),
+      srec(3, 'llm_call', 'exit', { result: { text: 'last' } }),
+      srec(4, 'exit', 'exit', { result: { code: 3, reason: 'gave up' } }),
+    ]);
+    assert(s.exitCode === 3, `exitCode, got ${s.exitCode}`);
+    assert(s.exitReason === 'gave up', 'exitReason');
+    assert(s.lastText === 'last', `last llm text, got ${s.lastText}`);
+    assert(s.traps === 1, `1 trap, got ${s.traps}`);
+    assert(s.syscalls === 4, '4 syscalls');
+    assert(s.wallMs === 3000, `wall 3000ms, got ${s.wallMs}`);
+  });
+
+  check('filterStateRecords drops __state transitions', () => {
+    const kept = filterStateRecords([
+      srec(1, '__state', 'exit'),
+      srec(2, 'llm_call', 'enter'),
+      srec(3, '__state', 'exit'),
+    ]);
+    assert(kept.length === 1, `1 kept, got ${kept.length}`);
+    assert(kept[0]!.syscall === 'llm_call', 'llm_call kept');
+  });
+
+  check('recordDetail renders traps, args and results distinctly', () => {
+    assert(recordDetail(srec(1, 'x', 'trap', { error: { errno: 'EPERM', message: 'denied' } })).startsWith('trap EPERM'), 'trap');
+    assert(recordDetail(srec(1, 'x', 'enter', { args: { a: 1 } })).startsWith('in '), 'enter');
+    assert(recordDetail(srec(1, 'x', 'exit', { result: { a: 1 } })).startsWith('out '), 'exit');
+  });
+
+  check('formatMs and clockOf match the trace command', () => {
+    assert(formatMs(500) === '500ms', 'ms');
+    assert(formatMs(3200) === '3.2s', 'seconds');
+    assert(formatMs(null) === '-', 'null');
+    assert(clockOf('2026-01-01T14:23:01.409Z') === '14:23:01.409', 'clock');
+  });
+
+  await checkAsync('cortex diff end to end over two real .crec files', async () => {
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-diff-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      const parent = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes') });
+      await parent.append({
+        timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(2), syscall: 'llm_call',
+        callId: 'p1', phase: 'exit', result: { text: 'shared thought' },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await parent.append({
+        timestamp: '2026-01-01T00:00:02.000Z', pid: asProcessId(2), syscall: 'fork',
+        callId: 'p2', phase: 'exit', args: { kind: 'cognitive' },
+        result: { childPid: 3, childChainId: 'cccc', sharedCausalPast: 0, irreversibleInPast: ['fs_write'] },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await parent.append({
+        timestamp: '2026-01-01T00:00:03.000Z', pid: asProcessId(2), syscall: 'llm_call',
+        callId: 'p3', phase: 'exit', result: { text: 'branch A answer' },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await parent.append({
+        timestamp: '2026-01-01T00:00:04.000Z', pid: asProcessId(2), syscall: 'exit',
+        callId: 'p4', phase: 'exit', result: { code: 0, reason: 'branch A complete' },
+        stateBefore: 'running', stateAfter: 'exiting', reversibility: 'irreversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await parent.flush();
+      await parent.close();
+
+      const child = await Recorder.open({ pid: asProcessId(3), dir: join(tmp, 'processes') });
+      await child.append({
+        timestamp: '2026-01-01T00:00:05.000Z', pid: asProcessId(3), syscall: 'llm_call',
+        callId: 'c1', phase: 'exit', result: { text: 'branch B answer' },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await child.append({
+        timestamp: '2026-01-01T00:00:06.000Z', pid: asProcessId(3), syscall: 'exit',
+        callId: 'c2', phase: 'exit', result: { code: 1, reason: 'branch B gave up' },
+        stateBefore: 'running', stateAfter: 'exiting', reversibility: 'irreversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await child.flush();
+      await child.close();
+
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      console.error = (): void => {};
+      const code = await cmdDiff(['2', '3']);
+
+      assert(code === 0, `exit 0, got ${code}`);
+      assert(out.includes('fork recorded in pid 2'), 'the fork record was found');
+      assert(out.includes('branch A answer'), 'branch A output surfaced');
+      assert(out.includes('branch B answer'), 'branch B output surfaced');
+      assert(out.includes('fs_write'), 'irreversible-before-fork surfaced');
+      assert(out.includes('branch A complete'), 'A exit reason');
+      assert(out.includes('branch B gave up'), 'B exit reason');
+    } finally {
+      console.log = prevLog;
+      console.error = prevErr;
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('cortex diff with one argument prints help and fails', async () => {
+    const prevLog = console.log;
+    try {
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      const code = await cmdDiff(['2']);
+      assert(code === 1, `exit 1, got ${code}`);
+      assert(out.includes('USAGE'), 'prints usage');
+    } finally {
+      console.log = prevLog;
+    }
+  });
+}
+
 
 async function runInMemChecks(): Promise<void> {
   check('InMemMemoryDriver defaults', () => {
@@ -7821,6 +8836,8 @@ await runMockLLMChecks();
 await runDeepseekChecks();
 await runOpenAiChecks();
 await runFsChecks();
+await runMcpChecks();
+await runDiffChecks();
 await runInMemChecks();
 await runSqliteChecks();
 await runCliChecks();

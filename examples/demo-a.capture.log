@@ -1,0 +1,52 @@
+[pid 2]
+[planner pid 2] spawning 3 coders (tinylog README)
+[coder overview pid 3] generating section: overview
+[coder overview pid 3] section ready
+[coder install pid 4] generating section: install
+[coder install pid 4] section ready
+[coder api pid 5] generating section: api
+[coder api pid 5] slow model — will miss its deadline
+[planner] api (pid 5) missed its 8000ms deadline — killing
+[coder api#2 pid 6] generating section: api
+[coder api#2 pid 6] section ready
+[planner] overview=ok(0) install=ok(0) api=respawned(0)
+[planner] assembled README.md:
++--------------------------------------------------------------------------------+
+| # tinylog                                                                      |
+|                                                                                |
+| > A 12-line structured logger for Node.                                        |
+|                                                                                |
+| ## Overview                                                                    |
+|                                                                                |
+| tinylog is a structured logger you can still read at 2am. Twelve lines of      |
+| source, zero dependencies, one `log` export.                                   |
+|                                                                                |
+| ```ts                                                                          |
+| import { log } from 'tinylog';                                                 |
+|                                                                                |
+| log.info('boot', { pid: process.pid });                                        |
+| log.error('db', { err: 'down' });                                              |
+| ```                                                                            |
+|                                                                                |
+| ## Install                                                                     |
+|                                                                                |
+| ```bash                                                                        |
+| npm install tinylog                                                            |
+| ```                                                                            |
+|                                                                                |
+| ```ts                                                                          |
+| import { log } from 'tinylog';                                                 |
+|                                                                                |
+| log.level = 'debug';                                                           |
+| log.info('ready');                                                             |
+| ```                                                                            |
+|                                                                                |
+| ## API                                                                         |
+|                                                                                |
+| - `log(level, msg, meta?)` — emit one structured line.                         |
+| - `log.child(meta)` — derive a child logger that merges `meta` into every line. |
+| - `log.level` — `'debug' | 'info' | 'warn' | 'error'` (default `'info'`).      |
+|                                                                                |
++--------------------------------------------------------------------------------+
+process exited (code 0: planner complete: overview=ok(0),install=ok(0),api=respawned(0))
+tokens: 0 (in 0, out 0)

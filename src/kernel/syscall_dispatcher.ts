@@ -102,6 +102,7 @@ import {
   type ToolDescriptor,
   type ToolInvokeContext,
   type ToolResult,
+  type WaitOptions,
   type WaitResult,
   asProcessId,
   unbrand,
@@ -115,6 +116,7 @@ import type { CheckpointManager } from './checkpoint.js';
 import type { ForkManager } from './fork.js';
 import type { InitProcess } from './init.js';
 import type { Scheduler } from './scheduler.js';
+import type { WakeGate } from './wake_gate.js';
 import type { SyscallRecordInput } from './recorder.js';
 
 // =============================================================================
@@ -177,7 +179,7 @@ export const SYSCALL_NAMES: readonly SyscallName[] = Object.freeze([
  */
 export interface SyscallArgs {
   spawn: [opts: SpawnOptions];
-  wait: [pid?: ProcessId];
+  wait: [pid?: ProcessId, opts?: WaitOptions];
   exit: [code: number, reason?: string];
   kill: [pid: ProcessId, signal: Signal];
   ps: [filter?: ProcessFilter];
@@ -433,6 +435,16 @@ export interface DispatcherOptions {
     pid: ProcessId,
     kind: 'tokens' | 'usd' | 'wallTime',
   ) => void | Promise<void>;
+
+  /**
+   * The kernel's wake gate. When present, a parked `wait()` is *not* resolved
+   * the instant its child zombifies — the resolution is deferred until the
+   * scheduler puts the parent back on the CPU, so the agent's next syscall sees
+   * RUNNING rather than the transient BLOCKED/READY of the wake itself. See
+   * `wake_gate.ts` for the race this closes. Absent ⇒ resolve immediately (the
+   * pre-rework behaviour, still correct when continuations run to completion).
+   */
+  readonly wakeGate?: WakeGate;
 }
 
 /** Default LLM call timeout (docs/ABI.md §4.3). */
@@ -452,6 +464,8 @@ interface Waiter {
   resolve: (result: WaitResult) => void;
   reject: (err: unknown) => void;
   settled: boolean;
+  /** Timeout timer, present only when `wait()` was called with a `timeoutMs`. */
+  timer: unknown | null;
 }
 
 // =============================================================================
@@ -487,6 +501,7 @@ export class SyscallDispatcher {
   #setTimeoutFn: (cb: () => void, ms: number) => unknown;
   #clearTimeoutFn: (handle: unknown) => void;
   #onBudgetExhausted: DispatcherOptions['onBudgetExhausted'];
+  #wakeGate: WakeGate | null;
 
   /** pid → forkable-region nesting depth. */
   #forkableDepth = new Map<number, number>();
@@ -519,6 +534,7 @@ export class SyscallDispatcher {
     if (opts.onBudgetExhausted !== undefined) {
       this.#onBudgetExhausted = opts.onBudgetExhausted;
     }
+    this.#wakeGate = opts.wakeGate ?? null;
     const explicitCallId = opts.nextCallId;
     this.#nextCallId =
       explicitCallId ??
@@ -664,7 +680,11 @@ export class SyscallDispatcher {
       case 'spawn':
         return await this.#spawn(pid, args[0] as SpawnOptions);
       case 'wait':
-        return await this.#wait(pid, args[0] as ProcessId | undefined);
+        return await this.#wait(
+          pid,
+          args[0] as ProcessId | undefined,
+          args[1] as WaitOptions | undefined,
+        );
       case 'exit':
         // Never returns; throws ProcessExitSignal after recording.
         return await this.#exit(pid, args[0] as number, args[1] as string | undefined, callId);
@@ -761,19 +781,39 @@ export class SyscallDispatcher {
     return { pid: childPid };
   }
 
-  async #wait(pid: ProcessId, target?: ProcessId): Promise<WaitResult> {
+  async #wait(pid: ProcessId, target?: ProcessId, opts?: WaitOptions): Promise<WaitResult> {
+    const timeoutMs = opts?.timeoutMs;
     const children = this.#table.children(pid);
 
     if (target !== undefined) {
       if (!children.includes(target)) {
+        // Not a live child. Either it was already reaped (init auto-reaps
+        // zombies, so this is the common case for a supervisor that waits
+        // late) — in which case the table retained its status — or it was
+        // never our child at all.
+        const retained = this.#table.takeReapedChild(pid, target);
+        if (retained !== null) return retained;
         trap('ESRCH', 'wait', { pid: unbrand(pid), target: unbrand(target) });
       }
       const tEntry = this.#table.get(target);
       if (tEntry !== undefined && tEntry.state === 'zombie') {
         return await this.#table.reap(target);
       }
-      return await this.#parkWait(pid, target);
+      // `timeoutMs: 0` is a poll: never park.
+      if (timeoutMs === 0) {
+        trap('ETIMEDOUT', 'wait', {
+          pid: unbrand(pid),
+          target: unbrand(target),
+          timeoutMs: 0,
+        });
+      }
+      return await this.#parkWait(pid, target, timeoutMs);
     }
+
+    // Any-child form: collect a child that exited before we got here first, so
+    // waiting late is not distinguishable from waiting on time.
+    const retainedAny = this.#table.takeReapedChildAny(pid);
+    if (retainedAny !== null) return retainedAny;
 
     if (children.length === 0) {
       trap('ECHILD', 'wait', { pid: unbrand(pid) });
@@ -785,18 +825,49 @@ export class SyscallDispatcher {
         return await this.#table.reap(child);
       }
     }
-    return await this.#parkWait(pid, null);
+    if (timeoutMs === 0) {
+      trap('ETIMEDOUT', 'wait', { pid: unbrand(pid), timeoutMs: 0 });
+    }
+    return await this.#parkWait(pid, null, timeoutMs);
   }
 
-  /** Park the caller in BLOCKED until an awaited child zombifies. */
-  #parkWait(parentPid: ProcessId, childPid: ProcessId | null): Promise<WaitResult> {
+  /**
+   * Park the caller in BLOCKED until an awaited child zombifies — or until
+   * `timeoutMs` elapses, in which case the wait traps `ETIMEDOUT` and the
+   * caller is returned to READY. The child is deliberately *not* killed: that
+   * is the supervisor's call, and `kill()` is its own syscall (docs/ABI.md
+   * §4.1). This is what lets a supervisor express "bound every child, kill and
+   * respawn the ones that hang" as ordinary control flow.
+   */
+  #parkWait(
+    parentPid: ProcessId,
+    childPid: ProcessId | null,
+    timeoutMs?: number,
+  ): Promise<WaitResult> {
     return new Promise<WaitResult>((resolve, reject) => {
-      const waiter: Waiter = { parentPid, childPid, resolve, reject, settled: false };
+      const waiter: Waiter = { parentPid, childPid, resolve, reject, settled: false, timer: null };
       const key = childPid === null ? unbrand(parentPid) : unbrand(childPid);
       const map = childPid === null ? this.#waitersAny : this.#waitersByChild;
       const list = map.get(key) ?? [];
       list.push(waiter);
       map.set(key, list);
+
+      if (timeoutMs !== undefined) {
+        waiter.timer = this.#setTimeoutFn(() => {
+          if (waiter.settled) return;
+          waiter.settled = true;
+          this.#removeWaiter(waiter);
+          this.#unpark(parentPid, () => {
+            waiter.reject(new CortexError('ETIMEDOUT', 'wait', {
+              message: `wait timed out after ${timeoutMs}ms`,
+              details: {
+                parent: unbrand(parentPid),
+                child: childPid === null ? null : unbrand(childPid),
+              },
+            }));
+          });
+        }, timeoutMs);
+      }
 
       // Best-effort BLOCKED transition. If the state machine forbids it (the
       // caller is somehow not RUNNING), leave the state alone — the promise
@@ -816,6 +887,18 @@ export class SyscallDispatcher {
           });
       }
     });
+  }
+
+  /** Remove a parked waiter from whichever list it is registered in. */
+  #removeWaiter(waiter: Waiter): void {
+    const key =
+      waiter.childPid === null ? unbrand(waiter.parentPid) : unbrand(waiter.childPid);
+    const map = waiter.childPid === null ? this.#waitersAny : this.#waitersByChild;
+    const list = map.get(key);
+    if (list === undefined) return;
+    const idx = list.indexOf(waiter);
+    if (idx >= 0) list.splice(idx, 1);
+    if (list.length === 0) map.delete(key);
   }
 
   /**
@@ -844,16 +927,22 @@ export class SyscallDispatcher {
     const deliver = (waiter: Waiter): void => {
       if (waiter.settled) return;
       waiter.settled = true;
+      // A child that exited beat the timeout: cancel it, or the parent would be
+      // woken twice (once by the reap, once by a stale timer).
+      if (waiter.timer !== null) {
+        this.#clearTimeoutFn(waiter.timer);
+        waiter.timer = null;
+      }
       if (result !== null) {
-        this.#unpark(waiter.parentPid);
-        waiter.resolve(result);
+        this.#unpark(waiter.parentPid, () => waiter.resolve(result));
       } else {
         // Child vanished without a usable zombie (already reaped elsewhere).
-        this.#unpark(waiter.parentPid);
-        waiter.reject(new CortexError('ECHILD', 'wait', {
-          message: 'awaited child is gone',
-          details: { child: childKey },
-        }));
+        this.#unpark(waiter.parentPid, () => {
+          waiter.reject(new CortexError('ECHILD', 'wait', {
+            message: 'awaited child is gone',
+            details: { child: childKey },
+          }));
+        });
       }
     };
 
@@ -873,19 +962,44 @@ export class SyscallDispatcher {
     }
   }
 
-  /** Return a parked parent from BLOCKED to READY (the scheduler re-adopts it). */
-  #unpark(parentPid: ProcessId): void {
+  /**
+   * Return a parked parent from BLOCKED to READY (the scheduler re-adopts it),
+   * then settle its `wait()`.
+   *
+   * The two halves are deliberately decoupled. `resume` — resolving or rejecting
+   * the parked Promise — is handed to the wake gate instead of being called
+   * inline, so the agent body restarts on its next *dispatch* rather than in
+   * the middle of the wake. Resolving inline would let the body run its next
+   * syscall while the process is still BLOCKED (the state transition behind it
+   * is an `await` on the recorder) and trap ESTATE. See `wake_gate.ts`.
+   *
+   * With no gate configured, `resume` runs immediately — correct for hosts whose
+   * continuations run to completion inside one quantum.
+   */
+  #unpark(parentPid: ProcessId, resume: () => void): void {
     const entry = this.#table.get(parentPid);
-    if (entry === undefined) return;
-    if (entry.state === 'blocked') {
-      this.#table.setBlockedOn(parentPid, null);
-      void this.#table
-        .setState(parentPid, 'ready', { trigger: 'wait-return' })
-        .then(() => this.#scheduler?.enqueue(parentPid))
-        .catch(() => {
-          /* best-effort */
-        });
+    if (entry === undefined) {
+      resume();
+      return;
     }
+    if (entry.state !== 'blocked') {
+      // Not parked on `wait` (or already woken): nothing to schedule, and the
+      // gate would never be released, so settle inline.
+      resume();
+      return;
+    }
+    this.#table.setBlockedOn(parentPid, null);
+    if (this.#wakeGate !== null) this.#wakeGate.defer(parentPid, resume);
+    void this.#table
+      .setState(parentPid, 'ready', { trigger: 'wait-return' })
+      .then(() => this.#scheduler?.enqueue(parentPid))
+      .catch(() => {
+        // The state write failed: never leave the wake stranded behind a
+        // dispatch that cannot happen.
+        this.#wakeGate?.clear(parentPid);
+        resume();
+      });
+    if (this.#wakeGate === null) resume();
   }
 
   async #exit(

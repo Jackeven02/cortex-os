@@ -25,6 +25,12 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# WorkBuddy local memory/skills (project-specific, not source)
+.workbuddy/
+
+# Demo capture fixtures are inputs to the GIF/HTML generators — keep them tracked
+!examples/*.capture.log
+
 # Environment
 .env
 .env.local

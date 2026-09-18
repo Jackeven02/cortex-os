@@ -438,6 +438,32 @@ export interface WaitResult {
   readonly reapedAt: Timestamp;
 }
 
+/**
+ * Options for `wait()`.
+ *
+ * `timeoutMs` is what makes a supervision tree expressible inside the
+ * supervisor itself: without it, a hung child parks the parent forever and the
+ * only remaining option is polling `ps()` in a loop — glue code outside the
+ * supervisor. With it, the planner can bound every child and act on the
+ * timeout (kill + respawn) as ordinary control flow.
+ *
+ *   • `timeoutMs: undefined` (default) — wait indefinitely, the POSIX default.
+ *   • `timeoutMs: 0`                   — poll: return the child's status if it
+ *                                        has already exited, else time out at
+ *                                        once (never parks).
+ *   • `timeoutMs: n`                   — park for at most `n` ms.
+ *
+ * On timeout the syscall traps `ETIMEDOUT` and the process is returned from
+ * BLOCKED to READY; the child is *not* killed (that is the supervisor's
+ * decision, and `kill()` is a separate syscall).
+ *
+ * See: docs/ABI.md §4.1; docs/PROCESS.md §10
+ */
+export interface WaitOptions {
+  /** Maximum time to park, in milliseconds. `0` polls; omit to wait forever. */
+  readonly timeoutMs?: number;
+}
+
 // =============================================================================
 // §9. Spawn
 // =============================================================================
@@ -942,7 +968,7 @@ export interface CortexContext {
   // §4.1 Process control
   // ---------------------------------------------------------------------------
   spawn(opts: SpawnOptions): Promise<{ readonly pid: ProcessId }>;
-  wait(pid?: ProcessId): Promise<WaitResult>;
+  wait(pid?: ProcessId, opts?: WaitOptions): Promise<WaitResult>;
   exit(code: number, reason?: string): never;
   kill(pid: ProcessId, signal: Signal): Promise<void>;
   ps(filter?: ProcessFilter): Promise<readonly ProcessInfo[]>;

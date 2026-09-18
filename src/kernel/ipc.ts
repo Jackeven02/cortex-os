@@ -108,6 +108,7 @@ import {
 import { CortexError, isCortexError, trap } from './errors.js';
 import type { ProcessTable } from './process_table.js';
 import type { SignalManager } from './signals.js';
+import type { WakeGate } from './wake_gate.js';
 import type { SyscallRecordInput } from './recorder.js';
 
 // =============================================================================
@@ -239,6 +240,14 @@ export interface IpcManagerOptions {
   /** setTimeout injection point so tests can run without real timers. */
   readonly setTimeoutFn?: typeof setTimeout;
   readonly clearTimeoutFn?: typeof clearTimeout;
+  /**
+   * The kernel's wake gate. When present, a `recv()` that is woken (by a
+   * message, a close, or a timeout) does not resolve the instant the message is
+   * in hand — the resolution is deferred until the scheduler next dispatches the
+   * receiver, so the agent's next syscall sees RUNNING instead of the transient
+   * READY left behind by the wake. See `wake_gate.ts`. Absent ⇒ resolve inline.
+   */
+  readonly wakeGate?: WakeGate;
 }
 
 /**
@@ -272,6 +281,7 @@ export class IpcManager {
   #signals: SignalManager | null;
   #now: () => Timestamp;
   #nextCallId: () => string;
+  #wakeGate: WakeGate | null;
   #defaultQueueLimit: number;
   #setTimeout: typeof setTimeout;
   #clearTimeout: typeof clearTimeout;
@@ -289,6 +299,7 @@ export class IpcManager {
     this.#defaultQueueLimit = opts.defaultQueueLimit ?? DEFAULT_QUEUE_LIMIT;
     this.#setTimeout = opts.setTimeoutFn ?? setTimeout;
     this.#clearTimeout = opts.clearTimeoutFn ?? clearTimeout;
+    this.#wakeGate = opts.wakeGate ?? null;
     this.#nextCallId =
       opts.nextCallId ??
       (() => {
@@ -687,7 +698,11 @@ export class IpcManager {
                   callId,
                 });
               }
-              resolve(msg);
+              // The message is in hand, but the body may only resume once the
+              // scheduler has put the process back in RUNNING — otherwise its
+              // next syscall runs against the transient READY above and traps
+              // ESTATE. See wake_gate.ts.
+              this.#settleWake(pid, () => resolve(msg));
             } catch (err) {
               // Recording or state-transition failure. Surface to the
               // awaiter; the message is still consumed (it was handed off
@@ -715,7 +730,9 @@ export class IpcManager {
                 });
               }
             } finally {
-              reject(err);
+              // Same reasoning as the resolve path: hand the rejection to the
+              // agent on its next dispatch, not mid-wake.
+              this.#settleWake(pid, () => reject(err));
             }
           })();
         },
@@ -757,6 +774,19 @@ export class IpcManager {
         this.#settleWaiterResolve(waiter, late);
       }
     });
+  }
+
+  /**
+   * Settle a parked `recv()`: either run `fn` now (no gate configured — the
+   * host's continuations run to completion and never race the state machine) or
+   * defer it to the receiver's next dispatch. See `wake_gate.ts`.
+   */
+  #settleWake(pid: ProcessId, fn: () => void): void {
+    if (this.#wakeGate === null) {
+      fn();
+      return;
+    }
+    this.#wakeGate.defer(pid, fn);
   }
 
   // ---------------------------------------------------------------------------

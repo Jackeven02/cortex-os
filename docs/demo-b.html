@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cortex — Demo B: pause across reboots</title>
+<style>
+  :root {
+    --bg: #0b0e14; --bar: #11151f; --edge: #1c2230;
+    --fg: #e6e6e6; --role: #8be9fd; --checkpoint: #ffb86c;
+    --recovered: #50fa7b; --skip: #6272a4; --sys: #bd93f9;
+    --banner: #ff79c6; --muted: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #05070b; color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 24px;
+  }
+  .term {
+    width: min(880px, 96vw); background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 10px; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .bar {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--bar); padding: 10px 14px; border-bottom: 1px solid var(--edge);
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .r { background: #ff5f56; } .y { background: #ffbd2e; } .g { background: #27c93f; }
+  .title { margin-left: 10px; color: #9aa4b2; font-size: 13px; }
+  .body {
+    margin: 0; padding: 16px 18px; height: 560px; overflow: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .line { min-height: 1.5em; }
+  .role { color: var(--role); }
+  .checkpoint { color: var(--checkpoint); }
+  .recovered { color: var(--recovered); }
+  .skip { color: var(--skip); }
+  .sys { color: var(--sys); }
+  .banner { color: var(--banner); font-weight: 700; }
+  .exit { color: var(--recovered); font-weight: 700; }
+  .muted { color: var(--muted); }
+  .out { color: var(--fg); }
+  .cursor {
+    display: inline-block; width: 9px; height: 1.05em; vertical-align: -2px;
+    background: #cdd6f4; animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .cap { color: #6b7280; font-size: 12px; padding: 0 18px 14px; }
+</style>
+</head>
+<body>
+  <div class="term">
+    <div class="bar">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="title">cortex &middot; examples/checkpoint-agent.ts — Demo B: pause across reboots</span>
+    </div>
+    <pre class="body" id="body"></pre>
+    <div class="cap">Replay of the real CLI run (offline, mock driver): spawn &rarr; reboot &rarr; restore. Loops automatically.</div>
+  </div>
+<script>
+  const ROWS = [{"t": "[pid 2]", "c": "muted"}, {"t": "[inbox-watcher pid 2] inbox-watcher up — 6 tickets in queue", "c": "role"}, {"t": "[inbox-watcher pid 2] #T-1180 App crashes on launch after the 2.3 update -&gt; bug; reply drafted", "c": "role"}, {"t": "[inbox-watcher pid 2] #T-1181 Can I export my data to CSV? -&gt; feature; reply drafted", "c": "role"}, {"t": "[inbox-watcher pid 2] #T-1182 How do I reset my password? -&gt; question; reply drafted", "c": "role"}, {"t": "[inbox-watcher pid 2] 3/6 handled — checkpointing (tag &#x27;inbox-watcher&#x27;) before shutdown", "c": "checkpoint"}, {"t": "[inbox-watcher pid 2] suspended at bf9a81b1-debe-4f02-8d04-6f716adcd7d7 — resume after reboot: cortex restore --tag inbox-watcher", "c": "checkpoint"}, {"t": "process suspended at checkpoint after 1191ms", "c": "checkpoint"}, {"t": "  chain: bf9a81b1-debe-4f02-8d04-6f716adcd7d7", "c": "muted"}, {"t": "  resume with: cortex restore --chain bf9a81b1-debe-4f02-8d04-6f716adcd7d7", "c": "muted"}, {"t": "tokens: 0 (in 0, out 0)", "c": "muted"}, {"t": "###  laptop reboots - kernel torn down, .csnap persists on disk  ###", "c": "banner"}, {"t": "restored as pid 3 (chain bf9a81b1-debe-4f02-8d04-6f716adcd7d7)", "c": "sys"}, {"t": "[inbox-watcher pid 3] inbox-watcher up — 6 tickets in queue", "c": "role"}, {"t": "[inbox-watcher pid 3] recovered 3 processed ticket(s) from memory", "c": "recovered"}, {"t": "[inbox-watcher pid 3] skip T-1180 (already handled)", "c": "skip"}, {"t": "[inbox-watcher pid 3] skip T-1181 (already handled)", "c": "skip"}, {"t": "[inbox-watcher pid 3] skip T-1182 (already handled)", "c": "skip"}, {"t": "[inbox-watcher pid 3] #T-1183 Dark mode flickers on Windows 11 -&gt; bug; reply drafted", "c": "role"}, {"t": "[inbox-watcher pid 3] #T-1184 Please add keyboard shortcuts for navigation -&gt; feature; reply drafted", "c": "role"}, {"t": "[inbox-watcher pid 3] #T-1185 I was charged twice this month -&gt; bug; reply drafted", "c": "role"}, {"t": "[inbox-watcher pid 3] inbox cleared (6/6)", "c": "exit"}, {"t": "process exited (code 0: inbox cleared)", "c": "exit"}];
+  const body = document.getElementById('body');
+  const cursor = document.createElement('span');
+  cursor.className = 'cursor';
+  let i = 0;
+  function step() {
+    if (i < ROWS.length) {
+      const d = document.createElement('div');
+      d.className = 'line ' + ROWS[i].c;
+      d.textContent = ROWS[i].t;
+      body.appendChild(d);
+      body.appendChild(cursor);
+      i++;
+      body.scrollTop = body.scrollHeight;
+      setTimeout(step, 230);
+    } else {
+      setTimeout(() => {
+        body.innerHTML = '';
+        i = 0;
+        step();
+      }, 4500);
+    }
+  }
+  step();
+</script>
+</body>
+</html>

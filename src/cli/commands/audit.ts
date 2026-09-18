@@ -12,6 +12,7 @@
 
 import { parseArgs } from 'node:util';
 import { bootCliKernel, defaultKernelDir } from '../index.js';
+import { isMcpToolDriver } from '../../drivers/tool/mcp.js';
 
 export async function cmdAudit(args: string[]): Promise<number> {
   const { values } = parseArgs({
@@ -40,6 +41,7 @@ OPTIONS
   try {
     const manifest = kernel.registry.listAll();
     let totalTools = 0;
+    let undeclared = 0;
 
     console.log('Tool drivers:');
     console.log('-'.repeat(80));
@@ -51,7 +53,19 @@ OPTIONS
         console.log(`  ${driver.name} v${driver.version} (forkable=${driver.forkable}, twoPhase=${driver.twoPhase})`);
         for (const toolName of driver.tools) {
           totalTools++;
-          console.log(`    - ${toolName}`);
+          const resolved = kernel.registry.resolveTool(toolName);
+          const tag = resolved?.descriptor.reversibility ?? '?';
+          // #040, properly: a driver can *report* a tag without the tool ever
+          // having declared one. MCP servers cannot declare reversibility at
+          // all, so their tools are all defaulted — flag those, because a
+          // defaulted 'irreversible' silently forbids forkable() regions.
+          const inferred =
+            resolved !== undefined &&
+            isMcpToolDriver(resolved.driver) &&
+            resolved.driver.declaredReversibility[toolName] !== true;
+          if (inferred) undeclared++;
+          const suffix = inferred ? '   <- NOT declared; defaulted' : '';
+          console.log(`    - ${toolName.padEnd(30)}${tag}${suffix}`);
         }
       }
     }
@@ -85,6 +99,14 @@ OPTIONS
 
     console.log('');
     console.log(`${totalTools} tool(s) across ${manifest.tools.length} driver(s)`);
+    if (undeclared > 0) {
+      console.log(
+        `${undeclared} tool(s) never declared a reversibility tag — they are treated as ` +
+          `'irreversible' and will be refused inside forkable() regions.\n` +
+          `Set them explicitly (MCP: the 'reversibility' option on mcpTool(), or ` +
+          `CORTEX_MCP_* env for the CLI) to make them forkable.`,
+      );
+    }
 
     await kernel.shutdown();
     return 0;

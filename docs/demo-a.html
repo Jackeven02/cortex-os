@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cortex — Demo A: supervision tree</title>
+<style>
+  :root {
+    --bg: #0b0e14; --bar: #11151f; --edge: #1c2230;
+    --fg: #e6e6e6; --planner: #ffb86c; --coder: #8be9fd;
+    --exit: #50fa7b; --doc: #6272a4; --muted: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #05070b; color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 24px;
+  }
+  .term {
+    width: min(860px, 96vw); background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 10px; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .bar {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--bar); padding: 10px 14px; border-bottom: 1px solid var(--edge);
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .r { background: #ff5f56; } .y { background: #ffbd2e; } .g { background: #27c93f; }
+  .title { margin-left: 10px; color: #9aa4b2; font-size: 13px; }
+  .body {
+    margin: 0; padding: 16px 18px; height: 560px; overflow: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .line { min-height: 1.5em; }
+  .planner { color: var(--planner); }
+  .coder   { color: var(--coder); }
+  .exit    { color: var(--exit); font-weight: 700; }
+  .doc     { color: var(--doc); }
+  .muted   { color: var(--muted); }
+  .out     { color: var(--fg); }
+  .cursor {
+    display: inline-block; width: 9px; height: 1.05em; vertical-align: -2px;
+    background: #cdd6f4; animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .cap { color: #6b7280; font-size: 12px; padding: 0 18px 14px; }
+</style>
+</head>
+<body>
+  <div class="term">
+    <div class="bar">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="title">cortex &middot; examples/supervision-tree.ts — Demo A: supervision tree</span>
+    </div>
+    <pre class="body" id="body"></pre>
+    <div class="cap">Replay of the real CLI run (offline, mock LLM driver). Loops automatically.</div>
+  </div>
+<script>
+  const ROWS = [{"t": "[pid 2]", "c": "muted"}, {"t": "[planner pid 2] spawning 3 coders (tinylog README)", "c": "out"}, {"t": "[coder overview pid 3] generating section: overview", "c": "coder"}, {"t": "[coder overview pid 3] section ready", "c": "coder"}, {"t": "[coder install pid 4] generating section: install", "c": "coder"}, {"t": "[coder install pid 4] section ready", "c": "coder"}, {"t": "[coder api pid 5] generating section: api", "c": "coder"}, {"t": "[coder api pid 5] slow model — will miss its deadline", "c": "coder"}, {"t": "[planner] api (pid 5) missed its 8000ms deadline — killing", "c": "planner"}, {"t": "[coder api#2 pid 6] generating section: api", "c": "coder"}, {"t": "[coder api#2 pid 6] section ready", "c": "coder"}, {"t": "[planner] overview=ok(0) install=ok(0) api=respawned(0)", "c": "planner"}, {"t": "[planner] assembled README.md:", "c": "planner"}, {"t": "+--------------------------------------------------------------------------------+", "c": "doc"}, {"t": "| # tinylog                                                                      |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| &gt; A 12-line structured logger for Node.                                        |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| ## Overview                                                                    |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| tinylog is a structured logger you can still read at 2am. Twelve lines of      |", "c": "doc"}, {"t": "| source, zero dependencies, one `log` export.                                   |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| ```ts                                                                          |", "c": "doc"}, {"t": "| import { log } from &#x27;tinylog&#x27;;                                                 |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| log.info(&#x27;boot&#x27;, { pid: process.pid });                                        |", "c": "doc"}, {"t": "| log.error(&#x27;db&#x27;, { err: &#x27;down&#x27; });                                              |", "c": "doc"}, {"t": "| ```                                                                            |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| ## Install                                                                     |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| ```bash                                                                        |", "c": "doc"}, {"t": "| npm install tinylog                                                            |", "c": "doc"}, {"t": "| ```                                                                            |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| ```ts                                                                          |", "c": "doc"}, {"t": "| import { log } from &#x27;tinylog&#x27;;                                                 |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| log.level = &#x27;debug&#x27;;                                                           |", "c": "doc"}, {"t": "| log.info(&#x27;ready&#x27;);                                                             |", "c": "doc"}, {"t": "| ```                                                                            |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| ## API                                                                         |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "| - `log(level, msg, meta?)` — emit one structured line.                         |", "c": "doc"}, {"t": "| - `log.child(meta)` — derive a child logger that merges `meta` into every line. |", "c": "doc"}, {"t": "| - `log.level` — `&#x27;debug&#x27; | &#x27;info&#x27; | &#x27;warn&#x27; | &#x27;error&#x27;` (default `&#x27;info&#x27;`).      |", "c": "doc"}, {"t": "|                                                                                |", "c": "doc"}, {"t": "+--------------------------------------------------------------------------------+", "c": "doc"}, {"t": "process exited (code 0: planner complete: overview=ok(0),install=ok(0),api=respawned(0))", "c": "exit"}, {"t": "tokens: 0 (in 0, out 0)", "c": "muted"}];
+  const body = document.getElementById('body');
+  const cursor = document.createElement('span');
+  cursor.className = 'cursor';
+  let i = 0;
+  function step() {
+    if (i < ROWS.length) {
+      const d = document.createElement('div');
+      d.className = 'line ' + ROWS[i].c;
+      d.textContent = ROWS[i].t;
+      body.appendChild(d);
+      body.appendChild(cursor);
+      i++;
+      body.scrollTop = body.scrollHeight;
+      setTimeout(step, 240);
+    } else {
+      setTimeout(() => {
+        body.innerHTML = '';
+        i = 0;
+        step();
+      }, 4500);
+    }
+  }
+  step();
+</script>
+</body>
+</html>

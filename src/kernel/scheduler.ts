@@ -119,6 +119,12 @@ export type ResumeFn = (pid: ProcessId) => Promise<void>;
  *                  quantum. Not re-queued.
  *   - `detached` — the process ended in STOPPED / SUSPENDED / CHECKPOINTING;
  *                  left in that state, not re-queued.
+ *   - `parked`  — the continuation is still live but suspended on something the
+ *                 kernel owes it (a `wait()`/`recv()` wake, a driver call, a
+ *                 timer). The process stays RUNNING and is NOT re-queued:
+ *                 re-queueing would re-enter its agent body mid-`await`. It is
+ *                 resumed by releasing the wake on a later dispatch, or it
+ *                 drives its own exit when the body finally settles.
  */
 export type DispatchReason =
   | 'yielded'
@@ -126,7 +132,8 @@ export type DispatchReason =
   | 'sigxcpu'
   | 'signal'
   | 'exited'
-  | 'detached';
+  | 'detached'
+  | 'parked';
 
 /**
  * Outcome of a single `tick()`. Either nothing was runnable (`dispatched:
@@ -185,6 +192,26 @@ export interface SchedulerOptions {
    * wake path.
    */
   readonly autoReconcile?: boolean;
+  /**
+   * "Is this process's continuation still live?" — i.e. has its agent body been
+   * started and not yet finished?
+   *
+   * Needed once the continuation is cooperative (see boot.ts, "The execution
+   * model"): `resume` returns as soon as the body hits its first suspension
+   * point, so from the scheduler's point of view a dispatched process looks
+   * like it merely yielded. Re-queueing it (the `yielded` path) would dispatch
+   * it again while its body is still mid-`await`, and the kernel must not run
+   * two copies of one agent.
+   *
+   * When this predicate answers `true` for a still-RUNNING process, the
+   * scheduler instead reports `parked`: it leaves the process in RUNNING and
+   * drops it from the run queue. It becomes schedulable again the moment the
+   * kernel wakes it (BLOCKED → READY) or its body drives its own exit.
+   *
+   * Defaults to `null` (no cooperative bodies — every `resume` runs to
+   * completion, the pre-rework behaviour).
+   */
+  readonly isLive?: (pid: ProcessId) => boolean;
 }
 
 /** Opaque timer handle (matches both Node's `Timeout` and the browser's number). */
@@ -246,10 +273,21 @@ export class Scheduler {
   #clearTimeoutFn: (handle: TimerHandle) => void;
   #onIdle: (() => void) | null;
   #autoReconcile: boolean;
+  #isLive: ((pid: ProcessId) => boolean) | null;
 
   /** The run queue. Unsorted array; selection does a linear min-scan (§4). */
   #queue: QueueNode[] = [];
-  /** Membership mirror of `#queue` for O(1) idempotent enqueue. */
+  /**
+   * Membership mirror of `#queue` for O(1) idempotent enqueue.
+   *
+   * It must be kept *exactly* in step with `#queue`. Every removal path has to
+   * clear both: a PID left behind here makes `enqueue()` a silent no-op, and
+   * since `reconcile()` also defers to it, the process can then never re-enter
+   * the run queue — it sits READY forever, dispatched by nobody. That is not
+   * hypothetical: a cooperative agent body is enqueued when the kernel wakes it
+   * and can block again on a later `wait()`, which leaves exactly such a stale
+   * node behind (see `#selectNext`).
+   */
   #queued = new Set<number>();
   /** Monotonic FIFO counter for tie-breaking equal-nice processes. */
   #seqCounter = 0;
@@ -272,6 +310,7 @@ export class Scheduler {
       opts.clearTimeoutFn ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
     this.#onIdle = opts.onIdle ?? null;
     this.#autoReconcile = opts.autoReconcile ?? true;
+    this.#isLive = opts.isLive ?? null;
   }
 
   // ---------------------------------------------------------------------------
@@ -477,6 +516,18 @@ export class Scheduler {
         await this.#fireSigxcpu(pid, budget.kind, 'post-quantum');
         return { dispatched: pid, reason: 'sigxcpu' };
       }
+      // A cooperative continuation that has not finished: it is suspended on a
+      // kernel wake, a driver call, or a timer. Leaving it RUNNING (and out of
+      // the run queue) is the "resume the Promise" half of the contract — it is
+      // re-adopted when the kernel wakes it, or it exits on its own.
+      if (this.#isLive !== null && this.#isLive(pid)) {
+        await this.#recordSched(pid, 'parked', {
+          nice: entry.nice,
+          blockedOn: entry.blockedOn ?? null,
+        });
+        return { dispatched: pid, reason: 'parked' };
+      }
+
       // RUNNING → READY, re-queued at the back of its nice band (round-robin).
       await this.#table.setState(pid, 'ready', { trigger: 'scheduler-yield' });
       this.enqueue(pid);
@@ -561,8 +612,13 @@ export class Scheduler {
 
     for (const node of this.#queue) {
       const entry = this.#table.get(node.pid);
-      if (entry === undefined) continue; // gone → drop
-      if (NON_QUEUEABLE.has(entry.state)) continue; // handled elsewhere → drop
+      if (entry === undefined || NON_QUEUEABLE.has(entry.state)) {
+        // Stale: the process is gone, or it has left the schedulable set and is
+        // being handled elsewhere. Drop it from the array **and** from the
+        // membership mirror — see the bug note on `#queued` below.
+        this.#queued.delete(unbrand(node.pid));
+        continue;
+      }
 
       // Kept: state is 'ready' or 'new'.
       kept.push(node);

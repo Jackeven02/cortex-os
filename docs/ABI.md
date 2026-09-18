@@ -132,15 +132,53 @@ const child = await ctx.spawn({
 });
 ```
 
-#### `wait(pid?: ProcessId): Promise<WaitResult>`
+#### `wait(pid?: ProcessId, opts?: WaitOptions): Promise<WaitResult>`
 
 Block until a child exits. If `pid` is omitted, wait for any child.
 
 - **Allowed states:** RUNNING → BLOCKED (`{kind: 'wait', pid}`) → READY → RUNNING
 - **Returns:** `WaitResult` (see PROCESS.md §10)
-- **Errors:** `ECHILD` (no children), `ESRCH` (specific PID is not your child), `EINTR` (signal delivered while waiting)
+- **Errors:** `ECHILD` (no children), `ESRCH` (specific PID is not your child and was never reaped as yours), `ETIMEDOUT` (`timeoutMs` elapsed), `EINTR` (signal delivered while waiting)
 - **Reversibility:** `idempotent` — calling twice on the same zombie returns the same result the first time and `ECHILD` the second
 - **Recording:** the PID waited on, the result
+
+`WaitOptions`:
+
+```typescript
+interface WaitOptions {
+  /** Maximum time to park, in ms. `0` polls; omit to wait forever. */
+  readonly timeoutMs?: number;
+}
+```
+
+  - `timeoutMs: undefined` — wait indefinitely (the POSIX default).
+  - `timeoutMs: 0` — **poll**: return the child's status if it has already
+    exited, otherwise trap `ETIMEDOUT` immediately without ever parking.
+  - `timeoutMs: n` — park for at most `n` ms.
+
+A timeout is an **observation, not a punishment**: on `ETIMEDOUT` the child is
+left running and the caller is returned to READY. Killing it is the
+supervisor's decision, expressed as a separate `kill()` — which is what makes a
+restart policy expressible inside the supervisor itself:
+
+```typescript
+try {
+  await ctx.wait(child, { timeoutMs: 10_000 });
+} catch {
+  await ctx.kill(child, 'SIGKILL');           // my policy, my call
+  const { pid } = await ctx.spawn({ /* fresh attempt */ });
+  await ctx.wait(pid);
+}
+```
+
+**Late waits still work.** init auto-reaps zombies, so a child can be gone
+before its parent gets around to waiting for it (the common case when a
+supervisor waits for child A, does work, then waits for child B). The table
+therefore retains each reaped child's `WaitResult` for its parent
+(`ProcessTable.takeReapedChild` / `takeReapedChildAny`), and `wait()` consumes
+it. Without that, a late `wait()` would trap `ESRCH` or park forever, and
+supervision trees would not be expressible at all. Statuses are consumed once,
+exactly like a real reap.
 
 #### `exit(code: number, reason?: string): never`
 
@@ -480,6 +518,13 @@ interface IToolDriver {
 }
 ```
 
+**v0 ships two tool drivers, and the contrast is the point.** `drivers/tool/fs.ts` is in-process: four hardcoded tools, each with a hand-declared reversibility tag. `drivers/tool/mcp.ts` (#025) is a *subprocess*: it spawns an MCP server, speaks JSON-RPC 2.0 over stdio, and discovers whatever tools that server advertises at runtime. Same interface, same kernel path, no kernel change. That is the abstraction holding.
+
+Two MCP-specific notes that live in the driver, not here:
+
+- **Namespacing.** MCP tool names are server-local (`read_file`); cortex tool names are global. The driver exposes them as `<namespace>/<name>` so several servers can coexist with `fs`.
+- **Reversibility.** MCP has no such field. Undeclared tools default to `irreversible`; see §10.
+
 ### 7.3 `IMemoryDriver`
 
 ```typescript
@@ -518,7 +563,7 @@ export interface CortexContext {
 
   // 4.1 Process control
   spawn(opts: SpawnOptions): Promise<{ pid: ProcessId }>;
-  wait(pid?: ProcessId): Promise<WaitResult>;
+  wait(pid?: ProcessId, opts?: WaitOptions): Promise<WaitResult>;
   exit(code: number, reason?: string): never;
   kill(pid: ProcessId, signal: Signal): Promise<void>;
   ps(filter?: ProcessFilter): Promise<readonly ProcessInfo[]>;
@@ -613,6 +658,7 @@ A driver returning a malformed `LLMResponse` is `EDRIVER`. But what if the drive
 Predictions:
 
 - **Reversibility tagging will be inconsistent across drivers.** Some authors will tag everything `reversible` to avoid friction. We will need a `cortex audit` tool to surface this and shame them gently.
+  - **Worse than predicted, and already hit:** MCP (§7.2) has *no reversibility field at all*. A third-party server cannot declare whether its tools mutate the world, so the driver must invent a tag. `drivers/tool/mcp.ts` defaults every undeclared tool to `irreversible` — an untagged tool therefore refuses to run inside `forkable()` rather than silently corrupting a fork. Operators override per tool name; `declaredReversibility` records which names were declared so `cortex audit` can surface the rest. The default is safe, not correct, and the audit loop is what makes it temporary.
 - **`recv` semantics will turn out to need explicit channels.** The "implicit channel creation" decision (§9.3) will bite us. We will add `channel_open` in v0.2.
 - **`now()` and `random()` recording will bloat logs.** Agents that call them in tight loops will produce gigabytes of `.crec`. We will add a "compact recording" mode that elides repeated identical calls.
 - **`fork()` from BLOCKED state will be the source of three subtle bugs.** We will document the workarounds, then fix the kernel.

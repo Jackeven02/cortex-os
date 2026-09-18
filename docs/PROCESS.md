@@ -298,6 +298,19 @@ If the parent never reaps and dies itself, init inherits and reaps immediately.
 
 If the parent set `autoReap: true` on spawn, the kernel reaps automatically and the parent receives a `SIGCHLD` with the exit info embedded. This is the right choice for high-volume short-lived children (e.g. a planner that spawns 1000 micro-agents).
 
+**Waiting late still works.** Because a zombie can be reaped before its parent
+gets around to waiting for it — init reaps orphans, and a supervisor that waits
+for child A and *then* child B will routinely find B already gone — the table
+retains each reaped child's `WaitResult` for its parent
+(`takeReapedChild` / `takeReapedChildAny`). A `wait()` for an already-reaped
+child consumes that retained status instead of trapping `ESRCH` or parking
+forever. Consumed once, exactly like a real reap.
+
+**Bounded waits.** `wait(pid, { timeoutMs })` traps `ETIMEDOUT` if the child has
+not exited in time (`timeoutMs: 0` polls without parking). The child is *not*
+killed — a timeout is an observation; the supervisor decides what to do about
+it, with `kill()` and a fresh `spawn()`. See ABI.md §4.1.
+
 ---
 
 ## 7. Signals
@@ -364,6 +377,30 @@ loop:
 Cortex does **not** preempt a running syscall. If an LLM call is in flight, it completes. If a tool call hangs, it hangs until its own timeout.
 
 This is a deliberate choice. Preempting an LLM call wastes the tokens already spent. Preempting a tool call leaves external state inconsistent. Cooperative scheduling means agents must yield explicitly (return from a syscall) or block (await external event).
+
+#### The continuation
+
+`resume(pid)` — the scheduler's continuation — starts the agent body and
+returns; it does **not** run the body to completion. The body then lives in its
+own Promise, advancing on the Node event loop while the scheduler goes on to
+other processes. Consequences:
+
+  - A parent parked in `wait()` does not hold the CPU. Its child is dispatched
+    in a later tick; when the child exits, the kernel wakes the parent, and it
+    resumes at the next statement *inside a quantum* — i.e. in RUNNING, so its
+    next syscall is legal. The wake is handed over by `wake_gate.ts`, which
+    defers the resolution of the parked `wait()` until the process is
+    dispatched again. Resolving it inline would race the BLOCKED → READY
+    transition and trap `ESTATE` on the agent's very next call.
+  - A dispatch of a process whose body is still live reports `parked`: the
+    process stays RUNNING and is **not** re-queued, because re-queueing would
+    re-enter the agent body mid-`await`. It re-enters the run queue only when
+    the kernel wakes it (BLOCKED → READY) or when its body drives its own exit.
+  - An earlier implementation ran the body to completion inside its quantum
+    ("run-to-completion"). It was simpler, but it made `wait()` on a child
+    deadlock by construction — the child could not be dispatched until the
+    parent's `resume` returned, which it never did. Supervision trees were
+    therefore impossible. That is why the continuation is cooperative now.
 
 The kernel's only "preemption" mechanism is the budget system: when budgets are exhausted, SIGXCPU fires and the default disposition is STOPPED. The supervisor decides what to do.
 

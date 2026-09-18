@@ -311,6 +311,19 @@ export class ProcessTable {
 
   #entries = new Map<number, ProcessEntry>();
   #recorders = new Map<number, Recorder | null>();
+  /**
+   * Retained exit statuses of already-reaped children, keyed by *parent* pid
+   * and then child pid.
+   *
+   * A `wait()` is a race against whoever else reaps the child — in practice
+   * init, which auto-reaps every zombie. Without this ledger a supervisor that
+   * waits for child A, does some work, and *then* waits for child B loses B's
+   * status entirely (B was reaped while the parent was busy), and the wait
+   * either traps or parks forever. Real Unix has the same shape but no
+   * auto-reaper, so it never bites; here it would make supervision trees
+   * unusable. Statuses are consumed once by `wait`, exactly like a real reap.
+   */
+  #reapedChildren = new Map<number, Map<number, WaitResult>>();
   #nextPid = PID_FIRST_USER;
   #recorderFactory: RecorderFactory;
   #now: () => Timestamp;
@@ -535,8 +548,56 @@ export class ProcessTable {
       }
     }
 
+    // Retain the status for the parent (if it has one) so a late `wait()` can
+    // still collect it — see the #reapedChildren field comment.
+    if (entry.ppid !== null) {
+      const parentKey = unbrand(entry.ppid);
+      let ledger = this.#reapedChildren.get(parentKey);
+      if (ledger === undefined) {
+        ledger = new Map<number, WaitResult>();
+        this.#reapedChildren.set(parentKey, ledger);
+      }
+      ledger.set(unbrand(pid), result);
+    }
+
     this.#entries.delete(unbrand(pid));
     this.#recorders.delete(unbrand(pid));
+    // The reaped process's own ledger is now unreachable — a dead parent cannot
+    // wait. Drop it so a long-lived kernel does not grow without bound.
+    this.#reapedChildren.delete(unbrand(pid));
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // §6.2b Retained exit statuses
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Take the retained status of one reaped child, if the parent has not
+   * collected it yet. Consumes it: a second `wait()` for the same child sees
+   * nothing, matching real reap semantics.
+   */
+  takeReapedChild(parentPid: ProcessId, childPid: ProcessId): WaitResult | null {
+    const ledger = this.#reapedChildren.get(unbrand(parentPid));
+    if (ledger === undefined) return null;
+    const result = ledger.get(unbrand(childPid));
+    if (result === undefined) return null;
+    ledger.delete(unbrand(childPid));
+    if (ledger.size === 0) this.#reapedChildren.delete(unbrand(parentPid));
+    return result;
+  }
+
+  /**
+   * Take the oldest retained status for any child of `parentPid`. Used by the
+   * `wait()` (any-child) form so a supervisor that waits late still sees
+   * children that exited while it was busy, in exit order.
+   */
+  takeReapedChildAny(parentPid: ProcessId): WaitResult | null {
+    const ledger = this.#reapedChildren.get(unbrand(parentPid));
+    if (ledger === undefined || ledger.size === 0) return null;
+    const [childKey, result] = ledger.entries().next().value as [number, WaitResult];
+    ledger.delete(childKey);
+    if (ledger.size === 0) this.#reapedChildren.delete(unbrand(parentPid));
     return result;
   }
 
@@ -901,6 +962,28 @@ export class ProcessTable {
    */
   recorderFor(pid: ProcessId): Recorder | null {
     return this.#recorders.get(unbrand(pid)) ?? null;
+  }
+
+  /**
+   * Flush every open recorder to disk.
+   *
+   * Appends are chained and buffered (see `Recorder.flush`), so a host that
+   * wants to read the `.crec` logs — or hand them to another process — must ask
+   * for an explicit flush rather than hope the event loop got around to it.
+   * `Kernel.settle()` does this on the way out; `shutdown()` should too.
+   *
+   * Best-effort: a recorder that was already closed (its process was reaped) is
+   * skipped rather than failing the whole flush.
+   */
+  async flushAll(): Promise<void> {
+    for (const recorder of this.#recorders.values()) {
+      if (recorder === null) continue;
+      try {
+        await recorder.flush();
+      } catch {
+        // Already closed, or the fd went away. Nothing useful to do.
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------

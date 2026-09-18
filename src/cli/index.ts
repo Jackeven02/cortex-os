@@ -40,6 +40,7 @@ import { mockLLM } from '../drivers/llm/mock.js';
 import { deepseekLLM } from '../drivers/llm/deepseek.js';
 import { openaiLLM } from '../drivers/llm/openai.js';
 import { fsTool } from '../drivers/tool/fs.js';
+import { mcpTool } from '../drivers/tool/mcp.js';
 import { inmemMemory } from '../drivers/memory/inmem.js';
 import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type MemoryRegionPolicy } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
@@ -53,6 +54,7 @@ import { cmdTrace } from './commands/trace.js';
 import { cmdCheckpoint } from './commands/checkpoint.js';
 import { cmdRestore } from './commands/restore.js';
 import { cmdFork } from './commands/fork.js';
+import { cmdDiff } from './commands/diff.js';
 import { cmdSend } from './commands/send.js';
 import { cmdLimit } from './commands/limit.js';
 import { cmdAudit } from './commands/audit.js';
@@ -90,6 +92,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdRestore(rest);
       case 'fork':
         return await cmdFork(rest);
+      case 'diff':
+        return await cmdDiff(rest);
       case 'send':
         return await cmdSend(rest);
       case 'limit':
@@ -140,11 +144,29 @@ export function defaultKernelDir(): string {
 }
 
 /**
+ * Environment variables that mount an MCP server as a tool namespace (#025).
+ *
+ *   CORTEX_MCP_COMMAND    the server executable, e.g. `npx`
+ *   CORTEX_MCP_ARGS       whitespace-separated arguments, e.g. `-y @modelcontextprotocol/server-filesystem .`
+ *   CORTEX_MCP_NAMESPACE  tool-name prefix; default `mcp`
+ *
+ * Opt-in, not on by default: a kernel that spawns subprocesses the operator
+ * did not ask for is not a kernel you want running on your laptop.
+ */
+export const MCP_ENV = {
+  command: 'CORTEX_MCP_COMMAND',
+  args: 'CORTEX_MCP_ARGS',
+  namespace: 'CORTEX_MCP_NAMESPACE',
+} as const;
+
+/**
  * Build the default driver-loading hook for the kernel. Registers built-in
  * LLM, tool, and memory drivers. LLM driver selection is env-driven:
  * `DEEPSEEK_API_KEY` → deepseek, `OPENAI_API_KEY` → openai, else mock.
+ *
+ * MCP is opt-in via `CORTEX_MCP_COMMAND` (see `MCP_ENV`).
  */
-export function defaultLoadDrivers(registry: import('../kernel/driver_registry.js').DriverRegistry): Promise<void> {
+export async function defaultLoadDrivers(registry: import('../kernel/driver_registry.js').DriverRegistry): Promise<void> {
   if (process.env['DEEPSEEK_API_KEY'] !== undefined) {
     registry.registerLLM(deepseekLLM());
   }
@@ -155,12 +177,33 @@ export function defaultLoadDrivers(registry: import('../kernel/driver_registry.j
   registry.registerLLM(mockLLM());
 
   // Tool: filesystem.
-  registry.registerTool(fsTool({ root: process.cwd() }));
+  await registry.registerTool(fsTool({ root: process.cwd() }));
+
+  // Tool: MCP (#025). Mount the configured server under a namespace.
+  const mcpCommand = process.env[MCP_ENV.command];
+  if (mcpCommand !== undefined && mcpCommand.trim().length > 0) {
+    const args = (process.env[MCP_ENV.args] ?? '')
+      .split(/\s+/)
+      .filter((s) => s.length > 0);
+    const namespace = process.env[MCP_ENV.namespace] ?? 'mcp';
+    try {
+      await registry.registerTool(
+        mcpTool({ name: 'mcp', namespace, command: mcpCommand.trim(), args }),
+      );
+    } catch (err) {
+      // A dead MCP server must not brick unrelated commands (`ps`, `trace`).
+      // Warn and continue without it — the driver has already closed its own
+      // subprocess by this point.
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `cortex: warning: MCP server '${mcpCommand}' did not start: ${msg}\n` +
+          `cortex: continuing without MCP tools.\n`,
+      );
+    }
+  }
 
   // Memory: inmem for v0 (sqlite is available but experimental).
   registry.registerMemory(inmemMemory());
-
-  return Promise.resolve();
 }
 
 /**

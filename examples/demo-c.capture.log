@@ -1,0 +1,43 @@
+[pid 2]
+[parent 2] forked as pid 3 — branch A: counting bloom filter
+[branch A pid 2] {"approach":"counting bloom filter","spaceComplexity":"O(k) bits, k = hashes x bits-per-counter","falsePositiveRate":"tunable, ~1% at 10 bits/key","handles":"memory-tight, very high throughput, tolerates rare false positives"}
+[branch B pid 3] resumed from the fork's snapshot
+[branch B pid 3] {"approach":"lru-bounded hash set","spaceComplexity":"O(cap) entries, cap = retained recent window","falsePositiveRate":"0 (exact)","handles":"exact dedup, bounded recent window, higher per-key memory"}
+process exited (code 0: branch A complete)
+tokens: 0 (in 0, out 0)
+###  now diff the two branches: cortex diff 2 3  ###
+  A  pid 2     role=demo         state=zombie       exit=0 (branch A complete)
+  B  pid 3     role=-            state=-            exit=0 (branch B complete)
+  note: no .meta.json for one branch (spawn persists meta only for the process it started); role/state shown as '-'. Syscall logs are unaffected.
+
+  diverged after 4 shared syscall(s) — fork recorded in pid 2 at byte offset 1712
+
+  syscall diff   (4 shared, - 6 A-only, + 8 B-only)
+  --------------------------------------------------------------------------------------------
+  - 15:21:58.345  fork           out {"childChainId":"9c7acbf9-483d-4daa-a092-4c44a27a0057","c...
+  - 15:21:58.346  llm_call       in  {"messages":[{"content":"Design dedup with a counting Blo...
+  - 15:21:58.347  llm_call       out {"driverVersion":"1.0.0","finishReason":"stop","model":"m...
+  - 15:21:58.347  memory_write   exit
+  - 15:21:58.348  exit           in  [0,"branch A complete"]
+  - 15:21:58.348  exit           out {"code":0,"reason":"branch A complete"}
+  + 15:21:58.346  fork           out {"childChainId":"9c7acbf9-483d-4daa-a092-4c44a27a0057"}
+  + 15:21:58.352  memory_read    out {"count":1,"valuesHash":"1c28f2eb0958c3d15db1f0f0e7f2b899...
+  + 15:21:58.352  __sched        exit
+  + 15:21:58.352  llm_call       in  {"messages":[{"content":"Design dedup with an LRU-bounded...
+  + 15:21:58.352  llm_call       out {"driverVersion":"1.0.0","finishReason":"stop","model":"m...
+  + 15:21:58.352  memory_write   exit
+  + 15:21:58.353  exit           in  [0,"branch B complete"]
+  + 15:21:58.353  exit           out {"code":0,"reason":"branch B complete"}
+
+  summary
+  --------------------------------------------------------------------------------------------
+    records   14                      12
+    syscalls  10                      8
+    traps     0                       0
+    wall      206ms                   8ms
+    exit      0 branch A complete     0 branch B complete
+
+  last llm_call output
+  --------------------------------------------------------------------------------------------
+    A: mock reply to: Design dedup with a counting Bloom filter.
+    B: mock reply to: Design dedup with an LRU-bounded hash set.

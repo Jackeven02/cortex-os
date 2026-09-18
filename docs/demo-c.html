@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cortex — Demo C: fork and compare</title>
+<style>
+  :root {
+    --bg: #0b0e14; --bar: #11151f; --edge: #1c2230;
+    --fg: #e6e6e6; --role: #8be9fd; --ansA: #7ee787; --ansB: #ffa657;
+    --minus: #ff7b72; --plus: #3fb950; --diff: #f1fa8c; --sys: #bd93f9;
+    --banner: #ff79c6; --muted: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #05070b; color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 24px;
+  }
+  .term {
+    width: min(960px, 96vw); background: var(--bg);
+    border: 1px solid var(--edge); border-radius: 10px; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .bar {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--bar); padding: 10px 14px; border-bottom: 1px solid var(--edge);
+  }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .r { background: #ff5f56; } .y { background: #ffbd2e; } .g { background: #27c93f; }
+  .title { margin-left: 10px; color: #9aa4b2; font-size: 13px; }
+  .body {
+    margin: 0; padding: 16px 18px; height: 600px; overflow: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .line { min-height: 1.5em; }
+  .role { color: var(--role); }
+  .ansA { color: var(--ansA); }
+  .ansB { color: var(--ansB); }
+  .minus { color: var(--minus); }
+  .plus { color: var(--plus); }
+  .diff { color: var(--diff); font-weight: 700; }
+  .sys { color: var(--sys); }
+  .banner { color: var(--banner); font-weight: 700; }
+  .exit { color: var(--ansA); font-weight: 700; }
+  .muted { color: var(--muted); }
+  .out { color: var(--fg); }
+  .cursor {
+    display: inline-block; width: 9px; height: 1.05em; vertical-align: -2px;
+    background: #cdd6f4; animation: blink 1s steps(1) infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .cap { color: #6b7280; font-size: 12px; padding: 0 18px 14px; }
+</style>
+</head>
+<body>
+  <div class="term">
+    <div class="bar">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span class="title">cortex &middot; examples/fork-compare-agent.ts — Demo C: fork and compare</span>
+    </div>
+    <pre class="body" id="body"></pre>
+    <div class="cap">Replay of the real CLI run (offline, mock driver): spawn &rarr; fork &rarr; diff. Loops automatically.</div>
+  </div>
+<script>
+  const ROWS = [{"t": "[pid 2]", "c": "muted"}, {"t": "[parent 2] forked as pid 3 — branch A: counting bloom filter", "c": "role"}, {"t": "[branch A pid 2] {&quot;approach&quot;:&quot;counting bloom filter&quot;,&quot;spaceComplexity&quot;:&quot;O(k) bits, k = hashes x bits-per-counter&quot;,&quot;falsePositiveRate&quot;:&quot;tunable, ~1% at 10 bits/key&quot;,&quot;handles&quot;:&quot;memory-tight, very high throughput, tolerates rare false positives&quot;}", "c": "ansA"}, {"t": "[branch B pid 3] resumed from the fork&#x27;s snapshot", "c": "role"}, {"t": "[branch B pid 3] {&quot;approach&quot;:&quot;lru-bounded hash set&quot;,&quot;spaceComplexity&quot;:&quot;O(cap) entries, cap = retained recent window&quot;,&quot;falsePositiveRate&quot;:&quot;0 (exact)&quot;,&quot;handles&quot;:&quot;exact dedup, bounded recent window, higher per-key memory&quot;}", "c": "ansB"}, {"t": "process exited (code 0: branch A complete)", "c": "exit"}, {"t": "tokens: 0 (in 0, out 0)", "c": "muted"}, {"t": "###  now diff the two branches: cortex diff 2 3  ###", "c": "banner"}, {"t": "  A  pid 2     role=demo         state=zombie       exit=0 (branch A complete)", "c": "sys"}, {"t": "  B  pid 3     role=-            state=-            exit=0 (branch B complete)", "c": "sys"}, {"t": "  note: no .meta.json for one branch (spawn persists meta only for the process it started); role/state shown as &#x27;-&#x27;. Syscall logs are unaffected.", "c": "muted"}, {"t": " ", "c": "muted"}, {"t": "  diverged after 4 shared syscall(s) — fork recorded in pid 2 at byte offset 1712", "c": "diff"}, {"t": " ", "c": "muted"}, {"t": "  syscall diff   (4 shared, - 6 A-only, + 8 B-only)", "c": "sys"}, {"t": "  --------------------------------------------------------------------------------------------", "c": "muted"}, {"t": "  - 15:21:58.345  fork           out {&quot;childChainId&quot;:&quot;9c7acbf9-483d-4daa-a092-4c44a27a0057&quot;,&quot;c...", "c": "minus"}, {"t": "  - 15:21:58.346  llm_call       in  {&quot;messages&quot;:[{&quot;content&quot;:&quot;Design dedup with a counting Blo...", "c": "minus"}, {"t": "  - 15:21:58.347  llm_call       out {&quot;driverVersion&quot;:&quot;1.0.0&quot;,&quot;finishReason&quot;:&quot;stop&quot;,&quot;model&quot;:&quot;m...", "c": "minus"}, {"t": "  - 15:21:58.347  memory_write   exit", "c": "minus"}, {"t": "  - 15:21:58.348  exit           in  [0,&quot;branch A complete&quot;]", "c": "minus"}, {"t": "  - 15:21:58.348  exit           out {&quot;code&quot;:0,&quot;reason&quot;:&quot;branch A complete&quot;}", "c": "minus"}, {"t": "  + 15:21:58.346  fork           out {&quot;childChainId&quot;:&quot;9c7acbf9-483d-4daa-a092-4c44a27a0057&quot;}", "c": "plus"}, {"t": "  + 15:21:58.352  memory_read    out {&quot;count&quot;:1,&quot;valuesHash&quot;:&quot;1c28f2eb0958c3d15db1f0f0e7f2b899...", "c": "plus"}, {"t": "  + 15:21:58.352  __sched        exit", "c": "plus"}, {"t": "  + 15:21:58.352  llm_call       in  {&quot;messages&quot;:[{&quot;content&quot;:&quot;Design dedup with an LRU-bounded...", "c": "plus"}, {"t": "  + 15:21:58.352  llm_call       out {&quot;driverVersion&quot;:&quot;1.0.0&quot;,&quot;finishReason&quot;:&quot;stop&quot;,&quot;model&quot;:&quot;m...", "c": "plus"}, {"t": "  + 15:21:58.352  memory_write   exit", "c": "plus"}, {"t": "  + 15:21:58.353  exit           in  [0,&quot;branch B complete&quot;]", "c": "plus"}, {"t": "  + 15:21:58.353  exit           out {&quot;code&quot;:0,&quot;reason&quot;:&quot;branch B complete&quot;}", "c": "plus"}, {"t": " ", "c": "muted"}, {"t": "  summary", "c": "muted"}, {"t": "  --------------------------------------------------------------------------------------------", "c": "muted"}, {"t": "    records   14                      12", "c": "out"}, {"t": "    syscalls  10                      8", "c": "out"}, {"t": "    traps     0                       0", "c": "out"}, {"t": "    wall      206ms                   8ms", "c": "out"}, {"t": "    exit      0 branch A complete     0 branch B complete", "c": "out"}, {"t": " ", "c": "muted"}, {"t": "  last llm_call output", "c": "muted"}, {"t": "  --------------------------------------------------------------------------------------------", "c": "muted"}, {"t": "    A: mock reply to: Design dedup with a counting Bloom filter.", "c": "out"}, {"t": "    B: mock reply to: Design dedup with an LRU-bounded hash set.", "c": "out"}];
+  const body = document.getElementById('body');
+  const cursor = document.createElement('span');
+  cursor.className = 'cursor';
+  let i = 0;
+  function step() {
+    if (i < ROWS.length) {
+      const d = document.createElement('div');
+      d.className = 'line ' + ROWS[i].c;
+      d.textContent = ROWS[i].t;
+      body.appendChild(d);
+      body.appendChild(cursor);
+      i++;
+      body.scrollTop = body.scrollHeight;
+      setTimeout(step, 220);
+    } else {
+      setTimeout(() => {
+        body.innerHTML = '';
+        i = 0;
+        step();
+      }, 4500);
+    }
+  }
+  step();
+</script>
+</body>
+</html>

@@ -288,6 +288,22 @@ interface Scheduler {
 
 **The "resume the async function" part** is the trickiest. Each agent process is implemented as a Promise that the kernel can suspend and resume. v0 uses a simple continuation-passing approach: every syscall returns a Promise that the kernel controls. When the scheduler decides to resume, it resolves the Promise.
 
+Two consequences of that design are worth stating explicitly, because the first
+implementation got them wrong:
+
+  - **A dispatch starts the body; it does not finish it.** `resume` returns as
+    soon as the body reaches a suspension point, and the body keeps running on
+    the event loop across later ticks. Running it to completion inside the
+    quantum (the first implementation) made `wait()` deadlock by construction —
+    a parent parked on a child held the tick the child needed in order to run.
+  - **A woken body resumes on a dispatch, not on the wake.** When a `wait()` or
+    `recv()` is satisfied the process is made READY, but the Promise is resolved
+    only once the scheduler puts it back in RUNNING (`wake_gate.ts`). Resolving
+    it inline races the state transition and the agent's next syscall traps
+    `ESTATE`.
+
+See PROCESS.md §8.2 for the full statement, and boot.ts "The execution model".
+
 ### 4.9 `init.ts` (PID 1)
 
 **Responsibility.** The first process. Reaps orphaned zombies. Restarts daemons per their restart policies. Logs unusual patterns.
