@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>cortex — an operating system for AI agents</title>
+<meta name="description" content="Today's agent frameworks treat an agent as a function. Cortex treats it as a process: PIDs, fork, signals, IPC, checkpoint/restore, supervision trees, syscall traces, token budgets." />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='13' fill='none' stroke='%23ff6b5b' stroke-width='4'/><circle cx='16' cy='16' r='5' fill='%23ff6b5b'/></svg>" />
+<style>
+  :root {
+    --bg: #0a0c10;
+    --bg-2: #0f1218;
+    --surface: #14181f;
+    --surface-2: #1a1f28;
+    --border: #242b36;
+    --border-2: #2f3846;
+    --text: #e9ecf1;
+    --muted: #9aa5b4;
+    --muted-2: #6b7686;
+    --accent: #ff6b5b;
+    --accent-2: #ffb454;
+    --cool: #7dd3fc;
+    --green: #7ee787;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    --maxw: 1080px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1100px 600px at 50% -200px, rgba(255,107,91,0.10), transparent 60%),
+      radial-gradient(900px 500px at 90% 0%, rgba(125,211,252,0.06), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: inherit; text-decoration: none; }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- nav ---------- */
+  header.nav {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(12px);
+    background: rgba(10,12,16,0.72);
+    border-bottom: 1px solid var(--border);
+  }
+  .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: -0.01em; }
+  .brand .dot { width: 14px; height: 14px; border-radius: 50%; border: 3px solid var(--accent); position: relative; }
+  .brand .dot::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: var(--accent); }
+  .nav-links { display: flex; align-items: center; gap: 22px; font-size: 14px; color: var(--muted); }
+  .nav-links a:hover { color: var(--text); }
+  .gh {
+    display: inline-flex; align-items: center; gap: 7px;
+    border: 1px solid var(--border-2); border-radius: 8px; padding: 6px 12px;
+    color: var(--text); background: var(--surface); font-size: 13px; font-weight: 600;
+  }
+  .gh:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ---------- hero ---------- */
+  .hero { padding: 76px 0 40px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 12.5px; color: var(--accent-2);
+    border: 1px solid rgba(255,180,84,0.30); background: rgba(255,180,84,0.07);
+    padding: 5px 12px; border-radius: 999px; margin-bottom: 22px;
+  }
+  h1 {
+    font-size: clamp(38px, 6vw, 66px); line-height: 1.04; letter-spacing: -0.03em;
+    margin: 0 0 20px; font-weight: 800;
+  }
+  h1 .grad {
+    background: linear-gradient(100deg, var(--accent), var(--accent-2) 55%, var(--cool));
+    -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .lede { font-size: clamp(17px, 2.2vw, 21px); color: var(--muted); max-width: 720px; margin: 0 0 14px; }
+  .lede strong { color: var(--text); font-weight: 600; }
+  .cta { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 30px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 9px;
+    padding: 12px 20px; border-radius: 10px; font-weight: 650; font-size: 15px;
+    border: 1px solid var(--border-2); background: var(--surface); color: var(--text);
+    transition: transform .08s ease, border-color .15s ease;
+  }
+  .btn:hover { transform: translateY(-1px); border-color: var(--accent); }
+  .btn.primary { background: linear-gradient(180deg, #ff7a6b, #f2543f); border-color: transparent; color: #180b08; }
+  .btn.primary:hover { border-color: transparent; filter: brightness(1.05); }
+
+  /* ---------- terminal ---------- */
+  .term {
+    margin-top: 48px; border: 1px solid var(--border); border-radius: 14px; overflow: hidden;
+    background: linear-gradient(180deg, #0d1015, #0b0e13);
+    box-shadow: 0 30px 80px -40px rgba(0,0,0,0.9), inset 0 1px 0 rgba(255,255,255,0.03);
+  }
+  .term-bar { display: flex; align-items: center; gap: 8px; padding: 11px 14px; border-bottom: 1px solid var(--border); background: var(--bg-2); }
+  .term-bar .d { width: 11px; height: 11px; border-radius: 50%; background: #3a4452; }
+  .term-bar .d.r { background: #ff5f57; } .term-bar .d.y { background: #febc2e; } .term-bar .d.g { background: #28c840; }
+  .term-title { margin-left: 8px; font-family: var(--mono); font-size: 12px; color: var(--muted-2); }
+  .term-body { padding: 18px 18px 22px; font-family: var(--mono); font-size: 13.5px; line-height: 1.75; min-height: 320px; overflow-x: auto; }
+  .term-body .line { white-space: pre-wrap; word-break: break-word; }
+  .c-prompt { color: var(--green); } .c-dim { color: var(--muted-2); } .c-sys { color: var(--cool); }
+  .c-warn { color: var(--accent-2); } .c-ok { color: var(--green); } .c-role { color: var(--accent); }
+  .caret { display: inline-block; width: 8px; height: 15px; background: var(--accent); vertical-align: -2px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* ---------- sections ---------- */
+  section { padding: 72px 0; border-top: 1px solid var(--border); }
+  .eyebrow { font-family: var(--mono); font-size: 12.5px; color: var(--accent); letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 14px; }
+  h2 { font-size: clamp(26px, 3.4vw, 38px); letter-spacing: -0.02em; margin: 0 0 16px; font-weight: 750; }
+  .sub { color: var(--muted); max-width: 760px; font-size: 17px; margin: 0 0 40px; }
+
+  .contrast { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .card {
+    border: 1px solid var(--border); border-radius: 14px; padding: 22px;
+    background: linear-gradient(180deg, var(--surface), var(--bg-2));
+  }
+  .card h3 { margin: 0 0 10px; font-size: 16px; }
+  .card .fn { color: var(--muted-2); font-family: var(--mono); font-size: 13px; }
+  .card.hi { border-color: rgba(255,107,91,0.35); box-shadow: inset 0 0 0 1px rgba(255,107,91,0.08); }
+  .card.hi .fn { color: var(--accent-2); }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 14px; }
+  .prim {
+    border: 1px solid var(--border); border-radius: 12px; padding: 16px 16px 15px; background: var(--surface);
+    transition: border-color .15s ease, transform .1s ease;
+  }
+  .prim:hover { border-color: var(--border-2); transform: translateY(-2px); }
+  .prim .k { font-family: var(--mono); font-size: 14px; color: var(--accent-2); margin-bottom: 6px; }
+  .prim .v { font-size: 13.5px; color: var(--muted); }
+
+  .demos { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .demo { border: 1px solid var(--border); border-radius: 14px; padding: 20px; background: var(--surface); display: flex; flex-direction: column; }
+  .demo .tagline { font-family: var(--mono); font-size: 12px; color: var(--accent); margin-bottom: 8px; }
+  .demo h3 { margin: 0 0 8px; font-size: 17px; }
+  .demo p { color: var(--muted); font-size: 14px; flex: 1; }
+  .demo a.view { margin-top: 12px; color: var(--cool); font-size: 14px; font-weight: 600; }
+  .demo a.view:hover { text-decoration: underline; }
+
+  pre.code {
+    background: #0b0e13; border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px 18px; overflow-x: auto; font-family: var(--mono); font-size: 13px; line-height: 1.7; margin: 0;
+  }
+  pre.code .cm { color: var(--muted-2); } pre.code .kw { color: var(--accent); } pre.code .st { color: var(--green); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; }
+
+  .status { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 26px; }
+  .stat { border: 1px solid var(--border); border-radius: 12px; padding: 16px; background: var(--surface); }
+  .stat .n { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; }
+  .stat .l { color: var(--muted); font-size: 13.5px; }
+  .caveat { border-left: 3px solid var(--accent-2); padding: 4px 0 4px 16px; color: var(--muted); font-size: 14.5px; margin-top: 18px; }
+  .caveat b { color: var(--text); }
+
+  footer { border-top: 1px solid var(--border); padding: 40px 0 60px; color: var(--muted-2); font-size: 14px; }
+  footer .fin { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 16px; align-items: center; }
+  footer a:hover { color: var(--text); }
+
+  @media (max-width: 820px) {
+    .contrast, .demos, .cols { grid-template-columns: 1fr; }
+    .nav-links { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { .caret { animation: none; } }
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top"><span class="dot"></span>cortex</a>
+    <nav class="nav-links">
+      <a href="#idea">Idea</a>
+      <a href="#primitives">Primitives</a>
+      <a href="#demos">Demos</a>
+      <a href="#start">Quickstart</a>
+      <a href="./MANIFESTO.md">Manifesto</a>
+      <a class="gh" href="https://github.com/Jackeven02/cortex-os">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+  <div class="wrap hero">
+    <span class="pill">v0 · Phase 0–4 complete · TypeScript / Node 22+</span>
+    <h1>An operating system<br />for <span class="grad">AI agents</span>.</h1>
+    <p class="lede">
+      Today's agent frameworks treat an agent as a <strong>function</strong>.
+      Cortex treats it as a <strong>process</strong>.
+    </p>
+    <p class="lede">
+      PIDs. Fork. Exec. Signals. IPC. Checkpoint. Restore. Supervision trees.
+      Syscall traces. Token budgets. Everything Unix gave to programs in 1975,
+      applied to agents in 2026.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="#start">Get started →</a>
+      <a class="btn" href="./MANIFESTO.md">Read the manifesto</a>
+      <a class="btn" href="https://github.com/Jackeven02/cortex-os">View on GitHub</a>
+    </div>
+
+    <div class="term" role="img" aria-label="Terminal replay of a checkpoint/resume across a reboot">
+      <div class="term-bar">
+        <span class="d r"></span><span class="d y"></span><span class="d g"></span>
+        <span class="term-title">cortex — pause across reboots</span>
+      </div>
+      <div class="term-body" id="term"></div>
+    </div>
+  </div>
+
+  <section id="idea">
+    <div class="wrap">
+      <div class="eyebrow">The idea</div>
+      <h2>You can't supervise what you can't name.</h2>
+      <p class="sub">
+        Every hard problem in agent systems today — a run that dies halfway,
+        a tool call you can't take back, two strategies you wish you could try
+        at once, a process that should survive a reboot — is a problem operating
+        systems solved decades ago. We just never gave agents those primitives.
+      </p>
+      <div class="contrast">
+        <div class="card">
+          <h3>The function model</h3>
+          <p class="fn">run(prompt) → result</p>
+          <p class="fn" style="color:var(--muted)">One shot. No identity across restarts. No way to pause, fork, bound, or restart. Orchestration leaks into YAML you can't debug.</p>
+        </div>
+        <div class="card hi">
+          <h3>The process model</h3>
+          <p class="fn">spawn / fork / signal / wait / checkpoint</p>
+          <p class="fn" style="color:var(--muted-2)">A PID that survives across invocations. A log of every syscall. A parent that can bound, kill, and respawn a child — in ordinary <code>async</code> code.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="primitives">
+    <div class="wrap">
+      <div class="eyebrow">Primitives</div>
+      <h2>A small kernel, borrowed from the best.</h2>
+      <p class="sub">
+        Eleven kernel modules. Nineteen syscalls. Three driver interfaces.
+        Everything here has a fifty-year-old precedent — that's the point.
+      </p>
+      <div class="grid">
+        <div class="prim"><div class="k">spawn</div><div class="v">Start an agent as a real process with a PID, budgets, and lineage.</div></div>
+        <div class="prim"><div class="k">ps</div><div class="v">Inspect the process tree: state, tokens, age.</div></div>
+        <div class="prim"><div class="k">kill</div><div class="v">Thirteen signals, from SIGINT to SIGXCPU.</div></div>
+        <div class="prim"><div class="k">wait</div><div class="v">Block on a child — or bound it with a deadline (<code>ETIMEDOUT</code>).</div></div>
+        <div class="prim"><div class="k">fork</div><div class="v">Cognitive fork: clone a process at its current state, diverge.</div></div>
+        <div class="prim"><div class="k">diff</div><div class="v">Compare two forked branches' syscall logs, from their shared past.</div></div>
+        <div class="prim"><div class="k">checkpoint</div><div class="v">Snapshot the process image to disk, content-addressed.</div></div>
+        <div class="prim"><div class="k">restore</div><div class="v">Re-materialise it as a new PID — after a reboot — with memory intact.</div></div>
+        <div class="prim"><div class="k">trace</div><div class="v">Every syscall, enter/exit/trap, in an append-only <code>.crec</code> log.</div></div>
+        <div class="prim"><div class="k">attach</div><div class="v">Follow a running process's syscall stream, like <code>tail -f</code>.</div></div>
+        <div class="prim"><div class="k">limit</div><div class="v">Token, USD, and wall-time budgets per process.</div></div>
+        <div class="prim"><div class="k">daemon</div><div class="v">Register a long-lived agent to start on boot and restart on failure.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="demos">
+    <div class="wrap">
+      <div class="eyebrow">Killer demos</div>
+      <h2>Three things no prompt wrapper can do.</h2>
+      <p class="sub">Each reproduces end-to-end on a laptop, offline, against a deterministic mock driver.</p>
+      <div class="demos">
+        <div class="demo">
+          <div class="tagline">Demo B · lead</div>
+          <h3>Pause across reboots</h3>
+          <p>A long-running watcher checkpoints mid-thought, the machine reboots, <code>cortex restore</code> brings it back exactly where it left off — skewing nothing it already handled.</p>
+          <a class="view" href="./demo-b.html">Watch the replay →</a>
+        </div>
+        <div class="demo">
+          <div class="tagline">Demo C</div>
+          <h3>Fork and compare</h3>
+          <p>A coder reaches a decision point, <code>fork</code>s to explore two designs at once, then <code>cortex diff</code> lines up the branches so you keep the winner. Agent search, in one primitive.</p>
+          <a class="view" href="./demo-c.html">Watch the replay →</a>
+        </div>
+        <div class="demo">
+          <div class="tagline">Demo A</div>
+          <h3>Supervision tree</h3>
+          <p>A planner spawns three coders; one hangs, the planner detects the timeout, kills it, respawns it, and assembles the result. No orchestrator, no glue — the tree is the agent.</p>
+          <a class="view" href="./demo-a.html">Watch the replay →</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="wrap">
+      <div class="eyebrow">Quickstart</div>
+      <h2>Run a supervision tree in a minute.</h2>
+      <p class="sub">No API key needed — the mock driver is deterministic, so it reproduces identically in CI and on your laptop.</p>
+      <div class="cols">
+        <pre class="code"><span class="cm"># clone, install, build</span>
+git clone https://github.com/Jackeven02/cortex-os
+cd cortex-os &amp;&amp; npm install
+
+<span class="cm"># use the deterministic mock (no network, no key)</span>
+unset OPENAI_API_KEY DEEPSEEK_API_KEY
+
+<span class="cm"># a planner that supervises three coders</span>
+npx tsx src/cli/index.ts spawn \
+  --role planner --module ./examples/supervision-tree.ts
+
+<span class="cm"># and everything else</span>
+npx tsx src/cli/index.ts ps
+npx tsx src/cli/index.ts attach 2
+npx tsx src/cli/index.ts diff 2 3</pre>
+        <pre class="code"><span class="cm">// an agent is a module with a default export</span>
+<span class="kw">import</span> type { CortexContext } <span class="kw">from</span> <span class="st">'cortex-os'</span>;
+
+<span class="kw">export default async function</span> agent(ctx: CortexContext) {
+  <span class="cm">// spawn a child, bound it, act on the timeout</span>
+  <span class="kw">const</span> { pid } = <span class="kw">await</span> ctx.spawn({
+    role: <span class="st">'coder'</span>,
+    agent: { module: import.meta.url }, <span class="cm">// absolute!</span>
+  });
+  <span class="kw">try</span> {
+    <span class="kw">await</span> ctx.wait(pid, { timeoutMs: <span class="st">8000</span> });
+  } <span class="kw">catch</span> {
+    <span class="kw">await</span> ctx.kill(pid, <span class="st">'SIGKILL'</span>);   <span class="cm">// restart policy, in one line</span>
+  }
+
+  <span class="cm">// snapshot the process image and suspend</span>
+  <span class="kw">await</span> ctx.checkpoint({ tag: <span class="st">'before-risky-edit'</span>, detach: <span class="kw">true</span> });
+}</pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="status">
+    <div class="wrap">
+      <div class="eyebrow">Status</div>
+      <h2>Built in the open, documented honestly.</h2>
+      <div class="status">
+        <div class="stat"><div class="n">11</div><div class="l">kernel modules</div></div>
+        <div class="stat"><div class="n">19</div><div class="l">syscalls</div></div>
+        <div class="stat"><div class="n">7</div><div class="l">drivers (LLM · MCP · FS · memory)</div></div>
+        <div class="stat"><div class="n">479</div><div class="l">smoke checks, all green</div></div>
+      </div>
+      <p class="sub" style="margin-bottom:0">
+        Phases 0–4 are complete: the kernel boots, all drivers ship, the whole CLI
+        works, and all three demos reproduce. Known v0 gaps are recorded in the
+        backlog, not hidden.
+      </p>
+      <div class="caveat">
+        <b>Honest about what v0 is.</b> A checkpoint captures the process <i>image</i> —
+        state, memory, budgets, lineage — not the live JS call stack, so a restored
+        agent re-runs from the top and skips completed work via a memory marker.
+        <code>attach</code> follows the on-disk syscall log; the interactive send-half
+        lands with a first-class daemon.
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap fin">
+    <div>
+      <span class="brand" style="font-size:15px"><span class="dot" style="width:12px;height:12px;border-width:2.5px"></span>cortex</span>
+      &nbsp;· MIT licensed · Design lineage: Plan 9, Erlang/OTP, MINIX, seL4.
+    </div>
+    <div style="display:flex;gap:20px;flex-wrap:wrap">
+      <a href="https://github.com/Jackeven02/cortex-os">GitHub</a>
+      <a href="./MANIFESTO.md">Manifesto</a>
+      <a href="./HACKING.md">Hacking</a>
+      <a href="./COOKBOOK.md">Cookbook</a>
+      <a href="./ARCHITECTURE.md">Architecture</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // Dependency-free typewriter over the Demo B transcript.
+  const script = [
+    { t: '$ cortex spawn --role inbox-watcher --module ./examples/checkpoint-agent.ts', c: 'c-prompt' },
+    { t: '[inbox-watcher pid 2] 6 tickets in queue', c: 'c-role' },
+    { t: '[inbox-watcher pid 2] #T-1180 App crashes on launch after the 2.3 update -> bug', c: 'c-dim' },
+    { t: '[inbox-watcher pid 2] #T-1181 Can I export my data to CSV? -> feature', c: 'c-dim' },
+    { t: '[inbox-watcher pid 2] #T-1182 How do I reset my password? -> question', c: 'c-dim' },
+    { t: '[inbox-watcher pid 2] 3/6 handled — checkpointing (tag \'inbox-watcher\')', c: 'c-warn' },
+    { t: 'process suspended at checkpoint', c: 'c-warn' },
+    { t: '###  laptop reboots — kernel torn down, .csnap persists on disk  ###', c: 'c-sys' },
+    { t: '$ cortex restore --tag inbox-watcher', c: 'c-prompt' },
+    { t: '[inbox-watcher pid 3] recovered 3 processed ticket(s) from memory', c: 'c-ok' },
+    { t: '[inbox-watcher pid 3] skip T-1180 / T-1181 / T-1182 (already handled)', c: 'c-dim' },
+    { t: '[inbox-watcher pid 3] #T-1183 Dark mode flickers on Windows 11 -> bug', c: 'c-dim' },
+    { t: '[inbox-watcher pid 3] #T-1184 Please add keyboard shortcuts -> feature', c: 'c-dim' },
+    { t: '[inbox-watcher pid 3] #T-1185 I was charged twice this month -> bug', c: 'c-dim' },
+    { t: '[inbox-watcher pid 3] inbox cleared (6/6)', c: 'c-ok' },
+    { t: 'process exited (code 0: inbox cleared)', c: 'c-ok' },
+  ];
+  const el = document.getElementById('term');
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let i = 0;
+
+  function renderAll() {
+    el.innerHTML = '';
+    for (const s of script) {
+      const d = document.createElement('div');
+      d.className = 'line ' + s.c;
+      d.textContent = s.t;
+      el.appendChild(d);
+    }
+    const d = document.createElement('div');
+    d.className = 'line c-prompt';
+    d.innerHTML = '$ <span class="caret"></span>';
+    el.appendChild(d);
+  }
+
+  function typeLine() {
+    if (i >= script.length) {
+      const d = document.createElement('div');
+      d.className = 'line c-prompt';
+      d.innerHTML = '$ <span class="caret"></span>';
+      el.appendChild(d);
+      return;
+    }
+    const s = script[i++];
+    const line = document.createElement('div');
+    line.className = 'line ' + s.c;
+    el.appendChild(line);
+    let j = 0;
+    const full = s.t;
+    const speed = s.c === 'c-sys' ? 6 : 12;
+    (function tick() {
+      line.textContent = full.slice(0, j);
+      if (j++ <= full.length) setTimeout(tick, speed);
+      else setTimeout(typeLine, 130);
+    })();
+  }
+
+  if (reduce) renderAll();
+  else { el.innerHTML = ''; typeLine(); }
+</script>
+</body>
+</html>

@@ -12,7 +12,9 @@ This directory holds the technical specifications. **Read them in this order:**
 
 5. **[CRITIQUE.md](./CRITIQUE.md)** — the running log of external critique and what we changed (or didn't) because of it.
 
-6. **[HACKING.md](./HACKING.md)** *(coming in Phase 5)* — how to contribute, how to write a driver, how to add a syscall.
+6. **[HACKING.md](./HACKING.md)** — how to contribute: dev setup, conventions, how to write a driver / an agent / a syscall, testing.
+
+7. **[COOKBOOK.md](./COOKBOOK.md)** — recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC, budgets.
 
 ---
 
@@ -25,11 +27,12 @@ This directory holds the technical specifications. **Read them in this order:**
 | ABI.md | **drafted v0** — open questions logged in §9 |
 | ARCHITECTURE.md | **drafted v0** — open questions logged in §12 |
 | CRITIQUE.md | live, 1 entry |
-| HACKING.md | post-v0.1 |
+| HACKING.md | drafted (Phase 5) |
+| COOKBOOK.md | drafted (Phase 5) |
 
-**Phase 0 is design-complete.** The four core documents are drafted v0; open questions in each doc are intentionally rolling — they resolve as Phase 1 implementation forces decisions. Phase 1 (kernel skeleton, ~1500 lines TS) is unblocked.
+**Phases 0–4 are complete.** The four core documents are drafted v0 (their open questions are intentionally rolling — they resolve as implementation forces decisions); the kernel, all seven drivers, the CLI (including `attach` and `daemon`), and the three killer demos are implemented and covered by the smoke suite. **Phase 5 — launch material — is in progress.**
 
-Track progress in [BACKLOG.md](../BACKLOG.md), Phase 0.
+Track progress in [BACKLOG.md](../BACKLOG.md).
 
 ---
 
