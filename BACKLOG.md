@@ -168,6 +168,8 @@ Phase 5 is done, so the work history above is complete through the first release
 
 - [x] **`v0.1.1`** — 2026-09-19. One-defect patch: the fix for the version bug that shipped in `0.1.0`. `VERSION` is now read from `package.json` at load time instead of being hand-written in three places, and the smoke assertion that was too weak to catch the drift now compares against the manifest *and* rejects a hardcoded banner literal. Kernel, ABI, CLI surface and state model untouched. Published as `cortex-agent-os@0.1.1`. Artifacts: [`CHANGELOG.md`](./CHANGELOG.md) and [`docs/release/v0.1.1.md`](./docs/release/v0.1.1.md).
 
+- [x] **`v0.1.2`** — 2026-09-19. Documentation-only patch: both READMEs gained an `## Install` section — they had none at all, which is what a tool looks like when its docs were written before it had a published release. They now cover the global install, the `npx` form, the requirements, the clone-and-run-the-suite path, and the `cortex-agent-os` vs `cortex` naming. Published as `cortex-agent-os@0.1.2`. Artifacts: [`CHANGELOG.md`](./CHANGELOG.md) and [`docs/release/v0.1.2.md`](./docs/release/v0.1.2.md).
+
 Next release (`0.2.0`): whatever comes out of the Icebox below.
 
 ---

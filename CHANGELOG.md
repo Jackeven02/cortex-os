@@ -33,6 +33,26 @@ exact version.
 
 ---
 
+## [0.1.2] — 2026-09-19
+
+Documentation only. No code, no ABI, no CLI surface, no behaviour change —
+`0.1.2` is `0.1.1`.
+
+### Changed
+
+- **The READMEs now explain how to install the thing.** Neither one had an install
+  section at all: both went straight from the CLI demo to Status, and the only
+  install instructions anywhere in the tree were the `git clone` lines in the
+  publish runbook — while the package had been on npm since `0.1.0`. `README.md`
+  and `README.zh-CN.md` now carry an `## Install` / `## 安装` section in the same
+  position, covering the global install (`npm i -g cortex-agent-os`, which puts
+  `cortex` and `ctx` on the `PATH`), the `npx` form, the Node and dependency
+  requirements, the clone-and-run-the-suite path for anyone working on Cortex
+  itself, and why the npm package is `cortex-agent-os` while the binary is still
+  `cortex`.
+
+---
+
 ## [0.1.1] — 2026-09-19
 
 A one-defect patch. The kernel, the syscall ABI, the CLI surface, the drivers and
@@ -168,5 +188,6 @@ These are deliberate `v0` boundaries, not oversights. Each is recorded in
 - Persistence is a flat directory, not the subtree described in ARCHITECTURE §7.
 - Sandbox fork, shadow process, `cortex gc`, and `cortex doctor` are post-v0.
 
+[0.1.2]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.2
 [0.1.1]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.0

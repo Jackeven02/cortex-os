@@ -2,7 +2,7 @@
 
 > AI agent 的操作系统。
 
-[![release](https://img.shields.io/badge/release-v0.1.1-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v0.1.2-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -101,7 +101,7 @@ npx tsx scripts/smoke.ts                # 479 项断言，0 失败
 
 ## 当前状态
 
-**已发布 [`v0.1.1`](./CHANGELOG.md)**（2026-09-19）—— 在 `v0.1.0`（第一个打 tag 的版本，覆盖 Phase 0–5）之上的单缺陷补丁。这个 `0.x` 是诚实的：syscall ABI 到 `1.0.0` 才冻结，所以小版本号提升可能带着 ABI 或状态模型的破坏性变更。今天要基于 Cortex 开发的话，请锁死确切版本。（Phase 是建设阶段，版本号才是发布。）
+**已发布 [`v0.1.2`](./CHANGELOG.md)**（2026-09-19）—— 在 `v0.1.1`（即 `v0.1.0` 之上的单缺陷补丁）之上的纯文档补丁；`v0.1.0` 是第一个打 tag 的版本，覆盖 Phase 0–5。这个 `0.x` 是诚实的：syscall ABI 到 `1.0.0` 才冻结，所以小版本号提升可能带着 ABI 或状态模型的破坏性变更。今天要基于 Cortex 开发的话，请锁死确切版本。（Phase 是建设阶段，版本号才是发布。）
 
 **Phase 0 — 设计（完成）。** 四份文档 v0 落地：`STATE.md`（最难的那份）、`PROCESS.md`（生命周期）、`ABI.md`（syscall 契约）、`ARCHITECTURE.md`（内核模块）。每份文档末尾的 open questions 是有意滚动记录的，会随着实现逼出决定而解决。
 
