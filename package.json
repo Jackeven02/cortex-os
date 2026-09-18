@@ -1,6 +1,6 @@
 {
   "name": "cortex-os",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "An operating system for AI agents.",
   "type": "module",
   "license": "MIT",
@@ -36,6 +36,7 @@
     "MANIFESTO.zh-CN.md",
     "README.md",
     "README.zh-CN.md",
+    "CHANGELOG.md",
     "assets",
     "docs"
   ],

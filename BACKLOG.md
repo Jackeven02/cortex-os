@@ -158,6 +158,16 @@ Three demos that prove the abstraction matters. Each one becomes a GIF in the RE
 
 ---
 
+## Releases
+
+Phase 5 is done, so the work history above is complete through the first release.
+
+- [x] **`v0.1.0`** — 2026-09-19. First tagged release; covers Phases 0–5. `package.json` bumped `0.0.1` → `0.1.0`, annotated tag pushed. Artifacts: [`CHANGELOG.md`](./CHANGELOG.md) (full, itemised, including the known-limitations list) and [`docs/release/v0.1.0.md`](./docs/release/v0.1.0.md) (the GitHub release body — `gh` is not installed locally, so paste it into the Releases UI or `gh release create v0.1.0 --notes-file docs/release/v0.1.0.md`). The `0.x` is deliberate: the syscall ABI is not frozen until `1.0.0`, so a minor bump before then may break the ABI or the state model.
+
+Next release (`0.2.0`): whatever comes out of the Icebox below.
+
+---
+
 ## Icebox (post-v0.1)
 
 Things we want, but not yet:
@@ -189,4 +199,4 @@ Things we want, but not yet:
 - Commits reference issues: `kernel: implement scheduler (#013)`.
 - Anything that changes the ABI or the state model requires a MANIFESTO-level discussion in an issue first.
 - We do not close issues for being "stale." Stale means we have not decided. Decisions get made, not aged out.
-- External critique is welcome and gets logged. See `docs/CRITIQUE.md` (forthcoming) for the running record of what reviewers said and what we changed because of it.
+- External critique is welcome and gets logged. See [`docs/CRITIQUE.md`](./docs/CRITIQUE.md) for the running record of what reviewers said and what we changed because of it.

@@ -2,7 +2,7 @@
 
 > An operating system for AI agents.
 
-[![status](https://img.shields.io/badge/status-v0%20%C2%B7%20phases%200%E2%80%934%20complete-brightgreen)](./MANIFESTO.md)
+[![release](https://img.shields.io/badge/release-v0.1.0-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -72,6 +72,8 @@ Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `di
 ---
 
 ## Status
+
+**Released as [`v0.1.0`](./CHANGELOG.md)** (2026-09-19) — the first tagged release, covering Phases 0–5. The `0.x` is honest: the syscall ABI is not frozen until `1.0.0`, so a minor bump may carry a breaking change to the ABI or the state model. If you build against Cortex today, pin the exact version. (Phases are build milestones; `v0.1.0` is the release.)
 
 **Phase 0 — Design (complete).** Four documents drafted v0: `STATE.md` (the hard part), `PROCESS.md` (lifecycle), `ABI.md` (syscall contract), `ARCHITECTURE.md` (kernel modules). Open questions in each doc are logged and resolve as implementation forces decisions.
 
@@ -171,6 +173,7 @@ See **[BACKLOG.md](./BACKLOG.md)** for the full list, prioritized.
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | Recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC, budgets. |
 | [docs/logo.md](./docs/logo.md) | The mark: why layers + a nucleus + a fork, and which file to use where. |
 | [docs/CRITIQUE.md](./docs/CRITIQUE.md) | Running log of external critique and what we changed because of it. |
+| [CHANGELOG.md](./CHANGELOG.md) | Release history, the versioning policy, and this release's known limitations. |
 | [BACKLOG.md](./BACKLOG.md) | First issues, prioritized |
 
 ---

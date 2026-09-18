@@ -2,7 +2,7 @@
 
 *An operating system for AI agents.*
 
-> **Status:** v0. Phases 0–4 are built — the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. This document is the *why*, and it has not changed.
+> **Status:** `v0.1.0` — the first tagged release. Phases 0–5 are complete: the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. This document is the *why*, and it has not changed.
 
 **English** | [简体中文](./MANIFESTO.zh-CN.md)
 
@@ -141,7 +141,7 @@ This document is the **why**. The next documents are the **how**:
 | `docs/COOKBOOK.md` | Recipes: supervision, pause/resume, fork, daemons | **done** |
 | `BACKLOG.md` | The first issues, prioritized | live |
 
-Then code — and the code is written. **Phases 0–4 are complete**; Phase 5 (launch) is in progress.
+Then code — and the code is written. **Phases 0–5 are complete, and released as [`v0.1.0`](./CHANGELOG.md).**
 
 ---
 
