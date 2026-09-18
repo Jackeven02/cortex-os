@@ -71,13 +71,13 @@ Pluggable backends. Each driver is independently testable.
 
 - [x] **#022** `drivers/llm/mock.ts` — deterministic mock for tests and CI (build this first; it unblocks everything else) → this commit (first concrete `ILLMDriver`; registers through `driver_registry.ts`, exercised end-to-end via the dispatcher in smoke)
 - [x] **#023** `drivers/llm/deepseek.ts` — first real LLM driver → this commit (OpenAI-compatible HTTP `/chat/completions`; the driver is its own error boundary — the dispatcher does not wrap LLM-driver throws — so it translates HTTP status / abort / transport failure into stable `CortexError` errnos via `errnoForStatus` + `wrapDriverError`. Injectable `fetchFn` / `env` / `pricing` keep the smoke checks off the network; CJK-aware `countTokens`; cached-input token pricing; no `stream` in v0)
-- [ ] **#024** `drivers/llm/openai.ts` — second LLM driver, validates the abstraction
+- [x] **#024** `drivers/llm/openai.ts` — second LLM driver, validates the abstraction → implemented (OpenAI `/v1/chat/completions`; same error-boundary discipline as deepseek; injectable `fetchFn`/`pricing`; o1/o3 model temperature handling; CJK-aware `countTokens`)
 - [ ] **#025** `drivers/tool/mcp.ts` — MCP client, mounts any MCP server as a tool namespace
-- [ ] **#026** `drivers/tool/fs.ts` — file system tools (read, write, list, glob)
-- [ ] **#027** `drivers/memory/inmem.ts` — in-memory store for tests
-- [ ] **#028** `drivers/memory/sqlite.ts` — SQLite-backed memory store
+- [x] **#026** `drivers/tool/fs.ts` — file system tools (read, write, list, glob) → implemented (`fs_read`, `fs_write`, `fs_list`, `fs_glob`; sandbox root enforcement; reversibility tags)
+- [x] **#027** `drivers/memory/inmem.ts` — in-memory store for tests → implemented (`Map<string, Map<string, Entry>>`; TTL support; snapshot/restore)
+- [x] **#028** `drivers/memory/sqlite.ts` — SQLite-backed memory store → implemented (`node:sqlite` (Node 22+); WAL mode; per-region tables; snapshot/restore compatible with inmem)
 
-**Exit criteria:** swapping a driver requires changing one import. No kernel code knows about any specific vendor.
+**Exit criteria:** swapping a driver requires changing one import. No kernel code knows about any specific vendor. → **Phase 2 drivers implemented: #024 (openai), #026 (fs), #027 (inmem), #028 (sqlite). #025 (MCP) remains.**
 
 ---
 
@@ -85,15 +85,15 @@ Pluggable backends. Each driver is independently testable.
 
 The user-facing surface. Should feel like a real OS shell.
 
-- [ ] **#029** `cortex spawn` — start an agent, print PID
-- [ ] **#030** `cortex ps` — list processes with state, tokens, age
+- [x] **#029** `cortex spawn` — start an agent, print PID → implemented (`--role`, `--task`, `--system`; env-driven driver selection)
+- [x] **#030** `cortex ps` — list processes with state, tokens, age → implemented (table format with PID/PPID/ROLE/STATE/TOKENS/AGE; `--state`/`--role` filters)
 - [ ] **#031** `cortex attach` / `detach` — interactive session with a running agent
-- [ ] **#032** `cortex kill` — send signals
-- [ ] **#033** `cortex trace` — strace-style syscall log, live or from `.crec` file
-- [ ] **#034** `cortex fork` — clone a running process at its current state
-- [ ] **#035** `cortex checkpoint` / `cortex restore`
-- [ ] **#036** `cortex send` / `cortex recv` — IPC from the shell
-- [ ] **#037** `cortex limit` — set token / cost / time budgets per process
+- [x] **#032** `cortex kill` — send signals → implemented (`--signal`; all 13 cortex signals)
+- [x] **#033** `cortex trace` — strace-style syscall log, live or from `.crec` file → implemented (reads `.crec` by PID or file path)
+- [x] **#034** `cortex fork` — clone a running process at its current state → implemented (`--tag`, `--budgets`)
+- [x] **#035** `cortex checkpoint` / `cortex restore` → implemented (`--tag`, `--detach`; restore by `--chain` or `--tag`)
+- [x] **#036** `cortex send` — IPC from the shell → implemented (`--channel` or PID target)
+- [x] **#037** `cortex limit` — set token / cost / time budgets per process → implemented (`--tokens`, `--usd`, `--wall-time`; show mode when no limits given)
 - [ ] **#038** `cortex diff` — compare two forked branches' syscall logs and outputs
 - [ ] **#039** `cortex daemon install` — register a long-running agent to start on boot
 - [ ] **#040** `cortex audit` — surface tools that are untagged for reversibility (STATE.md §8.7)

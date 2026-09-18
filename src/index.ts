@@ -8,14 +8,9 @@
  *   - The error model (CortexError + 15 errnos)
  *   - VERSION and KERNEL_ABI_VERSION constants
  *
- * What does NOT live here (yet):
- *   - The kernel implementation (lands across Phase 1, see BACKLOG.md)
- *   - Driver implementations (Phase 2)
- *   - CLI (Phase 3)
- *
- * Until Phase 1 lands the runtime modules, this entry point is essentially
- * types-only plus the version constants. That is intentional: the ABI is
- * the contract, and the contract is what ships first.
+ * The kernel runtime, drivers, and CLI are implemented in their respective
+ * modules. This entry point re-exports the kernel's public surface so
+ * consumers can `import { bootKernel } from 'cortex-os'`.
  *
  * See:
  *   - MANIFESTO.md         — why this project exists
@@ -30,10 +25,8 @@
 
 export const VERSION = '0.0.1' as const;
 
-export const CODENAME = 'design-phase' as const;
-
 /**
- * Kernel ABI version, recorded in every `.crec` file. Replay engines use
+ * Kernel Abi version, recorded in every `.crec` file. Replay engines use
  * this to negotiate backward compatibility (see docs/ABI.md §9.6).
  *
  * Bumped on every ABI change. Within a major version, recordings are
@@ -42,18 +35,5 @@ export const CODENAME = 'design-phase' as const;
  */
 export const KERNEL_ABI_VERSION = '1.0.0' as const;
 
-// Re-export the kernel public surface (types + errors).
+// Re-export the kernel public surface (types + errors + boot).
 export * from './kernel/index.js';
-
-/**
- * Placeholder. Removed once Phase 1 lands the kernel runtime.
- *
- * @deprecated Will be removed in v0.1.0.
- */
-export function hello(): string {
-  return `cortex v${VERSION} (${CODENAME}) — ABI shipped, kernel pending.`;
-}
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  console.log(hello());
-}

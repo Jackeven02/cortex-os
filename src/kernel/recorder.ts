@@ -541,12 +541,17 @@ export async function effectiveEof(path: string): Promise<SyscallOffset> {
 /**
  * Conventional path for a process's syscall log.
  *
- * `.cortex/proc/<pid>.crec`
+ * `.cortex/processes/<pid>.crec`
+ *
+ * This matches the `processesDir` that `boot.ts` passes to `Recorder.open`
+ * (default `<dir>/processes`). The earlier doc comment said `proc/` which
+ * was a spec/impl mismatch — the recorder has always written to
+ * `processes/` (see `boot.ts` §2 `processesDir`).
  *
  * See docs/ARCHITECTURE.md §7 for the full persistence layout.
  */
 export function crecPath(rootDir: string, pid: ProcessId): string {
-  return join(rootDir, 'proc', `${unbrand(pid)}${CREC_EXTENSION}`);
+  return join(rootDir, 'processes', `${unbrand(pid)}${CREC_EXTENSION}`);
 }
 
 // =============================================================================

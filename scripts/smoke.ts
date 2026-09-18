@@ -24,7 +24,6 @@ import {
   unbrand,
   KERNEL_ABI_VERSION,
   VERSION,
-  CODENAME,
   Recorder,
   readRecords,
   effectiveEof,
@@ -165,6 +164,46 @@ import {
   type FetchResponseLike,
 } from '../src/drivers/llm/deepseek.js';
 
+import {
+  OpenAiLLMDriver,
+  openaiLLM,
+  OPENAI_DEFAULTS,
+  OPENAI_PRICING,
+  OPENAI_CHARS_PER_TOKEN,
+  estimateOpenAiTokens,
+  estimateOpenAiMessageTokens,
+  computeUsd as computeOpenAiUsd,
+  errnoForStatus as openaiErrnoForStatus,
+  type FetchFn as OpenAiFetchFn,
+  type FetchResponseLike as OpenAiFetchResponseLike,
+} from '../src/drivers/llm/openai.js';
+
+import {
+  FsToolDriver,
+  fsTool,
+  FS_DEFAULTS,
+} from '../src/drivers/tool/fs.js';
+
+import {
+  InMemMemoryDriver,
+  inmemMemory,
+} from '../src/drivers/memory/inmem.js';
+
+import {
+  SqliteMemoryDriver,
+  sqliteMemory,
+  SQLITE_DEFAULTS,
+} from '../src/drivers/memory/sqlite.js';
+
+import {
+  writeMeta,
+  readMeta,
+  readAllMetas,
+  maxPidOnDisk,
+  metaPath,
+  type ProcessMeta,
+} from '../src/cli/process_store.js';
+
 let passed = 0;
 let failed = 0;
 
@@ -184,7 +223,7 @@ function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
 }
 
-console.log(`cortex v${VERSION} (${CODENAME}) — ABI ${KERNEL_ABI_VERSION}`);
+console.log(`cortex v${VERSION} — ABI ${KERNEL_ABI_VERSION}`);
 console.log('smoke check: types + errors\n');
 
 check('errno table has 15 entries', () => {
@@ -328,7 +367,6 @@ check('brand constructors produce values that round-trip', () => {
 
 check('version constants are frozen string literals', () => {
   assert(typeof VERSION === 'string' && VERSION.length > 0, 'VERSION bad');
-  assert(typeof CODENAME === 'string' && CODENAME.length > 0, 'CODENAME bad');
   assert(
     typeof KERNEL_ABI_VERSION === 'string' && /^\d+\.\d+\.\d+$/.test(KERNEL_ABI_VERSION),
     `KERNEL_ABI_VERSION not semver: ${KERNEL_ABI_VERSION}`,
@@ -359,13 +397,13 @@ async function runRecorderChecks(): Promise<void> {
   const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-'));
 
   try {
-    await checkAsync('crecPath produces conventional layout', async () => {
-      const p = crecPath('/var/lib/cortex', asProcessId(42));
-      assert(
-        p === join('/var/lib/cortex', 'proc', '42.crec'),
-        `unexpected path: ${p}`,
-      );
-    });
+await checkAsync('crecPath produces conventional layout', async () => {
+const p = crecPath('/var/lib/cortex', asProcessId(42));
+assert(
+p === join('/var/lib/cortex', 'processes', '42.crec'),
+`unexpected path: ${p}`,
+);
+});
 
     await checkAsync('Recorder.open creates file with magic', async () => {
       const rec = await Recorder.open({ pid: asProcessId(100), dir: tmp });
@@ -7125,6 +7163,569 @@ async function runDeepseekChecks(): Promise<void> {
   });
 }
 
+// =============================================================================
+// OpenAI LLM driver checks
+// =============================================================================
+
+async function runOpenAiChecks(): Promise<void> {
+  const userMsg = (content: string): Message => ({ role: 'user', content });
+  const ctx = (over: Record<string, unknown> = {}) => ({
+    pid: asProcessId(2),
+    callId: 'c1',
+    deadline: new Date().toISOString(),
+    abortSignal: new AbortController().signal,
+    kernelAbiVersion: KERNEL_ABI_VERSION,
+    ...over,
+  });
+
+  function jsonResponse(status: number, body: unknown): OpenAiFetchResponseLike {
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      async json() { return body; },
+      async text() { return JSON.stringify(body); },
+    };
+  }
+
+  function makeFetch(responder: (url: string, init: RequestInit) => OpenAiFetchResponseLike | Promise<OpenAiFetchResponseLike>): { fn: OpenAiFetchFn; calls: { url: string; init: RequestInit }[] } {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fn: OpenAiFetchFn = async (url, init) => { calls.push({ url, init }); return responder(url, init); };
+    return { fn, calls };
+  }
+
+  const okBody = {
+    model: 'gpt-4o-mini',
+    choices: [{ message: { role: 'assistant', content: 'Hello from OpenAI!' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 10, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 3 } },
+  };
+
+  check('OpenAiLLMDriver defaults match OPENAI_DEFAULTS', () => {
+    const d = new OpenAiLLMDriver();
+    assert(d.name === OPENAI_DEFAULTS.name, `name ${d.name}`);
+    assert(d.version === OPENAI_DEFAULTS.version, 'version');
+    assert(d.abiCompat === OPENAI_DEFAULTS.abiCompat, 'abiCompat');
+    assert(d.supportedModels.includes('gpt-4o-mini'), 'mini model claimed');
+    assert(d.supportedModels.includes('o1'), 'o1 model claimed');
+    assert(d.closed === false, 'fresh driver is open');
+  });
+
+  check('openai abiCompat admits the live kernel ABI', () => {
+    assert(satisfiesAbi(KERNEL_ABI_VERSION, openaiLLM().abiCompat) === true, 'registry would accept it');
+  });
+
+  check('openaiErrnoForStatus maps HTTP statuses onto stable errnos', () => {
+    assert(openaiErrnoForStatus(400) === 'EINVAL', '400 -> EINVAL');
+    assert(openaiErrnoForStatus(401) === 'EPERM', '401 -> EPERM');
+    assert(openaiErrnoForStatus(404) === 'ENOENT', '404 -> ENOENT');
+    assert(openaiErrnoForStatus(429) === 'EAGAIN', '429 -> EAGAIN');
+    assert(openaiErrnoForStatus(500) === 'EDRIVER', '500 -> EDRIVER');
+  });
+
+  check('estimateOpenAiTokens is CJK-aware', () => {
+    assert(estimateOpenAiTokens('') === 0, 'empty -> 0');
+    assert(estimateOpenAiTokens('hello') === 2, '5 chars / 4 = ceil 2');
+    assert(estimateOpenAiTokens('你好') === 2, '2 CJK chars -> 2 tokens');
+    assert(estimateOpenAiTokens('你好ab') === 3, '2 CJK + ceil(2/4)=1 -> 3');
+  });
+
+  check('computeOpenAiUsd bills cached input at the discount rate', () => {
+    assert(computeOpenAiUsd('gpt-4o-mini', 1_000_000, 0, 0) === 0.15, '1M fresh input -> $0.15');
+    assert(computeOpenAiUsd('gpt-4o-mini', 0, 1_000_000, 0) === 0.6, '1M output -> $0.6');
+    assert(computeOpenAiUsd('gpt-4o-mini', 1_000_000, 0, 1_000_000) === 0.075, '1M cached input -> $0.075');
+    assert(computeOpenAiUsd('gpt-4o', 1_000_000, 0, 0) === 2.5, 'gpt-4o input rate');
+    assert(computeOpenAiUsd('unknown-model', 1_000_000, 0, 0) === 0.15, 'unknown falls back to mini rate');
+  });
+
+  await checkAsync('call() POSTs to OpenAI endpoint with auth', async () => {
+    const { fn, calls } = makeFetch(() => jsonResponse(200, okBody));
+    const d = openaiLLM({ apiKey: 'sk-test', fetchFn: fn });
+    await d.call({ messages: [userMsg('hi')] }, ctx());
+    assert(calls.length === 1, 'exactly one HTTP call');
+    const c = calls[0]!;
+    assert(c.url === 'https://api.openai.com/v1/chat/completions', `url ${c.url}`);
+    assert(c.init.method === 'POST', 'POST');
+    const headers = c.init.headers as Record<string, string>;
+    assert(headers['authorization'] === 'Bearer sk-test', 'bearer token sent');
+    const body = JSON.parse(String(c.init.body)) as Record<string, unknown>;
+    assert(body['model'] === 'gpt-4o-mini', 'default model in body');
+    assert(body['stream'] === false, 'stream false');
+  });
+
+  await checkAsync('call() omits temperature for o1/o3 models', async () => {
+    const { fn, calls } = makeFetch(() => jsonResponse(200, { ...okBody, model: 'o1-mini' }));
+    const d = openaiLLM({ apiKey: 'k', fetchFn: fn });
+    await d.call({ messages: [userMsg('hi')], temperature: 0.3, model: 'o1-mini' }, ctx());
+    const body = JSON.parse(String(calls[0]!.init.body)) as Record<string, unknown>;
+    assert(body['temperature'] === undefined, 'temperature omitted for o1');
+    assert(body['model'] === 'o1-mini', 'model forwarded');
+  });
+
+  await checkAsync('call() maps a successful completion into an LLMResponse', async () => {
+    const { fn } = makeFetch(() => jsonResponse(200, okBody));
+    const d = openaiLLM({ apiKey: 'k', fetchFn: fn });
+    const res = await d.call({ messages: [userMsg('hi')] }, ctx());
+    assert(res.text === 'Hello from OpenAI!', `text ${res.text}`);
+    assert(res.finishReason === 'stop', 'finish stop');
+    assert(res.usage.inputTokens === 10 && res.usage.outputTokens === 5 && res.usage.cachedTokens === 3, 'usage counters');
+    assert(res.usage.usd === computeOpenAiUsd('gpt-4o-mini', 10, 5, 3), `usd ${res.usage.usd}`);
+    assert(res.model === 'gpt-4o-mini', 'response model');
+    assert(res.driverVersion === d.version, 'driverVersion stamped');
+  });
+
+  await checkAsync('call() parses tool_calls', async () => {
+    const toolBody = {
+      model: 'gpt-4o-mini',
+      choices: [{
+        message: {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"SF"}' } }],
+        },
+        finish_reason: 'tool_calls',
+      }],
+      usage: { prompt_tokens: 20, completion_tokens: 8 },
+    };
+    const { fn } = makeFetch(() => jsonResponse(200, toolBody));
+    const d = openaiLLM({ apiKey: 'k', fetchFn: fn });
+    const res = await d.call({ messages: [userMsg('weather?')] }, ctx());
+    assert(res.text === null, 'null text on tool-only turn');
+    assert(res.finishReason === 'tool_use', 'tool_calls -> tool_use');
+    assert(res.toolCalls.length === 1, 'one tool call');
+    assert(res.toolCalls[0]!.name === 'get_weather', 'tool name');
+  });
+
+  await checkAsync('a missing API key traps EINVAL before any fetch', async () => {
+    const d = openaiLLM({ apiKey: undefined, env: {} });
+    let caught: unknown = null;
+    try { await d.call({ messages: [userMsg('hi')] }, ctx()); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EINVAL', 'EINVAL');
+  });
+
+  await checkAsync('HTTP error statuses translate to mapped errno', async () => {
+    const { fn } = makeFetch(() => jsonResponse(429, { error: { message: 'rate limited' } }));
+    const d = openaiLLM({ apiKey: 'k', fetchFn: fn });
+    let caught: unknown = null;
+    try { await d.call({ messages: [userMsg('hi')] }, ctx()); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EAGAIN', '429 -> EAGAIN');
+  });
+
+  await checkAsync('a closed driver traps EDRIVER', async () => {
+    const d = openaiLLM({ apiKey: 'k' });
+    await d.close();
+    let caught: unknown = null;
+    try { await d.call({ messages: [userMsg('hi')] }, ctx()); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EDRIVER', 'EDRIVER');
+  });
+
+  await checkAsync('openai registers into DriverRegistry', async () => {
+    const { fn } = makeFetch(() => jsonResponse(200, okBody));
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(openaiLLM({ apiKey: 'k', fetchFn: fn }));
+    assert(reg.hasLLM('openai'), 'registered');
+    assert(reg.resolveLLM().name === 'openai', 'resolves as default');
+    await reg.closeAll();
+  });
+}
+
+// =============================================================================
+// FS tool driver checks
+// =============================================================================
+
+async function runFsChecks(): Promise<void> {
+    const { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-fs-'));
+  try {
+    mkdirSync(join(tmp, 'sub'), { recursive: true });
+    writeFileSync(join(tmp, 'a.txt'), 'hello world');
+    writeFileSync(join(tmp, 'sub', 'b.ts'), 'export const x = 1;');
+
+    check('FsToolDriver defaults match FS_DEFAULTS', () => {
+      const d = new FsToolDriver();
+      assert(d.name === FS_DEFAULTS.name, `name ${d.name}`);
+      assert(d.version === FS_DEFAULTS.version, 'version');
+      assert(d.abiCompat === FS_DEFAULTS.abiCompat, 'abiCompat');
+      assert(d.closed === false, 'fresh driver is open');
+      assert(d.forkable === true, 'forkable');
+    });
+
+    check('fs abiCompat admits the live kernel ABI', () => {
+      assert(satisfiesAbi(KERNEL_ABI_VERSION, fsTool().abiCompat) === true, 'registry would accept it');
+    });
+
+    await checkAsync('listTools returns 4 tools', async () => {
+      const d = fsTool({ root: tmp });
+      const tools = await d.listTools();
+      assert(tools.length === 4, `4 tools, got ${tools.length}`);
+      assert(tools[0]!.name === 'fs_read', 'first is fs_read');
+      assert(tools[1]!.name === 'fs_write', 'second is fs_write');
+      assert(tools[2]!.name === 'fs_list', 'third is fs_list');
+      assert(tools[3]!.name === 'fs_glob', 'fourth is fs_glob');
+    });
+
+    await checkAsync('fs_read reads file content', async () => {
+      const d = fsTool({ root: tmp });
+      const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+      const res = await d.invoke('fs_read', { path: join(tmp, 'a.txt') }, ctx);
+      const output = res.output as { content: string; size: number };
+      assert(output.content === 'hello world', `content: ${output.content}`);
+      assert(output.size === 11, `size: ${output.size}`);
+      assert(res.error === null, 'no error');
+    });
+
+    await checkAsync('fs_write writes content (irreversible)', async () => {
+      const d = fsTool({ root: tmp });
+      const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+      const res = await d.invoke('fs_write', { path: join(tmp, 'written.txt'), content: 'written!' }, ctx);
+      const output = res.output as { bytes: number };
+      assert(output.bytes === 8, `bytes: ${output.bytes}`);
+      assert(res.reversibility === 'irreversible', `irreversible, got ${res.reversibility}`);
+      // Verify file was written.
+      const content = readFileSync(join(tmp, 'written.txt'), 'utf8');
+      assert(content === 'written!', 'content matches');
+    });
+
+    await checkAsync('fs_list lists directory entries', async () => {
+      const d = fsTool({ root: tmp });
+      const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+      const res = await d.invoke('fs_list', { path: tmp }, ctx);
+      const output = res.output as { entries: Array<{ name: string; isFile: boolean }> };
+      assert(output.entries.length >= 2, `at least 2 entries, got ${output.entries.length}`);
+      const names = output.entries.map((e) => e.name);
+      assert(names.includes('a.txt'), 'a.txt listed');
+      assert(names.includes('sub'), 'sub listed');
+    });
+
+    await checkAsync('fs_glob finds matching files', async () => {
+      const d = fsTool({ root: tmp });
+      const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+      const res = await d.invoke('fs_glob', { pattern: '**/*.ts', cwd: tmp }, ctx);
+      const output = res.output as { matches: string[] };
+      assert(output.matches.length >= 1, `at least 1 match, got ${output.matches.length}`);
+      assert(output.matches.some((m) => m.includes('b.ts')), 'b.ts matched');
+    });
+
+    await checkAsync('fs_read on nonexistent file traps ENOENT', async () => {
+      const d = fsTool({ root: tmp });
+      const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+      let caught: unknown = null;
+      try { await d.invoke('fs_read', { path: join(tmp, 'nope.txt') }, ctx); } catch (e) { caught = e; }
+      assert(isCortexError(caught), 'CortexError');
+      assert((caught as CortexError).errno === 'ENOENT', 'ENOENT');
+    });
+
+    await checkAsync('path outside sandbox root traps EPERM', async () => {
+      const d = fsTool({ root: tmp });
+      const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+      let caught: unknown = null;
+      try { await d.invoke('fs_read', { path: '/etc/passwd' }, ctx); } catch (e) { caught = e; }
+      assert(isCortexError(caught), 'CortexError');
+      assert((caught as CortexError).errno === 'EPERM', 'EPERM');
+    });
+
+    await checkAsync('unknown tool traps ENOENT', async () => {
+      const d = fsTool({ root: tmp });
+      const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+      let caught: unknown = null;
+      try { await d.invoke('fs_delete', {}, ctx); } catch (e) { caught = e; }
+      assert(isCortexError(caught), 'CortexError');
+      assert((caught as CortexError).errno === 'ENOENT', 'ENOENT');
+    });
+
+    await checkAsync('closed driver traps EDRIVER', async () => {
+      const d = fsTool({ root: tmp });
+      await d.close();
+      const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+      let caught: unknown = null;
+      try { await d.invoke('fs_read', { path: join(tmp, 'a.txt') }, ctx); } catch (e) { caught = e; }
+      assert(isCortexError(caught), 'CortexError');
+      assert((caught as CortexError).errno === 'EDRIVER', 'EDRIVER');
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
+// InMem memory driver checks
+// =============================================================================
+
+async function runInMemChecks(): Promise<void> {
+  check('InMemMemoryDriver defaults', () => {
+    const d = new InMemMemoryDriver();
+    assert(d.name === 'inmem', `name ${d.name}`);
+    assert(d.version === '1.0.0', 'version');
+    assert(d.abiCompat === '^1.0.0', 'abiCompat');
+    assert(d.closed === false, 'fresh driver is open');
+  });
+
+  check('inmem abiCompat admits the live kernel ABI', () => {
+    assert(satisfiesAbi(KERNEL_ABI_VERSION, inmemMemory().abiCompat) === true, 'registry would accept it');
+  });
+
+  await checkAsync('write then read round-trips', async () => {
+    const d = inmemMemory();
+    await d.write('episodic', 'key1', { value: 42 });
+    const entries = await d.read('episodic', { key: 'key1' });
+    assert(entries.length === 1, `1 entry, got ${entries.length}`);
+    assert(entries[0]!.key === 'key1', 'key');
+    assert(JSON.stringify(entries[0]!.value) === JSON.stringify({ value: 42 }), 'value');
+    await d.close();
+  });
+
+  await checkAsync('read with prefix returns matching entries', async () => {
+    const d = inmemMemory();
+    await d.write('episodic', 'user:1', { a: 1 });
+    await d.write('episodic', 'user:2', { a: 2 });
+    await d.write('episodic', 'other', { a: 3 });
+    const entries = await d.read('episodic', { prefix: 'user:' });
+    assert(entries.length === 2, `2 entries, got ${entries.length}`);
+    await d.close();
+  });
+
+  await checkAsync('read with limit narrows results', async () => {
+    const d = inmemMemory();
+    await d.write('episodic', 'a', 1);
+    await d.write('episodic', 'b', 2);
+    await d.write('episodic', 'c', 3);
+    const entries = await d.read('episodic', { limit: 2 });
+    assert(entries.length === 2, `2 entries, got ${entries.length}`);
+    await d.close();
+  });
+
+  await checkAsync('delete removes an entry', async () => {
+    const d = inmemMemory();
+    await d.write('episodic', 'key', 'val');
+    await d.delete('episodic', 'key');
+    const entries = await d.read('episodic', { key: 'key' });
+    assert(entries.length === 0, 'entry deleted');
+    await d.close();
+  });
+
+  await checkAsync('listRegions returns non-empty regions', async () => {
+    const d = inmemMemory();
+    await d.write('episodic', 'k', 'v');
+    await d.write('semantic', 'k2', 'v2');
+    const regions = await d.listRegions();
+    assert(regions.length === 2, `2 regions, got ${regions.length}`);
+    assert(regions.includes('episodic'), 'episodic listed');
+    assert(regions.includes('semantic'), 'semantic listed');
+    await d.close();
+  });
+
+  await checkAsync('snapshotRegion + restoreRegion round-trips', async () => {
+    const d = inmemMemory();
+    await d.write('episodic', 'k1', 'v1');
+    await d.write('episodic', 'k2', 'v2');
+    const blob = await d.snapshotRegion('episodic');
+    assert(blob.length > 0, 'blob non-empty');
+    // Clear and restore.
+    const d2 = inmemMemory();
+    await d2.restoreRegion('episodic', blob);
+    const entries = await d2.read('episodic', {});
+    assert(entries.length === 2, `2 entries after restore, got ${entries.length}`);
+    await d.close();
+    await d2.close();
+  });
+
+  await checkAsync('TTL expires entries', async () => {
+    const d = inmemMemory();
+    await d.write('episodic', 'temp', 'v', { ttlMs: 1 });
+    // Wait for TTL to expire.
+    await new Promise((r) => setTimeout(r, 10));
+    const entries = await d.read('episodic', { key: 'temp' });
+    assert(entries.length === 0, 'TTL entry expired');
+    await d.close();
+  });
+
+  await checkAsync('closed driver traps EDRIVER', async () => {
+    const d = inmemMemory();
+    await d.close();
+    let caught: unknown = null;
+    try { await d.read('episodic', {}); } catch (e) { caught = e; }
+    assert(isCortexError(caught), 'CortexError');
+    assert((caught as CortexError).errno === 'EDRIVER', 'EDRIVER');
+  });
+}
+
+// =============================================================================
+// SQLite memory driver checks
+// =============================================================================
+
+async function runSqliteChecks(): Promise<void> {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-sqlite-'));
+  try {
+    check('SqliteMemoryDriver defaults match SQLITE_DEFAULTS', () => {
+      const d = new SqliteMemoryDriver();
+      assert(d.name === SQLITE_DEFAULTS.name, `name ${d.name}`);
+      assert(d.version === SQLITE_DEFAULTS.version, 'version');
+      assert(d.abiCompat === SQLITE_DEFAULTS.abiCompat, 'abiCompat');
+      assert(d.closed === false, 'fresh driver is open');
+    });
+
+    check('sqlite abiCompat admits the live kernel ABI', () => {
+      assert(satisfiesAbi(KERNEL_ABI_VERSION, sqliteMemory().abiCompat) === true, 'registry would accept it');
+    });
+
+    await checkAsync('write then read round-trips', async () => {
+      const d = sqliteMemory({ dir: tmp });
+      await d.write('episodic', 'key1', { value: 42 });
+      const entries = await d.read('episodic', { key: 'key1' });
+      assert(entries.length === 1, `1 entry, got ${entries.length}`);
+      assert(entries[0]!.key === 'key1', 'key');
+      assert(JSON.stringify(entries[0]!.value) === JSON.stringify({ value: 42 }), 'value');
+      await d.close();
+    });
+
+    await checkAsync('read with prefix returns matching entries', async () => {
+      const d = sqliteMemory({ dir: join(tmp, 'sub1') });
+      await d.write('episodic', 'user:1', { a: 1 });
+      await d.write('episodic', 'user:2', { a: 2 });
+      await d.write('episodic', 'other', { a: 3 });
+      const entries = await d.read('episodic', { prefix: 'user:' });
+      assert(entries.length === 2, `2 entries, got ${entries.length}`);
+      await d.close();
+    });
+
+    await checkAsync('delete removes an entry', async () => {
+      const d = sqliteMemory({ dir: join(tmp, 'sub2') });
+      await d.write('episodic', 'key', 'val');
+      await d.delete('episodic', 'key');
+      const entries = await d.read('episodic', { key: 'key' });
+      assert(entries.length === 0, 'entry deleted');
+      await d.close();
+    });
+
+    await checkAsync('listRegions returns non-empty regions', async () => {
+      const d = sqliteMemory({ dir: join(tmp, 'sub3') });
+      await d.write('episodic', 'k', 'v');
+      await d.write('semantic', 'k2', 'v2');
+      const regions = await d.listRegions();
+    assert(regions.length >= 2, `at least 2 regions, got ${regions.length}`);
+    assert(regions.includes('episodic'), 'episodic listed');
+    assert(regions.includes('semantic'), 'semantic listed');
+    await d.close();
+    });
+
+    await checkAsync('snapshotRegion + restoreRegion round-trips', async () => {
+      const d = sqliteMemory({ dir: join(tmp, 'sub4') });
+      await d.write('episodic', 'k1', 'v1');
+      await d.write('episodic', 'k2', 'v2');
+      const blob = await d.snapshotRegion('episodic');
+      assert(blob.length > 0, 'blob non-empty');
+      const d2 = sqliteMemory({ dir: join(tmp, 'sub4b') });
+      await d2.restoreRegion('episodic', blob);
+      const entries = await d2.read('episodic', {});
+      assert(entries.length === 2, `2 entries after restore, got ${entries.length}`);
+      await d.close();
+      await d2.close();
+    });
+
+    await checkAsync('closed driver traps EDRIVER', async () => {
+      const d = sqliteMemory({ dir: join(tmp, 'sub5') });
+      await d.close();
+      let caught: unknown = null;
+      try { await d.read('episodic', {}); } catch (e) { caught = e; }
+      assert(isCortexError(caught), 'CortexError');
+      assert((caught as CortexError).errno === 'EDRIVER', 'EDRIVER');
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
+// CLI process_store + disk-truth model checks
+// =============================================================================
+
+async function runCliChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, existsSync, mkdirSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-cli-'));
+  try {
+    // Create processes dir.
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    check('metaPath produces conventional layout', () => {
+      const p = metaPath(tmp, asProcessId(7));
+      assert(p === join(tmp, 'processes', '7.meta.json'), `path: ${p}`);
+    });
+
+    check('writeMeta + readMeta round-trips', () => {
+      const meta: ProcessMeta = {
+        pid: 2,
+        ppid: 1,
+        pgid: 2,
+        role: 'coder',
+        state: 'zombie',
+        exitCode: 0,
+        exitReason: 'completed',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        lastTransitionAt: '2026-01-01T00:00:01.000Z',
+        budgetsSpent: { tokensIn: 100, tokensOut: 50, tokensCached: 0, usdSpent: 0, wallTimeMs: 1000, syscallCount: 5 },
+        budgetsRemaining: { tokens: 10000, usd: 100, wallTimeMs: 30000 },
+        agent: { system: 'test' },
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      };
+      writeMeta(tmp, meta);
+      const loaded = readMeta(tmp, asProcessId(2));
+      assert(loaded !== undefined, 'meta loaded');
+      assert(loaded!.pid === 2, 'pid');
+      assert(loaded!.role === 'coder', 'role');
+      assert(loaded!.state === 'zombie', 'state');
+      assert(loaded!.exitCode === 0, 'exitCode');
+    });
+
+    check('readMeta on missing pid returns undefined', () => {
+      const loaded = readMeta(tmp, asProcessId(999));
+      assert(loaded === undefined, 'undefined for missing');
+    });
+
+    check('readAllMetas returns sorted by PID', () => {
+      // Write PID 5 then PID 3 to test sorting.
+      writeMeta(tmp, { pid: 5, ppid: 1, pgid: 5, role: 'r5', state: 'running', exitCode: null, exitReason: null, startedAt: '', lastTransitionAt: '', budgetsSpent: { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 0, syscallCount: 0 }, budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 }, agent: { system: '' }, kernelAbiVersion: KERNEL_ABI_VERSION });
+      writeMeta(tmp, { pid: 3, ppid: 1, pgid: 3, role: 'r3', state: 'running', exitCode: null, exitReason: null, startedAt: '', lastTransitionAt: '', budgetsSpent: { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 0, syscallCount: 0 }, budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 }, agent: { system: '' }, kernelAbiVersion: KERNEL_ABI_VERSION });
+      const all = readAllMetas(tmp);
+      assert(all.length >= 3, `at least 3, got ${all.length}`);
+      // Verify sorted: PID 2 before 3 before 5.
+      const pids = all.map((m) => m.pid);
+      const idx2 = pids.indexOf(2);
+      const idx3 = pids.indexOf(3);
+      const idx5 = pids.indexOf(5);
+      assert(idx2 < idx3 && idx3 < idx5, 'sorted by PID');
+    });
+
+    check('maxPidOnDisk returns highest PID', () => {
+      const max = maxPidOnDisk(tmp);
+      assert(max === 5, `max PID 5, got ${max}`);
+    });
+
+    check('maxPidOnDisk on empty dir returns 1', () => {
+      const empty = mkdtempSync(join(tmpdir(), 'cortex-empty-'));
+      try {
+        const max = maxPidOnDisk(empty);
+        assert(max === 1, `max PID 1, got ${max}`);
+      } finally {
+        rmSync(empty, { recursive: true, force: true });
+      }
+    });
+
+    check('crecPath uses processes/ not proc/', () => {
+      const p = crecPath(tmp, asProcessId(42));
+      assert(p === join(tmp, 'processes', '42.crec'), `path: ${p}`);
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -7134,6 +7735,11 @@ await runDispatcherChecks();
 await runDriverRegistryChecks();
 await runMockLLMChecks();
 await runDeepseekChecks();
+await runOpenAiChecks();
+await runFsChecks();
+await runInMemChecks();
+await runSqliteChecks();
+await runCliChecks();
 await runBootChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
