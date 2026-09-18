@@ -10,7 +10,7 @@
  *
  * The kernel runtime, drivers, and CLI are implemented in their respective
  * modules. This entry point re-exports the kernel's public surface so
- * consumers can `import { bootKernel } from 'cortex-os'`.
+ * consumers can `import { bootKernel } from 'cortex-agent-os'`.
  *
  * See:
  *   - MANIFESTO.md         — why this project exists
@@ -20,7 +20,7 @@
  *   - docs/ARCHITECTURE.md — kernel modules and data flow
  *   - BACKLOG.md           — first 50 issues
  *
- * @module cortex-os
+ * @module cortex-agent-os
  */
 
 export const VERSION = '0.0.1' as const;

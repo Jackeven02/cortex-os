@@ -51,8 +51,14 @@ publish a broken package.
 ```bash
 cd cortex-os
 
-# 1. Is the name actually free? (404 = free; if it resolves, STOP and rename)
-npm view cortex-os version --registry https://registry.npmjs.org
+# 1. Is the name actually free? Two checks, and both must fail to resolve:
+#    the exact name, AND its de-punctuated form. npm rejects names that are
+#    "too similar" to an existing package (typosquatting guard): `cortex-os`
+#    is blocked by the existing `cortexos`, because the two are identical once
+#    punctuation is stripped. That rule only fires at publish time — there is
+#    no API to query it — so this check lowers the odds, it cannot settle them.
+npm view cortex-agent-os version --registry https://registry.npmjs.org
+curl -s -o /dev/null -w '%{http_code}\n' https://registry.npmjs.org/cortexagentos
 
 # 2. Does it compile, and does dist/ actually get written?
 npm run build && ls dist/index.js dist/cli/index.js
@@ -72,8 +78,8 @@ Three things to confirm in the output of 3 and 4:
 - **The bin survives.** `package.json` declares `cortex` and `ctx` pointing at
   `dist/cli/index.js`. Confirm the packed manifest still has them:
   ```bash
-  npm pack >/dev/null && tar -xzOf cortex-os-<version>.tgz package/package.json | grep -A3 '"bin"'
-  rm -f cortex-os-*.tgz
+  npm pack >/dev/null && tar -xzOf cortex-agent-os-<version>.tgz package/package.json | grep -A3 '"bin"'
+  rm -f cortex-agent-os-*.tgz
   ```
   (npm normalises this field on publish — both `dist/cli/index.js` and
   `./dist/cli/index.js` work, but writing it the way npm wants keeps the
@@ -166,18 +172,22 @@ builds first, then npm uploads the tarball with public access.
 Verify the result:
 
 ```bash
-npm view cortex-os version --registry https://registry.npmjs.org
-npm view cortex-os dist.tarball --registry https://registry.npmjs.org
+npm view cortex-agent-os version --registry https://registry.npmjs.org
+npm view cortex-agent-os dist.tarball --registry https://registry.npmjs.org
 
 # smoke-test the real install in a scratch dir
 mkdir -p /tmp/cortex-install-check && cd /tmp/cortex-install-check
 npm init -y >/dev/null
-npm i cortex-os --registry https://registry.npmjs.org
-npx cortex help
+npm i cortex-agent-os --registry https://registry.npmjs.org
+npx cortex-agent-os help
 ```
 
-`npx cortex help` printing the command list is the end-to-end proof: it means the
-tarball, the bin wiring and the CLI all survived the round trip.
+`npx cortex-agent-os help` prints the command list. It must be the **package**
+name here, not the bin name — `npx <name>` resolves a *package*, so
+`npx cortex help` would fetch the unrelated `cortex` package and prove nothing.
+(`npx -p cortex-agent-os cortex help` is the explicit equivalent.) Seeing the
+command list is the end-to-end proof: the tarball, the bin wiring and the CLI
+all survived the round trip.
 
 ---
 

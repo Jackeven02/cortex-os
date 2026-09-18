@@ -2,7 +2,7 @@
  * cortex drivers — public surface.
  *
  * Re-exports every built-in driver so consumers can `import { mockLLM, deepseekLLM, openaiLLM }
- * from 'cortex-os/drivers'`.
+ * from 'cortex-agent-os/drivers'`.
  *
  * @module drivers
  */

@@ -291,7 +291,7 @@ await ctx.tool_call('email.commit', { staged_id: staged.id });
 
 ## 7. TypeScript 类型
 
-内核侧契约。这些类型住在 `src/kernel/types.ts`，并从 `cortex-os` 重新导出。
+内核侧契约。这些类型住在 `src/kernel/types.ts`，并从 `cortex-agent-os` 重新导出。
 
 ```typescript
 export type ProcessId = number;      // 实现中是 Brand<number,'ProcessId'>

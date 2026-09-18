@@ -290,7 +290,7 @@ Full state machine in `PROCESS.md`. Quick summary:
 ## 7. TypeScript types
 
 The kernel-side contract. These types live in `src/kernel/types.ts` (the
-compiler-enforced form of the ABI) and are re-exported from `cortex-os`. The
+compiler-enforced form of the ABI) and are re-exported from `cortex-agent-os`. The
 three id types are **branded** — `Brand<T, B>` — so a `ChainId` can never be
 passed where a `ProcessId` is expected; construct them with the kernel's
 `asProcessId()` / `asChainId()` / `asSyscallOffset()` and strip the brand with

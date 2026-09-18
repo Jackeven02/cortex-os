@@ -8,8 +8,8 @@
  *
  * Or programmatically:
  *
- *   import { bootKernel, KERNEL_ABI_VERSION } from 'cortex-os';
- *   import { mockLLM } from 'cortex-os/drivers';
+ *   import { bootKernel, KERNEL_ABI_VERSION } from 'cortex-agent-os';
+ *   import { mockLLM } from 'cortex-agent-os/drivers';
  *
  *   const kernel = await bootKernel({
  *     kernelAbiVersion: KERNEL_ABI_VERSION,
