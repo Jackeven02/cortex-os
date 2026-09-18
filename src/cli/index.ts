@@ -51,6 +51,7 @@ import { cmdSpawn } from './commands/spawn.js';
 import { cmdPs } from './commands/ps.js';
 import { cmdKill } from './commands/kill.js';
 import { cmdTrace } from './commands/trace.js';
+import { cmdAttach } from './commands/attach.js';
 import { cmdCheckpoint } from './commands/checkpoint.js';
 import { cmdRestore } from './commands/restore.js';
 import { cmdFork } from './commands/fork.js';
@@ -85,6 +86,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdKill(rest);
       case 'trace':
         return await cmdTrace(rest);
+      case 'attach':
+        return await cmdAttach(rest);
       case 'checkpoint':
       case 'ckpt':
         return await cmdCheckpoint(rest);

@@ -23,6 +23,7 @@ COMMANDS
   restore      Restore a process from a checkpoint
   fork         Clone a running process at its current state
   diff         Compare two forked branches' syscall logs
+  attach       Follow a process's syscall stream (tail -f on .crec)
   send         Send an IPC message to a process or channel
   limit        Set or show resource budgets per process
   audit        Surface tools untagged for reversibility
@@ -41,6 +42,7 @@ EXAMPLES
   cortex restore --tag "before risky edit"
   cortex fork 1234
   cortex diff 1234 1240
+  cortex attach 1234
   cortex limit 1234 --tokens 10000
   cortex audit
 

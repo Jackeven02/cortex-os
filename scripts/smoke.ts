@@ -217,6 +217,8 @@ import {
 } from '../src/cli/diff_core.js';
 
 import { cmdDiff } from '../src/cli/commands/diff.js';
+import { cmdTrace } from '../src/cli/commands/trace.js';
+import { cmdAttach } from '../src/cli/commands/attach.js';
 
 import {
   InMemMemoryDriver,
@@ -8462,6 +8464,178 @@ async function runDiffChecks(): Promise<void> {
         out += parts.map((p) => String(p)).join(' ') + '\n';
       };
       const code = await cmdDiff(['2']);
+      assert(code === 1, `exit 1, got ${code}`);
+      assert(out.includes('USAGE'), 'prints usage');
+    } finally {
+      console.log = prevLog;
+    }
+  });
+
+  // ---- cortex attach (#031) ----------------------------------------------
+
+  /** Lines that look like syscall-record rows (start with HH:MM:SS.mmm). */
+  function recordLines(out: string): string[] {
+    return out
+      .split('\n')
+      .filter((l) => /^\d{2}:\d{2}:\d{2}\.\d{3}/.test(l));
+  }
+
+  await checkAsync('cortex attach --once prints the same rows as cortex trace', async () => {
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-attach-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes') });
+      for (let i = 0; i < 3; i++) {
+        await rec.append({
+          timestamp: `2026-01-01T00:00:0${i}.000Z`, pid: asProcessId(2), syscall: 'llm_call',
+          callId: `p${i}`, phase: 'exit', result: { text: `thought ${i}` },
+          stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        });
+      }
+      await rec.flush();
+      await rec.close();
+
+      process.env['CORTEX_HOME'] = tmp;
+      const capture = async (fn: () => Promise<number>): Promise<{ code: number; out: string }> => {
+        let out = '';
+        console.log = (...parts: unknown[]): void => {
+          out += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        console.error = (): void => {};
+        const code = await fn();
+        return { code, out };
+      };
+
+      const a = await capture(() => cmdAttach(['2', '--once']));
+      const t = await capture(() => cmdTrace(['2']));
+
+      assert(a.code === 0, `attach exit 0, got ${a.code}`);
+      assert(t.code === 0, `trace exit 0, got ${t.code}`);
+      const attachRows = recordLines(a.out);
+      const traceRows = recordLines(t.out);
+      assert(attachRows.length === 3, `3 rows from attach, got ${attachRows.length}`);
+      assert(
+        attachRows.join('\n') === traceRows.join('\n'),
+        'attach --once renders identical syscall rows to trace',
+      );
+    } finally {
+      console.log = prevLog;
+      console.error = prevErr;
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('cortex attach follow-mode picks up frames appended mid-window', async () => {
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-attach-follow-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      process.env['CORTEX_HOME'] = tmp;
+      const rec = await Recorder.open({ pid: asProcessId(5), dir: join(tmp, 'processes') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(5), syscall: 'llm_call',
+        callId: 'p0', phase: 'exit', result: { text: 'seed' },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      console.error = (): void => {};
+
+      // Attach streams for 1500ms; append two more frames during the window.
+      const promise = cmdAttach(['5', '--timeout-ms', '1500']);
+      const appendAt = async (ms: number, text: string): Promise<void> => {
+        await new Promise<void>((r) => setTimeout(r, ms));
+        await rec.append({
+          timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(5), syscall: 'llm_call',
+          callId: text, phase: 'exit', result: { text },
+          stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        });
+        await rec.flush();
+      };
+      const w1 = appendAt(350, 'mid-a');
+      const w2 = appendAt(700, 'mid-b');
+      const code = await promise;
+      await w1;
+      await w2;
+      await rec.close();
+
+      assert(code === 0, `follow exit 0, got ${code}`);
+      const rows = recordLines(out);
+      assert(rows.length === 3, `3 rows streamed (seed + 2 mid), got ${rows.length}`);
+      // formatRecordLine emits time/pid/syscall/phase/duration/reversibility only,
+      // so the only field that distinguishes the mid-window frames is their
+      // timestamp (00:00:01.000), which the seed row (00:00:00.000) lacks.
+      assert(out.includes('00:00:00.000'), 'seed row present');
+      assert(out.includes('00:00:01.000'), 'mid-window frames surfaced (by timestamp)');
+      assert(out.includes('detached'), 'prints the detached footer');
+    } finally {
+      console.log = prevLog;
+      console.error = prevErr;
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('cortex attach on a missing pid fails with a clear error', async () => {
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-attach-missing-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      console.log = (...parts: unknown[]): void => { out += parts.map((p) => String(p)).join(' ') + '\n'; };
+      console.error = (...parts: unknown[]): void => { out += parts.map((p) => String(p)).join(' ') + '\n'; };
+
+      const code = await cmdAttach(['99']);
+      assert(code === 1, `exit 1, got ${code}`);
+      assert(out.includes('no .crec file'), 'explains the missing log');
+
+      const codeBad = await cmdAttach(['not-a-pid']);
+      assert(codeBad === 1, `invalid pid exit 1, got ${codeBad}`);
+    } finally {
+      console.log = prevLog;
+      console.error = prevErr;
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('cortex attach with no argument prints help and fails', async () => {
+    const prevLog = console.log;
+    try {
+      let out = '';
+      console.log = (...parts: unknown[]): void => { out += parts.map((p) => String(p)).join(' ') + '\n'; };
+      const code = await cmdAttach([]);
       assert(code === 1, `exit 1, got ${code}`);
       assert(out.includes('USAGE'), 'prints usage');
     } finally {

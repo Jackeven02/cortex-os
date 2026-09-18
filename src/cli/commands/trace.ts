@@ -18,6 +18,23 @@ import { defaultKernelDir, crecPath } from '../index.js';
 import { readRecords } from '../../kernel/recorder.js';
 import { unbrand, asProcessId, type SyscallRecord } from '../../kernel/types.js';
 
+/**
+ * Render one syscall record as a fixed-width `trace`/`attach` line.
+ *
+ * Shared by `cortex trace` and `cortex attach` so both commands print an
+ * identical column layout for the same `.crec` file. Keep this the single
+ * source of truth for the on-disk log's human-readable shape.
+ */
+export function formatRecordLine(rec: SyscallRecord): string {
+  const time = rec.timestamp.substring(11, 23); // HH:MM:SS.mmm
+  const pidStr = String(unbrand(rec.pid)).padEnd(6);
+  const syscallStr = rec.syscall.padEnd(16);
+  const phaseStr = rec.phase.padEnd(7);
+  const durStr = rec.durationMs !== undefined ? `${rec.durationMs}ms`.padEnd(9) : '-'.padEnd(9);
+  const revStr = rec.reversibility;
+  return `${time}  ${pidStr} ${syscallStr} ${phaseStr} ${durStr} ${revStr}`;
+}
+
 export async function cmdTrace(args: string[]): Promise<number> {
   const { positionals, values } = parseArgs({
     args,
@@ -73,13 +90,7 @@ EXAMPLES
 
   let count = 0;
   for await (const rec of readRecords(crecFile) as AsyncGenerator<SyscallRecord>) {
-    const time = rec.timestamp.substring(11, 23); // HH:MM:SS.mmm
-    const pidStr = String(unbrand(rec.pid)).padEnd(6);
-    const syscallStr = rec.syscall.padEnd(16);
-    const phaseStr = rec.phase.padEnd(7);
-    const durStr = rec.durationMs !== undefined ? `${rec.durationMs}ms`.padEnd(9) : '-'.padEnd(9);
-    const revStr = rec.reversibility;
-    console.log(`${time}  ${pidStr} ${syscallStr} ${phaseStr} ${durStr} ${revStr}`);
+    console.log(formatRecordLine(rec));
     count++;
   }
 

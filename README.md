@@ -30,10 +30,13 @@ PID    PPID   ROLE       STATE     TOKENS   AGE
 1235   1234   tester     waiting   0        30s
 1236   1234   reviewer   blocked   2.1k     10s
 
-# Attach to a running agent
+# Follow a running agent's syscall stream (tail -f on its .crec)
 $ cortex attach 1234
-[attached. ctrl-d to detach]
-> analyzing stack trace, calling grep tool...
+# attach .cortex/processes/1234.crec (follow-mode)
+14:23:01 1234  __state     exit  idempotent
+14:23:01 1234  memory_read  exit  idempotent
+14:23:04 1234  llm_call     exit  reversible
+# (interactive send / live prompt lands with cortex daemon install, #039)
 
 # Fork state to try an alternative path
 $ cortex fork 1234
@@ -57,7 +60,7 @@ $ cortex restore --tag "before risky edit"
 [restored as pid 1502]
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit` and `audit` are implemented and covered by the smoke suite. `attach` is not. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit` and `audit` are implemented and covered by the smoke suite. `attach` is a read-only, disk-based follow-mode syscall trace in v0 (it tails the on-disk `.crec`, not a live in-memory process — see its honest caveat in [BACKLOG.md](./BACKLOG.md) #031); the interactive send-half lands with `cortex daemon install` (#039). All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 
@@ -67,7 +70,7 @@ Most of this works now — `spawn`, `ps`, `kill`, `trace`, `fork`, `diff`, `chec
 
 **Phases 1–3 — largely complete.** The kernel boots; all ten kernel modules plus the driver registry are in; all seven drivers ship (mock / deepseek / openai LLM, MCP and filesystem tools, inmem and sqlite memory); most of the CLI works. `cortex spawn → llm_call → exit → reap` runs, and checkpoint/restore survives across separate CLI invocations. Known v0 gaps are recorded honestly in [BACKLOG.md](./BACKLOG.md), not hidden.
 
-**Phase 4 — Killer demos.** All three are polished and captured as replays. Demo A (supervision tree): coders each generate one section of a README for a fictional library (see `examples/supervision-tree.ts`, [`docs/demo-a.html`](./docs/demo-a.html), `docs/demo-a.gif`). Demo B (pause across reboots): an inbox-watcher classifies tickets, checkpoints mid-run, and resumes after a reboot (see `examples/checkpoint-agent.ts`, [`docs/demo-b.html`](./docs/demo-b.html), `docs/demo-b.gif`). Demo C (fork and compare): a coder forks to explore two dedup strategies in parallel, then `cortex diff` lines up the branches so you keep the winner (see `examples/fork-compare-agent.ts`, [`docs/demo-c.html`](./docs/demo-c.html), `docs/demo-c.gif`). Also pending: `cortex attach` / `cortex daemon install`.
+**Phase 4 — Killer demos.** All three are polished and captured as replays. Demo A (supervision tree): coders each generate one section of a README for a fictional library (see `examples/supervision-tree.ts`, [`docs/demo-a.html`](./docs/demo-a.html), `docs/demo-a.gif`). Demo B (pause across reboots): an inbox-watcher classifies tickets, checkpoints mid-run, and resumes after a reboot (see `examples/checkpoint-agent.ts`, [`docs/demo-b.html`](./docs/demo-b.html), `docs/demo-b.gif`). Demo C (fork and compare): a coder forks to explore two dedup strategies in parallel, then `cortex diff` lines up the branches so you keep the winner (see `examples/fork-compare-agent.ts`, [`docs/demo-c.html`](./docs/demo-c.html), `docs/demo-c.gif`). `cortex attach` now ships as a follow-mode syscall trace (BACKLOG #031). Still pending: `cortex daemon install` (#039) — the long-running agent that makes `attach`'s interactive send-half real.
 
 Demo A is worth calling out because it changed the kernel: agents used to run to completion inside the quantum that dispatched them, so a parent parked in `wait()` held its own tick and its children could never run — `wait()` deadlocked by construction, and a supervision tree could not be written at all. The continuation is now cooperative (see PROCESS.md §8.2), so this works with no orchestrator:
 
