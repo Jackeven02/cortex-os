@@ -171,6 +171,7 @@ See **[BACKLOG.md](./BACKLOG.md)** for the full list, prioritized.
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow: 11 modules, syscall lifecycle, persistence layout, concurrency model |
 | [docs/HACKING.md](./docs/HACKING.md) | Contributor guide: dev setup, conventions, how to write a driver / agent / syscall, testing. |
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | Recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC, budgets. |
+| [docs/PUBLISHING.md](./docs/PUBLISHING.md) | Release runbook: pre-flight checks, npm login/publish (and the regional-mirror trap), version bumps. |
 | [docs/logo.md](./docs/logo.md) | The mark: why layers + a nucleus + a fork, and which file to use where. |
 | [docs/CRITIQUE.md](./docs/CRITIQUE.md) | Running log of external critique and what we changed because of it. |
 | [CHANGELOG.md](./CHANGELOG.md) | Release history, the versioning policy, and this release's known limitations. |

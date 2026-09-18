@@ -2,6 +2,7 @@
 dist/
 build/
 *.tsbuildinfo
+*.tgz
 
 # Dependencies
 node_modules/

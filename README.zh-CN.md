@@ -171,6 +171,7 @@ $ cortex diff 2 3
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 内核模块和数据流：11 个模块、syscall 生命周期、持久化布局、并发模型 |
 | [docs/HACKING.md](./docs/HACKING.md) | 贡献者指南：开发环境、约定、怎么写驱动 / agent / syscall、测试。 |
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | 配方：监督树、暂停与恢复、fork 对比、daemon、工具、IPC、预算。 |
+| [docs/PUBLISHING.md](./docs/PUBLISHING.md) | 发版手册：飞行前检查、npm 登录/发布（含国内镜像的坑）、版本号提升流程。 |
 | [docs/logo.md](./docs/logo.md) | 标志：为什么是「层 + 核 + 分叉」，以及哪个文件用在哪。 |
 | [docs/CRITIQUE.md](./docs/CRITIQUE.md) | 外部批评的滚动记录，以及我们因此改了什么。 |
 | [CHANGELOG.md](./CHANGELOG.md) | 发布历史、版本号规则，以及本版本的已知限制。 |
