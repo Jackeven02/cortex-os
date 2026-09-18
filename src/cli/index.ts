@@ -34,7 +34,7 @@ import { mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { KERNEL_ABI_VERSION } from '../index.js';
+import { KERNEL_ABI_VERSION, VERSION } from '../index.js';
 import { bootKernel, type Kernel } from '../kernel/boot.js';
 import { mockLLM } from '../drivers/llm/mock.js';
 import { deepseekLLM } from '../drivers/llm/deepseek.js';
@@ -113,7 +113,7 @@ export async function main(argv: string[]): Promise<number> {
         return 0;
       case '--version':
       case '-v':
-        console.log(`cortex v0.0.1 (ABI ${KERNEL_ABI_VERSION})`);
+        console.log(`cortex v${VERSION} (ABI ${KERNEL_ABI_VERSION})`);
         return 0;
       default:
         console.error(`unknown command: ${command}`);

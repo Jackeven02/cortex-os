@@ -23,7 +23,38 @@
  * @module cortex-agent-os
  */
 
-export const VERSION = '0.0.1' as const;
+import { readFileSync } from 'node:fs';
+
+/**
+ * Package version, read from the manifest at load time.
+ *
+ * Deliberately *not* a literal. A hand-maintained version string drifts the
+ * moment someone bumps `package.json` and forgets this line — which is exactly
+ * what shipped in `0.1.0`: npm served `cortex-agent-os@0.1.0` while the CLI
+ * reported itself as `v0.0.1`. Reading the manifest makes that desync
+ * structurally impossible.
+ *
+ * Resolved against `import.meta.url`, so it is correct from both `src/index.ts`
+ * and `dist/index.js` — both sit one level below the package root. Careful:
+ * this is URL resolution, not path joining, so the filename segment is consumed
+ * first and `../package.json` (not `../../`) is the right spelling.
+ *
+ * The manifest always ships in a published tarball, so the fallback exists only
+ * to report a wrong version rather than crash the CLI.
+ */
+function readPackageVersion(): string {
+  try {
+    const manifest: unknown = JSON.parse(
+      readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+    );
+    const version = (manifest as { version?: unknown }).version;
+    return typeof version === 'string' ? version : '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+}
+
+export const VERSION = readPackageVersion();
 
 /**
  * Kernel Abi version, recorded in every `.crec` file. Replay engines use

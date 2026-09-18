@@ -6,10 +6,10 @@
  * @module cli/commands/help
  */
 
-import { KERNEL_ABI_VERSION } from '../../index.js';
+import { KERNEL_ABI_VERSION, VERSION } from '../../index.js';
 
 export function cmdHelp(): void {
-  console.log(`cortex v0.0.1 (ABI ${KERNEL_ABI_VERSION}) — an operating system for AI agents
+  console.log(`cortex v${VERSION} (ABI ${KERNEL_ABI_VERSION}) — an operating system for AI agents
 
 USAGE
   cortex <command> [options]

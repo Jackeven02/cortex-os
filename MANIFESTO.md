@@ -2,7 +2,7 @@
 
 *An operating system for AI agents.*
 
-> **Status:** `v0.1.0` — the first tagged release. Phases 0–5 are complete: the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. This document is the *why*, and it has not changed.
+> **Status:** `v0.1.1` — a one-defect patch on `v0.1.0`, the first tagged release. Phases 0–5 are complete: the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. This document is the *why*, and it has not changed.
 
 **English** | [简体中文](./MANIFESTO.zh-CN.md)
 

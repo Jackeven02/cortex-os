@@ -8,6 +8,7 @@
  * tests/ and deleted.
  */
 
+import { readFileSync } from 'node:fs';
 import {
   CortexError,
   isCortexError,
@@ -415,12 +416,33 @@ check('brand constructors produce values that round-trip', () => {
   assert(unbrand(off) === 4096, 'syscallOffset round-trip failed');
 });
 
-check('version constants are frozen string literals', () => {
-  assert(typeof VERSION === 'string' && VERSION.length > 0, 'VERSION bad');
+check('VERSION tracks package.json and no banner hardcodes a version', () => {
+  const manifest: unknown = JSON.parse(
+    readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+  );
+  const declared = (manifest as { version?: unknown }).version;
+  assert(typeof declared === 'string', 'package.json declares no version');
+  assert(
+    VERSION === declared,
+    `VERSION ${VERSION} != package.json ${declared} — read the manifest, never hardcode`,
+  );
+  assert(/^\d+\.\d+\.\d+$/.test(VERSION), `VERSION not semver: ${VERSION}`);
   assert(
     typeof KERNEL_ABI_VERSION === 'string' && /^\d+\.\d+\.\d+$/.test(KERNEL_ABI_VERSION),
     `KERNEL_ABI_VERSION not semver: ${KERNEL_ABI_VERSION}`,
   );
+  // `0.1.0` shipped reporting itself as `v0.0.1`, because both CLI banners
+  // carried their own literal while `package.json` moved on. The constant is
+  // derived now, so this guards the call sites: a `cortex v<semver>` literal
+  // anywhere in the CLI means the bug is back. (The old assertion here only
+  // checked that VERSION was a non-empty string, which is why it passed.)
+  for (const rel of ['src/cli/index.ts', 'src/cli/commands/help.ts']) {
+    const src = readFileSync(new URL(`../${rel}`, import.meta.url), 'utf8');
+    assert(
+      !/cortex v\d+\.\d+\.\d+/.test(src),
+      `${rel} hardcodes a version in its banner — interpolate VERSION instead`,
+    );
+  }
 });
 
 // =============================================================================

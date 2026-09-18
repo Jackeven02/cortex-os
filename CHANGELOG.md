@@ -33,6 +33,38 @@ exact version.
 
 ---
 
+## [0.1.1] — 2026-09-19
+
+A one-defect patch. The kernel, the syscall ABI, the CLI surface, the drivers and
+the state model are all untouched — `0.1.1` is behaviourally identical to `0.1.0`
+apart from the version string the CLI prints about itself.
+
+### Fixed
+
+- **The CLI reported the wrong version about itself.** `cortex --version` and
+  `cortex help` both printed `cortex v0.0.1` while the manifest said `0.1.0`. The
+  number was written out by hand in three places — the `VERSION` constant in
+  `src/index.ts` plus a literal banner in each of `src/cli/index.ts` and
+  `src/cli/commands/help.ts` — and all three were missed when `package.json` was
+  bumped for the release. `VERSION` is now read from the package manifest at load
+  time, so the two cannot disagree again; it is resolved against
+  `import.meta.url` so it works from both `src/` and `dist/`.
+- **The smoke check that should have caught this was too weak to.** It asserted
+  only that `VERSION` was a non-empty string, never what it contained, so a
+  release shipping `v0.0.1` passed 479/479. It now compares `VERSION` against
+  `package.json` and additionally fails if either CLI banner reintroduces a
+  hardcoded `cortex v<x.y.z>` literal.
+
+### Note on the npm package name
+
+The npm artifact is **`cortex-agent-os`**, not `cortex-os`. npm refuses
+`cortex-os` as too similar to the already-registered `cortexos` — the two are
+identical once punctuation is stripped — and that guard is evaluated only at
+publish time, so it cannot be checked for in advance. The repository name and the
+`cortex` / `ctx` binary names are unchanged; only the package you install differs.
+
+---
+
 ## [0.1.0] — 2026-09-19
 
 The first tagged release. The kernel boots, all seven drivers ship, the CLI is
@@ -136,4 +168,5 @@ These are deliberate `v0` boundaries, not oversights. Each is recorded in
 - Persistence is a flat directory, not the subtree described in ARCHITECTURE §7.
 - Sandbox fork, shadow process, `cortex gc`, and `cortex doctor` are post-v0.
 
+[0.1.1]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.1
 [0.1.0]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.0
