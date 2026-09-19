@@ -544,11 +544,14 @@ export class MemoryManager {
     }
 
     try {
-      // Copy-on-write divergence: a shared cow region must be duplicated
-      // before this branch's first write mutates it.
-      await this.#maybeCowDuplicate(pid, region, binding, driver);
-
-      // ENOMEM check (coarse entry-count proxy — see §1).
+      // ENOMEM check (coarse entry-count proxy — see §1) runs BEFORE copy-on-
+      // write divergence: a write that is going to be rejected must not pay
+      // for — or leave behind — the COW split. #maybeCowDuplicate mutates
+      // `binding.physical`, releases the shared refcount, and migrates the
+      // size to the fresh key; doing that and *then* failing would break the
+      // parent/child share even though no write ever landed. The entry-count
+      // decision is identical either way, because the divergence copies the
+      // size forward to the new key rather than resetting it.
       if (
         this.#maxRegionEntries >= 0 &&
         (this.#sizes.get(binding.physical) ?? 0) >= this.#maxRegionEntries
@@ -560,6 +563,10 @@ export class MemoryManager {
         await this.#recordTrap(pid, 'memory_write', callId, err, { region, key });
         throw err;
       }
+
+      // Copy-on-write divergence: a shared cow region must be duplicated
+      // before this branch's first write mutates it.
+      await this.#maybeCowDuplicate(pid, region, binding, driver);
 
       await driver.write(
         binding.physical,

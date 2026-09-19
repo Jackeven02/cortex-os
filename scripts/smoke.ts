@@ -1828,6 +1828,103 @@ async function runIpcChecks(): Promise<void> {
       assert(info.totalSent === 1 && info.totalRecv === 1, 'counters should both be 1');
     });
 
+    await checkAsync('send rolls back the enqueue when recording fails (ERECORD)', async () => {
+      // A throwaway recorder whose append fails on demand. `fail` stays false
+      // during spawn (the __state records must land); we flip it only around
+      // the send we want to fail.
+      let fail = false;
+      const fake = {
+        append: async () => {
+          if (fail) throw new Error('disk on fire');
+        },
+        flush: async () => {},
+        close: async () => {},
+        path: '',
+      } as unknown as Recorder;
+      const table = new ProcessTable({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        recorderFactory: async () => fake,
+      });
+      tables.push(table);
+      const a = await spawnRunning(table, 'a');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('rollback-enqueue');
+
+      fail = true;
+      let caught: unknown;
+      try {
+        await mgr.send(a, chan, 'nope');
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught), 'failed send should throw CortexError');
+      assert(caught.errno === 'ERECORD', `expected ERECORD, got ${caught.errno}`);
+      // The commit must be undone: no phantom message, counter restored.
+      const info = mgr.getChannel(chan)!;
+      assert(info.queueDepth === 0, `queue should roll back to empty, got ${info.queueDepth}`);
+      assert(info.totalSent === 0, `totalSent should roll back to 0, got ${info.totalSent}`);
+
+      // A later send with a healthy recorder commits normally.
+      fail = false;
+      await mgr.send(a, chan, 'ok');
+      assert(mgr.getChannel(chan)!.queueDepth === 1, 'healthy send should enqueue');
+      assert(mgr.getChannel(chan)!.totalSent === 1, 'totalSent should be 1 after healthy send');
+    });
+
+    await checkAsync('send rolls back a failed direct handoff, leaving the waiter parked', async () => {
+      let fail = false;
+      const fake = {
+        append: async () => {
+          if (fail) throw new Error('disk on fire');
+        },
+        flush: async () => {},
+        close: async () => {},
+        path: '',
+      } as unknown as Recorder;
+      const table = new ProcessTable({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        recorderFactory: async () => fake,
+      });
+      tables.push(table);
+      const a = await spawnRunning(table, 'a');
+      const b = await spawnRunning(table, 'b');
+      const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const chan = asChannelId('rollback-handoff');
+
+      const recvPromise = mgr.recv(b, chan);
+      await waitFor(() => mgr.getChannel(chan)?.waiterCount === 1, 'waiter registered');
+
+      fail = true;
+      let caught: unknown;
+      try {
+        await mgr.send(a, chan, 'lost');
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught) && caught.errno === 'ERECORD', 'handoff send should ERECORD');
+      // The waiter must be restored to the parked set and counters unchanged;
+      // the receiver must still be blocked (recv did not resolve).
+      assert(mgr.getChannel(chan)!.waiterCount === 1, 'waiter should be restored to the parked set');
+      assert(
+        mgr.getChannel(chan)!.totalSent === 0 && mgr.getChannel(chan)!.totalRecv === 0,
+        'counters should stay 0 after a failed handoff',
+      );
+      assert(table.snapshot(b).state === 'blocked', 'receiver should still be blocked');
+
+      // With a healthy recorder, that very same parked waiter is served next.
+      fail = false;
+      await mgr.send(a, chan, 'served');
+      const got = await recvPromise;
+      assert(got.body === 'served', `parked waiter should get the second message, got ${JSON.stringify(got.body)}`);
+      assert(mgr.getChannel(chan)!.waiterCount === 0, 'waiter consumed after successful handoff');
+      assert(
+        mgr.getChannel(chan)!.totalSent === 1 && mgr.getChannel(chan)!.totalRecv === 1,
+        'counters should be 1 after the successful handoff',
+      );
+    });
+
     await checkAsync('closeChannel rejects parked waiters with EBADF', async () => {
       const table = await makeTable();
       const b = await spawnRunning(table, 'b');
@@ -2363,6 +2460,47 @@ async function runMemoryChecks(): Promise<void> {
       err = e;
     }
     assert(isCortexError(err) && err.errno === 'ENOMEM', 'over-limit write should trap ENOMEM');
+  });
+
+  await checkAsync('ENOMEM is checked before cow divergence: a rejected write leaves the share intact', async () => {
+    const table = await makeTable();
+    const parent = await spawnRunning(table, 'parent');
+    const driver = new FakeMemoryDriver(clock, KERNEL_ABI_VERSION);
+    const mgr = new MemoryManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      drivers: { inmem: driver },
+      maxRegionEntries: 1,
+    });
+    mgr.attachRegion(parent, 'memory', cow);
+    await mgr.write(parent, 'memory', 'seed', 'v'); // fills the single allowed entry
+
+    const child = await table.allocate({ ppid: parent, role: 'child', agent });
+    await mgr.forkCopy(parent, child); // cow share: refCount 2, no eager copy
+    assert(mgr.regionInfo(parent, 'memory')!.refCount === 2, 'precondition: shared, refCount 2');
+
+    const snapshotsBefore = driver.snapshotCalls.length;
+    let err: unknown;
+    try {
+      await mgr.write(child, 'memory', 'overflow', 'x'); // over the limit → ENOMEM
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ENOMEM', 'over-limit write should trap ENOMEM');
+    // The rejection must not have paid for — or left behind — a COW split.
+    assert(
+      driver.snapshotCalls.length === snapshotsBefore,
+      'a write that will ENOMEM must not trigger a cow region copy',
+    );
+    assert(
+      mgr.regionInfo(child, 'memory')!.bindingKey === mgr.regionInfo(parent, 'memory')!.bindingKey,
+      'child must remain bound to the shared physical key after the rejected write',
+    );
+    assert(
+      mgr.regionInfo(parent, 'memory')!.refCount === 2,
+      'the parent/child share must survive the rejection',
+    );
   });
 
   // --- shared semantics -----------------------------------------------------
@@ -6516,6 +6654,42 @@ async function runMockLLMChecks(): Promise<void> {
     await new Promise((r) => setTimeout(r, 0));
     const e = table.get(pid);
     assert(e !== undefined && e.state === 'stopped', `SIGXCPU stopped it, got ${e?.state}`);
+    await reg.closeAll();
+  });
+
+  await checkAsync('E2E: finite wallTime budget drains with real elapsed time -> SIGXCPU', async () => {
+    // Regression: `#account` used to charge tokens/usd only. A process's
+    // `budgetsRemaining.wallTimeMs` never decremented, so a finite wall-time
+    // budget could never trip checkBudget's `kind: 'wallTime'` and the SIGXCPU
+    // documented in types.ts ("decrement on every relevant syscall; when one
+    // hits zero, SIGXCPU fires") never fired. Fix: table.spend() now accrues
+    // elapsed milliseconds since the last accounting pass whenever the wall
+    // budget is bounded.
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(mockLLM());
+    const table = await makeTable();
+    const dispatcher = makeDispatcher(table, reg);
+    // Only a wall-time limit is set; tokens/usd stay unlimited so ONLY wall-time
+    // exhaustion can trigger SIGXCPU.
+    const pid = await runningPid(table, { budgets: { tokens: -1, usd: -1, wallTimeMs: 100 } });
+    const e0 = table.get(pid)!;
+    assert(e0.budgetsRemaining.wallTimeMs === 100, `initial remaining 100, got ${e0.budgetsRemaining.wallTimeMs}`);
+    fakeNow += 250; // real wall time elapses beyond the budget
+    await dispatcher.invoke(pid, 'llm_call', { messages: [userMsg('hi')] });
+    // The accounting pass has now run once, charging 250ms.
+    const e1 = table.get(pid)!;
+    assert(e1.budgetsRemaining.wallTimeMs === 0, `remaining clamps to 0, got ${e1.budgetsRemaining.wallTimeMs}`);
+    assert(e1.budgetsSpent.wallTimeMs >= 250, `spent accrues, got ${e1.budgetsSpent.wallTimeMs}`);
+    // SIGXCPU delivery is async; drain the microtasks.
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    const e2 = table.get(pid);
+    assert(e2 !== undefined && e2.state === 'stopped', `wall-time budget stopped it, got ${e2?.state}`);
+    // A further RUNNING-gated syscall now traps at the state gate.
+    let caught: unknown = null;
+    try { await dispatcher.invoke(pid, 'llm_call', { messages: [userMsg('again')] }); } catch (err) { caught = err; }
+    assert(isCortexError(caught) && (caught as CortexError).errno === 'ESTATE',
+      `further syscall ESTATE, got ${isCortexError(caught) ? (caught as CortexError).errno : 'no-throw'}`);
     await reg.closeAll();
   });
 

@@ -475,22 +475,40 @@ export class IpcManager {
     // Direct handoff if a waiter is parked.
     const waiter = channel.waiters.shift();
     if (waiter !== undefined) {
+      const queueDepthBefore = channel.queue.length;
       channel.totalSent++;
       channel.totalRecv++;
       this.#trackMembership(from, channel.id);
       this.#trackMembership(waiter.pid, channel.id);
-
-      await this.#recordSend(from, channel, msg, /* handedOff */ true);
+      try {
+        await this.#recordSend(from, channel, msg, /* handedOff */ true, queueDepthBefore);
+      } catch (err) {
+        // Recording failed: the send did not take effect. Undo the handoff so
+        // the waiter stays parked (a later send or the next recv can still be
+        // served) and the counters reflect reality, then surface the error.
+        // Channel-membership bookkeeping is diagnostic and left in place.
+        channel.waiters.unshift(waiter);
+        channel.totalSent--;
+        channel.totalRecv--;
+        throw err;
+      }
       this.#settleWaiterResolve(waiter, msg);
       return;
     }
 
     // Otherwise enqueue.
+    const queueDepthBefore = channel.queue.length;
     channel.queue.push(msg);
     channel.totalSent++;
     this.#trackMembership(from, channel.id);
-
-    await this.#recordSend(from, channel, msg, /* handedOff */ false);
+    try {
+      await this.#recordSend(from, channel, msg, /* handedOff */ false, queueDepthBefore);
+    } catch (err) {
+      // Roll back the enqueue: a failed send must leave no committed message.
+      channel.queue.pop();
+      channel.totalSent--;
+      throw err;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -842,6 +860,7 @@ export class IpcManager {
     channel: Channel,
     msg: IpcMessage,
     handedOff: boolean,
+    queueDepthBefore: number,
   ): Promise<void> {
     if (!isProcessTarget(from)) return; // system-originated; no log to write to
     const recorder = this.#table.recorderFor(from);
@@ -861,7 +880,7 @@ export class IpcManager {
         targetKind: 'channel',
         body: msg.body,
         toPid: isProcessTarget(msg.to) ? unbrand(msg.to) : null,
-        queueDepth: channel.queue.length,
+        queueDepth: queueDepthBefore,
         handedOff,
       },
       stateBefore: state,

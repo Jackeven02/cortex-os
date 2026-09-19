@@ -183,6 +183,13 @@ export interface ProcessEntry {
   nice: number;
   startedAt: Timestamp;
   lastTransitionAt: Timestamp;
+  /**
+   * Timestamp up to which this process's wall-clock budget has already been
+   * charged. `spend()` accrues real elapsed time from here to now on each
+   * accounting pass, so a finite `wallTimeMs` budget actually drains. Kept
+   * monotonic; set at allocation and refreshed whenever budgets are reset.
+   */
+  lastWallAccountAt: Timestamp;
   budgetsRemaining: BudgetLimits;
   budgetsSpent: BudgetCounters;
   exitCode: number | null;
@@ -439,6 +446,7 @@ export class ProcessTable {
       nice: opts.nice ?? 0,
       startedAt: now,
       lastTransitionAt: now,
+      lastWallAccountAt: now,
       budgetsRemaining,
       budgetsSpent: { ...DEFAULT_SPENT },
       exitCode: null,
@@ -885,8 +893,21 @@ export class ProcessTable {
     const tokensOut = delta.tokensOut ?? 0;
     const tokensCached = delta.tokensCached ?? 0;
     const usdSpent = delta.usdSpent ?? 0;
-    const wallTimeMs = delta.wallTimeMs ?? 0;
+    let wallTimeMs = delta.wallTimeMs ?? 0;
     const syscallCount = delta.syscallCount ?? 0;
+
+    // Accrue REAL elapsed time onto the wall-clock budget. A process can sit
+    // idle in `sleep()`/`recv()`/`wait()` between syscalls; without this the
+    // finite `wallTimeMs` limit would never drain and its SIGXCPU could never
+    // fire. Only meaningful for a bounded budget (>= 0) — unlimited stays -1.
+    if (remaining.wallTimeMs >= 0) {
+      const nowIso = this.#now();
+      const elapsed = Date.parse(nowIso) - Date.parse(entry.lastWallAccountAt);
+      if (Number.isFinite(elapsed) && elapsed > 0) {
+        wallTimeMs += elapsed;
+        entry.lastWallAccountAt = nowIso;
+      }
+    }
 
     entry.budgetsSpent = {
       tokensIn: spent.tokensIn + tokensIn,
@@ -944,6 +965,10 @@ export class ProcessTable {
     const entry = this.mustGet(pid, 'setBudgets');
     if (patch.remaining !== undefined) {
       entry.budgetsRemaining = { ...entry.budgetsRemaining, ...patch.remaining };
+      // The envelope was redefined (fork inherit/split, restore). Restart the
+      // wall-clock accrual window from now so spend() cannot charge time that
+      // predates this new budget, nor reuse a stale ancestor's allocation time.
+      entry.lastWallAccountAt = this.#now();
     }
     if (patch.spent !== undefined) {
       entry.budgetsSpent = { ...entry.budgetsSpent, ...patch.spent };

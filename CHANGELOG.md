@@ -33,6 +33,66 @@ exact version.
 
 ---
 
+## [0.1.5] — 2026-09-19
+
+Three more defects from the `0.1.3` review's "found but deferred" list, chosen
+because each is a genuine correctness break rather than a stylistic wart. The
+syscall ABI, the state model, the CLI surface and the memory/IPC/contract text
+are all unchanged; this is a patch bump. The smoke suite grew from 486 to 490
+assertions.
+
+### Fixed
+
+- **A finite `wallTimeMs` budget never drained, so wall-clock time could never
+  trip `SIGXCPU`.** The budget docs promise remaining time "decrements on every
+  relevant syscall", and `checkBudget()` looks for the wall-time counter to reach
+  zero — but the accounting path only ever charged wall-time from an explicit
+  `delta.wallTimeMs` in the syscall result, which no driver ever supplies. Real
+  elapsed time between syscalls was simply dropped, so a process configured with
+  unlimited tokens and USD but a capped wall time ran forever. Each process now
+  carries a `lastWallAccountAt` timestamp; `spend()` adds the elapsed interval
+  since the last charge (and advances the stamp) before decrementing the
+  remaining wall-time budget, clamping to zero on exhaustion as the other budget
+  kinds do. `setBudgets()` — used by `fork` under `inherit`/`split` policies and
+  by checkpoint restore — resets the stamp so a fresh process does not inherit a
+  stale window. Regression-tested end to end: with tokens and USD unlimited and
+  `wallTimeMs: 100`, advancing the clock past the cap and issuing one `llm_call`
+  drains the budget to zero, fires `SIGXCPU`, stops the process, and a further
+  syscall then traps `ESTATE`.
+- **`send()` mutated channel state before an awaitable record that can fail, so
+  a "failed" send could still take effect.** Both the direct-handoff and the
+  enqueue branches incremented counters / shifted a parked waiter / pushed onto
+  the queue *before* `await this.#recordSend(...)`. If the `.crec` append threw,
+  the call surfaced `ERECORD` while the message had in fact been delivered or
+  enqueued and the counters bumped — a phantom, half-committed send. The mutation
+  branches are now atomic: commit, attempt the record, and on failure roll back
+  (restore the waiter to the front of the parked set and undo the send/recv
+  counters for a handoff; pop the queued message and decrement `totalSent` for an
+  enqueue) before rethrowing. `#recordSend` also captures the queue depth as a
+  parameter taken *before* the mutation, so the recorded value no longer depends
+  on live channel state that a rollback might have undone. Channel-membership
+  bookkeeping is left in place on rollback because it is purely diagnostic.
+  Regression-tested both ways: a recording failure leaves the queue empty and
+  `totalSent` at zero (and a later healthy send still commits), and a failed
+  handoff leaves the very same waiter parked and the receiver still blocked, so
+  the next healthy send serves it.
+- **A write destined for `ENOMEM` still paid for — and left behind — a
+  copy-on-write split.** In `memory_write`, the COW divergence ran before the
+  entry-count ceiling check. Duplicating a shared region is not free: it
+  snapshots and restores the whole region, releases the shared physical key, and
+  rebinds the writer to a fresh key — and none of that was rolled back when the
+  subsequent `ENOMEM` rejected the write. The result was that a syscall which
+  should be observably a no-op silently broke the parent/child share: the
+  sibling relationship diverged even though no data was ever written. The
+  entry-count check now runs first, so a rejected write fails before touching any
+  state. The accept/reject decision is unchanged because divergence copies the
+  size forward to the new key rather than resetting it, so the count being tested
+  is the same either way. Regression-tested: writing to a shared `cow` region at
+  its limit traps `ENOMEM`, triggers no region snapshot, and leaves both the
+  binding keys identical and the refcount at 2.
+
+---
+
 ## [0.1.4] — 2026-09-19
 
 Two more real defects, both from the "found but deferred" list of the `0.1.3`
