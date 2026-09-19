@@ -509,6 +509,8 @@ export class SyscallDispatcher {
   #waitersByChild = new Map<number, Waiter[]>();
   /** Parked `wait()` calls awaiting any child of a parent. */
   #waitersAny = new Map<number, Waiter[]>();
+  /** pid → handle of the timer armed by a pending `sleep()`. */
+  #sleepHandles = new Map<number, unknown>();
 
   #callCounter = 0;
 
@@ -1026,6 +1028,10 @@ export class SyscallDispatcher {
     const entry = this.#table.mustGet(pid, 'exit');
     const stateBefore = entry.state;
 
+    // A process that exits while parked in `sleep()` leaves a live timer behind
+    // whose only job would be to wake a dead PID.
+    this.#cancelSleep(pid);
+
     // Walk to EXITING. Legal directly from running/blocked/stopped; new/ready
     // route through running first. checkpointing/suspended have no edge to
     // exiting (docs/PROCESS.md §5) — exit from those is a kernel bug.
@@ -1300,23 +1306,56 @@ export class SyscallDispatcher {
   // §7.9 Time, determinism, signals, budgets
   // ---------------------------------------------------------------------------
 
+  /**
+   * Park the caller on a timer: RUNNING → BLOCKED → READY → RUNNING.
+   *
+   * The process really is `blocked` while the timer is pending —
+   * `blockedOn.kind === 'sleep'` with the wake timestamp — so `ps` and the
+   * audit log tell the truth about a sleeping agent instead of reporting it as
+   * runnable (docs/ABI.md §4.6, docs/PROCESS.md §5).
+   *
+   * The wake goes through `#unpark`, i.e. through the wake gate: the process is
+   * made READY and enqueued first, and the body's `await` returns only once the
+   * scheduler has dispatched it again. Resolving inline would resume the body
+   * while it is still BLOCKED and its very next syscall would trap `ESTATE` —
+   * the race `wake_gate.ts` exists to remove.
+   */
   async #sleep(pid: ProcessId, ms: number): Promise<void> {
     if (!Number.isFinite(ms) || ms < 0) {
       trap('EINVAL', 'sleep', { ms });
     }
-    // v0 simplification: the `await` on the timer *is* the cooperative yield —
-    // while it is pending the event loop runs other agents. We do not drive the
-    // RUNNING→BLOCKED→READY dance here; that belongs to the scheduler/continuation
-    // layer wired in boot.ts. The requested/actual durations are recorded so
-    // replay can serve the same value (docs/ABI.md §4.6).
+    const entry = this.#table.get(pid);
+
+    // Best-effort park: a caller that is somehow not RUNNING, or a table that
+    // refuses the edge, still gets a plain yield. The timer is what the agent
+    // asked for; losing it because bookkeeping failed would be worse than an
+    // incomplete state trace.
+    if (entry !== undefined && entry.state === 'running') {
+      const until = new Date(Date.parse(this.#now()) + ms).toISOString();
+      this.#table.setBlockedOn(pid, { kind: 'sleep', until });
+      await this.#table.setState(pid, 'blocked', { trigger: 'sleep' }).catch(() => {
+        /* state recording is best-effort here; the timer still governs the yield */
+      });
+    }
+
     await new Promise<void>((resolve) => {
-      const handle = this.#setTimeoutFn(() => resolve(), ms);
-      // If the process is killed mid-sleep, the timer still fires and resolves;
-      // the agent runner notices the zombie state on the next syscall. The
-      // handle is retained so a future EINTR path can clear it.
-      void pid;
-      void handle;
+      const handle = this.#setTimeoutFn(() => {
+        this.#sleepHandles.delete(unbrand(pid));
+        this.#unpark(pid, () => resolve());
+      }, ms);
+      // Retained so a future EINTR path (and teardown) can cancel a pending
+      // timer instead of letting it fire into a dead process.
+      this.#sleepHandles.set(unbrand(pid), handle);
     });
+  }
+
+  /** Cancel a pending `sleep` timer for `pid`, if one is armed. */
+  #cancelSleep(pid: ProcessId): void {
+    const key = unbrand(pid);
+    const handle = this.#sleepHandles.get(key);
+    if (handle === undefined) return;
+    this.#sleepHandles.delete(key);
+    this.#clearTimeoutFn(handle);
   }
 
   #onSignal(

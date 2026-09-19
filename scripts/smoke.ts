@@ -5693,9 +5693,24 @@ async function runDispatcherChecks(): Promise<void> {
     assert(!done, 'sleep is pending until the timer fires');
     assert(ft.timers.length === 1, `one timer registered, got ${ft.timers.length}`);
     assert(ft.timers[0]?.ms === 5000, 'timer carries the requested ms');
+    // The whole point of the fix: a sleeping process is BLOCKED, not RUNNING,
+    // and it says what it is blocked on.
+    const parked = table.get(pid);
+    assert(parked?.state === 'blocked', `sleep parks the process, got ${parked?.state}`);
+    assert(
+      parked?.blockedOn?.kind === 'sleep',
+      `blockedOn reports the timer, got ${parked?.blockedOn?.kind}`,
+    );
     ft.fireAll();
     await p;
     assert(done, 'sleep resolved after the timer fired');
+    // Waking is a scheduler event, not an inline one: the process comes back
+    // READY with blockedOn cleared, and only a re-dispatch makes it RUNNING
+    // again (the wake gate releases the body at that moment).
+    const woken = table.get(pid);
+    assert(woken?.state === 'ready', `a woken sleeper is READY, got ${woken?.state}`);
+    assert(woken?.blockedOn === null, 'waking clears blockedOn');
+    await table.setState(pid, 'running', { trigger: 'test' });
 
     let caught: unknown;
     try {
@@ -7409,6 +7424,36 @@ async function runBootChecks(): Promise<void> {
     await k.settle(200, timerYield);
     assert(log.join(',') === 'ok:0,ESRCH',
       `first wait succeeds, second traps ESRCH, got "${log.join(',')}"`);
+  });
+
+  await checkAsync('ps() reports a sleeping agent as blocked on its timer, not runnable', async () => {
+    // The end-to-end half of the sleep fix: under a real kernel (wake gate +
+    // scheduler), a process inside ctx.sleep() must read `blocked` with
+    // blockedOn.kind === 'sleep'. Before the fix it stayed RUNNING for the
+    // whole nap, so `ps` lied about what the agent was doing.
+    const seen: string[] = [];
+    agentImpls.set('./agents/sleeper.js', async (ctx) => {
+      await ctx.sleep(150);
+    });
+    agentImpls.set('./agents/watcher.js', async (ctx) => {
+      const { pid } = await ctx.spawn({
+        role: 'sleeper',
+        agent: { module: './agents/sleeper.js' },
+      });
+      await ctx.sleep(20); // let the child reach its own sleep
+      const all = await ctx.ps();
+      const info = all.find((p) => p.pid === pid);
+      seen.push(info === undefined ? 'missing' : `${info.state}:${info.blockedOn?.kind ?? 'none'}`);
+      const r = await ctx.wait(pid);
+      seen.push(`exit:${r.exitCode}`);
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'watcher', agent: { module: './agents/watcher.js' } });
+    await k.settle(300, timerYield);
+    assert(
+      seen.join(',') === 'blocked:sleep,exit:0',
+      `a sleeping child reads blocked on its timer, got "${seen.join(',')}"`,
+    );
   });
 
   await checkAsync('wait(pid, { timeoutMs }) traps ETIMEDOUT: a supervisor can bound a child', async () => {

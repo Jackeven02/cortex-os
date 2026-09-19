@@ -62,11 +62,13 @@
  * Promise' trick will be the source of subtle bugs … we will write three
  * implementations before one feels right." This is implementation #2.
  *
- * One accepted gap remains: **`sleep()` does not park.** `dispatcher.#sleep`
- * awaits a real timer without the RUNNING → BLOCKED → READY dance (its own
- * header defers that to boot.ts). The process stays RUNNING for the duration,
- * so `ps` shows it as runnable rather than blocked on a timer. Correct, just
- * not yet honest in the audit log.
+ * `sleep()` parks for real (since `0.2.0`). `dispatcher.#sleep` walks
+ * RUNNING → BLOCKED (`blockedOn.kind === 'sleep'`) → READY and wakes through
+ * `#unpark`, i.e. through the same gate `wait()` and `recv()` use — so the body
+ * resumes only once the scheduler has handed the CPU back, and `ps` tells the
+ * truth about a napping agent instead of calling it runnable. Before this, the
+ * process stayed RUNNING for the whole nap: correct, but dishonest in the audit
+ * log.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * The sync/async seam

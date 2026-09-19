@@ -346,6 +346,7 @@ export type BlockedReason =
   | { readonly kind: 'wait'; readonly pid: ProcessId }
   | { readonly kind: 'tool'; readonly callId: string }
   | { readonly kind: 'llm'; readonly callId: string }
+  | { readonly kind: 'sleep'; readonly until: Timestamp }
   | { readonly kind: 'budget'; readonly until: Timestamp }
   | { readonly kind: 'lock'; readonly resource: string };
 

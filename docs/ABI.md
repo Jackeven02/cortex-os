@@ -348,13 +348,22 @@ Receive a message. Blocking by default.
 
 #### `sleep(ms: number): Promise<void>`
 
-Yield to the scheduler for at least `ms` milliseconds.
+Yield to the scheduler for at least `ms` milliseconds. The caller really is
+parked: it sits in BLOCKED with `blockedOn.kind === 'sleep'` for the duration,
+is made READY when the timer fires, and resumes on its next dispatch.
 
-- **Allowed states:** RUNNING → BLOCKED (`{kind: 'budget', until}`) → READY → RUNNING
+- **Allowed states:** RUNNING → BLOCKED (`{kind: 'sleep', until}`) → READY → RUNNING
 - **Returns:** nothing
-- **Errors:** `EINTR`
+- **Errors:** `EINVAL` (negative or non-finite `ms`)
 - **Reversibility:** `idempotent`
 - **Recording:** requested ms, actual ms (replay may differ)
+
+A sleeping process is `blocked`, not `runnable` — that is the whole point, and
+it is what `ps()` reports. Waking goes through the wake gate (`wake_gate.ts`):
+the body's `await` returns only after the scheduler has dispatched the process
+again, so the instruction after `sleep()` never runs while the process is still
+BLOCKED. `exit` cancels a pending sleep timer, so a killed sleeper cannot leave
+one armed.
 
 #### `now(): Timestamp`
 
