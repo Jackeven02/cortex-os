@@ -275,9 +275,18 @@ const jitter = ctx.random();              // injectable RNG, NOT Math.random()
 ```
 
 Use `ctx.now()` / `ctx.random()` instead of `Date.now()` / `Math.random()` so
-the kernel's injected clock and seed govern your agent too. (In v0 these
-synchronous syscalls are **not** written to `.crec`; determinism comes from the
-injected sources — see `BACKLOG.md` known gaps.)
+the kernel's injected clock and seed govern your agent too. Both are written to
+`.crec` with the value they returned, so a replay serves the same number even
+though the wall clock has moved on.
+
+Two things worth knowing about how:
+
+- The frame is queued synchronously (capturing the value) and flushed at your
+  next async syscall, so it lands **before** that syscall's own `enter` record —
+  the log reads in the order things happened.
+- `ctx.budget()` is the one sync call that is **not** recorded, on purpose: it
+  is derivable from the syscalls that spent it, and logging it would bloat every
+  log (ABI §4.8).
 
 ---
 

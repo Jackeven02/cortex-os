@@ -7020,6 +7020,53 @@ async function runBootChecks(): Promise<void> {
     return rec === undefined ? undefined : (rec.result as { code: number; reason: string });
   }
 
+  await checkAsync('synchronous syscalls land in the .crec, in order, before the next syscall', async () => {
+    // The gap: ctx.now() / ctx.random() / ctx.on_signal() are synchronous on
+    // CortexContext, and the sync fast-path used to skip recording entirely —
+    // so a replay had no idea what value the agent actually saw. They are now
+    // queued at call time and flushed at the process's next async boundary.
+    const sub = join(tmp, 'rec-sync');
+    await mkdir(sub, { recursive: true });
+    agentImpls.set('./agents/sync.js', async (ctx) => {
+      ctx.now();
+      ctx.random();
+      ctx.on_signal('SIGUSR1', 'ignore');
+      ctx.budget(); // unrecorded by policy (ABI 4.8): derivable from other frames
+      await ctx.llm_call({ messages: [userMsg('go')] });
+    });
+    const { k, procDir } = await makeKernel({}, { record: true, sub });
+    const pid = await k.spawn({ role: 'sync', agent: { module: './agents/sync.js' } });
+    await k.settle();
+
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(join(procDir as string, `${unbrand(pid)}.crec`))) {
+      records.push(r);
+    }
+    const nowRec = records.find((r) => r.syscall === 'now');
+    const randRec = records.find((r) => r.syscall === 'random');
+    const sigRec = records.find((r) => r.syscall === 'on_signal');
+    assert(nowRec !== undefined, 'ctx.now() is recorded');
+    assert(typeof nowRec?.result === 'string', `now records the value served, got ${JSON.stringify(nowRec?.result)}`);
+    assert(randRec !== undefined && typeof randRec.result === 'number', 'ctx.random() is recorded with its value');
+    assert(sigRec !== undefined, 'ctx.on_signal() is recorded');
+    assert(
+      (sigRec?.args as { signal?: string } | undefined)?.signal === 'SIGUSR1',
+      'on_signal records which signal',
+    );
+    assert(
+      (sigRec?.result as { disposition?: string } | undefined)?.disposition === 'ignore',
+      'on_signal records the disposition kind, not the closure',
+    );
+    assert(!records.some((r) => r.syscall === 'budget'), 'budget stays unrecorded by policy');
+
+    // The ordering guarantee: everything the body did synchronously must be
+    // written before the next syscall's own enter frame.
+    const idxNow = records.indexOf(nowRec as SyscallRecord);
+    const idxEnter = records.findIndex((r) => r.syscall === 'llm_call' && r.phase === 'enter');
+    assert(idxEnter >= 0, 'the following async syscall was recorded');
+    assert(idxNow < idxEnter, `sync records precede the next syscall, got now@${idxNow} enter@${idxEnter}`);
+  });
+
   // --- §1 assembly + boot ---------------------------------------------------
 
   await checkAsync('boot() constructs every module and brings init to RUNNING', async () => {

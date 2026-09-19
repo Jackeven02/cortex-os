@@ -622,6 +622,36 @@ export interface CortexContext {
 
 That is the whole kernel surface. Anything else lives in user space.
 
+### 8.1 The synchronous syscalls and their records
+
+Five members are synchronous: `now()`, `random()`, `budget()`,
+`on_signal()` return a value; `exit()` throws. They are synchronous because a
+clock read, a draw, a counter and a registration have nothing to await —
+forcing them through a Promise would only make agent code noisier.
+
+Synchronous means they cannot await the recorder, so they cannot write their
+own frame at call time. They are recorded as follows:
+
+| syscall | recorded? | what the frame carries |
+|---|---|---|
+| `now` | yes | the timestamp served |
+| `random` | yes | the value served (and its options) |
+| `on_signal` | yes | the signal and the disposition **kind** (`handler` / `default` / `ignore`) — not the handler, which is a live closure and cannot be serialised |
+| `budget` | **no** | unrecorded by policy (§4.8): it is derivable from the syscalls that spent it |
+
+The frame is built synchronously — capturing the exact value the caller is
+about to receive, which is the whole point — and queued; the dispatcher writes
+the queue at the process's next async boundary, which is the start of its next
+`invoke`. So the log still reads in the order things happened: everything the
+body did synchronously appears **before** the next syscall's `enter` frame.
+Each sync syscall is a single frame (`phase: 'exit'`, `args` and `result`
+together), not an enter/exit pair — a synchronous call has no duration and
+cannot fail past its state gate.
+
+Before `0.2.0` these were not recorded at all, and replay leaned on the
+injected clock and RNG happening to produce the same values — which is only
+true if the agent makes the same calls in the same order.
+
 ---
 
 ## 9. Open questions

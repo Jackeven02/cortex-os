@@ -84,14 +84,22 @@
  *   • They replicate the dispatcher's **uniform state gate** synchronously
  *     (`#gateSync` reads the table and applies `SYSCALL_ALLOWED_STATES`), so an
  *     illegal-state call still traps `ESTATE` exactly as `invoke` would.
- *   • They **skip per-call `.crec` recording.** An async recorder cannot be
- *     awaited from a sync method, and fire-and-forget appends would reorder
- *     against the recorded enter/exit pairs. This is a deliberate v0 trade:
- *     `now`/`random` determinism for replay is provided by the *injected*
- *     clock/RNG sources (shared with the dispatcher, so record and replay see
- *     one timeline), not by per-call records; `budget` is `UNRECORDED` by policy
- *     anyway; `on_signal` dispositions are reconstructable from the spawn-time
- *     signal map (a known replay gap, tracked for the replay work).
+ *   • They **used to skip per-call `.crec` recording** — an async recorder
+ *     cannot be awaited from a sync method, and fire-and-forget appends would
+ *     reorder against the recorded enter/exit pairs. As of `0.2.0` that is
+ *     fixed the only way it can be: `dispatcher.noteSyncCall` builds the record
+ *     *at call time*, capturing the exact value the caller is about to receive,
+ *     and the dispatcher flushes the queue at the start of the process's next
+ *     `invoke` — after everything the body did synchronously, before the next
+ *     syscall's `enter` frame. One frame per sync call (`phase: 'exit'`, args
+ *     and result together), because a sync call has no duration and cannot fail
+ *     past its state gate.
+ *
+ *     `budget` is still unrecorded, and now *by policy rather than by
+ *     accident*: ABI §4.8 keeps it out of the log because it is derivable from
+ *     the syscalls that spent it. `on_signal` records the disposition **kind**,
+ *     not the handler — a live closure cannot be serialised, and the kind is
+ *     what replay actually needs.
  *   • `exit()` throws `ProcessExitSignal` **synchronously** (honouring `never`),
  *     which unwinds the agent's async function. The agent runner catches it and
  *     performs the *real* teardown through `dispatcher.invoke('exit', …)` — one
@@ -750,11 +758,17 @@ export class Kernel {
       sleep: (ms: number) => d.invoke(pid, 'sleep', ms),
       now: (): Timestamp => {
         this.#gateSync(pid, 'now');
-        return this.#now();
+        const value = this.#now();
+        // Record the exact value handed back — that is what makes a replay
+        // able to serve the same timestamp even when the wall clock differs.
+        d.noteSyncCall(pid, 'now', undefined, value);
+        return value;
       },
       random: (o?: RandomOptions): number => {
         this.#gateSync(pid, 'random');
-        return this.#random(o);
+        const value = this.#random(o);
+        d.noteSyncCall(pid, 'random', o, value);
+        return value;
       },
 
       // §4.7 Signals (sync fast-path)
@@ -768,6 +782,10 @@ export class Kernel {
               : { kind: 'handler', handler };
         // setDisposition traps EPERM for SIGKILL/SIGSTOP, EINVAL for unknowns.
         this.table.setDisposition(pid, signal, disp);
+        // The handler itself is a live closure and cannot go in the log; what
+        // replay needs is *which kind* of disposition this signal ended up
+        // with, which is exactly what the log can carry.
+        d.noteSyncCall(pid, 'on_signal', { signal }, { disposition: disp.kind });
       },
 
       // §4.8 Budgets (sync fast-path)

@@ -511,6 +511,8 @@ export class SyscallDispatcher {
   #waitersAny = new Map<number, Waiter[]>();
   /** pid → handle of the timer armed by a pending `sleep()`. */
   #sleepHandles = new Map<number, unknown>();
+  /** pid → records of synchronous syscalls awaiting their next flush. */
+  #syncPending = new Map<number, SyscallRecordInput[]>();
 
   #callCounter = 0;
 
@@ -587,6 +589,11 @@ export class SyscallDispatcher {
     const recorded = !selfRecorded && !UNRECORDED_SYSCALLS.has(syscall);
     const startedAt = Date.now();
 
+    // Anything the body did *synchronously* since its last syscall (now /
+    // random / on_signal) is recorded here — before this syscall's own `enter`
+    // frame, so the log still reads in the order it happened.
+    await this.flushSyncCalls(pid);
+
     if (recorded) {
       await this.#write(pid, syscall, callId, 'enter', {
         stateBefore,
@@ -633,6 +640,78 @@ export class SyscallDispatcher {
         });
       }
       throw err;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // §7.1b The synchronous syscalls' recording path
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Queue a record for a **synchronous** syscall (`now`, `random`,
+   * `on_signal`) — one that `CortexContext` serves without ever awaiting
+   * anything (docs/ABI.md §8).
+   *
+   * Why a queue and not a direct write: the recorder is async (it awaits a
+   * framed append), and a sync method cannot await it. Fire-and-forget
+   * appends would land out of order against the enter/exit pairs of the
+   * syscalls around them. So the record is built *now* — capturing the exact
+   * value the caller is about to receive, which is what replay needs — and
+   * written at the next async boundary, which is the start of the process's
+   * next `invoke` (see `#flushSync`). Order is preserved: everything the body
+   * did synchronously since its last syscall is recorded before the next
+   * syscall's `enter` frame.
+   *
+   * Each sync syscall is one frame, not an enter/exit pair: it has no
+   * duration and cannot fail after its state gate. The frame is `phase:
+   * 'exit'` and carries both `args` and `result`.
+   *
+   * `budget` is deliberately *not* queued — ABI §4.8 keeps it unrecorded by
+   * policy (it is derivable from the syscalls that spent it).
+   */
+  noteSyncCall(
+    pid: ProcessId,
+    syscall: SyscallName,
+    args: unknown,
+    result: unknown,
+  ): void {
+    if (this.#table.recorderFor(pid) === null) return;
+    const state = this.#table.get(pid)?.state ?? 'running';
+    const list = this.#syncPending.get(unbrand(pid)) ?? [];
+    list.push({
+      timestamp: this.#now(),
+      pid,
+      syscall,
+      callId: this.#nextCallId(),
+      phase: 'exit',
+      stateBefore: state,
+      stateAfter: state,
+      reversibility: SYSCALL_REVERSIBILITY[syscall],
+      kernelAbiVersion: this.kernelAbiVersion,
+      ...(args !== undefined ? { args } : {}),
+      ...(result !== undefined ? { result } : {}),
+    });
+    this.#syncPending.set(unbrand(pid), list);
+  }
+
+  /** Flush queued sync-syscall records for `pid`. Idempotent. */
+  async flushSyncCalls(pid: ProcessId): Promise<void> {
+    const list = this.#syncPending.get(unbrand(pid));
+    if (list === undefined || list.length === 0) return;
+    this.#syncPending.delete(unbrand(pid));
+    const recorder = this.#table.recorderFor(pid);
+    if (recorder === null) return;
+    for (const rec of list) {
+      try {
+        await recorder.append(rec);
+      } catch (err) {
+        if (isCortexError(err)) throw err;
+        throw new CortexError('ERECORD', rec.syscall, {
+          message: `failed to record a deferred ${rec.syscall}`,
+          details: { pid: unbrand(pid), phase: rec.phase },
+          cause: err,
+        });
+      }
     }
   }
 
