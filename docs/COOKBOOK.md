@@ -189,8 +189,17 @@ console.log(`spent ${after.tokensIn + after.tokensOut} tokens`);
 cortex spawn --role coder --task "..." --token-budget 20000
 cortex limit 1234 --tokens 10000 --usd 0.50 --wall-time 60000
 cortex limit 1234                      # show current limits
-cortex spawn --role hoarder --task "..." --max-region-entries 500  # cap writes per memory region (ENOMEM beyond it; omit = unlimited)
+cortex spawn --role hoarder --task "..." --max-region-entries 500  # global cap: every region stops at 500 writes (ENOMEM beyond it; omit = unlimited)
+cortex spawn --role hoarder --task "..." --max-region-entries 500 \
+  --memory '{"episodic":{"kind":"cow","backing":"inmem","maxEntries":50},"semantic":{"kind":"shared","backing":"inmem","maxEntries":-1}}'
+  # per-region overrides win over the global 500: episodic caps at 50,
+  # semantic opts out to unlimited (-1)
 ```
+
+A region's own `maxEntries` (in `--memory`) takes precedence over the global
+`--max-region-entries`: `absent` inherits it, `-1` is unlimited, `0+` is a hard
+cap. `--memory` is a JSON object keyed by region name, merged over the standard
+`episodic`/`semantic`/`procedural` defaults — you only spell out what you change.
 
 Exceeding a budget raises `SIGXCPU` (see `PROCESS.md` §6). `ctx.budget()` is a
 **synchronous** syscall — it does not write a `.crec` record (a known v0 gap).

@@ -108,6 +108,7 @@ EXAMPLES
     // `--module` agents). Capture it while it is definitely present.
     const restored = kernel.table.get(newPid);
     const restoredAgent = restored?.agent;
+    const restoredMemory = restored?.memoryRegions;
     const restoredPpid = restored?.ppid !== undefined && restored.ppid !== null
       ? unbrand(restored.ppid)
       : 1;
@@ -148,6 +149,9 @@ EXAMPLES
       budgetsSpent: e?.budgetsSpent ?? restored?.budgetsSpent ?? { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: elapsed, syscallCount: 0 },
       budgetsRemaining: e?.budgetsRemaining ?? restored?.budgetsRemaining ?? { tokens: -1, usd: -1, wallTimeMs: -1 },
       agent: restoredAgent ?? e?.agent ?? { system: 'restored' },
+      ...(restoredMemory !== undefined && restoredMemory.size > 0
+        ? { memory: Object.fromEntries(restoredMemory) }
+        : {}),
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
     writeMeta(dir, meta);

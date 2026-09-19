@@ -318,7 +318,7 @@ Write a value to a memory region.
 
 - **Allowed states:** RUNNING
 - **Returns:** nothing
-- **Errors:** `ENOENT` (no such region), `ENOMEM` (region reached its configured write-count ceiling — see `maxRegionEntries`; unlimited when unset), `EDRIVER`, `EPERM` (region is read-only)
+- **Errors:** `ENOENT` (no such region), `ENOMEM` (region reached its effective write-count ceiling — the region's own `maxEntries` if declared via `--memory`, else the kernel-wide `maxRegionEntries`; unlimited when neither is set, and a per-region `maxEntries: -1` opts that region out of a lower global cap), `EDRIVER`, `EPERM` (region is read-only)
 - **Reversibility:** `reversible` — every write is logged and can be undone from the log
 - **Recording:** region, key, value (or value hash if large), policy kind
 

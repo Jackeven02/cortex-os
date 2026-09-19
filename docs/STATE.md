@@ -56,6 +56,7 @@ Every piece of state an agent has falls into one of these:
   - `shared` — both processes see the same backing store; writes are visible to both (see §8.1 on concurrency).
   - `cow` — copy-on-write. Reads shared until first write, then fork the page.
 - **Defaults:** `cow` for episodic, `shared` for semantic, `private` for procedural.
+- **Size ceiling:** each region may declare `maxEntries` — a write-count cap that `memory_write` enforces with `ENOMEM` *before* any copy-on-write divergence. Absent inherits the kernel-wide ceiling; `-1` opts that region out to unlimited. Declared per region via `cortex spawn`/`cortex daemon install --memory` and inherited on `fork` unless `memoryOverrides` supplies a different value.
 
 ### 2.4 Resource budgets
 
@@ -348,6 +349,12 @@ export type MemoryRegionKind = 'private' | 'shared' | 'cow';
 export interface MemoryRegionPolicy {
   readonly kind: MemoryRegionKind;
   readonly backing: string;         // driver-identified
+  readonly readOnly?: boolean;      // memory_write traps EPERM when true
+  readonly maxEntries?: number;     // per-region write-count ceiling:
+                                    //   absent = inherit kernel maxRegionEntries
+                                    //   -1     = unlimited for this region
+                                    //   0+     = hard cap (ENOMEM, checked
+                                    //            before cow divergence)
 }
 
 export interface Checkpoint {

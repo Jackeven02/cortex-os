@@ -33,6 +33,62 @@ exact version.
 
 ---
 
+## [0.1.8] — 2026-09-19
+
+The region ceiling becomes a real per-region quota. `0.1.6` and `0.1.7` exposed a
+single *global*, per-boot write-count cap (`maxRegionEntries`) shared by every
+region. This release lets each memory region carry its own `maxEntries`, so one
+process can hold `episodic` tight while leaving `semantic` wide open, and it
+finally gives the CLI a way to *declare* region policies at all — the thing that
+was missing and made the global knob the only reachable one. It is additive and
+backwards compatible: the default regions and their copy semantics are unchanged,
+unspecified regions keep their defaults, plain `.meta.json` files omit the new
+field, and the syscall ABI and state model are untouched.
+
+A region's `maxEntries` resolves in three states and **takes precedence** over
+the global cap — absent inherits it, `-1` opts that region out to unlimited, `0+`
+is a hard cap. The `MemoryManager` resolves the *effective* cap per region at
+write time and still runs the `ENOMEM` check *before* any copy-on-write
+divergence, so a rejected write never splits a shared region. The resolved value
+is now visible to introspection as `MemoryRegionInfo.effectiveMaxEntries`.
+
+On the CLI, a new `--memory <json>` option on `cortex spawn` and
+`cortex daemon install` takes a JSON object keyed by region name and merges it
+over the standard `episodic`/`semantic`/`procedural` defaults — override-by-name,
+add-new, keep-untouched — so you only spell out what you change. Parsing,
+validation and merging live in a new pure module, `src/cli/regions.ts`, which
+rejects malformed JSON and bad policy shapes (unknown fields, a bad `kind`, an
+empty `backing`, a non-boolean `readOnly`, a non-integer or sub-`-1`
+`maxEntries`) and makes the command exit `1` *before* booting. For daemons the
+resolved policies persist in the daemon spec and apply on every (re)spawn; for
+spawned and restored processes they persist in the process's `.meta.json` (a new
+optional `memory` field), which `bootCliKernel`'s `restoreContext` now re-declares
+instead of reverting to defaults. That last piece also closes a pre-existing
+latent gap: a custom region policy set at spawn time (even just `readOnly`) used
+to be silently dropped across a cross-invocation `cortex restore`.
+
+### Added
+
+- **`MemoryRegionPolicy.maxEntries`** — the per-region write-count ceiling, with
+  `MemoryManager` enforcement (precedence over the global cap, `ENOMEM`-before-
+  COW preserved) and `MemoryRegionInfo.effectiveMaxEntries` introspection. Fork
+  inherits a region's `maxEntries` by reference; `memoryOverrides` may supply a
+  different one for the child.
+- **`--memory <json>` on `cortex spawn` and `cortex daemon install`**, backed by
+  the new `src/cli/regions.ts` parser/validator/merger.
+- **Cross-invocation persistence of resolved region policies** via a new optional
+  `ProcessMeta.memory` field written by `spawn`/`restore` and honored by the
+  disk-backed `restoreContext`.
+
+The smoke suite grew from 492 to 510 — 18 new checks covering manager-level
+per-region precedence, the `-1` opt-out and effective-cap introspection,
+per-region `ENOMEM`-before-COW, fork inheritance and `memoryOverrides`, a boot
+end-to-end tighten-and-opt-out through the real `spawn` path, unit coverage of
+the `regions.ts` parser and its validation rejections, the `ProcessMeta.memory`
+round-trip, and the `cmdSpawn --memory` argument-validation path.
+
+---
+
 ## [0.1.7] — 2026-09-19
 
 A small follow-on to `0.1.6`: the region-entry ceiling is now reachable from the

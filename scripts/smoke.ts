@@ -255,6 +255,15 @@ import {
   type ProcessMeta,
 } from '../src/cli/process_store.js';
 
+import {
+  parseMemoryArg,
+  mergeRegionPolicies,
+  validateRegionPolicy,
+  MemoryArgError,
+} from '../src/cli/regions.js';
+import { cmdSpawn } from '../src/cli/commands/spawn.js';
+import { DEFAULT_MEMORY_REGIONS } from '../src/cli/index.js';
+
 let passed = 0;
 let failed = 0;
 
@@ -2503,6 +2512,113 @@ async function runMemoryChecks(): Promise<void> {
     );
   });
 
+  // --- per-region maxEntries -----------------------------------------------
+
+  await checkAsync('per-region maxEntries imposes its own cap under an unlimited global', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table); // global unlimited (default -1)
+    mgr.attachRegion(pid, 'bounded', { kind: 'private', backing: 'inmem', maxEntries: 2 });
+    await mgr.write(pid, 'bounded', 'k1', 1);
+    await mgr.write(pid, 'bounded', 'k2', 2);
+    let err: unknown;
+    try {
+      await mgr.write(pid, 'bounded', 'k3', 3); // exceeds per-region cap 2
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ENOMEM', 'per-region cap should trap ENOMEM');
+    if (isCortexError(err)) {
+      assert((err.details as { scope?: string }).scope === 'region', 'ENOMEM should report region scope');
+    }
+  });
+
+  await checkAsync('per-region maxEntries tightens a lower-than-global ceiling', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table, { maxRegionEntries: 5 }); // global 5
+    mgr.attachRegion(pid, 'tight', { kind: 'private', backing: 'inmem', maxEntries: 1 });
+    await mgr.write(pid, 'tight', 'k1', 1);
+    let err: unknown;
+    try {
+      await mgr.write(pid, 'tight', 'k2', 2); // per-region cap 1 wins over global 5
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ENOMEM', 'per-region cap 1 should override global 5');
+  });
+
+  await checkAsync('per-region maxEntries:-1 opts a region out of a lower global cap', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table, { maxRegionEntries: 2 }); // global 2
+    mgr.attachRegion(pid, 'free', { kind: 'private', backing: 'inmem', maxEntries: -1 });
+    mgr.attachRegion(pid, 'capped', { kind: 'private', backing: 'inmem' }); // inherits global 2
+    // 'free' is unbounded — write far past the global cap without error.
+    for (let i = 0; i < 10; i++) await mgr.write(pid, 'free', `k${i}`, i);
+    // 'capped' still obeys the global 2.
+    await mgr.write(pid, 'capped', 'a', 1);
+    await mgr.write(pid, 'capped', 'b', 2);
+    let err: unknown;
+    try {
+      await mgr.write(pid, 'capped', 'c', 3);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ENOMEM', 'sibling region should still hit global cap 2');
+    if (isCortexError(err)) {
+      assert((err.details as { scope?: string }).scope === 'global', 'global-cap ENOMEM reports global scope');
+    }
+  });
+
+  await checkAsync('effectiveMaxEntries reflects region value then global default', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    const mgr = makeManager(table, { maxRegionEntries: 8 });
+    mgr.attachRegion(pid, 'own', { kind: 'private', backing: 'inmem', maxEntries: 3 });
+    mgr.attachRegion(pid, 'inherited', { kind: 'private', backing: 'inmem' });
+    mgr.attachRegion(pid, 'unlimited', { kind: 'private', backing: 'inmem', maxEntries: -1 });
+    assert(mgr.regionInfo(pid, 'own')!.effectiveMaxEntries === 3, 'region cap wins');
+    assert(mgr.regionInfo(pid, 'inherited')!.effectiveMaxEntries === 8, 'falls back to global');
+    assert(mgr.regionInfo(pid, 'unlimited')!.effectiveMaxEntries === -1, 'explicit -1 opt-out');
+  });
+
+  await checkAsync('per-region ENOMEM is checked before cow divergence', async () => {
+    const table = await makeTable();
+    const parent = await spawnRunning(table, 'parent');
+    const driver = new FakeMemoryDriver(clock, KERNEL_ABI_VERSION);
+    const mgr = new MemoryManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      drivers: { inmem: driver },
+      // global unlimited; the per-region cap is what must bite.
+    });
+    mgr.attachRegion(parent, 'memory', { kind: 'cow', backing: 'inmem', maxEntries: 1 });
+    await mgr.write(parent, 'memory', 'seed', 'v');
+
+    const child = await table.allocate({ ppid: parent, role: 'child', agent });
+    await mgr.forkCopy(parent, child);
+    assert(mgr.regionInfo(parent, 'memory')!.refCount === 2, 'precondition: cow share refCount 2');
+
+    const snapshotsBefore = driver.snapshotCalls.length;
+    let err: unknown;
+    try {
+      await mgr.write(child, 'memory', 'overflow', 'x'); // exceeds per-region cap 1
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ENOMEM', 'per-region cap should trap ENOMEM');
+    assert(
+      driver.snapshotCalls.length === snapshotsBefore,
+      'a per-region ENOMEM must not trigger a cow copy',
+    );
+    assert(
+      mgr.regionInfo(child, 'memory')!.bindingKey === mgr.regionInfo(parent, 'memory')!.bindingKey,
+      'child stays bound to the shared physical key after rejection',
+    );
+  });
+
   // --- shared semantics -----------------------------------------------------
 
   await checkAsync('shared region: write by one process is visible to another', async () => {
@@ -3610,6 +3726,54 @@ async function runForkChecks(): Promise<void> {
       memory.regionInfo(res.childPid, 'episodic')!.kind === 'private',
       'override turned cow into private for the child',
     );
+  });
+
+  await checkAsync('per-region maxEntries inherits through fork', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table, 'worker', {
+      notes: { kind: 'private', backing: 'inmem', maxEntries: 2 },
+    });
+    const { fork, memory } = makeFork(table);
+    memory.syncFromTable(pid);
+    const res = await fork.fork(pid);
+    assert(
+      memory.regionInfo(res.childPid, 'notes')!.effectiveMaxEntries === 2,
+      'child inherits the parent region cap of 2',
+    );
+    // The cap bites on the child independently.
+    await memory.write(res.childPid, 'notes', 'a', 1);
+    await memory.write(res.childPid, 'notes', 'b', 2);
+    let err: unknown;
+    try {
+      await memory.write(res.childPid, 'notes', 'c', 3);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ENOMEM', 'inherited per-region cap enforced on child');
+  });
+
+  await checkAsync('memoryOverrides can change maxEntries on fork', async () => {
+    const table = await makeTable();
+    const pid = await spawnRunning(table, 'worker', {
+      notes: { kind: 'private', backing: 'inmem', maxEntries: 2 },
+    });
+    const { fork, memory } = makeFork(table);
+    memory.syncFromTable(pid);
+    const res = await fork.fork(pid, {
+      memoryOverrides: { notes: { kind: 'private', backing: 'inmem', maxEntries: 1 } },
+    });
+    assert(
+      memory.regionInfo(res.childPid, 'notes')!.effectiveMaxEntries === 1,
+      'override cap of 1 wins for the child',
+    );
+    await memory.write(res.childPid, 'notes', 'a', 1);
+    let err: unknown;
+    try {
+      await memory.write(res.childPid, 'notes', 'b', 2);
+    } catch (e) {
+      err = e;
+    }
+    assert(isCortexError(err) && err.errno === 'ENOMEM', 'override cap enforced on child');
   });
 
   // --- cognitive ------------------------------------------------------------
@@ -6914,6 +7078,32 @@ async function runBootChecks(): Promise<void> {
     assert(seen.length === 2, `region should hold the 2 accepted entries, got ${seen.length}`);
   });
 
+  await checkAsync('E2E: per-region maxEntries overrides the boot global cap (tighten + opt-out)', async () => {
+    const { k } = await makeKernel({ maxRegionEntries: 5 }); // global 5
+    k.memory.registerDriver(inmemMemory());
+    const pid = await k.spawn({
+      role: 'mixed',
+      agent: { module: './agents/noop.js' },
+      memory: {
+        tight: { kind: 'private', backing: 'inmem', maxEntries: 2 }, // tighter than global
+        wild: { kind: 'private', backing: 'inmem', maxEntries: -1 }, // opts out entirely
+      },
+    });
+    assert(
+      k.memory.regionInfo(pid, 'tight')!.effectiveMaxEntries === 2 &&
+        k.memory.regionInfo(pid, 'wild')!.effectiveMaxEntries === -1,
+      'per-region caps should be visible via introspection',
+    );
+    // 'tight' bites at 2, well before the global 5.
+    await k.memory.write(pid, 'tight', 'a', 1);
+    await k.memory.write(pid, 'tight', 'b', 2);
+    await expectErrno(() => k.memory.write(pid, 'tight', 'c', 3), 'ENOMEM');
+    // 'wild' survives past the global 5 because it opted out.
+    for (let i = 0; i < 6; i++) await k.memory.write(pid, 'wild', `k${i}`, i);
+    const wild = await k.memory.read(pid, 'wild', {});
+    assert(wild.length === 6, `wild region should hold all 6 writes, got ${wild.length}`);
+  });
+
   // --- §2 the §13 milestone: spawn -> llm_call -> exit -> reap --------------
 
   await checkAsync('§13 milestone: spawn -> llm_call -> exit -> reap', async () => {
@@ -9212,6 +9402,73 @@ async function runSqliteChecks(): Promise<void> {
 }
 
 // =============================================================================
+// CLI `--memory` region-policy parsing checks
+// =============================================================================
+
+function runRegionsChecks(): void {
+  check('parseMemoryArg accepts valid policies (incl readOnly + maxEntries variants)', () => {
+    const parsed = parseMemoryArg(
+      '{"a":{"kind":"cow","backing":"inmem"},"b":{"kind":"private","backing":"sqlite","readOnly":true,"maxEntries":-1},"c":{"kind":"shared","backing":"inmem","maxEntries":0},"d":{"kind":"private","backing":"inmem","maxEntries":5}}',
+    );
+    assert(parsed.a !== undefined && parsed.a.kind === 'cow' && parsed.a.backing === 'inmem', 'a ok');
+    assert(!('maxEntries' in parsed.a), 'a omits absent maxEntries');
+    assert(parsed.b.readOnly === true && parsed.b.maxEntries === -1, 'b readOnly + -1');
+    assert(parsed.c.maxEntries === 0, 'c 0 is a valid hard cap (rejects every write)');
+    assert(parsed.d.maxEntries === 5, 'd positive cap');
+    assert(!('readOnly' in parsed.d), 'd omits absent readOnly');
+  });
+
+  check('parseMemoryArg rejects malformed JSON / non-objects', () => {
+    const bad = ['{', '[]', 'null', '"str"', '42'];
+    for (const raw of bad) {
+      let threw = false;
+      try { parseMemoryArg(raw); } catch (e) { threw = e instanceof MemoryArgError; }
+      assert(threw, `should reject ${raw}`);
+    }
+    // empty object is a legal no-op
+    assert(Object.keys(parseMemoryArg('{}')).length === 0, 'empty object ok');
+  });
+
+  check('parseMemoryArg rejects bad policy shapes', () => {
+    const cases: readonly string[] = [
+      '{"x":{}}',                                   // missing kind + backing
+      '{"x":{"kind":"nope","backing":"inmem"}}',   // bad kind
+      '{"x":{"kind":"cow"}}',                       // missing backing
+      '{"x":{"kind":"cow","backing":"  "}}',        // blank backing
+      '{"x":{"kind":"cow","backing":"inmem","readOnly":"yes"}}', // readOnly non-bool
+      '{"x":{"kind":"cow","backing":"inmem","maxEntries":1.5}}', // non-integer
+      '{"x":{"kind":"cow","backing":"inmem","maxEntries":-2}}',  // < -1
+      '{"x":{"kind":"cow","backing":"inmem","oops":1}}',          // unknown field
+      '{"x":"notanobject"}',                        // region value not an object
+    ];
+    for (const raw of cases) {
+      let threw = false;
+      try { parseMemoryArg(raw); } catch (e) { threw = e instanceof MemoryArgError; }
+      assert(threw, `should reject ${raw}`);
+    }
+  });
+
+  check('validateRegionPolicy omits undefined optional fields', () => {
+    const p = validateRegionPolicy('r', { kind: 'private', backing: 'inmem' });
+    assert(p.kind === 'private' && p.backing === 'inmem', 'required fields present');
+    assert(!('readOnly' in p) && !('maxEntries' in p), 'no undefined optionals leaked');
+  });
+
+  check('mergeRegionPolicies overrides-by-name, adds-new, keeps-untouched', () => {
+    const base = { ...DEFAULT_MEMORY_REGIONS };
+    const overrides = {
+      episodic: { kind: 'cow', backing: 'sqlite', maxEntries: 10 } as const,
+      scratch: { kind: 'private', backing: 'inmem' } as const,
+    };
+    const merged = mergeRegionPolicies(base, overrides);
+    assert(merged.episodic.backing === 'sqlite' && merged.episodic.maxEntries === 10, 'episodic overridden');
+    assert(merged.scratch !== undefined, 'scratch added');
+    assert(merged.semantic.kind === 'shared' && merged.procedural.kind === 'private', 'untouched defaults kept');
+    assert(base.episodic.backing === DEFAULT_MEMORY_REGIONS.episodic.backing, 'base not mutated');
+  });
+}
+
+// =============================================================================
 // CLI process_store + disk-truth model checks
 // =============================================================================
 
@@ -9252,6 +9509,39 @@ async function runCliChecks(): Promise<void> {
       assert(loaded!.role === 'coder', 'role');
       assert(loaded!.state === 'zombie', 'state');
       assert(loaded!.exitCode === 0, 'exitCode');
+    });
+
+    check('writeMeta + readMeta round-trips the optional memory policies', () => {
+      const meta: ProcessMeta = {
+        pid: 4,
+        ppid: 1,
+        pgid: 4,
+        role: 'hoarder',
+        state: 'zombie',
+        exitCode: 0,
+        exitReason: 'completed',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        lastTransitionAt: '2026-01-01T00:00:01.000Z',
+        budgetsSpent: { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 1, syscallCount: 0 },
+        budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+        agent: { system: 'test' },
+        memory: {
+          episodic: { kind: 'cow', backing: 'inmem', maxEntries: 50 },
+          semantic: { kind: 'shared', backing: 'inmem', readOnly: true },
+          scratch: { kind: 'private', backing: 'inmem' },
+        },
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      };
+      writeMeta(tmp, meta);
+      const loaded = readMeta(tmp, asProcessId(4));
+      assert(loaded?.memory?.episodic.maxEntries === 50, 'episodic maxEntries survives round-trip');
+      assert(loaded?.memory?.semantic.readOnly === true, 'readOnly survives');
+      assert(loaded?.memory?.scratch !== undefined && !('maxEntries' in loaded.memory.scratch), 'plain policy survives');
+    });
+
+    check('readMeta omits memory when it was never persisted', () => {
+      const loaded = readMeta(tmp, asProcessId(2));
+      assert(loaded !== undefined && !('memory' in loaded), 'no memory key on a plain meta');
     });
 
     check('readMeta on missing pid returns undefined', () => {
@@ -9391,6 +9681,47 @@ async function runCliChecks(): Promise<void> {
       const missing = await findCheckpointByTag(tmp, 'no-such-tag');
       assert(missing === undefined, 'unknown tag => undefined');
     });
+
+    // cmdSpawn `--memory` validation path.
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    process.env['CORTEX_HOME'] = tmp;
+    try {
+      await checkAsync('cortex spawn rejects a malformed --memory before booting', async () => {
+        console.log = () => {};
+        console.error = () => {};
+        const code = await cmdSpawn(['--role', 'x', '--memory', 'not-json']);
+        assert(code === 1, `exit 1 for malformed JSON, got ${code}`);
+      });
+
+      await checkAsync('cortex spawn rejects a bad --memory policy shape', async () => {
+        console.log = () => {};
+        console.error = () => {};
+        const code = await cmdSpawn([
+          '--role', 'x',
+          '--memory', '{"a":{"kind":"nope","backing":"inmem"}}',
+        ]);
+        assert(code === 1, `exit 1 for invalid kind, got ${code}`);
+      });
+
+      await checkAsync('cortex spawn accepts a valid --memory and runs the prompt agent', async () => {
+        console.log = () => {};
+        console.error = () => {};
+        const code = await cmdSpawn([
+          '--role', 'x',
+          '--task', 'noop',
+          '--memory', '{"scratch":{"kind":"private","backing":"inmem","maxEntries":3}}',
+          '-t', '2000',
+        ]);
+        assert(typeof code === 'number', 'spawn returns a numeric exit code when --memory validates');
+      });
+    } finally {
+      console.log = prevLog;
+      console.error = prevErr;
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+    }
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -9537,6 +9868,7 @@ await runMcpChecks();
 await runDiffChecks();
 await runInMemChecks();
 await runSqliteChecks();
+runRegionsChecks();
 await runCliChecks();
 await runDaemonChecks();
 await runBootChecks();

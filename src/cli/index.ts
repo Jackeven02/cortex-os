@@ -287,7 +287,7 @@ export async function bootCliKernel(
       return {
         role: meta.role,
         agent: meta.agent,
-        memory: DEFAULT_MEMORY_REGIONS,
+        memory: meta.memory ?? DEFAULT_MEMORY_REGIONS,
         ppid: cp.parentPid,
       };
     },

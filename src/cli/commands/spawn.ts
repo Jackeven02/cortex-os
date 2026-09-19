@@ -23,7 +23,8 @@ import {
   DEFAULT_MEMORY_REGIONS,
 } from '../index.js';
 import type { ProcessMeta } from '../index.js';
-import type { AgentSpec, ProcessState } from '../../kernel/types.js';
+import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
+import type { AgentSpec, ProcessState, MemoryRegionPolicy } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
 
 /** Default time to let an agent run before giving up (ms). */
@@ -42,6 +43,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       'max-tokens': { type: 'string' },
       'token-budget': { type: 'string' },
       'max-region-entries': { type: 'string' },
+      memory: { type: 'string' },
       timeout: { type: 'string', short: 't' },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -80,6 +82,21 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       return 1;
     }
     maxRegionEntries = parsed;
+  }
+
+  let regionPolicies: Record<string, MemoryRegionPolicy> = DEFAULT_MEMORY_REGIONS;
+  if (values.memory !== undefined) {
+    let overrides: Record<string, MemoryRegionPolicy>;
+    try {
+      overrides = parseMemoryArg(values.memory);
+    } catch (err) {
+      if (err instanceof MemoryArgError) {
+        console.error(`cortex spawn: invalid --memory: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    }
+    regionPolicies = mergeRegionPolicies(DEFAULT_MEMORY_REGIONS, overrides);
   }
 
   const dir = defaultKernelDir();
@@ -130,7 +147,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
     const pid = await kernel.spawn({
       role: values.role,
       agent: agentSpec,
-      memory: DEFAULT_MEMORY_REGIONS,
+      memory: regionPolicies,
       ...(tokenBudget !== undefined ? { budgets: { tokens: tokenBudget } } : {}),
     });
     console.log(`[pid ${unbrand(pid)}]`);
@@ -232,6 +249,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       budgetsSpent: { ...spent, wallTimeMs: elapsed },
       budgetsRemaining: remaining,
       agent: agentSpec,
+      ...(values.memory !== undefined ? { memory: regionPolicies } : {}),
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
     writeMeta(dir, meta);
@@ -264,6 +282,15 @@ OPTIONS
   --token-budget <n>    Total token budget for the process
   --max-region-entries <n>  Cap writes per memory region; a region that would
                         exceed n writes traps ENOMEM. Omit for unlimited.
+  --memory <json>       Per-region memory policy overrides, a JSON object
+                        keyed by region name, merged over the standard
+                        episodic/semantic/procedural defaults. Each value:
+                          kind: 'private'|'shared'|'cow'   (required)
+                          backing: "<driver>"              (required)
+                          readOnly: <bool>                 (optional)
+                          maxEntries: <int>                (optional;
+                             -1 = unlimited, 0+ = hard write cap,
+                             absent = inherit --max-region-entries)
   -t, --timeout <ms>    Max wall time (default 30000)
   -h, --help            Show this help
 
@@ -271,6 +298,10 @@ EXAMPLES
   cortex spawn --role coder --task "fix issue #42"
   cortex spawn --role reviewer --system "You review code for bugs."
   cortex spawn --role coder --task "analyze" --model gpt-4o-mini -t 60000
+
+  # Cap one region tighter than the global ceiling, leave another unlimited:
+  cortex spawn --role coder --task "analyze" --max-region-entries 500 \
+    --memory '{"episodic":{"kind":"cow","backing":"inmem","maxEntries":50},"semantic":{"kind":"shared","backing":"inmem","maxEntries":-1}}'
 
   # Demo B — pause an agent at a checkpoint, resume it in a later invocation:
   cortex spawn --role demo --module ./examples/checkpoint-agent.ts

@@ -34,7 +34,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState } from '../kernel/types.js';
+import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy } from '../kernel/types.js';
 import { readRecords, crecPath } from '../kernel/recorder.js';
 
 // =============================================================================
@@ -54,6 +54,14 @@ export interface ProcessMeta {
   readonly budgetsSpent: BudgetCounters;
   readonly budgetsRemaining: BudgetLimits;
   readonly agent: AgentSpec;
+  /**
+   * Resolved per-region memory policies, persisted so a later
+   * `cortex restore` re-declares the SAME regions (including any per-region
+   * `maxEntries` / `readOnly`) rather than silently reverting to the standard
+   * defaults. Optional and additive — when absent, restore falls back to
+   * `DEFAULT_MEMORY_REGIONS`.
+   */
+  readonly memory?: Readonly<Record<string, MemoryRegionPolicy>>;
   readonly kernelAbiVersion: string;
 }
 

@@ -40,8 +40,9 @@ import {
   unbrand,
   DEFAULT_MEMORY_REGIONS,
 } from '../index.js';
+import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
 import { type DaemonSpec } from '../../kernel/init.js';
-import { type AgentSpec, type RestartPolicy } from '../../kernel/types.js';
+import { type AgentSpec, type RestartPolicy, type MemoryRegionPolicy } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
 import {
   listDaemons,
@@ -99,6 +100,7 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
       restart: { type: 'string', default: 'never' },
       'max-restarts': { type: 'string' },
       'backoff-ms': { type: 'string' },
+      memory: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: true,
@@ -161,11 +163,26 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
     ...(backoffMs !== undefined ? { backoffMs } : {}),
   };
 
+  let regionPolicies: Record<string, MemoryRegionPolicy> = DEFAULT_MEMORY_REGIONS;
+  if (values.memory !== undefined) {
+    let overrides: Record<string, MemoryRegionPolicy>;
+    try {
+      overrides = parseMemoryArg(values.memory);
+    } catch (err) {
+      if (err instanceof MemoryArgError) {
+        console.error(`cortex daemon install: invalid --memory: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    }
+    regionPolicies = mergeRegionPolicies(DEFAULT_MEMORY_REGIONS, overrides);
+  }
+
   const spec: DaemonSpec = {
     role: values.role,
     agent: agentSpec,
     restart,
-    memory: DEFAULT_MEMORY_REGIONS,
+    memory: regionPolicies,
     ...(values['token-budget'] !== undefined
       ? { budgets: { tokens: parseInt(values['token-budget'], 10) } }
       : {}),
@@ -533,11 +550,21 @@ OPTIONS
   --restart <kind>      always | on-failure | never (default: never)
   --max-restarts <n>    Cap restarts for always/on-failure
   --backoff-ms <n>      Base restart backoff in ms (default: 1000, exponential)
+  --memory <json>       Per-region memory policy overrides (a JSON object keyed
+                        by region name: kind, backing, optional readOnly,
+                        optional maxEntries), merged over the standard
+                        episodic/semantic/procedural defaults. Persisted into
+                        the daemon spec (daemons.json) and applied every time
+                        the daemon (re)spawns. maxEntries: -1 unlimited, 0+ hard
+                        write cap, absent inherits the run's global
+                        --max-region-entries (a 'daemon run' boot flag).
   -h, --help            Show this help
 
 EXAMPLES
   cortex daemon install watcher --role inbox-watcher --module ./examples/checkpoint-agent.ts --restart on-failure
   cortex daemon install logger --role logger --task "log everything" --restart always --max-restarts 10
+  cortex daemon install scribe --role scribe --task "note facts" \
+    --memory '{"episodic":{"kind":"cow","backing":"inmem","maxEntries":100}}'
 `);
 }
 

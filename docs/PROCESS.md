@@ -510,7 +510,7 @@ export interface SpawnOptions {
   readonly daemon?: boolean;                      // default false
   readonly autoReap?: boolean;                    // default false
   readonly restart?: RestartPolicy;               // default never
-  readonly memory?: Record<string, MemoryRegionPolicy>;
+  readonly memory?: Record<string, MemoryRegionPolicy>;  // per-region policy; may set maxEntries (CLI: --memory <json>, merged over defaults)
   readonly signals?: Partial<Record<Signal, SignalDisposition>>;
   readonly exitTimeoutMs?: number;                // default 5000
 }

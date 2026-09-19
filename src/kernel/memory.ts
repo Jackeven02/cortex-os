@@ -194,6 +194,11 @@ export interface MemoryRegionInfo {
   readonly refCount: number;
   /** Approximate write count against this physical key (see §1). */
   readonly entryCount: number;
+  /**
+   * Resolved write-count ceiling for this region: `policy.maxEntries` when
+   * set, else the kernel-wide `maxRegionEntries`. `-1` = unbounded.
+   */
+  readonly effectiveMaxEntries: number;
 }
 
 // =============================================================================
@@ -309,6 +314,16 @@ export class MemoryManager {
    */
   get maxRegionEntries(): number {
     return this.#maxRegionEntries;
+  }
+
+  /**
+   * Resolve the write-count ceiling that actually governs one region: its own
+   * `policy.maxEntries` when declared, else the kernel-wide default. `-1`
+   * means unbounded. A per-region value always wins over the global cap —
+   * including `-1`, which lets one region opt out of a lower global ceiling.
+   */
+  #effectiveCap(policy: MemoryRegionPolicy): number {
+    return policy.maxEntries ?? this.#maxRegionEntries;
   }
 
   #driverFor(backing: string, syscall: string): IMemoryDriver {
@@ -435,6 +450,7 @@ export class MemoryManager {
       bindingKey: binding.physical,
       refCount: this.#refCounts.get(binding.physical) ?? 0,
       entryCount: this.#sizes.get(binding.physical) ?? 0,
+      effectiveMaxEntries: this.#effectiveCap(binding.policy),
     };
   }
 
@@ -561,13 +577,19 @@ export class MemoryManager {
       // parent/child share even though no write ever landed. The entry-count
       // decision is identical either way, because the divergence copies the
       // size forward to the new key rather than resetting it.
+      //
+      // The governing ceiling is the region's own `maxEntries` when declared
+      // (which may be `-1` to opt out of a lower global cap), else the
+      // kernel-wide `maxRegionEntries`.
+      const cap = this.#effectiveCap(binding.policy);
       if (
-        this.#maxRegionEntries >= 0 &&
-        (this.#sizes.get(binding.physical) ?? 0) >= this.#maxRegionEntries
+        cap >= 0 &&
+        (this.#sizes.get(binding.physical) ?? 0) >= cap
       ) {
+        const perRegion = binding.policy.maxEntries !== undefined;
         const err = new CortexError('ENOMEM', 'memory_write', {
-          message: `region '${region}' exceeded entry limit ${this.#maxRegionEntries}`,
-          details: { region, limit: this.#maxRegionEntries },
+          message: `region '${region}' exceeded entry limit ${cap}`,
+          details: { region, limit: cap, ...(perRegion ? { scope: 'region' } : { scope: 'global' }) },
         });
         await this.#recordTrap(pid, 'memory_write', callId, err, { region, key });
         throw err;

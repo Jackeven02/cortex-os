@@ -224,11 +224,25 @@ export type MemoryRegionKind = 'private' | 'shared' | 'cow';
  * Note: under `exactOptionalPropertyTypes`, construct with a conditional
  * spread (`...(ro ? { readOnly: true } : {})`) rather than passing
  * `readOnly: undefined`.
+ *
+ * `maxEntries` is a per-region write-count ceiling — the maximum number of
+ * distinct entries this region may hold. It resolves in three states:
+ *   - `undefined` — inherit the kernel-wide `maxRegionEntries` (unlimited
+ *                    when that is also unset).
+ *   - `-1`        — explicitly unlimited for this region, overriding a
+ *                    lower kernel-wide cap.
+ *   - `>= 1`      — a hard cap. `memory_write` that would grow the region
+ *                    beyond it fails with `ENOMEM`, checked BEFORE any
+ *                    copy-on-write divergence so a rejected write leaves the
+ *                    shared backing intact.
+ * Same `exactOptionalPropertyTypes` caveat as `readOnly`: build with a
+ * conditional spread, never pass `maxEntries: undefined`.
  */
 export interface MemoryRegionPolicy {
   readonly kind: MemoryRegionKind;
   readonly backing: string;
   readonly readOnly?: boolean;
+  readonly maxEntries?: number;
 }
 
 /**
