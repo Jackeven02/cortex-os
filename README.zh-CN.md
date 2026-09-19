@@ -2,7 +2,7 @@
 
 > AI agent 的操作系统。
 
-[![release](https://img.shields.io/badge/release-v0.1.8-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v0.2.0-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -29,6 +29,16 @@ PID    PPID   ROLE       STATE     TOKENS   AGE
 1234   1      coder      running   12.3k    2m
 1235   1234   tester     waiting   0        30s
 1236   1234   reviewer   blocked   2.1k     10s
+
+# 同样这些进程，但按它们真实的父子关系画成树，并标出各自在等什么
+$ cortex top
+cortex top — 4 processes · 2 blocked · 1 running · 1 zombie
+31.4k tokens · $0.0480 spent · home .cortex
+
+1     init             running   0        $0.0000   0 syscalls
+└─ 1234 coder          blocked   12.3k    $0.0190   waiting on a model call
+   ├─ 1235 tester      blocked   0        $0.0000   waiting on a timer
+   └─ 1236 reviewer    zombie    2.1k     $0.0040   exit 0 (completed)
 
 # 跟随一个正在跑的 agent 的 syscall 流（对它的 .crec 做 tail -f）
 $ cortex attach 1234
@@ -101,7 +111,7 @@ npx tsx scripts/smoke.ts                # 479 项断言，0 失败
 
 ## 当前状态
 
-**已发布 [`v0.1.8`](./CHANGELOG.md)**（2026-09-19）—— `v0.1.0`（第一个打 tag 的版本，覆盖 Phase 0–5）之后一连串加固补丁中的最新一个。自 `0.1.2` 以来的工作集中在正确性与加固上：复审 `0.1.2` 发现的九个缺陷、文件系统 symlink 沙箱逃逸与 SQLite region 名冲突、wall-clock 预算的扣减、原子化的 `send()`、以及可从 CLI 配置的 memory 写入上限。这个 `0.x` 是诚实的：syscall ABI 到 `1.0.0` 才冻结，所以小版本号提升可能带着 ABI 或状态模型的破坏性变更。今天要基于 Cortex 开发的话，请锁死确切版本。（Phase 是建设阶段，版本号才是发布。）
+**已发布 [`v0.2.0`](./CHANGELOG.md)**（2026-09-20）—— 第一个不只是修缺陷、而是真正补上 v0 缺口的版本。`v0.1.x` 做的是正确性加固（复审 `0.1.2` 发现的九个缺陷、文件系统 symlink 沙箱逃逸、SQLite region 名冲突、wall-clock 预算扣减、原子化的 `send()`、可用的 memory 写入上限）。`0.2.0` 让三件「文档早就承诺、代码却没做到」的事成真：`sleep()` 真的挂起进程而不是让它保持在 RUNNING；restore 出来的进程自己会跑而不是卡在 NEW；同步 syscall（`now` / `random` / `on_signal`）写进 `.crec`，回放不必再相信注入的时钟。另外新增 **`cortex top`**。这个 `0.x` 是诚实的：syscall ABI 到 `1.0.0` 才冻结，所以小版本提升可能带破坏性变更 —— 这次就有（`blockedOn` 多了一个 `sleep` 变体）。今天要基于 Cortex 开发的话，请锁死确切版本。（Phase 是建设阶段，版本号才是发布。）
 
 **Phase 0 — 设计（完成）。** 四份文档 v0 落地：`STATE.md`（最难的那份）、`PROCESS.md`（生命周期）、`ABI.md`（syscall 契约）、`ARCHITECTURE.md`（内核模块）。每份文档末尾的 open questions 是有意滚动记录的，会随着实现逼出决定而解决。
 

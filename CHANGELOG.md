@@ -33,6 +33,67 @@ exact version.
 
 ---
 
+## [0.2.0] — 2026-09-20
+
+The first release that closes v0 gaps instead of only patching defects. Three of
+them were places where **the documents already promised behaviour the code did
+not implement** — arguably worse than a missing feature, because the docs were
+the thing you would have trusted. Each fix moves its documents in the same
+commit; nothing here is a silent divergence.
+
+### Fixed
+
+- **`sleep()` parks for real.** `dispatcher.#sleep` used to await a timer with
+  the process left in RUNNING the whole time, so `ps` called a napping agent
+  runnable — while `docs/ABI.md` §4.6 specified the walk RUNNING → BLOCKED →
+  READY and `docs/COOKBOOK.md` printed it in a comment. It now walks that walk,
+  reports `blockedOn.kind === 'sleep'`, and wakes through the same gate `wait()`
+  and `recv()` use, so the body never resumes while still BLOCKED. `exit`
+  cancels a pending sleep timer.
+- **A restored process runs on its own.** `restore` handed back a process in NEW
+  and nothing in the kernel adopts NEW — the scheduler dispatches READY — so it
+  sat there until something outside the kernel walked it forward. The CLI
+  carried a stopgap; library users had none. `dispatcher.#restore` now walks
+  NEW → READY and enqueues, and the stopgap is deleted. (`restoreAs` still
+  mints NEW: adoption is the syscall's job.)
+- **The synchronous syscalls are recorded.** `now`, `random` and `on_signal`
+  were served by a sync fast-path that replicated the state gate but wrote no
+  `.crec` frame, so a replay had to trust that the injected clock and RNG would
+  produce the same values — only true if the agent makes the same calls in the
+  same order. The frame is now built synchronously, capturing the value actually
+  served, and flushed at the process's next async boundary (before that syscall's
+  own `enter` record, so the log stays in causal order). `budget` stays
+  unrecorded — now by explicit policy (§4.8), because it is derivable, not
+  because the plumbing cannot reach it.
+
+### Added
+
+- **`cortex top`** — the process tree as a tree: parent above children, each
+  with its state, its spend, and, when it is blocked, *what it is waiting on*
+  (`sleep`, a child, a channel, a model call, a tool call). Orphans hang off
+  init rather than disappearing. Exists because the hardest thing about cortex
+  is not any single primitive; it is seeing that a running agent is a process
+  with a parent, a state and a budget. `ProcessMeta` gained an optional
+  `blockedOn` so the read-only views can say *why* a process is not running.
+
+### Changed (breaking, allowed under `0.x`)
+
+- **`BlockedReason` gained a `sleep` variant** (`{ kind: 'sleep', until }`).
+  Anything that switches exhaustively over `BlockedReason` must add a case. The
+  syscall ABI is not frozen until `1.0.0`.
+
+### Still open (honestly)
+
+- **The persistence layout is still flat.** `docs/ARCHITECTURE.md` §7 sketches
+  `processes/<pid>/{log.crec,meta.json,checkpoints/}`; the disk is still
+  `processes/<pid>.crec` + `<pid>.meta.json` + a single shared `checkpoints/`.
+  It was deliberately **not** done in this release: `CheckpointManager` owns one
+  directory and resolves a checkpoint by chainId by listing it, so per-process
+  checkpoint directories change `load()` from a list into a search across the
+  tree — a real refactor, not a rename. Tracked in `BACKLOG.md`.
+
+Smoke: 510 → 512 checks.
+
 ## [0.1.8] — 2026-09-19
 
 The region ceiling becomes a real per-region quota. `0.1.6` and `0.1.7` exposed a
@@ -491,6 +552,7 @@ These are deliberate `v0` boundaries, not oversights. Each is recorded in
 - Sandbox fork, shadow process, `cortex gc`, and `cortex doctor` are post-v0.
 
 [0.1.8]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.8
+[0.2.0]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.2.0
 [0.1.7]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.7
 [0.1.6]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.6
 [0.1.5]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.5

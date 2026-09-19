@@ -2,7 +2,7 @@
 
 *An operating system for AI agents.*
 
-> **Status:** `v0.1.8` — the latest of a run of hardening patches on `v0.1.0`, the first tagged release. Phases 0–5 are complete: the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. This document is the *why*, and it has not changed.
+> **Status:** `v0.2.0` — the first release that closes v0 gaps rather than only patching defects: `sleep()` really parks, a restored process runs on its own, and the synchronous syscalls are recorded. Plus `cortex top`, one view a stranger can read in five minutes. Phases 0–5 are complete: the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. This document is the *why*, and it has not changed.
 
 **English** | [简体中文](./MANIFESTO.zh-CN.md)
 
