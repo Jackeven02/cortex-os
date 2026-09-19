@@ -2,7 +2,7 @@
 
 > An operating system for AI agents.
 
-[![release](https://img.shields.io/badge/release-v0.1.2-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v0.1.8-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -105,7 +105,7 @@ npx tsx scripts/smoke.ts                # 479 assertions, 0 failures
 
 ## Status
 
-**Released as [`v0.1.2`](./CHANGELOG.md)** (2026-09-19) — a documentation-only patch on `v0.1.1`, which was a one-defect patch on `v0.1.0`, the first tagged release, covering Phases 0–5. The `0.x` is honest: the syscall ABI is not frozen until `1.0.0`, so a minor bump may carry a breaking change to the ABI or the state model. If you build against Cortex today, pin the exact version. (Phases are build milestones; the versions are the releases.)
+**Released as [`v0.1.8`](./CHANGELOG.md)** (2026-09-19) — the latest of a run of hardening patches on `v0.1.0`, the first tagged release, which covers Phases 0–5. Since `0.1.2` the work has been correctness and hardening: nine defects found reviewing `0.1.2`, a filesystem symlink sandbox escape and a SQLite region-name collision, wall-clock budget draining, an atomic `send()`, and a per-region memory write ceiling reachable from the CLI. The `0.x` is honest: the syscall ABI is not frozen until `1.0.0`, so a minor bump may carry a breaking change to the ABI or the state model. If you build against Cortex today, pin the exact version. (Phases are build milestones; the versions are the releases.)
 
 **Phase 0 — Design (complete).** Four documents drafted v0: `STATE.md` (the hard part), `PROCESS.md` (lifecycle), `ABI.md` (syscall contract), `ARCHITECTURE.md` (kernel modules). Open questions in each doc are logged and resolve as implementation forces decisions.
 

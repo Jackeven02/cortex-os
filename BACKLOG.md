@@ -170,6 +170,15 @@ Phase 5 is done, so the work history above is complete through the first release
 
 - [x] **`v0.1.2`** — 2026-09-19. Documentation-only patch: both READMEs gained an `## Install` section — they had none at all, which is what a tool looks like when its docs were written before it had a published release. They now cover the global install, the `npx` form, the requirements, the clone-and-run-the-suite path, and the `cortex-agent-os` vs `cortex` naming. Published as `cortex-agent-os@0.1.2`. Artifacts: [`CHANGELOG.md`](./CHANGELOG.md) and [`docs/release/v0.1.2.md`](./docs/release/v0.1.2.md).
 
+- [x] **`v0.1.3`** — 2026-09-19. Nine defects found reviewing `0.1.2`, across kernel, CLI and drivers.
+- [x] **`v0.1.4`** — 2026-09-19. Closes a filesystem-driver symlink sandbox escape and a SQLite driver region-name collision.
+- [x] **`v0.1.5`** — 2026-09-19. Three correctness fixes from the `0.1.3` "found but deferred" list: a finite `wallTimeMs` budget now actually drains (so wall-clock time can trip `SIGXCPU`); `send()` is atomic (a failing record no longer leaves a phantom, half-committed send); and the `ENOMEM` check runs *before* copy-on-write divergence, so a rejected write never splits a shared region.
+- [x] **`v0.1.6`** — 2026-09-19. Makes the region-size ceiling reachable at all: `KernelOptions.maxRegionEntries` is threaded from boot config to the CLI as `cortex spawn --max-region-entries <n>`. Docs updated in the same change (ARCHITECTURE §4.5, ABI §4.4, COOKBOOK).
+- [x] **`v0.1.7`** — 2026-09-19. The same ceiling on the supervised long-running path: `cortex daemon run --max-region-entries <n>`. Deliberately *not* persisted into `daemons.json`, which would need a `DaemonSpec` change. ARCHITECTURE §4.5 updated.
+- [x] **`v0.1.8`** — 2026-09-19. The ceiling becomes a real per-region quota: `MemoryRegionPolicy.maxEntries` (precedence over the global cap; `-1` opts that region out to unlimited), `MemoryRegionInfo.effectiveMaxEntries` for introspection, and a new `--memory <json>` on `cortex spawn` and `cortex daemon install`, backed by the new `src/cli/regions.ts` parser/validator/merger. Resolved policies persist (daemon spec / `ProcessMeta.memory`), which also closed a pre-existing latent gap: a custom region policy set at spawn time used to be silently dropped across a cross-invocation `cortex restore`. Smoke 492 → 510.
+
+**Release-material gap in `0.1.3`–`0.1.8`:** none of them got the `docs/release/v<version>.md` GitHub-release body that step 4 of [`docs/PUBLISHING.md`](./docs/PUBLISHING.md) calls for, and npm still serves `0.1.2` — six tagged versions exist only as git tags.
+
 Next release (`0.2.0`): whatever comes out of the Icebox below.
 
 ---
