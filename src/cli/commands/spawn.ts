@@ -250,6 +250,8 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       budgetsRemaining: remaining,
       agent: agentSpec,
       ...(values.memory !== undefined ? { memory: regionPolicies } : {}),
+      // Recorded so `top` can say what a still-blocked process is waiting on.
+      ...(entry?.blockedOn !== undefined ? { blockedOn: entry.blockedOn } : {}),
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
     writeMeta(dir, meta);

@@ -149,6 +149,7 @@ EXAMPLES
       ...(restoredMemory !== undefined && restoredMemory.size > 0
         ? { memory: Object.fromEntries(restoredMemory) }
         : {}),
+      ...(e?.blockedOn !== undefined ? { blockedOn: e.blockedOn } : {}),
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
     writeMeta(dir, meta);

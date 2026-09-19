@@ -17,6 +17,7 @@ USAGE
 COMMANDS
   spawn        Start an agent as a background process
   ps           List processes with state, tokens, age
+  top          The process tree, and what each process is waiting for
   kill         Send a signal to a process
   trace        strace-style syscall log
   checkpoint   Snapshot a process to disk
@@ -37,6 +38,7 @@ GLOBAL OPTIONS
 EXAMPLES
   cortex spawn --role coder --task "fix issue #42"
   cortex ps
+  cortex top
   cortex kill 1234 --signal SIGTERM
   cortex trace 1234
   cortex checkpoint 1234 --tag "before risky edit"

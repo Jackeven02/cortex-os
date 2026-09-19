@@ -49,6 +49,7 @@ import { readAllMetas, readMeta, writeMeta, maxPidOnDisk, readExitRecord, type P
 
 import { cmdSpawn } from './commands/spawn.js';
 import { cmdPs } from './commands/ps.js';
+import { cmdTop } from './commands/top.js';
 import { cmdKill } from './commands/kill.js';
 import { cmdTrace } from './commands/trace.js';
 import { cmdAttach } from './commands/attach.js';
@@ -83,6 +84,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdSpawn(rest);
       case 'ps':
         return await cmdPs(rest);
+      case 'top':
+        return await cmdTop(rest);
       case 'kill':
         return await cmdKill(rest);
       case 'trace':

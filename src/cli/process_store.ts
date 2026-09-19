@@ -34,7 +34,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy } from '../kernel/types.js';
+import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy, type BlockedReason } from '../kernel/types.js';
 import { readRecords, crecPath } from '../kernel/recorder.js';
 
 // =============================================================================
@@ -62,6 +62,13 @@ export interface ProcessMeta {
    * `DEFAULT_MEMORY_REGIONS`.
    */
   readonly memory?: Readonly<Record<string, MemoryRegionPolicy>>;
+  /**
+   * Why the process is not running, when it is BLOCKED. Persisted so the
+   * read-only views (`ps`, and especially `top`) can say *what a process is
+   * waiting on* rather than only that it is waiting. Optional: absent means
+   * "not blocked", or written by an older build that did not record it.
+   */
+  readonly blockedOn?: BlockedReason | null;
   readonly kernelAbiVersion: string;
 }
 

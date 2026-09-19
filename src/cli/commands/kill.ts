@@ -110,6 +110,8 @@ EXAMPLES
     exitCode,
     exitReason: `killed by ${signal}`,
     lastTransitionAt: new Date().toISOString(),
+    // It is dead, so it is not waiting on anything any more.
+    blockedOn: null,
   };
   writeMeta(dir, updatedMeta);
 
