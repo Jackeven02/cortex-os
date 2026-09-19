@@ -269,6 +269,7 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
     args,
     options: {
       'max-runtime-ms': { type: 'string', default: '0' },
+      'max-region-entries': { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: true,
@@ -284,6 +285,19 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
     typeof values['max-runtime-ms'] === 'string' && values['max-runtime-ms']!.trim().length > 0
       ? parseInt(values['max-runtime-ms']!, 10) || 0
       : 0;
+
+  let maxRegionEntries: number | undefined;
+  if (values['max-region-entries'] !== undefined) {
+    const parsed = parseInt(values['max-region-entries'], 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      console.error(
+        `cortex daemon run: invalid --max-region-entries: '${values['max-region-entries']}' ` +
+        `(expected a positive integer; omit the flag for unlimited)`,
+      );
+      return 1;
+    }
+    maxRegionEntries = parsed;
+  }
 
   const dir = defaultKernelDir();
   ensureKernelDirs(dir);
@@ -301,7 +315,10 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
     return 0;
   }
 
-  const kernel = await bootCliKernel(dir);
+  const kernel = await bootCliKernel(
+    dir,
+    maxRegionEntries !== undefined ? { maxRegionEntries } : {},
+  );
   try {
     for (const d of targets) {
       if (d === undefined) continue;
@@ -542,6 +559,9 @@ USAGE
   Stays alive until SIGTERM/SIGINT. For tests/headless use:
 
   --max-runtime-ms <n>  Auto-stop after n ms (then shut the kernel down)
+  --max-region-entries <n>  Cap writes per memory region for this supervisor
+                        kernel; a region exceeding n writes traps ENOMEM (omit =
+                        unlimited)
 
 EXAMPLE
   cortex daemon run watcher

@@ -213,7 +213,7 @@ interface MemoryManager {
 
 **Internals.** A region table per process: `{region: {policy, driverHandle}}`. COW logic is implemented at the region level, not per-key — when a `cow` region is first written by a forked child, the entire region is duplicated. This is coarser than true COW but vastly simpler.
 
-**Region-size ceiling.** The manager carries a global per-region write-count ceiling (`maxRegionEntries`; `-1` = unlimited). A `memory_write` that would push a region past it traps `ENOMEM` (ABI.md §4.4 "region size limit"); the check runs *before* copy-on-write divergence so a rejected write never splits a shared region. It is wired from boot config (`KernelOptions.maxRegionEntries`) through to the CLI as `cortex spawn --max-region-entries <n>`. This is one coarse guard shared by every region, not a per-region quota — finer per-region limits are a possible future refinement.
+**Region-size ceiling.** The manager carries a global per-region write-count ceiling (`maxRegionEntries`; `-1` = unlimited). A `memory_write` that would push a region past it traps `ENOMEM` (ABI.md §4.4 "region size limit"); the check runs *before* copy-on-write divergence so a rejected write never splits a shared region. It is wired from boot config (`KernelOptions.maxRegionEntries`) through to the CLI as `cortex spawn --max-region-entries <n>` and `cortex daemon run --max-region-entries <n>`. This is one coarse guard shared by every region, not a per-region quota — finer per-region limits are a possible future refinement.
 
 **Performance.** Reads and writes are O(1) plus driver overhead. COW duplication is O(region size) on first write. Acceptable for v0; per-key COW is post-v0.
 

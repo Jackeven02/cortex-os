@@ -33,6 +33,29 @@ exact version.
 
 ---
 
+## [0.1.7] — 2026-09-19
+
+A small follow-on to `0.1.6`: the region-entry ceiling is now reachable from the
+supervised long-running path too, not just one-shot `spawn`. Additive and
+backwards compatible — the boot-level plumbing and the `ENOMEM` enforcement are
+unchanged, the default is still unlimited, and the ABI/state model is untouched.
+
+### Added
+
+- **`cortex daemon run --max-region-entries <n>`.** The same boot-configurable
+  per-region write-count ceiling introduced in `0.1.6` is now surfaced on the
+  daemon supervisor command, so a long-lived supervised daemon's `memory_write`
+  calls are bounded the same way a `spawn`-ed agent's are. It is a boot-level
+  option applied to the kernel that runs the daemon(s) (deliberately *not*
+  persisted into `daemons.json`, which would require a `DaemonSpec`/data-model
+  change), validated as a positive integer, and omitted means unlimited exactly
+  as before. ARCHITECTURE.md §4.5 was updated to list both `cortex spawn` and
+  `cortex daemon run` as surfaces. No smoke-suite change (the manager-side
+  enforcement and the boot→manager plumbing are already covered by the `0.1.6`
+  tests, which this path reuses verbatim); verified end to end at the CLI level.
+
+---
+
 ## [0.1.6] — 2026-09-19
 
 Turned a latent capability into a usable knob. The kernel has always had a
