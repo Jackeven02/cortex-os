@@ -6883,6 +6883,37 @@ async function runBootChecks(): Promise<void> {
     assert(k.table.get(PID_INIT)?.state === 'running', 'init running');
   });
 
+  await checkAsync('maxRegionEntries: default unlimited, boot config overrides the manager', async () => {
+    const { k: dk } = await makeKernel();
+    assert(
+      dk.memory.maxRegionEntries === -1,
+      `default ceiling should be -1 (unlimited), got ${dk.memory.maxRegionEntries}`,
+    );
+    const { k } = await makeKernel({ maxRegionEntries: 7 });
+    assert(
+      k.memory.maxRegionEntries === 7,
+      `KernelOptions.maxRegionEntries should reach the manager as 7, got ${k.memory.maxRegionEntries}`,
+    );
+  });
+
+  await checkAsync('E2E: a spawned process honors the boot maxRegionEntries cap (ENOMEM)', async () => {
+    const { k } = await makeKernel({ maxRegionEntries: 2 });
+    k.memory.registerDriver(inmemMemory());
+    const pid = await k.spawn({
+      role: 'hoarder',
+      agent: { module: './agents/noop.js' },
+      memory: { buf: { kind: 'private', backing: 'inmem' } },
+    });
+    assert(k.memory.regionInfo(pid, 'buf') !== undefined, 'spawn should attach the buf region');
+    await k.memory.write(pid, 'buf', 'a', 1);
+    await k.memory.write(pid, 'buf', 'b', 2);
+    await expectErrno(() => k.memory.write(pid, 'buf', 'c', 3), 'ENOMEM');
+    // The two accepted writes persisted; only the third (which would exceed
+    // the cap) was rejected.
+    const seen = await k.memory.read(pid, 'buf', {});
+    assert(seen.length === 2, `region should hold the 2 accepted entries, got ${seen.length}`);
+  });
+
   // --- §2 the §13 milestone: spawn -> llm_call -> exit -> reap --------------
 
   await checkAsync('§13 milestone: spawn -> llm_call -> exit -> reap', async () => {

@@ -278,6 +278,16 @@ export interface KernelOptions {
   readonly restoreContext?: (cp: { readonly pid: ProcessId; readonly parentPid: ProcessId | null }) => RestoreContext | Promise<RestoreContext>;
   readonly defaultMemoryBacking?: string;
 
+  /**
+   * Global per-region write-count ceiling handed to the `MemoryManager`. When
+   * a region accrues this many writes, further `memory_write` calls against it
+   * trap `ENOMEM` (docs/ABI.md §4.4 "region size limit"). `-1` or `undefined`
+   * (the default) means unlimited. This is a single coarse guard shared by
+   * every region on the kernel — a per-region override is a possible future
+   * refinement — surfaced on the CLI as `cortex spawn --max-region-entries`.
+   */
+  readonly maxRegionEntries?: number;
+
   /** Supervisor hooks. */
   readonly onAlarm?: OnAlarmHook;
   readonly onBudgetExhausted?: (pid: ProcessId, kind: 'tokens' | 'usd' | 'wallTime') => void | Promise<void>;
@@ -492,6 +502,7 @@ export class Kernel {
       kernelAbiVersion: this.kernelAbiVersion,
       now: this.#now,
       ...(opts.nextCallId !== undefined ? { nextCallId: opts.nextCallId } : {}),
+      ...(opts.maxRegionEntries !== undefined ? { maxRegionEntries: opts.maxRegionEntries } : {}),
     });
 
     // --- ipc ----------------------------------------------------------------

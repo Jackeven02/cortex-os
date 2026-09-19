@@ -318,7 +318,7 @@ Write a value to a memory region.
 
 - **Allowed states:** RUNNING
 - **Returns:** nothing
-- **Errors:** `ENOENT` (no such region), `ENOMEM` (region size limit), `EDRIVER`, `EPERM` (region is read-only)
+- **Errors:** `ENOENT` (no such region), `ENOMEM` (region reached its configured write-count ceiling — see `maxRegionEntries`; unlimited when unset), `EDRIVER`, `EPERM` (region is read-only)
 - **Reversibility:** `reversible` — every write is logged and can be undone from the log
 - **Recording:** region, key, value (or value hash if large), policy kind
 

@@ -41,6 +41,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       model: { type: 'string' },
       'max-tokens': { type: 'string' },
       'token-budget': { type: 'string' },
+      'max-region-entries': { type: 'string' },
       timeout: { type: 'string', short: 't' },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -68,9 +69,25 @@ export async function cmdSpawn(args: string[]): Promise<number> {
   }
   const timeoutMs = values.timeout !== undefined ? parseInt(values.timeout, 10) : DEFAULT_TIMEOUT_MS;
 
+  let maxRegionEntries: number | undefined;
+  if (values['max-region-entries'] !== undefined) {
+    const parsed = parseInt(values['max-region-entries'], 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      console.error(
+        `cortex spawn: invalid --max-region-entries: '${values['max-region-entries']}' ` +
+        `(expected a positive integer; omit the flag for unlimited)`,
+      );
+      return 1;
+    }
+    maxRegionEntries = parsed;
+  }
+
   const dir = defaultKernelDir();
   ensureKernelDirs(dir);
-  const kernel = await bootCliKernel(dir);
+  const kernel = await bootCliKernel(
+    dir,
+    maxRegionEntries !== undefined ? { maxRegionEntries } : {},
+  );
 
   try {
     // Wire the LLM flags into the agent spec (they used to be parsed but
@@ -245,6 +262,8 @@ OPTIONS
   --model <string>      Model name to pass to the driver (prompt agent only)
   --max-tokens <n>      Max output tokens per LLM call (prompt agent only)
   --token-budget <n>    Total token budget for the process
+  --max-region-entries <n>  Cap writes per memory region; a region that would
+                        exceed n writes traps ENOMEM. Omit for unlimited.
   -t, --timeout <ms>    Max wall time (default 30000)
   -h, --help            Show this help
 

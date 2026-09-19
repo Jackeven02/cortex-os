@@ -257,7 +257,10 @@ export const DEFAULT_MEMORY_REGIONS: Readonly<Record<string, MemoryRegionPolicy>
   procedural: { kind: 'private', backing: DEFAULT_MEMORY_BACKING },
 };
 
-export async function bootCliKernel(dir: string): Promise<Kernel> {
+export async function bootCliKernel(
+  dir: string,
+  opts: { readonly maxRegionEntries?: number } = {},
+): Promise<Kernel> {
   ensureKernelDirs(dir);
   const kernel = await bootKernel({
     kernelAbiVersion: KERNEL_ABI_VERSION,
@@ -266,6 +269,7 @@ export async function bootCliKernel(dir: string): Promise<Kernel> {
     defaultLLM: defaultLLMName(),
     defaultMemory: DEFAULT_MEMORY_BACKING,
     defaultMemoryBacking: DEFAULT_MEMORY_BACKING,
+    ...(opts.maxRegionEntries !== undefined ? { maxRegionEntries: opts.maxRegionEntries } : {}),
     autoStart: true,
     // The kernel's default restoreContext reads an in-memory per-PID map that
     // is empty in a fresh CLI invocation, so cross-invocation `cortex restore`

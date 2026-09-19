@@ -33,6 +33,43 @@ exact version.
 
 ---
 
+## [0.1.6] — 2026-09-19
+
+Turned a latent capability into a usable knob. The kernel has always had a
+per-region write-count ceiling that traps `ENOMEM` when a memory region grows
+past it — but nothing outside the kernel could set it, so in practice the guard
+was unreachable and every region was effectively unlimited. This release wires
+that ceiling from the boot config all the way up to the CLI. It is additive and
+backwards compatible: the default is unchanged (unlimited), the syscall ABI,
+state model and existing behavior are untouched, and the `ENOMEM`-before-COW
+ordering was already corrected in `0.1.5`. The smoke suite grew from 490 to 492.
+
+### Added
+
+- **A boot-configurable region-size ceiling, reachable from the CLI.**
+  `KernelOptions.maxRegionEntries` is now threaded through `boot.ts` into the
+  `MemoryManager`, so a kernel can be booted with a global cap on how many
+  writes any single region may accept before `memory_write` traps `ENOMEM`
+  (docs/ABI.md §4.4 "region size limit"). It is surfaced on the command line as
+  `cortex spawn --max-region-entries <n>`, validated as a positive integer
+  (omitting the flag means unlimited, exactly as before). A read-only
+  `MemoryManager.maxRegionEntries` getter exposes the effective ceiling for
+  introspection and tests. Regression-tested two ways: the manager defaults to
+  unlimited and a boot-configured value reaches it intact; and a spawned process
+  carrying a private region enforces the cap end to end, accepting the writes up
+  to the limit and trapping `ENOMEM` on the first one that would exceed it while
+  leaving the accepted writes in place.
+  - *Scope note:* this is one coarse ceiling shared by every region on the
+    kernel, not a per-region quota — a `MemoryRegionPolicy.maxEntries` field and
+    cross-invocation persistence of per-region limits are natural future
+    refinements, deliberately left out of this release to avoid touching the
+    checkpoint/`meta.json` data model.
+  - *Docs:* ARCHITECTURE.md §4.5 (the ceiling and its boot/CLI wiring), ABI.md
+    §4.4 (the `ENOMEM` error now points at the configurable ceiling), and
+    COOKBOOK.md (a usage example) were updated in the same change.
+
+---
+
 ## [0.1.5] — 2026-09-19
 
 Three more defects from the `0.1.3` review's "found but deferred" list, chosen

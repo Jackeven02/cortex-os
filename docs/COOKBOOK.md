@@ -189,6 +189,7 @@ console.log(`spent ${after.tokensIn + after.tokensOut} tokens`);
 cortex spawn --role coder --task "..." --token-budget 20000
 cortex limit 1234 --tokens 10000 --usd 0.50 --wall-time 60000
 cortex limit 1234                      # show current limits
+cortex spawn --role hoarder --task "..." --max-region-entries 500  # cap writes per memory region (ENOMEM beyond it; omit = unlimited)
 ```
 
 Exceeding a budget raises `SIGXCPU` (see `PROCESS.md` §6). `ctx.budget()` is a

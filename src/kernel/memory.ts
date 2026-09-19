@@ -302,6 +302,15 @@ export class MemoryManager {
     return [...this.#drivers.keys()];
   }
 
+  /**
+   * The effective global per-region write-count ceiling (`-1` = unlimited).
+   * Read-only introspection so a host or test can confirm a boot-configured
+   * cap actually reached the manager.
+   */
+  get maxRegionEntries(): number {
+    return this.#maxRegionEntries;
+  }
+
   #driverFor(backing: string, syscall: string): IMemoryDriver {
     const driver = this.#drivers.get(backing);
     if (driver === undefined) {
