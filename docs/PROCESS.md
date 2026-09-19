@@ -130,6 +130,8 @@ A suspended process **survives kernel restart** — `cortex restore <chain_id>` 
 
 Restore creates a **new process with a new PID** in state NEW. The lineage records that the new PID's `chain_id` matches the suspended process's snapshot. The old PID is *not* reanimated; it is reaped (see §6).
 
+NEW here describes the *image*, not the outcome: the `restore` syscall immediately adopts the process — NEW → READY, then enqueued — so what the caller gets back is a runnable process, exactly as `spawn` returns one. (`CheckpointManager.restoreAs` on its own leaves it in NEW; adoption is the syscall's job.) Before `0.2.0` the syscall skipped the adoption and a restored process sat in NEW until something outside the kernel walked it forward, which is why `cortex restore` carried a stopgap.
+
 This is one of the most consequential decisions in cortex. We chose **new PID on restore** over **same PID** because:
 - It keeps the syscall log append-only and unambiguous
 - It avoids "is this the same process?" philosophical traps

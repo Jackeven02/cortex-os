@@ -244,6 +244,14 @@ Write a snapshot to disk per STATE.md §4. State briefly enters CHECKPOINTING th
 
 Create a **new** process from a checkpoint. The new process gets a new PID (PROCESS.md §3.6, §11.3).
 
+The kernel adopts the process before returning: it is walked NEW → READY and
+enqueued, so it is *runnable* — the scheduler will dispatch it like any spawned
+process. (`CheckpointManager.restoreAs` still mints it in NEW; the adoption is
+the syscall's job, so a caller who wants an unadopted image can use the manager
+directly. Until `0.2.0` the syscall skipped this and a restored process sat in
+NEW until something outside the kernel walked it forward — the CLI carried a
+stopgap for exactly this.)
+
 - **Allowed states:** RUNNING (caller is unaffected; restore is morally a `spawn` from the past)
 - **Returns:** the new PID
 - **Errors:** `ENOENT` (no such chainId), `EINVAL` (snapshot version mismatch), `EDRIVER` (driver state could not be re-hydrated)

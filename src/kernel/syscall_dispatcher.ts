@@ -1152,6 +1152,20 @@ export class SyscallDispatcher {
       ...(opts?.parent === undefined ? { parent: pid } : {}),
     };
     const newPid = await this.#checkpointMgr.restoreAs(chainId, restoreOpts);
+
+    // `restoreAs` deliberately mints the process in NEW — restore is morally a
+    // fork from the past, so it begins life exactly like a spawned one
+    // (PROCESS.md §3.6). But nothing inside the kernel adopts NEW: the
+    // scheduler dispatches READY and `reconcile()` only reconciles READY. Left
+    // as-is, a restored process sat in NEW until something *outside* the kernel
+    // walked it forward — which is why the CLI needed a stopgap. Adopt it here
+    // instead: whoever asked for the restore wants the process to run.
+    //
+    // Best-effort: if the transition is refused the PID is still handed back,
+    // and the caller can drive it (or observe why it could not).
+    await this.#table.setState(newPid, 'ready', { trigger: 'restore' }).catch(() => {
+      /* a restored process that cannot be made READY is still a valid PID */
+    });
     this.#scheduler?.enqueue(newPid);
     return { pid: newPid };
   }

@@ -7290,11 +7290,22 @@ async function runBootChecks(): Promise<void> {
     assert(unbrand(newPid) !== unbrand(origPid), 'restore allocates a fresh pid');
     const e = k.table.get(newPid);
     assert(e !== undefined, 'restored process is in the table');
-    // KNOWN v0 GAP: restoreAs leaves the process in NEW; the scheduler only
-    // dispatches READY, so it does not auto-run. Asserted here, not fixed.
-    assert(e!.state === 'new', `restored state is NEW (documented gap), got ${e!.state}`);
+    // Was a known v0 gap: `restore` handed back a NEW process and the
+    // scheduler only adopts READY, so it never ran unless the caller (the CLI,
+    // via a stopgap) walked it forward itself. The dispatcher now adopts it.
+    assert(e!.state === 'ready', `restore leaves the process READY to run, got ${e!.state}`);
     assert(e!.budgetsSpent.tokensIn > 0, 'spent budget carried across the checkpoint');
     assert(e!.checkpointChain.some((c) => unbrand(c) === unbrand(chainId as ChainIdAlias)), 'lineage continues the chain');
+
+    // And "READY" must mean runnable, not merely labelled: settling the kernel
+    // has to actually run the restored agent to completion without any help
+    // from outside.
+    await k.settle();
+    const after = k.table.get(newPid);
+    assert(
+      after === undefined || after.state === 'zombie' || after.state === 'exiting',
+      `a restored process runs on its own, got ${after?.state}`,
+    );
   });
 
   // --- §7 fork through the kernel -------------------------------------------

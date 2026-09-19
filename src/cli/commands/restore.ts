@@ -91,14 +91,11 @@ EXAMPLES
     const result = await kernel.dispatcher.invoke(asProcessId(1), 'restore', chainId!, {});
     const newPid = result.pid;
 
-    // v0 known gap: restored processes start in NEW and need to be walked
-    // to READY. The scheduler only dispatches READY. We patch this here
-    // until the kernel fix lands (BACKLOG known gap #1).
-    const entry = kernel.table.get(newPid);
-    if (entry !== undefined && entry.state === 'new') {
-      await kernel.table.setState(newPid, 'ready', { trigger: 'restore-cli' });
-      kernel.scheduler.enqueue(newPid);
-    }
+    // No stopgap here any more. `restore` used to hand back a NEW process that
+    // nobody would ever dispatch (the scheduler only adopts READY), so this
+    // command had to walk NEW → READY itself. As of 0.2.0 the dispatcher's
+    // `restore` does the adoption, which is where it belongs: the kernel, not
+    // its caller, decides that a restored process is runnable.
 
     // Snapshot the REAL agent spec + parent now. The restored entry can be
     // reaped during the poll loop below, after which `kernel.table.get(newPid)`
