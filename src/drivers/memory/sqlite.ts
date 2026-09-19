@@ -208,14 +208,19 @@ export class SqliteMemoryDriver implements IMemoryDriver {
     }
 
     const prefix = query.prefix;
-    const limit = query.limit ?? 0;
-    const sql = prefix !== undefined
-      ? `SELECT key, value, at FROM ${table} WHERE key LIKE ? ESCAPE '\\' ORDER BY key${limit > 0 ? ` LIMIT ${limit}` : ''}`
-      : `SELECT key, value, at FROM ${table} ORDER BY key${limit > 0 ? ` LIMIT ${limit}` : ''}`;
+    const limit =
+      query.limit !== undefined && Number.isSafeInteger(query.limit) && query.limit > 0
+        ? query.limit
+        : undefined;
+    const params: unknown[] = [];
+    if (prefix !== undefined) params.push(escapeLike(prefix));
+    if (limit !== undefined) params.push(limit);
+    const sql = `SELECT key, value, at FROM ${table}` +
+      (prefix !== undefined ? ` WHERE key LIKE ? ESCAPE '\\'` : '') +
+      ` ORDER BY key` +
+      (limit !== undefined ? ` LIMIT ?` : '');
     const stmt = db.prepare(sql);
-    const rows = (prefix !== undefined
-      ? stmt.all(escapeLike(prefix))
-      : stmt.all()) as Array<{ key: string; value: string; at: string }>;
+    const rows = stmt.all(...params) as Array<{ key: string; value: string; at: string }>;
     return rows.map((r) => ({
       region,
       key: r.key,

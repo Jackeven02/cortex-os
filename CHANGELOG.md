@@ -33,6 +33,87 @@ exact version.
 
 ---
 
+## [0.1.3] — 2026-09-19
+
+A bug-fix pass over `0.1.2`. The syscall ABI (`docs/ABI.md`), the state model
+(`docs/STATE.md`), the CLI surface and the on-disk formats are all unchanged —
+this is a patch bump, not a new contract. Every fix below was reproduced before
+it was changed, and each is now pinned by a regression check; the smoke suite
+grew from 479 to 483 assertions.
+
+### Fixed
+
+- **A PID could be handed out twice across two CLI invocations, silently
+  merging two processes' logs.** This is the one that mattered. The CLI treats
+  the disk as the source of truth and, on every invocation, seeds its PID
+  counter from the highest PID already on disk so a new process never collides
+  with an old one. But `maxPidOnDisk` only scanned `*.meta.json` files — and a
+  *forked* child writes a `<pid>.crec` syscall log without ever writing a meta
+  file. So the highest live PID could be invisible to the scan; the next spawn
+  or fork reused it, and because `Recorder.open` uses `'a+'`, the two logs were
+  appended into one file. Verified empirically: a forked `3.crec` grew from
+  3,412 to 6,165 bytes when a second process was allowed to reuse PID 3.
+  `maxPidOnDisk` now scans `*.crec` and `*.meta.json` alike.
+- **A completed child could be `wait()`ed for twice.** When a child exited, its
+  final status was retained in the table so a parent that called `wait()` *late*
+  (after the child was already a zombie) could still collect it — but the retain
+  was unconditional and the retained copy was never consumed on delivery. A
+  second `wait()` for the same, now-gone child found the stale copy and handed
+  the status back again, which real Unix `wait()` can never do. `reap()` now
+  takes an explicit `retain` option; the fast (already-zombie) `wait()` paths
+  reap without retaining, and the wake path retains only long enough to deliver,
+  then consumes the copy — while still leaving it in place when a *different*
+  child exits and the parked parent has no waiter for *that* one yet. A second
+  `wait()` for a collected child now traps `ESRCH`.
+- **A reaped process's kernel-side attachments leaked.** Nothing was wired to
+  clean up after a process died: its parked IPC waiters, its memory-region
+  bindings, and its entry in the wake-gate all outlived it. A `close()`d channel
+  could leave a waiter parked forever, and stale region bindings could pin
+  copy-on-write backing memory. `InitProcess` now takes an `onReaped` hook, and
+  `boot.ts` wires it to cancel the dead PID's IPC waiters, release its memory
+  bindings, and clear its wake-gate entry. Reaping is the single choke point
+  every exit path flows through, so the cleanup is guaranteed regardless of how
+  the process died.
+- **The MCP tool driver crashed on a lenient server.** The response handler
+  treated any `error` field that was not `undefined` as a JSON-RPC failure — but
+  a number of servers echo `error: null` alongside a perfectly good result, and
+  `null !== undefined`, so the driver threw on success. The guard now only
+  rejects when `error` is a non-null object.
+- **The driver ABI gate rejected a legal version range.** `>= 1.0.0` — a
+  comparator with a space before the version, which npm and semver both accept —
+  was parsed by splitting on whitespace, so the comparator `>=` and the operand
+  `1.0.0` were treated as two unrelated tokens and the constraint could never
+  match. `satisfiesAbi` now normalises whitespace immediately after a comparator
+  before it splits.
+- **`cortex restore` wrote a placeholder meta file, and both `spawn` and
+  `restore` accepted garbage `--timeout` values.** After a successful restore the
+  command re-read the live table for the new PID, but by then the poll loop could
+  already have reaped it, so the meta written to disk carried placeholder
+  `agent`/`ppid`/budget fields instead of the restored process's real ones —
+  lying to every later command that reads that index. The real spec is now
+  captured before the poll can touch it. Separately, `--timeout` was parsed with
+  `parseInt` and never validated, so `--timeout abc` silently became `NaN` (no
+  timeout at all) and `--timeout -5` behaved as an immediate timeout; both
+  commands now reject non-positive-integer timeouts up front with exit 1.
+- **The filesystem driver's sandbox could be escaped by a glob.** `fs_glob`
+  resolved its `cwd` against the root but never filtered the *matches*, so a
+  pattern like `../*` returned paths outside the declared sandbox root. Each
+  match is now checked against the root the same way a direct path is.
+- **`sqlite` memory reads interpolated an unvalidated limit.** The `limit` was
+  spliced into the SQL text; while the surrounding `> 0` guard already rejected
+  the only way to actually inject through it, the read path is now hardened to a
+  bound `LIMIT ?` parameter with an explicit safe-integer check, so it cannot
+  regress into a live injection if the caller-side guard ever moves.
+- **A checkpoint lost the process's remaining budget.** A snapshot stored only
+  the *spent* counters, so restoring re-seeded a process with a full (untouched)
+  budget envelope and it got a free refill of every token and dollar it had
+  already burned. The `Checkpoint` record now also carries `budgetsRemaining`
+  (optional, so snapshots taken by `0.1.2` still load), and `restoreAs` overwrites
+  both the limits and the spent counters from the snapshot rather than
+  "spending" the recorded totals against a fresh envelope.
+
+---
+
 ## [0.1.2] — 2026-09-19
 
 Documentation only. No code, no ABI, no CLI surface, no behaviour change —

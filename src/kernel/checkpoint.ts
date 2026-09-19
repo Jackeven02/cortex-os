@@ -298,6 +298,7 @@ export class CheckpointManager {
         cognitive,
         memoryDelta,
         budgets: { ...entry.budgetsSpent },
+        budgetsRemaining: { ...entry.budgetsRemaining },
         syscallLogOffset,
         driverStates,
       };
@@ -546,8 +547,23 @@ export class CheckpointManager {
       }
     }
 
-    // Budgets are preserved across checkpoint/restore (PROCESS.md §8).
-    this.#table.spend(newPid, cp.budgets);
+    // Budgets are preserved across checkpoint/restore (PROCESS.md §8). A
+    // checkpoint stores the spent counters (`cp.budgets`) and — for anything
+    // snapshotted by this build — the remaining envelope (`cp.budgetsRemaining`).
+    // Restoring by `spend()` alone would re-apply the historical spend onto the
+    // DEFAULT limits (allocate used `opts.budgets ?? defaults`), silently wiping
+    // a process's custom ceiling — e.g. a `tokens: 1000` agent would wake up
+    // unlimited. When no caller override was given and we captured the envelope,
+    // set spent + remaining directly (setBudgets does not decrement). Older
+    // checkpoints without the field fall back to the prior spend-onto-defaults.
+    if (opts?.budgets === undefined && cp.budgetsRemaining !== undefined) {
+      this.#table.setBudgets(newPid, {
+        remaining: cp.budgetsRemaining,
+        spent: cp.budgets,
+      });
+    } else {
+      this.#table.spend(newPid, cp.budgets);
+    }
 
     if (this.#cognitiveSink !== undefined) {
       await this.#cognitiveSink(newPid, cp.cognitive);

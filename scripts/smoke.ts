@@ -5719,6 +5719,15 @@ async function runDriverRegistryChecks(): Promise<void> {
     assert(satisfiesAbi('2.5.0', '>=1.0.0 <2.0.0') === false, 'outside upper');
   });
 
+  check('satisfiesAbi: a space after a comparator operator is admitted', () => {
+    // `>= 1.0.0` is the most standard npm spelling; the range set must not be
+    // split into ['>=','1.0.0'] and rejected (which refused legit drivers).
+    assert(satisfiesAbi('1.0.0', '>= 1.0.0') === true, 'spaced >= hit');
+    assert(satisfiesAbi('1.0.0', '< 2.0.0') === true, 'spaced < hit');
+    assert(satisfiesAbi('2.1.0', '^1.0.0 || >= 2.0.0') === true, 'spaced OR second set');
+    assert(satisfiesAbi('1.5.0', '>= 1.0.0 < 2.0.0') === true, 'spaced AND inside both');
+  });
+
   check('satisfiesAbi: OR (||) unions range sets', () => {
     assert(satisfiesAbi('1.0.0', '^1.0.0 || ^3.0.0') === true, 'first set');
     assert(satisfiesAbi('3.1.0', '^1.0.0 || ^3.0.0') === true, 'second set');
@@ -6979,6 +6988,34 @@ async function runBootChecks(): Promise<void> {
     assert(codes.join(',') === '0,5', `a supervision tree reaps both children, got [${codes.join(',')}]`);
   });
 
+  await checkAsync('wait() cannot collect the same child twice (ESRCH on the second)', async () => {
+    // Regression: a completed child's status was retained without being
+    // consumed on delivery, so a second wait() for the SAME child handed the
+    // status back a second time — impossible under real Unix wait() semantics.
+    const log: string[] = [];
+    agentImpls.set('./agents/once.js', async (ctx) => {
+      await ctx.sleep(5);
+    });
+    agentImpls.set('./agents/double-wait.js', async (ctx) => {
+      const { pid } = await ctx.spawn({ role: 'once', agent: { module: './agents/once.js' } });
+      // First wait parks (child is still sleeping), then is woken on exit.
+      const r = await ctx.wait(pid);
+      log.push(`ok:${r.exitCode}`);
+      // The child is gone now — a second collection must fail.
+      try {
+        await ctx.wait(pid);
+        log.push('returned');
+      } catch (err) {
+        log.push(isCortexError(err) ? (err as CortexError).errno : `other:${String(err)}`);
+      }
+    });
+    const { k } = await makeKernel();
+    await k.spawn({ role: 'parent', agent: { module: './agents/double-wait.js' } });
+    await k.settle(200, timerYield);
+    assert(log.join(',') === 'ok:0,ESRCH',
+      `first wait succeeds, second traps ESRCH, got "${log.join(',')}"`);
+  });
+
   await checkAsync('wait(pid, { timeoutMs }) traps ETIMEDOUT: a supervisor can bound a child', async () => {
     const log: string[] = [];
     agentImpls.set('./agents/slow.js', async (ctx) => {
@@ -7735,6 +7772,8 @@ interface FakeMcpServerOptions {
   /** Methods the server accepts and then never answers — drives timeout tests. */
   readonly silence?: readonly string[];
   readonly protocolVersion?: string;
+  /** Emit `error: null` alongside a valid result (some lenient servers do). */
+  readonly nullError?: boolean;
 }
 
 /**
@@ -7810,7 +7849,7 @@ class FakeMcpServer implements McpTransport {
       const r = tool.call?.(params?.arguments) ?? {};
       const content =
         r.content ?? (r.text !== undefined ? [{ type: 'text', text: r.text }] : []);
-      return {
+      const success: JsonRpcMessage = {
         jsonrpc: '2.0',
         id: req.id,
         result: {
@@ -7819,6 +7858,10 @@ class FakeMcpServer implements McpTransport {
           ...(r.isError !== undefined ? { isError: r.isError } : {}),
         },
       };
+      if (this.#opts.nullError === true) {
+        return { ...(success as Record<string, unknown>), error: null } as unknown as JsonRpcMessage;
+      }
+      return success;
     }
     return {
       jsonrpc: '2.0',
@@ -8028,6 +8071,22 @@ async function runMcpChecks(): Promise<void> {
     try { await d.invoke('demo/broken', {}, mcpCtx()); } catch (e) { caught = e; }
     assert(isCortexError(caught), 'CortexError');
     assert((caught as CortexError).errno === 'EDRIVER', `-32000 => EDRIVER, got ${(caught as CortexError).errno}`);
+  });
+
+  await checkAsync('a lenient server sending `error: null` alongside a result resolves ok', async () => {
+    // Regression: the #onMessage guard once treated any non-undefined `error`
+    // as a failure, so a server that echoes `error: null` next to a valid
+    // result crashed instead of succeeding.
+    const server = new FakeMcpServer(
+      [{ name: 'ok', description: 'Fine.', call: () => ({ text: 'all good' }) }],
+      { nullError: true },
+    );
+    const d = mcpTool({ transport: server, namespace: 'demo' });
+    await d.listTools();
+    const res = await d.invoke('demo/ok', {}, mcpCtx());
+    assert(res.error === null, `no tool error, got ${res.error === null ? 'null' : 'set'}`);
+    const text = JSON.stringify(res.output);
+    assert(text.includes('all good'), `output carries text, got ${text}`);
   });
 
   await checkAsync('a failed initialize handshake traps EDRIVER', async () => {
@@ -8931,6 +8990,23 @@ async function runCliChecks(): Promise<void> {
     check('maxPidOnDisk returns highest PID', () => {
       const max = maxPidOnDisk(tmp);
       assert(max === 5, `max PID 5, got ${max}`);
+    });
+
+    await checkAsync('maxPidOnDisk counts .crec-only PIDs (forked children have no meta)', async () => {
+      // Regression: the old scanner only read *.meta.json. A forked child has
+      // a <pid>.crec but no meta, so it was invisible and its PID could be
+      // handed out again — silently merging two logs into one file.
+      const { writeFileSync, unlinkSync } = await import('node:fs');
+      const crecOnly = join(tmp, 'processes', '9.crec');
+      writeFileSync(crecOnly, Buffer.alloc(0));
+      try {
+        const max = maxPidOnDisk(tmp);
+        assert(max === 9, `.crec-only PID 9 counted, got ${max}`);
+      } finally {
+        unlinkSync(crecOnly);
+      }
+      // After removal we fall back to the highest meta PID, proving the file mattered.
+      assert(maxPidOnDisk(tmp) === 5, 'falls back to meta PID once .crec removed');
     });
 
     check('maxPidOnDisk on empty dir returns 1', () => {

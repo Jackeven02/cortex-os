@@ -125,13 +125,30 @@ export function readAllMetas(dir: string): readonly ProcessMeta[] {
 // =============================================================================
 
 /**
- * Find the highest PID in the on-disk index. Used by `spawn` to seed the
- * PID counter so a new spawn doesn't collide with a previous one.
+ * Find the highest PID that exists on disk. Used by `spawn`/`restore` to seed
+ * the PID counter so a new process doesn't collide with a previous one.
+ *
+ * CRUCIAL: this scans BOTH `*.meta.json` AND `*.crec`. A forked child gets a
+ * `.crec` (its own recorder) but NO `.meta.json` — `spawn` only writes a meta
+ * for the single top-level PID it started. If seeding looked at metas alone, a
+ * forked child's PID would be invisible, the counter would re-seed below it,
+ * and the next invocation would allocate that same PID again. Because
+ * `Recorder.open` uses `'a+'` (append), the new process's syscalls would be
+ * appended onto the *old* child's `.crec`, silently merging two unrelated
+ * processes and corrupting `trace`/`diff`/`readExitRecord`. Counting the raw
+ * `.crec` files too closes that collision.
  */
 export function maxPidOnDisk(dir: string): number {
-  const metas = readAllMetas(dir);
-  if (metas.length === 0) return 1; // init (PID 1) always exists conceptually
-  return Math.max(...metas.map((m) => m.pid));
+  const procDir = processesDir(dir);
+  if (!existsSync(procDir)) return 1; // init (PID 1) always exists conceptually
+  let max = 1;
+  for (const file of readdirSync(procDir)) {
+    const m = file.match(/^(\d+)\.(?:meta\.json|crec)$/);
+    if (m === null) continue;
+    const pid = Number(m[1]);
+    if (Number.isInteger(pid) && pid > max) max = pid;
+  }
+  return max;
 }
 
 /**

@@ -207,6 +207,13 @@ export interface InitProcessOptions {
   readonly clearTimeoutFn?: (handle: unknown) => void;
   /** Hook for unusual-termination notices (storm / max-restarts). */
   readonly onAlarm?: OnAlarmHook;
+  /**
+   * Per-PID teardown hook, called from `handleZombie` once a process has
+   * reached its terminal disposition. The host kernel uses it to cancel a dead
+   * process's parked IPC recv waiters, release its memory-region bindings, and
+   * clear any deferred wake-gate callback — none of which init owns directly.
+   */
+  readonly onReaped?: (pid: ProcessId) => void | Promise<void>;
   /** Override the default restart-storm threshold (see §1). */
   readonly restartStormThreshold?: number;
 }
@@ -254,6 +261,7 @@ export class InitProcess {
   #setTimeoutFn: (cb: () => void, ms: number) => unknown;
   #clearTimeoutFn: (handle: unknown) => void;
   #onAlarm: OnAlarmHook | null;
+  #onReaped: ((pid: ProcessId) => void | Promise<void>) | null;
   #stormThreshold: number;
 
   /** Keyed by `unbrand(daemonId)`. */
@@ -277,6 +285,7 @@ export class InitProcess {
     this.#clearTimeoutFn =
       opts.clearTimeoutFn ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
     this.#onAlarm = opts.onAlarm ?? null;
+    this.#onReaped = opts.onReaped ?? null;
     this.#stormThreshold = opts.restartStormThreshold ?? DEFAULT_RESTART_STORM_THRESHOLD;
   }
 
@@ -577,6 +586,20 @@ export class InitProcess {
       reaped: shouldReap,
       restarted,
     });
+
+    // 6. Per-PID teardown that init does not own: the host uses this to cancel
+    //    the dead process's parked IPC recv waiters (so they can never later
+    //    steal a message), release its memory-region bindings (so COW/private
+    //    physical keys are not pinned forever), and clear any deferred wake-gate
+    //    callback. Best-effort: a cleanup fault must not corrupt the reap that
+    //    has already committed above.
+    if (this.#onReaped !== null && unbrand(pid) !== unbrand(PID_INIT)) {
+      try {
+        await this.#onReaped(pid);
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------

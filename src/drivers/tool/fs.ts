@@ -301,6 +301,11 @@ export class FsToolDriver implements IToolDriver {
     try {
       const iter = glob(pattern, { cwd: base });
       for await (const match of iter) {
+        // A pattern like `../*` can yield matches that resolve OUTSIDE the
+        // sandbox root even though `base` is inside it. Re-check each resolved
+        // absolute path and drop the escapes.
+        const absolute = resolve(base, match);
+        if (!this.#pathWithinRoot(absolute)) continue;
         matches.push(match);
       }
     } catch (err) {
@@ -312,6 +317,13 @@ export class FsToolDriver implements IToolDriver {
   // ---------------------------------------------------------------------------
   // Sandbox helpers
   // ---------------------------------------------------------------------------
+
+  /** Boolean form of `#assertWithinRoot` (true when no root is configured). */
+  #pathWithinRoot(resolved: string): boolean {
+    if (this.#root === undefined) return true;
+    const root = this.#root + sep;
+    return resolved === this.#root || resolved.startsWith(root);
+  }
 
   #resolve(p: string): string {
     const resolved = resolve(p);

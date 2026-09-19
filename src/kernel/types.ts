@@ -587,6 +587,7 @@ export interface Checkpoint {
   readonly cognitive: CognitiveSnapshot;
   readonly memoryDelta: MemoryDelta;
   readonly budgets: BudgetCounters;
+  readonly budgetsRemaining?: BudgetLimits;
   readonly syscallLogOffset: SyscallOffset;
   readonly driverStates: Readonly<Record<string, Uint8Array | null>>;
   readonly signature: Uint8Array;

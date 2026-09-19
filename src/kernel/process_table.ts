@@ -517,7 +517,7 @@ export class ProcessTable {
    * @throws CortexError ESRCH if the PID is not in the table, ESTATE if the
    *         process is not in ZOMBIE state (cannot reap a live process).
    */
-  async reap(pid: ProcessId): Promise<WaitResult> {
+  async reap(pid: ProcessId, opts?: { retain?: boolean }): Promise<WaitResult> {
     const entry = this.mustGet(pid, 'reap');
     if (entry.state !== 'zombie') {
       trap('ESTATE', 'reap', {
@@ -548,10 +548,22 @@ export class ProcessTable {
       }
     }
 
-    // Retain the status for the parent (if it has one) so a late `wait()` can
-    // still collect it — see the #reapedChildren field comment.
-    if (entry.ppid !== null) {
-      const parentKey = unbrand(entry.ppid);
+    // Retain the status for the parent so a *late* `wait()` can still collect
+    // it — but ONLY when the parent is actually able to collect it:
+    //   - `retain !== false`: an active collector (a parked waiter served by the
+    //     dispatcher, or a parent calling wait() now) is resolving the result
+    //     directly to the caller. Retaining here would let a *subsequent* wait()
+    //     collect the same status a second time — real Unix returns ECHILD.
+    //   - parent is not init: init never calls `wait()`, so retaining under
+    //     PID 1 for every top-level / daemon child is an unbounded leak.
+    //   - parent is still present: a gone parent cannot consume its ledger.
+    const parentKey = entry.ppid === null ? null : unbrand(entry.ppid);
+    const shouldRetain =
+      opts?.retain !== false &&
+      parentKey !== null &&
+      parentKey !== unbrand(PID_INIT) &&
+      this.#entries.has(parentKey);
+    if (shouldRetain && parentKey !== null) {
       let ledger = this.#reapedChildren.get(parentKey);
       if (ledger === undefined) {
         ledger = new Map<number, WaitResult>();

@@ -797,7 +797,7 @@ export class SyscallDispatcher {
       }
       const tEntry = this.#table.get(target);
       if (tEntry !== undefined && tEntry.state === 'zombie') {
-        return await this.#table.reap(target);
+        return await this.#table.reap(target, { retain: false });
       }
       // `timeoutMs: 0` is a poll: never park.
       if (timeoutMs === 0) {
@@ -822,7 +822,7 @@ export class SyscallDispatcher {
     for (const child of children) {
       const cEntry = this.#table.get(child);
       if (cEntry !== undefined && cEntry.state === 'zombie') {
-        return await this.#table.reap(child);
+        return await this.#table.reap(child, { retain: false });
       }
     }
     if (timeoutMs === 0) {
@@ -914,7 +914,11 @@ export class SyscallDispatcher {
     const childEntry = this.#table.get(childPid);
     const parentPid = childEntry?.ppid ?? null;
 
-    // Reap once; hand the same WaitResult to every eligible waiter.
+    // Reap once (retain:true). Because reap() only retains for a live, non-init
+    // parent, a child that exits while its parent has no waiter parked yet is
+    // still collected later by that parent's wait(). When we DO deliver the
+    // result to a live waiter below, we consume this retained copy so the same
+    // exit status can never be collected twice.
     let result: WaitResult | null = null;
     if (childEntry !== undefined && childEntry.state === 'zombie') {
       try {
@@ -924,6 +928,8 @@ export class SyscallDispatcher {
       }
     }
 
+    // Whether the real (non-ECHILD) result was handed to at least one waiter.
+    let delivered = false;
     const deliver = (waiter: Waiter): void => {
       if (waiter.settled) return;
       waiter.settled = true;
@@ -934,6 +940,7 @@ export class SyscallDispatcher {
         waiter.timer = null;
       }
       if (result !== null) {
+        delivered = true;
         this.#unpark(waiter.parentPid, () => waiter.resolve(result));
       } else {
         // Child vanished without a usable zombie (already reaped elsewhere).
@@ -959,6 +966,13 @@ export class SyscallDispatcher {
       for (const w of anyList) if (!w.settled) stillWaiting.push(w);
       if (stillWaiting.length === 0) this.#waitersAny.delete(unbrand(parentPid));
       else this.#waitersAny.set(unbrand(parentPid), stillWaiting);
+    }
+
+    // The status went straight to a live waiter — drop the ledger copy so a
+    // later wait() for this same child does not re-collect it. When nothing was
+    // delivered, the retained copy stays for a late wait().
+    if (delivered && parentPid !== null) {
+      this.#table.takeReapedChild(parentPid, childPid);
     }
   }
 

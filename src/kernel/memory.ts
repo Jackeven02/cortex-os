@@ -383,6 +383,22 @@ export class MemoryManager {
     this.#releaseRef(binding.physical);
   }
 
+  /**
+   * Release every region bound to a process. Called when a process is reaped or
+   * killed so its bindings — and any COW/private physical keys it pinned — do
+   * not leak for the life of the kernel (the intended long-running case).
+   * Idempotent; safe for an unknown PID.
+   */
+  releaseProcess(pid: ProcessId): void {
+    const map = this.#bindings.get(unbrand(pid));
+    if (map === undefined) return;
+    // Copy the names first: detachRegion mutates the map as it goes.
+    for (const region of [...map.keys()]) {
+      this.detachRegion(pid, region);
+    }
+    this.#bindings.delete(unbrand(pid));
+  }
+
   /** Whether a logical region is attached to this process. */
   hasRegion(pid: ProcessId, region: string): boolean {
     return this.#bindings.get(unbrand(pid))?.has(region) ?? false;

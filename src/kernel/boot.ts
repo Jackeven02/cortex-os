@@ -462,6 +462,17 @@ export class Kernel {
       ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
       ...(opts.clearTimeoutFn !== undefined ? { clearTimeoutFn: opts.clearTimeoutFn } : {}),
       ...(opts.onAlarm !== undefined ? { onAlarm: opts.onAlarm } : {}),
+      onReaped: (pid) => {
+        // Per-PID teardown the supervisor cannot own: cancel a dead receiver's
+        // parked recv waiters (so a later send can never hand a message to a
+        // zombie and lose it), release its memory bindings (so COW/private
+        // physical keys are not pinned for the kernel's lifetime), and drop any
+        // deferred wake-gate callback. These modules are assigned later in this
+        // constructor, but this only runs at reap time — well after boot.
+        this.ipc.cancelWaitersFor(pid);
+        this.memory.releaseProcess(pid);
+        this.#gate.clear(pid);
+      },
     });
     initRef = this.init;
 

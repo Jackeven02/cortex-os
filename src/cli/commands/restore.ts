@@ -53,6 +53,13 @@ EXAMPLES
   }
 
   const dir = defaultKernelDir();
+  if (values.timeout !== undefined) {
+    const parsedTimeout = parseInt(values.timeout, 10);
+    if (!Number.isFinite(parsedTimeout) || parsedTimeout <= 0) {
+      console.error(`cortex restore: invalid --timeout: '${values.timeout}' (expected a positive integer of milliseconds)`);
+      return 1;
+    }
+  }
   const timeoutMs = values.timeout !== undefined ? parseInt(values.timeout, 10) : 30_000;
 
   // Resolve the chain ID.
@@ -93,6 +100,18 @@ EXAMPLES
       kernel.scheduler.enqueue(newPid);
     }
 
+    // Snapshot the REAL agent spec + parent now. The restored entry can be
+    // reaped during the poll loop below, after which `kernel.table.get(newPid)`
+    // returns undefined and we would otherwise be forced to write a placeholder
+    // meta — which the disk-backed restoreContext then reads back as the agent's
+    // spec, silently corrupting any restore→checkpoint→restore chain (notably
+    // `--module` agents). Capture it while it is definitely present.
+    const restored = kernel.table.get(newPid);
+    const restoredAgent = restored?.agent;
+    const restoredPpid = restored?.ppid !== undefined && restored.ppid !== null
+      ? unbrand(restored.ppid)
+      : 1;
+
     console.log(`restored as pid ${unbrand(newPid)} (chain ${chainId})`);
 
     // Let the restored agent run.
@@ -118,17 +137,17 @@ EXAMPLES
     // Write meta to disk.
     const meta: ProcessMeta = {
       pid: unbrand(newPid),
-      ppid: 1,
+      ppid: restoredPpid,
       pgid: unbrand(newPid),
       role: e?.role ?? 'restored',
       state: e?.state ?? 'zombie',
       exitCode: e?.exitCode ?? null,
       exitReason: e?.exitReason ?? null,
-      startedAt: e?.startedAt ?? new Date(startTime).toISOString(),
+      startedAt: e?.startedAt ?? restored?.startedAt ?? new Date(startTime).toISOString(),
       lastTransitionAt: e?.lastTransitionAt ?? new Date().toISOString(),
-      budgetsSpent: e?.budgetsSpent ?? { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: elapsed, syscallCount: 0 },
-      budgetsRemaining: e?.budgetsRemaining ?? { tokens: -1, usd: -1, wallTimeMs: -1 },
-      agent: { system: 'restored' },
+      budgetsSpent: e?.budgetsSpent ?? restored?.budgetsSpent ?? { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: elapsed, syscallCount: 0 },
+      budgetsRemaining: e?.budgetsRemaining ?? restored?.budgetsRemaining ?? { tokens: -1, usd: -1, wallTimeMs: -1 },
+      agent: restoredAgent ?? e?.agent ?? { system: 'restored' },
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
     writeMeta(dir, meta);

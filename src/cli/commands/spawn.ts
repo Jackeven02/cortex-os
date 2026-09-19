@@ -59,6 +59,13 @@ export async function cmdSpawn(args: string[]): Promise<number> {
   }
 
   const system = values.system ?? `You are a ${values.role}. Your task: ${values.task ?? '(no task specified)'}`;
+  if (values.timeout !== undefined) {
+    const parsed = parseInt(values.timeout, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      console.error(`cortex spawn: invalid --timeout: '${values.timeout}' (expected a positive integer of milliseconds)`);
+      return 1;
+    }
+  }
   const timeoutMs = values.timeout !== undefined ? parseInt(values.timeout, 10) : DEFAULT_TIMEOUT_MS;
 
   const dir = defaultKernelDir();

@@ -737,7 +737,7 @@ export class McpToolDriver implements IToolDriver {
     const entry = this.#pending.get(candidate.id);
     if (entry === undefined) return;
 
-    if (candidate.error !== undefined) {
+    if (candidate.error != null && typeof candidate.error === 'object') {
       const errno = errnoForRpcError(candidate.error.code);
       entry.reject(
         new CortexError(errno, 'tool_call', {

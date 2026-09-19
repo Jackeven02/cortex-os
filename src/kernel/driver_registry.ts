@@ -196,7 +196,12 @@ export function satisfiesAbi(version: string, range: string): boolean {
   if (trimmed === '' || trimmed === '*' || trimmed.toLowerCase() === 'x') return true;
 
   for (const orGroup of trimmed.split('||')) {
-    const tokens = orGroup.trim().split(/\s+/).filter((t) => t.length > 0);
+    // Collapse a space that sits between a comparator operator and its
+    // version (`>= 1.0.0` → `>=1.0.0`) BEFORE splitting on whitespace, so an
+    // operator and its operand stay a single token. Without this, the standard
+    // npm spelling `>= 1.0.0` would split into ['>=','1.0.0'] and be rejected.
+    const normalized = orGroup.replace(/([<>~^]=?)\s+/g, '$1');
+    const tokens = normalized.trim().split(/\s+/).filter((t) => t.length > 0);
     if (tokens.length === 0) {
       // An empty OR group (`* || ...` edge) matches anything.
       return true;
