@@ -164,12 +164,20 @@ export class SqliteMemoryDriver implements IMemoryDriver {
   // Region helpers
   // ---------------------------------------------------------------------------
 
-  /** Sanitize a region name into a valid SQLite table identifier. */
+  /**
+   * Encode a region name into a valid, COLLISION-FREE SQLite table identifier.
+   *
+   * The old sanitizer (`replace(/[^A-Za-z0-9_]/g, '_')`) was lossy: `mem-1` and
+   * `mem_1` both became `r_mem_1`, so two logically distinct regions silently
+   * shared a table and overwrote each other. This encoding is injective and
+   * reversible: safe characters stay verbatim (so `episodic` is unchanged), `_`
+   * is doubled to `__`, and every other code point becomes `_` + its code point
+   * in exactly 6 hex digits (fixed width, so decoding is unambiguous). The
+   * output is only `[A-Za-z0-9_]`, so it remains a legal identifier and never
+   * needs quoting — while `decodeRegion` can recover the exact name.
+   */
   #tableName(region: string): string {
-    // Region names are user-controlled; replace anything that isn't
-    // alphanumeric + underscore to prevent SQL injection through table names.
-    const clean = region.replace(/[^a-zA-Z0-9_]/g, '_');
-    return `r_${clean}`;
+    return REGION_TABLE_PREFIX + encodeRegion(region);
   }
 
   /** Create the region's table if it does not exist. */
@@ -257,8 +265,8 @@ export class SqliteMemoryDriver implements IMemoryDriver {
     const rows = db.prepare(
       `SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'r_%' ORDER BY name`,
     ).all() as Array<{ name: string }>;
-    // Strip the 'r_' prefix.
-    return rows.map((r) => r.name.slice(2));
+    // Decode the collision-free table identifier back to the logical region.
+    return rows.map((r) => decodeRegion(r.name.slice('r_'.length)));
   }
 
   async snapshotRegion(region: string): Promise<Uint8Array> {
@@ -307,6 +315,60 @@ export class SqliteMemoryDriver implements IMemoryDriver {
 // =============================================================================
 // §4. Helpers
 // =============================================================================
+
+/** Prefix applied to every encoded region table. */
+const REGION_TABLE_PREFIX = 'r_';
+
+/** Characters that may appear verbatim in a SQLite identifier. */
+const SAFE_REGION_CHARS = /^[A-Za-z0-9_]$/;
+
+/**
+ * Encode a region name into a collision-free identifier suffix (see
+ * `SqliteMemoryDriver.#tableName`). Safe characters pass through unchanged (so
+ * `episodic` is byte-for-byte the same as the old scheme); `_` is doubled; every
+ * other code point becomes `_` plus exactly 6 hex digits (fixed width, so the
+ * decoder is unambiguous). The output is only `[A-Za-z0-9_]`, so it is a legal
+ * unquoted identifier, and the mapping is one-to-one — `mem-1` and `mem_1` no
+ * longer collapse onto the same table.
+ */
+function encodeRegion(name: string): string {
+  let out = '';
+  for (const ch of name) {
+    if (ch === '_') {
+      out += '__';
+    } else if (SAFE_REGION_CHARS.test(ch)) {
+      out += ch;
+    } else {
+      out += '_' + ch.codePointAt(0)!.toString(16).padStart(6, '0');
+    }
+  }
+  return out;
+}
+
+/** Inverse of `encodeRegion`: recover the original region name. */
+function decodeRegion(encoded: string): string {
+  let out = '';
+  for (let i = 0; i < encoded.length; i++) {
+    const ch = encoded[i]!;
+    if (ch !== '_') {
+      out += ch;
+      continue;
+    }
+    if (encoded[i + 1] === '_') {
+      out += '_';
+      i++;
+      continue;
+    }
+    const hex = encoded.slice(i + 1, i + 7);
+    if (/^[0-9a-f]{6}$/.test(hex)) {
+      out += String.fromCodePoint(parseInt(hex, 16));
+      i += 6;
+    } else {
+      out += '_'; // malformed tail; keep the underscore literally
+    }
+  }
+  return out;
+}
 
 /**
  * Escape a prefix for SQLite `LIKE`: underscores and percent signs in the

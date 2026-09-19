@@ -33,6 +33,51 @@ exact version.
 
 ---
 
+## [0.1.4] — 2026-09-19
+
+Two more real defects, both from the "found but deferred" list of the `0.1.3`
+review — picked because they actually bite rather than merely being untidy. The
+syscall ABI, the state model, the CLI surface and the memory/IPC contracts are
+unchanged; this is a patch bump. The smoke suite grew from 483 to 486 assertions.
+
+### Fixed
+
+- **The filesystem driver's sandbox could be escaped with a symlink or a
+  directory junction.** Containment was checked on the *lexical* path —
+  `path.resolve()` collapses `..` but never follows a reparse point. So an agent
+  could plant a link *inside* the sandbox root that points at a file *outside*
+  it, read the link path, and the guard would wave it through because the string
+  looked contained while the real target was not. Reproduced on Windows with a
+  directory junction (and trivially on Linux/macOS with a symlink): `fs_read` on
+  the link path returned the outside file's contents. Every entry point
+  (`read`/`write`/`list`/`glob`) now canonicalises through `realpath` before the
+  containment check, resolving the deepest existing ancestor so not-yet-created
+  write targets are still checked at their real location, and compares the
+  canonical path to the canonical root via `relative()` (robust to separators and
+  case). `glob` matches are likewise canonicalised before being tested, so a
+  linked directory inside the tree can no longer leak its outside contents.
+- **Two logically distinct memory regions could silently share one SQLite
+  table.** The SQLite driver turned a region name into a table name by replacing
+  every non-alphanumeric character with `_`, which is lossy: `mem-1` and `mem_1`
+  both became `r_mem_1`, so writes to one region overwrote the other's entries,
+  and `listRegions()` — which just sliced off the prefix — could not tell them
+  apart either. Reproduced: `mem-1`'s value was clobbered by `mem_1` and only one
+  region was listed. Region names are now encoded with a reversible, injective
+  scheme (safe characters verbatim, `_` doubled, every other code point as `_`
+  plus six fixed-width hex digits), and `listRegions()` decodes back to the exact
+  original name. Common names like `episodic`/`semantic` are unchanged, so the
+  kernel's own region handling is unaffected.
+  - *Behaviour note:* tables created by `0.1.3` and earlier used the lossy name,
+    so after upgrading a persisted DB will present those under the new encoding;
+    use a fresh database file or re-register the regions. This does not touch the
+    in-memory driver, checkpoints, or any ABI.
+
+The symlink regression test creates a real reparse point and self-skips only on
+platforms that forbid it outright (e.g. a stock Windows shell without developer
+mode); Linux/macOS CI exercises the escape path for real.
+
+---
+
 ## [0.1.3] — 2026-09-19
 
 A bug-fix pass over `0.1.2`. The syscall ABI (`docs/ABI.md`), the state model

@@ -7727,6 +7727,45 @@ async function runFsChecks(): Promise<void> {
       assert((caught as CortexError).errno === 'EPERM', 'EPERM');
     });
 
+    await checkAsync('symlink/junction INSIDE the sandbox cannot escape to a target outside', async () => {
+      // Regression: containment was checked on the LEXICAL path, so a reparse
+      // point planted inside the root (symlink → file, or junction → dir) whose
+      // real target lives outside read straight through the guard. The fix
+      // canonicalises via realpath before checking.
+      const { symlinkSync } = await import('node:fs');
+      const outside = mkdtempSync(join(tmpdir(), 'cortex-fs-out-'));
+      try {
+        writeFileSync(join(outside, 'secret.txt'), 'OUTSIDE-SECRET');
+        const linkFile = join(tmp, 'escape.txt');
+        const linkDir = join(tmp, 'escapeDir');
+        let targetPath = '';
+        try {
+          symlinkSync(join(outside, 'secret.txt'), linkFile);
+          targetPath = linkFile;
+        } catch {
+          try {
+            symlinkSync(outside, linkDir, 'junction');
+            targetPath = join(linkDir, 'secret.txt');
+          } catch {
+            // No reparse points allowed here — nothing to test. Pass without
+            // a false failure; Linux/macOS CI still exercises the real path.
+            assert(true, 'skipped: symlinks/junctions not permitted on this platform');
+            return;
+          }
+        }
+        const d = fsTool({ root: tmp });
+        const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
+        let caught: unknown = null;
+        let out: unknown = null;
+        try { out = (await d.invoke('fs_read', { path: targetPath }, ctx)).output; }
+        catch (e) { caught = e; }
+        assert(isCortexError(caught) && (caught as CortexError).errno === 'EPERM',
+          `EPERM on symlink escape, got ${caught === null ? `READ OK ${JSON.stringify((out as { content?: string })?.content)}` : (caught as CortexError).errno}`);
+      } finally {
+        rmSync(outside, { recursive: true, force: true });
+      }
+    });
+
     await checkAsync('unknown tool traps ENOENT', async () => {
       const d = fsTool({ root: tmp });
       const ctx = { pid: asProcessId(2), callId: 'c1', deadline: '', abortSignal: new AbortController().signal, kernelAbiVersion: KERNEL_ABI_VERSION };
@@ -8896,6 +8935,48 @@ async function runSqliteChecks(): Promise<void> {
     assert(regions.includes('episodic'), 'episodic listed');
     assert(regions.includes('semantic'), 'semantic listed');
     await d.close();
+    });
+
+    await checkAsync('region names differing only by a special char do not share a table', async () => {
+      // Regression: #tableName replaced every non-alphanumeric char with '_',
+      // so `mem-1` and `mem_1` (and any name differing only in separators)
+      // collapsed onto one table and silently overwrote each other's entries.
+      const d = sqliteMemory({ dir: join(tmp, 'sub-nocollide') });
+      await d.write('mem-1', 'shared-key', 'DASH-VALUE');
+      await d.write('mem_1', 'shared-key', 'UNDER-VALUE');
+      const fromDash = await d.read('mem-1', { key: 'shared-key' });
+      const fromUnder = await d.read('mem_1', { key: 'shared-key' });
+      assert(fromDash[0]?.value === 'DASH-VALUE', `mem-1 keeps its value, got ${fromDash[0]?.value}`);
+      assert(fromUnder[0]?.value === 'UNDER-VALUE', `mem_1 keeps its value, got ${fromUnder[0]?.value}`);
+      const regions = await d.listRegions();
+      assert(regions.includes('mem-1') && regions.includes('mem_1'),
+        `both distinct names listed, got ${JSON.stringify(regions)}`);
+      // A special-character name must also survive a snapshot/restore round-trip.
+      const blob = await d.snapshotRegion('mem-1');
+      const d2 = sqliteMemory({ dir: join(tmp, 'sub-nocollide-r') });
+      await d2.restoreRegion('mem-1', blob);
+      const restored = await d2.read('mem-1', { key: 'shared-key' });
+      assert(restored[0]?.value === 'DASH-VALUE' && restored[0]?.region === 'mem-1',
+        'special-char region round-trips with its logical name intact');
+      await d.close();
+      await d2.close();
+    });
+
+    await checkAsync('oddly-named regions round-trip through listRegions exactly', async () => {
+      // The reversible identifier encoding must recover names with dashes,
+      // colons and literal underscores — and never merge two of them.
+      const names = ['a-b', 'a_b', 'a:b', 'weird$name', 'user:1:session', '__'];
+      const d = sqliteMemory({ dir: join(tmp, 'sub-exact') });
+      for (const n of names) await d.write(n, 'x', n);
+      const listed = [...(await d.listRegions())].sort();
+      const wanted = [...names].sort();
+      assert(JSON.stringify(listed) === JSON.stringify(wanted),
+        `exact round-trip, got ${JSON.stringify(listed)}`);
+      for (const n of names) {
+        const got = await d.read(n, { key: 'x' });
+        assert(got[0]?.value === n, `${n} reads back its own value, got ${got[0]?.value}`);
+      }
+      await d.close();
     });
 
     await checkAsync('snapshotRegion + restoreRegion round-trips', async () => {

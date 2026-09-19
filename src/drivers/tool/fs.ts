@@ -20,7 +20,7 @@
  */
 
 import { promises as fs, constants as fsConstants } from 'node:fs';
-import { basename, dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { glob } from 'node:fs/promises';
 
 import {
@@ -152,6 +152,12 @@ export class FsToolDriver implements IToolDriver {
   readonly forkable = true;
 
   #root: string | undefined;
+  /**
+   * `#root` after `realpath`. `undefined` = not yet computed, `null` = the
+   * configured root does not exist yet (fall back to its lexical form). Cached
+   * because it is needed on every containment check.
+   */
+  #resolvedRoot: string | null | undefined;
   #maxReadBytes: number;
   #closed = false;
 
@@ -229,7 +235,7 @@ export class FsToolDriver implements IToolDriver {
     args: unknown,
   ): Promise<{ output: unknown; reversibility: Reversibility }> {
     const { path, maxBytes } = parseReadArgs(args);
-    const resolved = this.#resolve(path);
+    const resolved = await this.#resolve(path);
     await this.#assertFile(resolved);
 
     const stat = await fs.stat(resolved);
@@ -249,8 +255,7 @@ export class FsToolDriver implements IToolDriver {
     args: unknown,
   ): Promise<{ output: unknown; reversibility: Reversibility }> {
     const { path, content, append } = parseWriteArgs(args);
-    const resolved = this.#resolve(path);
-    this.#assertWithinRoot(resolved);
+    const resolved = await this.#resolve(path);
 
     const dir = dirname(resolved);
     await fs.mkdir(dir, { recursive: true });
@@ -265,8 +270,7 @@ export class FsToolDriver implements IToolDriver {
     args: unknown,
   ): Promise<{ output: unknown; reversibility: Reversibility }> {
     const { path } = parseListArgs(args);
-    const resolved = this.#resolve(path);
-    this.#assertWithinRoot(resolved);
+    const resolved = await this.#resolve(path);
 
     const entries = await fs.readdir(resolved, { withFileTypes: true });
     const result = [];
@@ -294,18 +298,18 @@ export class FsToolDriver implements IToolDriver {
     args: unknown,
   ): Promise<{ output: unknown; reversibility: Reversibility }> {
     const { pattern, cwd } = parseGlobArgs(args);
-    const base = cwd !== undefined ? this.#resolve(cwd) : this.#root ?? process.cwd();
-    this.#assertWithinRoot(base);
+    // #resolve canonicalises AND enforces containment for whatever base we use.
+    const base = await this.#resolve(cwd ?? this.#root ?? process.cwd());
 
     const matches: string[] = [];
     try {
       const iter = glob(pattern, { cwd: base });
       for await (const match of iter) {
-        // A pattern like `../*` can yield matches that resolve OUTSIDE the
-        // sandbox root even though `base` is inside it. Re-check each resolved
-        // absolute path and drop the escapes.
-        const absolute = resolve(base, match);
-        if (!this.#pathWithinRoot(absolute)) continue;
+        // A pattern like `../*`, or a directory that is itself a junction/symlink,
+        // can yield matches whose REAL target is outside the sandbox even though
+        // `base` is inside it. Canonicalise the target, then drop any escape.
+        const absolute = await this.#canonicalPath(resolve(base, match));
+        if (!(await this.#assertContained(absolute))) continue;
         matches.push(match);
       }
     } catch (err) {
@@ -317,29 +321,82 @@ export class FsToolDriver implements IToolDriver {
   // ---------------------------------------------------------------------------
   // Sandbox helpers
   // ---------------------------------------------------------------------------
+  //
+  // Containment is enforced against the CANONICAL path — every symlink and
+  // junction resolved — not the lexical one. A purely lexical `resolve()` check
+  // is trivially defeated by planting a link INSIDE the sandbox that points at
+  // a file OUTSIDE it: the string looks contained, the real target is not. So
+  // we `realpath` first and only then decide.
 
-  /** Boolean form of `#assertWithinRoot` (true when no root is configured). */
-  #pathWithinRoot(resolved: string): boolean {
-    if (this.#root === undefined) return true;
-    const root = this.#root + sep;
-    return resolved === this.#root || resolved.startsWith(root);
+  /** The configured root, realpath-resolved (cached). Undefined when no root. */
+  async #canonicalRoot(): Promise<string | undefined> {
+    if (this.#root === undefined) return undefined;
+    if (this.#resolvedRoot === undefined) {
+      try {
+        this.#resolvedRoot = await fs.realpath(this.#root);
+      } catch {
+        // The root does not exist yet (e.g. a fresh workspace). Fall back to
+        // its lexical form; a caller cannot escape a directory that is absent.
+        this.#resolvedRoot = null;
+      }
+    }
+    return this.#resolvedRoot ?? this.#root;
   }
 
-  #resolve(p: string): string {
-    const resolved = resolve(p);
-    this.#assertWithinRoot(resolved);
-    return resolved;
+  /**
+   * Is `target` the same as, or strictly under, `root`? Written via `relative`
+   * so it is robust to separators, trailing slashes and (on Windows) case —
+   * both operands are already canonical here.
+   */
+  #contained(target: string, root: string): boolean {
+    const rel = relative(root, target);
+    return rel === '' || (!rel.startsWith('..' + sep) && rel !== '..' && !isAbsolute(rel));
   }
 
-  #assertWithinRoot(resolved: string): void {
-    if (this.#root === undefined) return;
-    const root = this.#root + sep;
-    if (resolved !== this.#root && !resolved.startsWith(root)) {
+  /**
+   * Lexically resolve `p`, canonicalise its reparse points, and enforce that the
+   * result stayed inside the sandbox root. Throws EPERM on escape.
+   */
+  async #resolve(p: string): Promise<string> {
+    const root = await this.#canonicalRoot();
+    const canonical = await this.#canonicalPath(resolve(p));
+    if (root !== undefined && !this.#contained(canonical, root)) {
       throw new CortexError('EPERM', 'tool_call', {
-        message: `path '${resolved}' is outside the sandbox root '${this.#root}'`,
-        details: { path: resolved, root: this.#root },
+        message: `path '${p}' resolves to '${canonical}', outside the sandbox root '${root}'`,
+        details: { path: canonical, root },
       });
     }
+    return canonical;
+  }
+
+  /**
+   * Resolve every symlink/junction in `target`. When the final component does
+   * not exist yet (a write target), canonicalise the nearest existing ancestor
+   * and re-join the lexical remainder — that is where a planted link lives, so
+   * resolving the ancestors is exactly what is needed.
+   */
+  async #canonicalPath(target: string): Promise<string> {
+    try {
+      return await fs.realpath(target);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw err;
+      const parent = dirname(target);
+      if (parent === target) return target; // reached the filesystem root
+      const canonicalParent = await this.#canonicalPath(parent);
+      return join(canonicalParent, basename(target));
+    }
+  }
+
+  /**
+   * Boolean containment probe for an already-absolute `path`. Compares against
+   * the CANONICAL root so both `..` traversals and reparse-point escapes are
+   * dropped. True when no root is configured.
+   */
+  async #assertContained(path: string): Promise<boolean> {
+    const root = await this.#canonicalRoot();
+    if (root === undefined) return true;
+    return this.#contained(path, root);
   }
 
   async #assertFile(p: string): Promise<void> {
