@@ -2,10 +2,13 @@
  * cortex CLI — disk-backed process store.
  *
  * This is the "disk as source of truth" bridge that lets CLI commands see
- * processes spawned by previous CLI invocations. Each `cortex spawn` writes
- * a `<dir>/processes/<pid>.meta.json` next to the `.crec` log. Read-only
- * commands (`ps`, `trace`, `kill`, `limit`) load these to reconstruct the
- * process table from disk instead of starting with an empty in-memory kernel.
+ * processes spawned by previous CLI invocations. Each `cortex spawn` writes a
+ * per-process directory `<dir>/processes/<pid>/{log.crec, meta.json,
+ * checkpoints/}` (ARCHITECTURE §7). The `.meta.json` index sits next to the
+ * syscall log. Read-only commands (`ps`, `trace`, `kill`, `limit`) load these
+ * to reconstruct the process table from disk instead of starting with an empty
+ * in-memory kernel. Pre-`0.2.1` flat files (`processes/<pid>.crec` /
+ * `<pid>.meta.json`) are still read, so an older home upgrades transparently.
  *
  * The `.meta.json` file carries a subset of `ProcessInfo` — enough for `ps`
  * and `kill` to be useful without booting a full kernel. It is NOT a
@@ -31,11 +34,11 @@
  * @module cli/process_store
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, mkdirSync, statSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 
 import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy, type BlockedReason } from '../kernel/types.js';
-import { readRecords, crecPath } from '../kernel/recorder.js';
+import { readRecords, existingCrecPath } from '../kernel/recorder.js';
 
 // =============================================================================
 // Types
@@ -76,12 +79,52 @@ export interface ProcessMeta {
 // Path helpers
 // =============================================================================
 
+/**
+ * `.cortex/processes/<pid>/meta.json` — one directory per process
+ * (docs/ARCHITECTURE.md §7).
+ */
 export function metaPath(dir: string, pid: ProcessId): string {
+  return join(procDir(dir, pid), 'meta.json');
+}
+
+/** The pre-`0.2.1` flat form, `.cortex/processes/<pid>.meta.json`. */
+export function legacyMetaPath(dir: string, pid: ProcessId): string {
   return join(dir, 'processes', `${unbrand(pid)}.meta.json`);
+}
+
+/** `.cortex/processes/<pid>/` — everything one process ever wrote. */
+export function procDir(dir: string, pid: ProcessId): string {
+  return join(dir, 'processes', String(unbrand(pid)));
 }
 
 export function processesDir(dir: string): string {
   return join(dir, 'processes');
+}
+
+/** `.cortex/processes/<pid>/checkpoints/`. */
+export function procCheckpointsDir(dir: string, pid: ProcessId): string {
+  return join(procDir(dir, pid), 'checkpoints');
+}
+
+/**
+ * Every process directory on disk, as `{ pid, dir }`. Covers the current
+ * per-process layout; the flat legacy files are read by `readAllMetas` /
+ * `maxPidOnDisk` directly.
+ */
+export function listProcDirs(dir: string): readonly { pid: number; dir: string }[] {
+  const root = processesDir(dir);
+  if (!existsSync(root)) return [];
+  const out: { pid: number; dir: string }[] = [];
+  for (const name of readdirSync(root)) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      if (!statSync(join(root, name)).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    out.push({ pid: Number(name), dir: join(root, name) });
+  }
+  return out.sort((a, b) => a.pid - b.pid);
 }
 
 // =============================================================================
@@ -90,15 +133,22 @@ export function processesDir(dir: string): string {
 
 export function writeMeta(dir: string, meta: ProcessMeta): void {
   const path = metaPath(dir, asProcessId(meta.pid));
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch {
+    // Best-effort: the write below reports the real failure if the directory
+    // could not be created.
+  }
   writeFileSync(path, JSON.stringify(meta, null, 2), 'utf8');
 }
 
 export function deleteMeta(dir: string, pid: ProcessId): void {
-  const path = metaPath(dir, pid);
-  try {
-    if (existsSync(path)) unlinkSync(path);
-  } catch {
-    // Best-effort.
+  for (const path of [metaPath(dir, pid), legacyMetaPath(dir, pid)]) {
+    try {
+      if (existsSync(path)) unlinkSync(path);
+    } catch {
+      // Best-effort.
+    }
   }
 }
 
@@ -107,32 +157,44 @@ export function deleteMeta(dir: string, pid: ProcessId): void {
 // =============================================================================
 
 export function readMeta(dir: string, pid: ProcessId): ProcessMeta | undefined {
-  const path = metaPath(dir, pid);
-  if (!existsSync(path)) return undefined;
-  try {
-    const text = readFileSync(path, 'utf8');
-    return JSON.parse(text) as ProcessMeta;
-  } catch {
-    return undefined;
+  // Current layout first; a meta written by a pre-0.2.1 build is still readable.
+  for (const path of [metaPath(dir, pid), legacyMetaPath(dir, pid)]) {
+    if (!existsSync(path)) continue;
+    try {
+      return JSON.parse(readFileSync(path, 'utf8')) as ProcessMeta;
+    } catch {
+      return undefined;
+    }
   }
+  return undefined;
 }
 
+/**
+ * Every process index on disk, both layouts: `processes/<pid>/meta.json`
+ * (current) and `processes/<pid>.meta.json` (pre-0.2.1).
+ */
 export function readAllMetas(dir: string): readonly ProcessMeta[] {
-  const procDir = processesDir(dir);
-  if (!existsSync(procDir)) return [];
-  const results: ProcessMeta[] = [];
-  for (const file of readdirSync(procDir)) {
+  const root = processesDir(dir);
+  if (!existsSync(root)) return [];
+  const results = new Map<number, ProcessMeta>();
+
+  for (const p of listProcDirs(dir)) {
+    const meta = readMeta(dir, asProcessId(p.pid));
+    if (meta !== undefined) results.set(p.pid, meta);
+  }
+  // Legacy flat files, for a home written before 0.2.1.
+  for (const file of readdirSync(root)) {
     if (!file.endsWith('.meta.json')) continue;
     try {
-      const text = readFileSync(join(procDir, file), 'utf8');
-      const meta = JSON.parse(text) as ProcessMeta;
-      results.push(meta);
+      const meta = JSON.parse(readFileSync(join(root, file), 'utf8')) as ProcessMeta;
+      // The newer layout wins if both exist.
+      if (!results.has(meta.pid)) results.set(meta.pid, meta);
     } catch {
       // Skip corrupt files.
     }
   }
   // Sort by PID for stable output.
-  return results.sort((a, b) => a.pid - b.pid);
+  return [...results.values()].sort((a, b) => a.pid - b.pid);
 }
 
 // =============================================================================
@@ -154,10 +216,13 @@ export function readAllMetas(dir: string): readonly ProcessMeta[] {
  * `.crec` files too closes that collision.
  */
 export function maxPidOnDisk(dir: string): number {
-  const procDir = processesDir(dir);
-  if (!existsSync(procDir)) return 1; // init (PID 1) always exists conceptually
+  const root = processesDir(dir);
+  if (!existsSync(root)) return 1; // init (PID 1) always exists conceptually
   let max = 1;
-  for (const file of readdirSync(procDir)) {
+  // Current layout: one directory per process.
+  for (const p of listProcDirs(dir)) if (p.pid > max) max = p.pid;
+  // Legacy flat files.
+  for (const file of readdirSync(root)) {
     const m = file.match(/^(\d+)\.(?:meta\.json|crec)$/);
     if (m === null) continue;
     const pid = Number(m[1]);
@@ -183,7 +248,7 @@ export async function readExitRecord(
   dir: string,
   pid: ProcessId,
 ): Promise<{ code: number; reason: string } | undefined> {
-  const file = crecPath(dir, pid);
+  const file = existingCrecPath(dir, pid);
   if (!existsSync(file)) return undefined;
   let found: { code: number; reason: string } | undefined;
   try {
@@ -213,13 +278,24 @@ export async function readExitRecord(
  * the most recent checkpoint whose tag matches. Returns `undefined` if none.
  */
 export async function findCheckpointByTag(dir: string, tag: string): Promise<string | undefined> {
-  const procDir = processesDir(dir);
-  if (!existsSync(procDir)) return undefined;
+  const root = processesDir(dir);
+  if (!existsSync(root)) return undefined;
   let latest: { chainId: string; at: string } | undefined;
-  for (const file of readdirSync(procDir)) {
-    if (!file.endsWith('.crec')) continue;
+
+  // Every log we can find, in either layout. `existingCrecPath` covers the
+  // per-process directory; the flat scan below covers pre-0.2.1 homes.
+  const logs: string[] = [];
+  for (const p of listProcDirs(dir)) {
+    const candidate = join(p.dir, 'log.crec');
+    if (existsSync(candidate)) logs.push(candidate);
+  }
+  for (const file of readdirSync(root)) {
+    if (file.endsWith('.crec')) logs.push(join(root, file));
+  }
+
+  for (const logPath of logs) {
     try {
-      for await (const rec of readRecords(join(procDir, file))) {
+      for await (const rec of readRecords(logPath)) {
         if (rec.syscall !== 'checkpoint' || rec.phase !== 'exit') continue;
         const args = rec.args as { tag?: unknown } | undefined;
         const result = rec.result as { chainId?: unknown } | undefined;
@@ -237,22 +313,26 @@ export async function findCheckpointByTag(dir: string, tag: string): Promise<str
 }
 
 /**
- * List all checkpoint files in the directory. Returns [{chainId, filename, createdAt}].
+ * List every checkpoint on disk. Scans both layouts: the shared
+ * `<dir>/checkpoints/` (pre-0.2.1) and each `processes/<pid>/checkpoints/`.
  */
 export function listCheckpoints(dir: string): readonly { chainId: string; filename: string; createdAt: string }[] {
-  const cpDir = join(dir, 'checkpoints');
-  if (!existsSync(cpDir)) return [];
-  const results: { chainId: string; filename: string; createdAt: string }[] = [];
-  for (const file of readdirSync(cpDir)) {
-    if (!file.endsWith('.csnap')) continue;
-    const match = file.match(/^(.+)_([0-9a-f-]{36})\.csnap$/);
-    if (match) {
-      results.push({
-        createdAt: match[1]!,
-        chainId: match[2]!,
-        filename: file,
-      });
+  const results = new Map<string, { chainId: string; filename: string; createdAt: string }>();
+  const dirs = [join(dir, 'checkpoints')];
+  for (const p of listProcDirs(dir)) dirs.push(procCheckpointsDir(dir, asProcessId(p.pid)));
+
+  for (const cpDir of dirs) {
+    if (!existsSync(cpDir)) continue;
+    for (const file of readdirSync(cpDir)) {
+      if (!file.endsWith('.csnap')) continue;
+      const match = file.match(/^(.+)_([0-9a-f-]{36})\.csnap$/);
+      if (match === null) continue;
+      const chainId = match[2]!;
+      // Shared and per-process dirs can both hold it after an upgrade; keep one.
+      if (!results.has(chainId)) {
+        results.set(chainId, { createdAt: match[1]!, chainId, filename: file });
+      }
     }
   }
-  return results.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  return [...results.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }

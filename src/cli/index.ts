@@ -44,7 +44,7 @@ import { mcpTool } from '../drivers/tool/mcp.js';
 import { inmemMemory } from '../drivers/memory/inmem.js';
 import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type MemoryRegionPolicy } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
-import { crecPath } from '../kernel/recorder.js';
+import { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir } from '../kernel/recorder.js';
 import { readAllMetas, readMeta, writeMeta, maxPidOnDisk, readExitRecord, type ProcessMeta } from './process_store.js';
 
 import { cmdSpawn } from './commands/spawn.js';
@@ -319,7 +319,7 @@ export function parsePid(s: string): ProcessId {
 
 export { unbrand, asProcessId };
 export { readAllMetas, readMeta, writeMeta, maxPidOnDisk, readExitRecord, type ProcessMeta };
-export { crecPath };
+export { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir };
 
 // =============================================================================
 // Module entry

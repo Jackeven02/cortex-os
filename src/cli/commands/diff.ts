@@ -20,7 +20,7 @@
 import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
 
-import { defaultKernelDir, crecPath, readMeta } from '../index.js';
+import { defaultKernelDir, existingCrecPath, readMeta } from '../index.js';
 import { readRecords } from '../../kernel/recorder.js';
 import { unbrand, asProcessId, type SyscallRecord } from '../../kernel/types.js';
 import {
@@ -244,7 +244,7 @@ function resolveTarget(target: string, dir: string): ResolvedTarget | null {
   }
   const pid = Number(target);
   if (!Number.isInteger(pid) || pid < 0) return null;
-  const file = crecPath(dir, asProcessId(pid));
+  const file = existingCrecPath(dir, asProcessId(pid));
   if (!existsSync(file)) return null;
   return { file, pid };
 }

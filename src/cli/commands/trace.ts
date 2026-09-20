@@ -14,7 +14,7 @@
 
 import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
-import { defaultKernelDir, crecPath } from '../index.js';
+import { defaultKernelDir, existingCrecPath } from '../index.js';
 import { readRecords } from '../../kernel/recorder.js';
 import { unbrand, asProcessId, type SyscallRecord } from '../../kernel/types.js';
 
@@ -75,7 +75,7 @@ EXAMPLES
       return 1;
     }
     const dir = defaultKernelDir();
-    crecFile = crecPath(dir, asProcessId(pid));
+    crecFile = existingCrecPath(dir, asProcessId(pid));
     if (!existsSync(crecFile)) {
       console.error(`cortex trace: no .crec file at '${crecFile}'`);
       console.error(`  (did you 'cortex spawn' this PID?)`);

@@ -33,7 +33,7 @@ import { existsSync, statSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { Buffer } from 'node:buffer';
 
-import { defaultKernelDir, crecPath } from '../index.js';
+import { defaultKernelDir, existingCrecPath } from '../index.js';
 import {
   CREC_HEADER_SIZE,
   CREC_FRAME_PREFIX_SIZE,
@@ -171,7 +171,7 @@ EXAMPLES
       return 1;
     }
     const dir = defaultKernelDir();
-    crecFile = crecPath(dir, asProcessId(pid));
+    crecFile = existingCrecPath(dir, asProcessId(pid));
     if (!existsSync(crecFile)) {
       console.error(`cortex attach: no .crec file at '${crecFile}'`);
       console.error(`  (did you 'cortex spawn' this PID?)`);

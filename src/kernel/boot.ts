@@ -449,7 +449,11 @@ export class Kernel {
     // --- recorder factory (§8 step 3b: initialise recorder) -----------------
     const recorderFactory: RecorderFactory =
       opts.recorderFactory ??
-      (async (pid: ProcessId) => Recorder.open({ pid, dir: this.#processesDir }));
+      // One directory per process (docs/ARCHITECTURE.md §7): the log lives at
+      // `<dir>/processes/<pid>/log.crec`, so a process's whole footprint is one
+      // subtree. `Recorder.open` creates the directory on first write.
+      (async (pid: ProcessId) =>
+        Recorder.open({ pid, dir: join(this.#processesDir, String(unbrand(pid))) }));
 
     // --- process_table ------------------------------------------------------
     this.table = new ProcessTable({
@@ -549,6 +553,12 @@ export class Kernel {
       table: this.table,
       kernelAbiVersion: this.kernelAbiVersion,
       dir: checkpointDir,
+      // Checkpoints live beside the process that took them
+      // (`processes/<pid>/checkpoints/`), not in one shared pile. Resolution by
+      // chainId therefore has to search the tree — see CheckpointManager.
+      dirFor: async (pid: ProcessId) =>
+        join(this.#processesDir, String(unbrand(pid)), 'checkpoints'),
+      processesRoot: this.#processesDir,
       now: this.#now,
       memory: this.memory,
       restoreContext,

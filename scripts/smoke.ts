@@ -29,6 +29,8 @@ import {
   readRecords,
   effectiveEof,
   crecPath,
+  legacyCrecPath,
+  existingCrecPath,
   CREC_MAGIC,
   CREC_MAX_FRAME_SIZE,
   type SyscallRecord,
@@ -250,6 +252,9 @@ import {
   readAllMetas,
   maxPidOnDisk,
   metaPath,
+  legacyMetaPath,
+  procDir,
+  listProcDirs,
   readExitRecord,
   findCheckpointByTag,
   type ProcessMeta,
@@ -481,13 +486,19 @@ async function runRecorderChecks(): Promise<void> {
 await checkAsync('crecPath produces conventional layout', async () => {
 const p = crecPath('/var/lib/cortex', asProcessId(42));
 assert(
-p === join('/var/lib/cortex', 'processes', '42.crec'),
+p === join('/var/lib/cortex', 'processes', '42', 'log.crec'),
 `unexpected path: ${p}`,
+);
+// A log written before 0.2.1 is still findable for reading.
+assert(
+legacyCrecPath('/var/lib/cortex', asProcessId(42)) ===
+join('/var/lib/cortex', 'processes', '42.crec'),
+'legacy flat path helper still resolves the old layout',
 );
 });
 
     await checkAsync('Recorder.open creates file with magic', async () => {
-      const rec = await Recorder.open({ pid: asProcessId(100), dir: tmp });
+      const rec = await Recorder.open({ pid: asProcessId(100), dir: join(tmp, '100') });
       assert(rec.currentOffset === asSyscallOffset(8), `expected offset 8, got ${rec.currentOffset}`);
       const buf = await readFile(rec.path);
       assert(buf.byteLength === 8, `expected 8-byte file, got ${buf.byteLength}`);
@@ -496,7 +507,7 @@ p === join('/var/lib/cortex', 'processes', '42.crec'),
     });
 
     await checkAsync('append + readRecords round-trips a record', async () => {
-      const rec = await Recorder.open({ pid: asProcessId(101), dir: tmp });
+      const rec = await Recorder.open({ pid: asProcessId(101), dir: join(tmp, '101') });
       const offset = await rec.append({
         timestamp: '2026-01-01T00:00:00.000Z',
         pid: asProcessId(101),
@@ -528,7 +539,7 @@ p === join('/var/lib/cortex', 'processes', '42.crec'),
     });
 
     await checkAsync('append serializes concurrent writes (no interleaving)', async () => {
-      const rec = await Recorder.open({ pid: asProcessId(102), dir: tmp });
+      const rec = await Recorder.open({ pid: asProcessId(102), dir: join(tmp, '102') });
       // Fire 50 appends concurrently. If serialization is broken, frames
       // will interleave and readRecords will fail or produce garbage.
       const promises = Array.from({ length: 50 }, (_, i) =>
@@ -563,7 +574,7 @@ p === join('/var/lib/cortex', 'processes', '42.crec'),
 
     await checkAsync('reopen appends to existing log (kernel restart)', async () => {
       const pid = asProcessId(103);
-      const rec1 = await Recorder.open({ pid, dir: tmp });
+      const rec1 = await Recorder.open({ pid, dir: join(tmp, String(unbrand(pid))) });
       await rec1.append({
         timestamp: '2026-01-01T00:00:00.000Z',
         pid,
@@ -579,7 +590,7 @@ p === join('/var/lib/cortex', 'processes', '42.crec'),
       await rec1.close();
 
       // Simulate kernel restart: reopen the same file.
-      const rec2 = await Recorder.open({ pid, dir: tmp });
+      const rec2 = await Recorder.open({ pid, dir: join(tmp, String(unbrand(pid))) });
       assert(
         rec2.currentOffset === offsetAfterFirst,
         `reopen should resume at ${offsetAfterFirst}, got ${rec2.currentOffset}`,
@@ -619,7 +630,7 @@ p === join('/var/lib/cortex', 'processes', '42.crec'),
 
     await checkAsync('readRecords discards torn frame at EOF', async () => {
       const pid = asProcessId(104);
-      const rec = await Recorder.open({ pid, dir: tmp });
+      const rec = await Recorder.open({ pid, dir: join(tmp, String(unbrand(pid))) });
       await rec.append({
         timestamp: '2026-01-01T00:00:00.000Z',
         pid,
@@ -655,7 +666,7 @@ p === join('/var/lib/cortex', 'processes', '42.crec'),
     });
 
     await checkAsync('append after close traps with ESTATE', async () => {
-      const rec = await Recorder.open({ pid: asProcessId(105), dir: tmp });
+      const rec = await Recorder.open({ pid: asProcessId(105), dir: join(tmp, '105') });
       await rec.close();
       let caught: unknown;
       try {
@@ -678,14 +689,14 @@ p === join('/var/lib/cortex', 'processes', '42.crec'),
     });
 
     await checkAsync('close is idempotent', async () => {
-      const rec = await Recorder.open({ pid: asProcessId(106), dir: tmp });
+      const rec = await Recorder.open({ pid: asProcessId(106), dir: join(tmp, '106') });
       await rec.close();
       await rec.close(); // should not throw
       assert(rec.closed === true, 'closed flag not set');
     });
 
     await checkAsync('oversized frame traps with EINVAL', async () => {
-      const rec = await Recorder.open({ pid: asProcessId(107), dir: tmp });
+      const rec = await Recorder.open({ pid: asProcessId(107), dir: join(tmp, '107') });
       const huge = 'x'.repeat(CREC_MAX_FRAME_SIZE + 1);
       let caught: unknown;
       try {
@@ -739,7 +750,7 @@ async function runProcessTableChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(tmp, String(unbrand(pid))) }),
     });
     tables.push(t);
     return t;
@@ -1102,7 +1113,7 @@ async function runSignalsChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(tmp, String(unbrand(pid))) }),
     });
     tables.push(t);
     return t;
@@ -1456,7 +1467,7 @@ async function runSignalsChecks(): Promise<void> {
       const table = new ProcessTable({
         kernelAbiVersion: KERNEL_ABI_VERSION,
         now: clock,
-        recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+        recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
       });
       tables.push(table);
       const pid = await spawnRunning(table);
@@ -1566,7 +1577,7 @@ async function runIpcChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(tmp, String(unbrand(pid))) }),
     });
     tables.push(t);
     return t;
@@ -2091,7 +2102,7 @@ async function runIpcChecks(): Promise<void> {
       const table = new ProcessTable({
         kernelAbiVersion: KERNEL_ABI_VERSION,
         now: clock,
-        recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+        recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
       });
       tables.push(table);
       const a = await spawnRunning(table, 'a');
@@ -2133,7 +2144,7 @@ async function runIpcChecks(): Promise<void> {
       const table = new ProcessTable({
         kernelAbiVersion: KERNEL_ABI_VERSION,
         now: clock,
-        recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+        recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
       });
       tables.push(table);
       const b = await spawnRunning(table, 'b');
@@ -2269,7 +2280,7 @@ async function runMemoryChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(tmp, String(unbrand(pid))) }),
     });
     tables.push(t);
     return t;
@@ -2809,7 +2820,7 @@ async function runMemoryChecks(): Promise<void> {
     const table = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
     });
     tables.push(table);
     const pid = await spawnRunning(table);
@@ -2847,7 +2858,7 @@ async function runMemoryChecks(): Promise<void> {
     const table = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
     });
     tables.push(table);
     const pid = await spawnRunning(table);
@@ -2877,7 +2888,7 @@ async function runMemoryChecks(): Promise<void> {
     const table = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
     });
     tables.push(table);
     const pid = await spawnRunning(table);
@@ -2926,7 +2937,7 @@ async function runCheckpointChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: tmp }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(tmp, String(unbrand(pid))) }),
     });
     tables.push(t);
     return t;
@@ -3328,7 +3339,7 @@ async function runCheckpointChecks(): Promise<void> {
     const table = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
     });
     tables.push(table);
     const pid = await spawnRunning(table);
@@ -3360,7 +3371,7 @@ async function runCheckpointChecks(): Promise<void> {
     const table = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir: sub }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
     });
     tables.push(table);
     const pid = await spawnRunning(table);
@@ -3411,7 +3422,7 @@ async function runForkChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      recorderFactory: async (pid) => Recorder.open({ pid, dir }),
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(dir, String(unbrand(pid))) }),
     });
     tables.push(t);
     return t;
@@ -3932,7 +3943,7 @@ async function runSchedulerChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      ...(record ? { recorderFactory: async (pid) => Recorder.open({ pid, dir }) } : {}),
+      ...(record ? { recorderFactory: async (pid) => Recorder.open({ pid, dir: join(dir, String(unbrand(pid))) }) } : {}),
     });
     tables.push(t);
     return t;
@@ -4349,7 +4360,7 @@ async function runInitChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      ...(record ? { recorderFactory: async (pid) => Recorder.open({ pid, dir }) } : {}),
+      ...(record ? { recorderFactory: async (pid) => Recorder.open({ pid, dir: join(dir, String(unbrand(pid))) }) } : {}),
     });
     tables.push(t);
     return t;
@@ -4895,7 +4906,7 @@ async function runDispatcherChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      ...(record ? { recorderFactory: async (pid) => Recorder.open({ pid, dir }) } : {}),
+      ...(record ? { recorderFactory: async (pid) => Recorder.open({ pid, dir: join(dir, String(unbrand(pid))) }) } : {}),
     });
     tables.push(t);
     return t;
@@ -6782,7 +6793,7 @@ async function runMockLLMChecks(): Promise<void> {
     const t = new ProcessTable({
       kernelAbiVersion: KERNEL_ABI_VERSION,
       now: clock,
-      ...(opts.record === true ? { recorderFactory: async (pid) => Recorder.open({ pid, dir }) } : {}),
+      ...(opts.record === true ? { recorderFactory: async (pid) => Recorder.open({ pid, dir: join(dir, String(unbrand(pid))) }) } : {}),
     });
     tables.push(t);
     return t;
@@ -6981,7 +6992,11 @@ async function runBootChecks(): Promise<void> {
         reg.registerLLM(mock);
       },
       ...(record
-        ? { recorderFactory: async (pid: ProcessIdAlias) => Recorder.open({ pid, dir: procDir as string }) }
+        ? {
+            recorderFactory: async (pid: ProcessIdAlias) =>
+              // One directory per process: the log is `<processes>/<pid>/log.crec`.
+              Recorder.open({ pid, dir: join(procDir as string, String(unbrand(pid))) }),
+          }
         : { recorderFactory: nullRecorderFactory }),
       ...overrides,
     });
@@ -7011,9 +7026,9 @@ async function runBootChecks(): Promise<void> {
     assert((caught as CortexError).errno === errno, `expected ${errno}, got ${(caught as CortexError).errno}`);
   }
 
-  // Recorder.open writes flat `<dir>/<pid>.crec`; read the exit record back.
+  // The kernel writes one directory per process: `<procDir>/<pid>/log.crec`.
   async function readExit(procDir: string, pid: ProcessIdAlias): Promise<{ code: number; reason: string } | undefined> {
-    const path = join(procDir, `${unbrand(pid)}.crec`);
+    const path = join(procDir, String(unbrand(pid)), 'log.crec');
     const records: SyscallRecord[] = [];
     for await (const r of readRecords(path)) records.push(r);
     const rec = records.find((r) => r.syscall === 'exit' && r.phase === 'exit');
@@ -7039,7 +7054,7 @@ async function runBootChecks(): Promise<void> {
     await k.settle();
 
     const records: SyscallRecord[] = [];
-    for await (const r of readRecords(join(procDir as string, `${unbrand(pid)}.crec`))) {
+    for await (const r of readRecords(join(procDir as string, String(unbrand(pid)), 'log.crec'))) {
       records.push(r);
     }
     const nowRec = records.find((r) => r.syscall === 'now');
@@ -9017,7 +9032,7 @@ async function runDiffChecks(): Promise<void> {
     const prevLog = console.log;
     const prevErr = console.error;
     try {
-      const parent = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes') });
+      const parent = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
       await parent.append({
         timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(2), syscall: 'llm_call',
         callId: 'p1', phase: 'exit', result: { text: 'shared thought' },
@@ -9046,7 +9061,7 @@ async function runDiffChecks(): Promise<void> {
       await parent.flush();
       await parent.close();
 
-      const child = await Recorder.open({ pid: asProcessId(3), dir: join(tmp, 'processes') });
+      const child = await Recorder.open({ pid: asProcessId(3), dir: join(tmp, 'processes', '3') });
       await child.append({
         timestamp: '2026-01-01T00:00:05.000Z', pid: asProcessId(3), syscall: 'llm_call',
         callId: 'c1', phase: 'exit', result: { text: 'branch B answer' },
@@ -9121,7 +9136,7 @@ async function runDiffChecks(): Promise<void> {
     const prevLog = console.log;
     const prevErr = console.error;
     try {
-      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes') });
+      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
       for (let i = 0; i < 3; i++) {
         await rec.append({
           timestamp: `2026-01-01T00:00:0${i}.000Z`, pid: asProcessId(2), syscall: 'llm_call',
@@ -9177,7 +9192,7 @@ async function runDiffChecks(): Promise<void> {
     const prevErr = console.error;
     try {
       process.env['CORTEX_HOME'] = tmp;
-      const rec = await Recorder.open({ pid: asProcessId(5), dir: join(tmp, 'processes') });
+      const rec = await Recorder.open({ pid: asProcessId(5), dir: join(tmp, 'processes', '5') });
       await rec.append({
         timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(5), syscall: 'llm_call',
         callId: 'p0', phase: 'exit', result: { text: 'seed' },
@@ -9576,7 +9591,7 @@ function runRegionsChecks(): void {
 // =============================================================================
 
 async function runCliChecks(): Promise<void> {
-  const { mkdtempSync, rmSync, existsSync, mkdirSync } = await import('node:fs');
+  const { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, unlinkSync } = await import('node:fs');
   const { join } = await import('node:path');
   const { tmpdir } = await import('node:os');
   const tmp = mkdtempSync(join(tmpdir(), 'cortex-cli-'));
@@ -9584,9 +9599,46 @@ async function runCliChecks(): Promise<void> {
     // Create processes dir.
     mkdirSync(join(tmp, 'processes'), { recursive: true });
 
-    check('metaPath produces conventional layout', () => {
+    check('metaPath produces the per-process layout', () => {
       const p = metaPath(tmp, asProcessId(7));
-      assert(p === join(tmp, 'processes', '7.meta.json'), `path: ${p}`);
+      assert(p === join(tmp, 'processes', '7', 'meta.json'), `path: ${p}`);
+      assert(
+        legacyMetaPath(tmp, asProcessId(7)) === join(tmp, 'processes', '7.meta.json'),
+        'legacy meta path helper still resolves the old layout',
+      );
+    });
+
+    check('readMeta reads a pre-0.2.1 flat meta.json', () => {
+      // An upgrade must not make old processes invisible: write the legacy
+      // file, then read it back through the normal reader.
+      const legacy = legacyMetaPath(tmp, asProcessId(91));
+      writeFileSync(
+        legacy,
+        JSON.stringify({
+          pid: 91,
+          ppid: 1,
+          pgid: 91,
+          role: 'legacy',
+          state: 'zombie',
+          exitCode: 0,
+          exitReason: 'completed',
+          startedAt: '2026-01-01T00:00:00.000Z',
+          lastTransitionAt: '2026-01-01T00:00:00.000Z',
+          budgetsSpent: { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 0, syscallCount: 0 },
+          budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+          agent: { system: 'old' },
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        }),
+        'utf8',
+      );
+      const back = readMeta(tmp, asProcessId(91));
+      assert(back !== undefined && back.role === 'legacy', 'a flat legacy meta is still readable');
+      assert(readAllMetas(tmp).some((m) => m.pid === 91), 'and it shows up in readAllMetas');
+      assert(maxPidOnDisk(tmp) >= 91, 'and it seeds the PID counter');
+      // Remove the synthetic legacy file so it does not pollute the later
+      // `maxPidOnDisk returns highest PID` check (which expects the highest
+      // meta PID written below, not this synthetic 91).
+      try { if (existsSync(legacy)) unlinkSync(legacy); } catch { /* ignore */ }
     });
 
     check('writeMeta + readMeta round-trips', () => {
@@ -9698,9 +9750,10 @@ async function runCliChecks(): Promise<void> {
       }
     });
 
-    check('crecPath uses processes/ not proc/', () => {
+    check('crecPath uses processes/<pid>/ not a flat processes/', () => {
       const p = crecPath(tmp, asProcessId(42));
-      assert(p === join(tmp, 'processes', '42.crec'), `path: ${p}`);
+      assert(p === join(tmp, 'processes', '42', 'log.crec'), `path: ${p}`);
+      assert(!p.includes('proc/'), 'still not the stale proc/ path');
     });
 
     check('advancePidCounterTo prevents PID reuse across invocations', () => {
@@ -9721,7 +9774,7 @@ async function runCliChecks(): Promise<void> {
     });
 
     await checkAsync('readExitRecord recovers the real exit code from .crec', async () => {
-      const rec = await Recorder.open({ pid: asProcessId(501), dir: join(tmp, 'processes') });
+      const rec = await Recorder.open({ pid: asProcessId(501), dir: join(tmp, 'processes', '501') });
       await rec.append({
         timestamp: '2026-01-01T00:00:00.000Z',
         pid: asProcessId(501),
@@ -9743,7 +9796,7 @@ async function runCliChecks(): Promise<void> {
     });
 
     await checkAsync('readExitRecord returns undefined when no exit was recorded', async () => {
-      const rec = await Recorder.open({ pid: asProcessId(502), dir: join(tmp, 'processes') });
+      const rec = await Recorder.open({ pid: asProcessId(502), dir: join(tmp, 'processes', '502') });
       await rec.append({
         timestamp: '2026-01-01T00:00:00.000Z',
         pid: asProcessId(502),
@@ -9763,7 +9816,7 @@ async function runCliChecks(): Promise<void> {
     });
 
     await checkAsync('findCheckpointByTag resolves tag -> chainId from .crec', async () => {
-      const rec = await Recorder.open({ pid: asProcessId(503), dir: join(tmp, 'processes') });
+      const rec = await Recorder.open({ pid: asProcessId(503), dir: join(tmp, 'processes', '503') });
       await rec.append({
         timestamp: '2026-01-01T00:00:00.000Z',
         pid: asProcessId(503),
@@ -9939,8 +9992,14 @@ async function runDaemonChecks(): Promise<void> {
       });
       const code = await cmdDaemon(['run', 'crasher', '--max-runtime-ms', '500']);
       assert(code === 0, `run exit 0, got ${code}`);
-      const crecs = readdirSync(join(tmp, 'processes')).filter((f) => f.endsWith('.crec'));
-      assert(crecs.length >= 2, `restart produced >= 2 .crec files (got ${crecs.length})`);
+      // Logs now live at processes/<pid>/log.crec, one directory per process.
+      const procRoot = join(tmp, 'processes');
+      const crecs = existsSync(procRoot)
+        ? readdirSync(procRoot).filter(
+            (name) => /^\d+$/.test(name) && existsSync(join(procRoot, name, 'log.crec')),
+          )
+        : [];
+      assert(crecs.length >= 2, `restart produced >= 2 process logs (got ${crecs.length})`);
     });
 
     await checkAsync('cortex daemon run with an unknown name fails', async () => {

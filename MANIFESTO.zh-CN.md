@@ -2,8 +2,10 @@
 
 *An operating system for AI agents. / 一个给 AI Agent 用的操作系统。*
 
-> **状态：** `v0.2.0` —— 第一个不只是修缺陷、而是真正补上 v0 缺口的版本：`sleep()`
-> 真的会挂起进程，restore 出来的进程自己会跑，同步 syscall 开始写进日志；另外新增
+> **状态：** `v0.2.1` —— 文档承诺的四个 v0 缺口现已全部补上：`sleep()`
+> 真的会挂起进程，restore 出来的进程自己会跑，同步 syscall 开始写进日志；`0.2.1`
+> 把第四件事也补上了——持久化布局现在是 ARCHITECTURE §7 描述的每进程子树
+> （`processes/<pid>/{log.crec, meta.json, checkpoints/}`）。另外新增
 > `cortex top`，一个陌生人五分钟能看懂的视图。Phase 0–5 全部完成：内核能启动，
 > 七个驱动全部交付，CLI 完整，三个 demo 端到端跑通。这份文档讲的是**为什么**，
 > 它没有变过。

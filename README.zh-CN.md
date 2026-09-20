@@ -2,7 +2,7 @@
 
 > AI agent 的操作系统。
 
-[![release](https://img.shields.io/badge/release-v0.2.0-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v0.2.1-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -102,7 +102,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 479 项断言，0 失败
+npx tsx scripts/smoke.ts                # 513 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -111,7 +111,7 @@ npx tsx scripts/smoke.ts                # 479 项断言，0 失败
 
 ## 当前状态
 
-**已发布 [`v0.2.0`](./CHANGELOG.md)**（2026-09-20）—— 第一个不只是修缺陷、而是真正补上 v0 缺口的版本。`v0.1.x` 做的是正确性加固（复审 `0.1.2` 发现的九个缺陷、文件系统 symlink 沙箱逃逸、SQLite region 名冲突、wall-clock 预算扣减、原子化的 `send()`、可用的 memory 写入上限）。`0.2.0` 让三件「文档早就承诺、代码却没做到」的事成真：`sleep()` 真的挂起进程而不是让它保持在 RUNNING；restore 出来的进程自己会跑而不是卡在 NEW；同步 syscall（`now` / `random` / `on_signal`）写进 `.crec`，回放不必再相信注入的时钟。另外新增 **`cortex top`**。这个 `0.x` 是诚实的：syscall ABI 到 `1.0.0` 才冻结，所以小版本提升可能带破坏性变更 —— 这次就有（`blockedOn` 多了一个 `sleep` 变体）。今天要基于 Cortex 开发的话，请锁死确切版本。（Phase 是建设阶段，版本号才是发布。）
+**已发布 [`v0.2.1`](./CHANGELOG.md)**（2026-09-20）—— 文档承诺的四个 v0 缺口现已全部补上。`v0.1.x` 做的是正确性加固（复审 `0.1.2` 发现的九个缺陷、文件系统 symlink 沙箱逃逸、SQLite region 名冲突、wall-clock 预算扣减、原子化的 `send()`、可用的 memory 写入上限）。`0.2.0` 让其中三件「文档早就承诺、代码却没做到」的事成真：`sleep()` 真的挂起进程而不是让它保持在 RUNNING；restore 出来的进程自己会跑而不是卡在 NEW；同步 syscall（`now` / `random` / `on_signal`）写进 `.crec`，回放不必再相信注入的时钟；另外新增 **`cortex top`**。`0.2.1` 补上最后一个：持久化布局现在是 ARCHITECTURE §7 描述的「每进程一棵子树」（`processes/<pid>/{log.crec, meta.json, checkpoints/}`），删掉一个进程就是 `rm -rf processes/<pid>`，而 `0.2.1` 之前写的 `.cortex` 在首次读取时会自动升级。这个 `0.x` 是诚实的：syscall ABI 到 `1.0.0` 才冻结，所以小版本提升可能带破坏性变更 —— 这次就有（`blockedOn` 多了一个 `sleep` 变体）。今天要基于 Cortex 开发的话，请锁死确切版本。（Phase 是建设阶段，版本号才是发布。）
 
 **Phase 0 — 设计（完成）。** 四份文档 v0 落地：`STATE.md`（最难的那份）、`PROCESS.md`（生命周期）、`ABI.md`（syscall 契约）、`ARCHITECTURE.md`（内核模块）。每份文档末尾的 open questions 是有意滚动记录的，会随着实现逼出决定而解决。
 

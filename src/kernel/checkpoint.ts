@@ -157,6 +157,22 @@ export interface CheckpointManagerOptions {
   readonly kernelAbiVersion: string;
   /** Directory where `.csnap` files are written. Created on demand. */
   readonly dir: string;
+  /**
+   * Per-process checkpoint directory. When supplied, a checkpoint is written
+   * next to the process that took it — `<processesRoot>/<pid>/checkpoints/`
+   * (docs/ARCHITECTURE.md §7) — instead of into the single shared `dir`.
+   *
+   * Omit it and every process writes into `dir`, which is the pre-`0.2.1`
+   * behaviour and is still supported.
+   */
+  readonly dirFor?: (pid: ProcessId) => string | Promise<string>;
+  /**
+   * Root to search when a chainId is not in the in-memory index. Needed
+   * because `load()` knows only the chainId, not the PID, so with per-process
+   * directories resolving it means looking through the tree. When omitted,
+   * only `dir` is scanned.
+   */
+  readonly processesRoot?: string;
   /** Wall-clock source. Injectable for tests. */
   readonly now?: () => Timestamp;
   /** Chain-id source. Injectable for deterministic tests. */
@@ -217,6 +233,8 @@ export class CheckpointManager {
   #driverStateSource: CheckpointManagerOptions['driverStateSource'];
   #restoreContext: CheckpointManagerOptions['restoreContext'];
   #defaultMemoryBacking: string;
+  #dirFor: CheckpointManagerOptions['dirFor'];
+  #processesRoot: string | undefined;
 
   /** chainId → ref, for O(1) load within a session. */
   #index = new Map<string, CheckpointRef>();
@@ -225,6 +243,8 @@ export class CheckpointManager {
     this.#table = opts.table;
     this.kernelAbiVersion = opts.kernelAbiVersion;
     this.dir = opts.dir;
+    this.#dirFor = opts.dirFor;
+    this.#processesRoot = opts.processesRoot;
     this.#now = opts.now ?? (() => new Date().toISOString());
     this.#nextChainId = opts.nextChainId ?? (() => asChainId(randomUUID()));
     this.#memory = opts.memory ?? null;
@@ -311,9 +331,11 @@ export class CheckpointManager {
         Buffer.from(signature),
       ]);
 
-      const path = join(this.dir, `${safeTimestamp(createdAt)}_${unbrand(chainId)}.csnap`);
+      const outDir =
+        this.#dirFor === undefined ? this.dir : await this.#dirFor(pid);
+      const path = join(outDir, `${safeTimestamp(createdAt)}_${unbrand(chainId)}.csnap`);
       try {
-        await mkdir(this.dir, { recursive: true });
+        await mkdir(outDir, { recursive: true });
         await writeFile(path, fileBytes);
       } catch (err) {
         throw new CortexError('ERECORD', 'checkpoint', {
@@ -450,25 +472,60 @@ export class CheckpointManager {
     };
   }
 
-  /** Find a checkpoint's path: in-memory index first, then a directory scan. */
+  /**
+   * Find a checkpoint's path: in-memory index first, then a directory scan.
+   *
+   * `load()` is given a chainId and nothing else, so it cannot know which
+   * process owns the checkpoint. With per-process directories (`dirFor`) that
+   * turns resolution into a search:
+   *
+   *   1. the in-memory index (covers anything taken in this session),
+   *   2. the shared `dir` (legacy flat layout, and the only place scanned when
+   *      `dirFor` was never supplied),
+   *   3. `<processesRoot>/<pid>/checkpoints/` for each process on disk.
+   *
+   * It is a scan rather than an index because a checkpoint has to be loadable
+   * after a kernel restart, by chainId, with no side index to keep in sync.
+   */
   async #resolvePath(chainId: ChainId): Promise<string> {
     const key = unbrand(chainId);
     const hit = this.#index.get(key);
     if (hit !== undefined) return hit.path;
 
+    const suffix = `_${key}.csnap`;
+    const found = await this.#findIn(this.dir, suffix);
+    if (found !== undefined) return found;
+
+    if (this.#processesRoot !== undefined) {
+      let procNames: string[];
+      try {
+        procNames = await readdir(this.#processesRoot);
+      } catch {
+        procNames = [];
+      }
+      for (const name of procNames) {
+        if (!/^\d+$/.test(name)) continue;
+        const inProcess = await this.#findIn(
+          join(this.#processesRoot, name, 'checkpoints'),
+          suffix,
+        );
+        if (inProcess !== undefined) return inProcess;
+      }
+    }
+
+    trap('ENOENT', 'load', { chainId: key, reason: 'no such checkpoint' });
+  }
+
+  /** Look for `*_<chainId>.csnap` in one directory. Returns undefined if absent. */
+  async #findIn(dir: string, suffix: string): Promise<string | undefined> {
     let names: string[];
     try {
-      names = await readdir(this.dir);
+      names = await readdir(dir);
     } catch {
-      trap('ENOENT', 'load', { chainId: key, reason: 'checkpoint directory missing' });
+      return undefined;
     }
-    const suffix = `_${key}.csnap`;
     const match = names.find((n) => n.endsWith(suffix));
-    if (match === undefined) {
-      trap('ENOENT', 'load', { chainId: key, reason: 'no such checkpoint' });
-    }
-    const path = join(this.dir, match as string);
-    return path;
+    return match === undefined ? undefined : join(dir, match);
   }
 
   // ---------------------------------------------------------------------------

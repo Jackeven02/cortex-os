@@ -33,6 +33,42 @@ exact version.
 
 ---
 
+## [0.2.1] — 2026-09-20
+
+Closes the last of the four v0 gaps: the on-disk layout is now the per-process
+subtree ARCHITECTURE §7 always described. `Recorder.open` writes `log.crec`
+inside the process's own directory (`processes/<pid>/{log.crec, meta.json,
+checkpoints/}`), created on first open, so `rm -rf processes/<pid>` removes the
+process's entire footprint — log, index and checkpoints — with no global index
+to sweep. `CheckpointManager` gained a `dirFor(pid)` and scans the tree when it
+must resolve a checkpoint by chainId.
+
+### Changed
+
+- **Per-process persistence subtree.** The flat `processes/<pid>.crec` +
+  `<pid>.meta.json` + one shared `checkpoints/` is replaced by
+  `processes/<pid>/{log.crec, meta.json, checkpoints/}`. `boot.ts`,
+  `recorder.ts`, `checkpoint.ts`, `process_store.ts` and the CLI path helpers
+  (`crecPath` / `metaPath` / `procDir` / `procCheckpointsDir`) all resolve under
+  it; `existingCrecPath` returns the new path when present, the legacy flat file
+  otherwise.
+- **Legacy homes still read.** `existingCrecPath`, `readMeta`, `maxPidOnDisk`
+  and `findCheckpointByTag` fall back to the pre-`0.2.1` flat files (`processes/
+  <pid>.crec` / `<pid>.meta.json`, shared `checkpoints/`), so a home written by
+  an older build upgrades transparently on first read. `maxPidOnDisk` keeps
+  scanning both layouts — a forked child has a `.crec` but no `.meta.json`, and
+  counting the raw `.crec` is what stops the PID counter reusing a dead child's
+  file.
+
+### Still open (honestly)
+
+- Nothing in the original four-gap list remains. The kernel now does everything
+  the v0 documents promised: `sleep()` parks, a restored process runs on its
+  own, the synchronous syscalls are recorded, and the persistence layout is the
+  per-process subtree.
+
+Smoke: 512 → 513 checks.
+
 ## [0.2.0] — 2026-09-20
 
 The first release that closes v0 gaps instead of only patching defects. Three of
@@ -552,6 +588,7 @@ These are deliberate `v0` boundaries, not oversights. Each is recorded in
 - Sandbox fork, shadow process, `cortex gc`, and `cortex doctor` are post-v0.
 
 [0.1.8]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.8
+[0.2.1]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.2.0
 [0.1.7]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.7
 [0.1.6]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.6

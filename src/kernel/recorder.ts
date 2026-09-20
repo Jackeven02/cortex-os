@@ -68,8 +68,9 @@
  * @module kernel/recorder
  */
 
-import { open, readFile } from 'node:fs/promises';
+import { mkdir, open, readFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { encode, decode } from 'cborg';
 
@@ -126,11 +127,16 @@ export type SyscallRecordInput = Omit<SyscallRecord, 'byteOffset'>;
  * Options for opening a recorder.
  */
 export interface RecorderOptions {
-  /** Process whose syscalls this log records. Used in the filename. */
+  /** Process whose syscalls this log records. */
   readonly pid: ProcessId;
   /**
-   * Directory containing the .crec file. Created if it does not exist.
-   * Conventionally `.cortex/proc/` per docs/ARCHITECTURE.md §7.
+   * The process's own directory — the log is written as `<dir>/log.crec`.
+   * Created if it does not exist. Conventionally
+   * `.cortex/processes/<pid>/` per docs/ARCHITECTURE.md §7.
+   *
+   * Up to `0.2.0` this was the shared `processes/` root and the file was named
+   * `<pid>.crec`; passing a shared directory now would make every process
+   * write to the same `log.crec`.
    */
   readonly dir: string;
   /**
@@ -191,8 +197,20 @@ export class Recorder {
    * @throws CortexError ERECORD on I/O failure, EINVAL on magic mismatch.
    */
   static async open(opts: RecorderOptions): Promise<Recorder> {
-    const filename = `${unbrand(opts.pid)}${CREC_EXTENSION}`;
-    const path = join(opts.dir, filename);
+    // `dir` is the process's OWN directory, so the log is always `log.crec`
+    // (docs/ARCHITECTURE.md §7: `processes/<pid>/log.crec`). Up to `0.2.0` the
+    // caller passed the shared `processes/` root and the file was named for the
+    // pid; the pid is now carried by the directory, which is what lets one
+    // `rm -rf` remove a process's whole footprint.
+    const path = join(opts.dir, `log${CREC_EXTENSION}`);
+
+    // The directory may not exist yet — a process's own subdirectory is
+    // created the first time its log is opened (docs/ARCHITECTURE.md §7).
+    try {
+      await mkdir(opts.dir, { recursive: true });
+    } catch (err) {
+      throw wrapIoError('Recorder.open', opts.dir, err);
+    }
 
     let handle: FileHandle;
     try {
@@ -541,17 +559,49 @@ export async function effectiveEof(path: string): Promise<SyscallOffset> {
 /**
  * Conventional path for a process's syscall log.
  *
- * `.cortex/processes/<pid>.crec`
+ * `.cortex/processes/<pid>/log.crec`
  *
- * This matches the `processesDir` that `boot.ts` passes to `Recorder.open`
- * (default `<dir>/processes`). The earlier doc comment said `proc/` which
- * was a spec/impl mismatch — the recorder has always written to
- * `processes/` (see `boot.ts` §2 `processesDir`).
+ * One directory per process (docs/ARCHITECTURE.md §7), so `rm -rf` of a single
+ * process removes everything it ever wrote — its log, its metadata index and
+ * its checkpoints — with no global index left to sweep.
  *
- * See docs/ARCHITECTURE.md §7 for the full persistence layout.
+ * Until `0.2.1` this was the flat `.cortex/processes/<pid>.crec`. Logs written
+ * by older builds are still read: see `existingCrecPath`.
  */
 export function crecPath(rootDir: string, pid: ProcessId): string {
+  return join(rootDir, 'processes', String(unbrand(pid)), `log${CREC_EXTENSION}`);
+}
+
+/**
+ * The pre-`0.2.1` layout: `.cortex/processes/<pid>.crec`. Kept so a reader can
+ * fall back to a log written by an older build instead of reporting the process
+ * as having no history at all.
+ */
+export function legacyCrecPath(rootDir: string, pid: ProcessId): string {
   return join(rootDir, 'processes', `${unbrand(pid)}${CREC_EXTENSION}`);
+}
+
+/** The directory holding everything one process ever wrote. */
+export function processDir(rootDir: string, pid: ProcessId): string {
+  return join(rootDir, 'processes', String(unbrand(pid)));
+}
+
+/** The directory holding one process's checkpoints. */
+export function checkpointsDir(rootDir: string, pid: ProcessId): string {
+  return join(processDir(rootDir, pid), 'checkpoints');
+}
+
+/**
+ * Resolve a process's log for **reading**: the current layout if it is there,
+ * otherwise the legacy flat file, otherwise the current path (so a caller that
+ * is about to create it gets the right one).
+ */
+export function existingCrecPath(rootDir: string, pid: ProcessId): string {
+  const current = crecPath(rootDir, pid);
+  if (existsSync(current)) return current;
+  const legacy = legacyCrecPath(rootDir, pid);
+  if (existsSync(legacy)) return legacy;
+  return current;
 }
 
 // =============================================================================
