@@ -57,7 +57,7 @@
  * @module examples/supervision-tree
  */
 
-import type { CortexContext, MemoryRegionPolicy } from '../src/index.js';
+import type { CortexContext, MemoryRegionPolicy } from 'cortex-agent-os';
 
 /**
  * How the planner points its children back at this file.

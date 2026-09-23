@@ -4,6 +4,13 @@ build/
 *.tsbuildinfo
 *.tgz
 
+# tsc emits to dist/ only. Any compiled output that lands in src/ (or anywhere
+# else) is an accidental emit and must never be committed.
+src/**/*.js
+src/**/*.js.map
+src/**/*.d.ts
+src/**/*.d.ts.map
+
 # Dependencies
 node_modules/
 

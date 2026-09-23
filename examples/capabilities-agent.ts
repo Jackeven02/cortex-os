@@ -29,7 +29,7 @@
  * of them into EPERM traps the moment they upgraded. Narrowing is opt-in.
  */
 
-import type { CortexContext } from '../src/index.js';
+import type { CortexContext } from 'cortex-agent-os';
 
 export default async function capabilitiesAgent(ctx: CortexContext): Promise<void> {
   console.log(`held: ${ctx.caps().join(', ') || '(none)'}`);

@@ -38,7 +38,7 @@
  * @module examples/checkpoint-agent
  */
 
-import type { CortexContext } from '../src/index.js';
+import type { CortexContext } from 'cortex-agent-os';
 
 const TAG = 'inbox-watcher';
 const PROGRESS = 'episodic'; // survives the checkpoint

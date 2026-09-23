@@ -38,6 +38,31 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ---
 
+## [1.0.2] — 2026-09-23
+
+### Fixed — the bundled demos actually load for an npm user
+
+`1.0.1` shipped `examples/` in the tarball, but that only exposed the second bug:
+Node refuses to type-strip `.ts` files **under `node_modules`**
+(`Stripping types is currently unsupported for files under node_modules`), so
+`cortex spawn --module ./examples/hello-agent.ts` still died with
+`code 127: agent load failed` for a real `npm i` user. Worse, the README told
+those users to run `./examples/<x>.ts` against their **cwd**, where the folder
+does not exist.
+
+- Examples are now **compiled to plain JS** in `dist/examples/` (`tsc -p
+  tsconfig.examples.json`, added to `build`), so they load on every Node in
+  `engines` with no type-stripping caveats.
+- New **`cortex example <name>`** command resolves the bundled module relative
+  to the *package itself* and forwards to `spawn` with the demo's default role.
+  No paths, no flags: `cortex example hello`, `cortex example demo-a`,
+  `cortex example caps --cap tool:dangerous`.
+- Both READMEs now point at `cortex example` and drop the inaccurate "Node
+  22.18 type stripping" workaround (it never applied under `node_modules`).
+
+No kernel or ABI change — this is a packaging and CLI patch. The `.ts` sources
+still ship and still work straight from a clone with `tsx`.
+
 ## [1.0.1] — 2026-09-23
 
 ### Fixed — the README's demos did not work for an npm user

@@ -29,6 +29,7 @@ COMMANDS
   limit        Set or show resource budgets per process
   audit        Surface tools untagged for reversibility
   daemon       Register/run long-lived supervised agents (install/list/uninstall/run)
+  example      Run one of the agent modules bundled with cortex
   help         Show this help
 
 GLOBAL OPTIONS
@@ -48,6 +49,8 @@ EXAMPLES
   cortex attach 1234
   cortex limit 1234 --tokens 10000
   cortex audit
+  cortex example hello
+  cortex example supervision-tree
 
 ENVIRONMENT
   CORTEX_HOME          Kernel state directory (default: ./.cortex)

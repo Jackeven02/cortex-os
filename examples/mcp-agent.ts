@@ -19,7 +19,7 @@
  * @module examples/mcp-agent
  */
 
-import type { CortexContext } from '../src/index.js';
+import type { CortexContext } from 'cortex-agent-os';
 
 export default async function mcpAgent(ctx: CortexContext): Promise<void> {
   // 1. Call an MCP tool. From the agent's side this is indistinguishable from

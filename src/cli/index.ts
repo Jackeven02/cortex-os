@@ -61,6 +61,7 @@ import { cmdDiff } from './commands/diff.js';
 import { cmdSend } from './commands/send.js';
 import { cmdLimit } from './commands/limit.js';
 import { cmdAudit } from './commands/audit.js';
+import { cmdExample } from './commands/example.js';
 import { cmdHelp } from './commands/help.js';
 
 // =============================================================================
@@ -109,6 +110,9 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdLimit(rest);
       case 'audit':
         return await cmdAudit(rest);
+      case 'example':
+      case 'examples':
+        return await cmdExample(rest);
       case 'help':
       case '--help':
       case '-h':

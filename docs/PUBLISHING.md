@@ -85,10 +85,11 @@ Three things to confirm in the output of 3 and 4:
   `./dist/cli/index.js` work, but writing it the way npm wants keeps the
   output warning-free.)
 - **The doc set ships.** `files` covers `dist`, both READMEs, both manifestos,
-  `CHANGELOG.md`, `assets/` and `docs/`. `examples/` is deliberately **not**
-  shipped: the examples import `../src/index.js`, and `src/` is not published,
-  so shipping them would ship broken code. They live in the repo for people who
-  clone.
+  `CHANGELOG.md`, `assets/` and `docs/`. `examples/` **ships too** — the `.ts`
+  sources for people who clone, plus their compiled `dist/examples/*.js` so that
+  `cortex example <name>` works for an `npm i` user. The `.ts` files import from
+  the package name (`cortex-agent-os`), not from `../src/...`, precisely so they
+  can be published without dragging `src/` along.
 
 ---
 

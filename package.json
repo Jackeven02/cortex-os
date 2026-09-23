@@ -1,6 +1,6 @@
 {
   "name": "cortex-agent-os",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "An operating system for AI agents.",
   "type": "module",
   "license": "MIT",
@@ -44,7 +44,9 @@
   ],
   "scripts": {
     "prepublishOnly": "npm run build",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.examples.json",
+    "build:kernel": "tsc -p tsconfig.json",
+    "build:examples": "tsc -p tsconfig.examples.json",
     "dev": "tsx watch src/index.ts",
     "test": "node --test --import tsx tests/**/*.test.ts",
     "smoke": "tsx scripts/smoke.ts",

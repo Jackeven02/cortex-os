@@ -36,7 +36,7 @@
  * @module examples/fork-compare-agent
  */
 
-import type { CortexContext } from '../src/index.js';
+import type { CortexContext } from 'cortex-agent-os';
 
 const REGION = 'episodic';
 const SHARED = 'semantic';

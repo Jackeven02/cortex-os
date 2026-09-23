@@ -97,11 +97,12 @@ npx cortex-agent-os help
 Requires **Node 22+**. One runtime dependency (`cborg`, for the syscall log), and
 no API key is needed to try it — the mock driver is deterministic and offline.
 
-`examples/` ships **inside the package**, so the demos below work straight after
-`npm i -g`. They are `.ts` files, loaded by Node's type stripping: that is on by
-default from **Node 22.18+**, so on earlier 22.x prefix your command with
-`NODE_OPTIONS=--experimental-strip-types`. If you would rather not think about
-it at all, `cortex spawn --role coder --task "..."` needs no `.ts` file.
+`examples/` ships **inside the package** — compiled to plain JS in
+`dist/examples/`, so the demos below run for a real `npm i` user with no extra
+flags and no Node-version caveats (`cortex example hello` works on every Node in
+`engines`). The `.ts` sources are also included and run straight from a clone
+with `tsx`. If you would rather not think about it at all, `cortex spawn --role
+coder --task "..."` needs no module file — `cortex` has a built-in prompt agent.
 
 Working on Cortex itself instead? Clone it and run the suite:
 
@@ -146,7 +147,7 @@ Demo A is worth calling out because it changed the kernel: agents used to run to
 The planner spawns three coders, each of which generates one section of a real README for a fictional library ("tinylog") and publishes it to a shared `semantic` memory region. One coder ("api") hangs — a model call that never returns — so the planner notices a bounded `wait`, kills it, spawns a replacement, and assembles the finished README from the three sections:
 
 ```bash
-$ cortex spawn --role planner --module ./examples/supervision-tree.ts
+$ cortex example supervision-tree        # or: cortex example demo-a
 [planner pid 2] spawning 3 coders (tinylog README)
 [coder api pid 5] slow model — will miss its deadline
 [planner] api (pid 5) missed its 8000ms deadline — killing
@@ -165,7 +166,7 @@ The inbox-watcher classifies each ticket (`bug` / `feature` / `question`), draft
 
 ```bash
 
-$ cortex spawn --role inbox-watcher --module ./examples/checkpoint-agent.ts
+$ cortex example checkpoint-agent        # or: cortex example demo-b
 [inbox-watcher pid 2] 6 tickets in queue
 [inbox-watcher pid 2] #T-1180 App crashes on launch after the 2.3 update -> bug; reply drafted
 [inbox-watcher pid 2] #T-1181 Can I export my data to CSV? -> feature; reply drafted
@@ -191,7 +192,7 @@ Demo C is the atom of *agent search*: reach a decision point, `fork` to explore 
 *(Live replay: [`docs/demo-c.html`](./docs/demo-c.html). The GIF is produced by `examples/make-demo-c-gif.py` once Pillow is installed.)*
 
 ```bash
-$ cortex spawn --role demo --module ./examples/fork-compare-agent.ts
+$ cortex example fork-compare-agent      # or: cortex example demo-c
 [parent 2] forked as pid 3 — branch A: counting bloom filter
 [branch A pid 2] {"approach":"counting bloom filter","spaceComplexity":"O(k) bits, ...}
 [branch B pid 3] resumed from the fork's snapshot

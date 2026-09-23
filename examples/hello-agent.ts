@@ -26,7 +26,7 @@
  * kernel surface. There is no other API.
  */
 
-import type { CortexContext } from '../src/index.js';
+import type { CortexContext } from 'cortex-agent-os';
 
 export default async function helloAgent(ctx: CortexContext): Promise<void> {
   // Call the LLM with a simple prompt.

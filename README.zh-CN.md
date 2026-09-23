@@ -96,9 +96,8 @@ npx cortex-agent-os help
 
 要求 **Node 22+**。只有一个运行时依赖（`cborg`，用于 syscall 日志）。想试一下**不需要任何 API key** —— mock 驱动是确定性的、完全离线。
 
-`examples/` 目录**随包发布**，所以 `npm i -g` 之后下面的 demo 直接能跑。它们是 `.ts` 文件，靠 Node 的类型剥离加载：**Node 22.18+ 默认支持**，更早的 22.x 请在命令前加
-`NODE_OPTIONS=--experimental-strip-types`。完全不想管这件事的话，
-`cortex spawn --role coder --task "..."` 不需要任何 `.ts` 文件。
+`examples/` 目录**随包发布** —— 编译成纯 JS 放在 `dist/examples/` 里，所以 `npm i` 之后下面的 demo 直接能跑，不需要任何额外 flag，也不挑 Node 版本（`cortex example hello` 在 `engines` 里写的每个 Node 上都能跑）。`.ts` 源码也一并打包，从克隆仓库用 `tsx` 直接跑即可。完全不想管这件事的话，
+`cortex spawn --role coder --task "..."` 不需要任何模块文件 —— `cortex` 自带一个 prompt agent。
 
 想改 Cortex 本身？克隆下来跑测试套件：
 
@@ -140,7 +139,7 @@ Demo A 值得单独说一下，因为它改变了内核：以前 agent 会在派
 planner spawn 三个 coder，每个 coder 为一个虚构库（"tinylog"）生成一份真实 README 的一个章节，并把它发布到一个共享的 `semantic` 记忆区域。其中一个 coder（"api"）卡住了 —— 一次永不返回的模型调用 —— 于是 planner 通过一个带超时的 `wait` 察觉，把它 kill，spawn 一个替补，然后从三个章节组装出最终 README：
 
 ```bash
-$ cortex spawn --role planner --module ./examples/supervision-tree.ts
+$ cortex example supervision-tree        # 或：cortex example demo-a
 [planner pid 2] spawning 3 coders (tinylog README)
 [coder api pid 5] slow model — will miss its deadline
 [planner] api (pid 5) missed its 8000ms deadline — killing
@@ -159,7 +158,7 @@ Demo B 把「重启」这个故事变得具体。一个 checkpoint 捕获的是*
 
 ```bash
 
-$ cortex spawn --role inbox-watcher --module ./examples/checkpoint-agent.ts
+$ cortex example checkpoint-agent        # 或：cortex example demo-b
 [inbox-watcher pid 2] 6 tickets in queue
 [inbox-watcher pid 2] #T-1180 App crashes on launch after the 2.3 update -> bug; reply drafted
 [inbox-watcher pid 2] #T-1181 Can I export my data to CSV? -> feature; reply drafted
@@ -185,7 +184,7 @@ Demo C 是「agent 搜索」的原子操作：走到一个决策点，`fork` 一
 *（实时回放：[`docs/demo-c.html`](./docs/demo-c.html)。GIF 由 `examples/make-demo-c-gif.py` 生成，需要先装 Pillow。）*
 
 ```bash
-$ cortex spawn --role demo --module ./examples/fork-compare-agent.ts
+$ cortex example fork-compare-agent      # 或：cortex example demo-c
 [parent 2] forked as pid 3 — branch A: counting bloom filter
 [branch A pid 2] {"approach":"counting bloom filter","spaceComplexity":"O(k) bits, ...}
 [branch B pid 3] resumed from the fork's snapshot
