@@ -14,7 +14,7 @@ This directory holds the technical specifications. **Read them in this order:**
 
 6. **[HACKING.md](./HACKING.md)** — how to contribute: dev setup, conventions, how to write a driver / an agent / a syscall, testing.
 
-7. **[COOKBOOK.md](./COOKBOOK.md)** — recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC, budgets.
+7. **[COOKBOOK.md](./COOKBOOK.md)** — recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC (+ explicit channels), budgets, least privilege (capabilities), testing.
 
 ---
 

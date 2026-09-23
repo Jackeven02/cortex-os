@@ -261,6 +261,24 @@ cortex send 1234 "try the dynamic-programming approach"   # from the shell
 A message is `{ from, to, body, sentAt }`. `recv` blocks by default; a
 `timeoutMs` returns control without a message. See `ABI.md` §4.5.
 
+**Explicit channels (1.0).** Sending to a channel that does not exist creates
+it implicitly — convenient, until a typo silently mints a channel nobody is
+listening on. Create it first when the channel must exist *before* anyone sends:
+
+```ts
+const { channelId } = await ctx.channel_open({ name: 'reviews' });
+await ctx.send(channelId, review);
+// ... later
+await ctx.channel_close(channelId);       // idempotent; parked recv() -> EBADF
+```
+
+`channel_open()` with no name mints an anonymous id (`ch-1`, `ch-2`, …), which
+is the right default for a private wire between two processes that already know
+each other. A `name` is for a rendezvous point that unrelated processes must
+find by convention; claiming an existing name is `EINVAL`. Implicit creation on
+`send` is still there — it was never the problem, only being the *only* way
+was.
+
 ---
 
 ## 8. Time and determinism
@@ -304,3 +322,51 @@ For a check inside the regression suite, exercise kernel modules directly
 `console.log` the way the `cortex diff` / `cortex attach` / `cortex daemon`
 checks do. A bug fix without a regression check is not done — see
 [`HACKING.md`](./HACKING.md) §8.
+
+---
+
+## 10. Least privilege — capabilities
+
+**When:** an agent should be able to do less than the kernel would otherwise
+allow. A worker that only classifies text has no business reaching out to the
+world; a sub-agent you did not write should not be able to kill your others.
+
+```ts
+// What do I hold? (synchronous, like budget())
+console.log(ctx.caps());        // ['spawn', 'kill', 'fork', 'tool:dangerous', 'ipc:any', 'admin']
+
+// Run unprivileged, escalate for the one operation that needs it.
+await ctx.acquire('kill');      // recorded in .crec, like any other syscall
+await ctx.kill(hungPid, 'SIGTERM');
+await ctx.release('kill');      // never fails, even if you never held it
+```
+
+```bash
+# Narrow a child at spawn time
+cortex spawn --role classifier --task "..." --cap 'tool:dangerous'
+cortex spawn --role coder      --task "..." --cap spawn --grantable kill
+```
+
+Six capabilities, a closed set: `spawn`, `kill`, `fork`, `tool:dangerous`,
+`ipc:any`, `admin`. Full list in `ABI.md` §4.9.
+
+Three things worth internalising, because they are where the design is
+non-obvious:
+
+1. **The default is full privilege, not least privilege.** Omitting `--cap` and
+   `--grantable` leaves the agent holding everything — so an agent written before
+   1.0 does not start trapping `EPERM` merely because it upgraded. Least privilege
+   is **opt-in**: pass `--cap` to narrow.
+2. **`kill`, `ipc:any` and `tool:dangerous` are conditional, not blanket.**
+   Killing your own descendants and your own process group always works — that is
+   what makes a supervision tree (recipe 1) expressible without handing out
+   `kill`. The capability governs reaching *across* the tree. Likewise
+   `tool:dangerous` is only required for tools tagged `irreversible`; a narrowed
+   leaf can still read, compute and call reversible tools.
+3. **`acquire` is recorded.** "When did this agent escalate, and what did it do
+   next" is answerable from the `.crec` log — which is why escalation is a
+   syscall rather than a config flag. `acquire` outside the `grantable` pool
+   traps `EPERM`; a name that is not a capability traps `EINVAL`.
+
+Capability state lives on the process entry, so it survives
+`checkpoint` → `restore` (recipe 2) and shows up in `ps`.

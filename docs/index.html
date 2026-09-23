@@ -172,6 +172,7 @@
     <a class="brand" href="#top"><span class="dot"></span>cortex</a>
     <nav class="nav-links">
       <a href="#idea">Idea</a>
+      <a href="#why">Why</a>
       <a href="#primitives">Primitives</a>
       <a href="#demos">Demos</a>
       <a href="#start">Quickstart</a>
@@ -238,12 +239,50 @@
     </div>
   </section>
 
+  <section id="why">
+    <div class="wrap">
+      <div class="eyebrow">Why now</div>
+      <h2>The demo is easy. Production is hard.</h2>
+      <p class="sub">
+        Getting an agent to run once takes an afternoon. The problems that cost you
+        weeks only appear once it matters: it dies at hour five of a six-hour run,
+        one child hangs and nobody notices, it burns $200 on something you cannot
+        reconstruct afterward. None of those are model problems — they are
+        <i>process</i> problems, and process problems are what an operating system
+        exists to answer.
+      </p>
+      <div class="grid">
+        <div class="prim">
+          <div class="k">It will die</div>
+          <div class="v">A long agent that crashes mid-run has to <i>continue</i>, not restart.
+            <code>checkpoint</code> + <code>restore</code> survive a real reboot.</div>
+        </div>
+        <div class="prim">
+          <div class="k">Children hang</div>
+          <div class="v">A supervisor must bound a child, kill it, and respawn it — as ordinary
+            <code>try</code>/<code>catch</code>, not orchestration YAML you cannot debug.</div>
+        </div>
+        <div class="prim">
+          <div class="k">Nobody can audit it</div>
+          <div class="v">Every syscall lands in an append-only <code>.crec</code> log, so
+            <code>trace</code>, <code>diff</code> and <code>audit</code> can answer "what did
+            it actually do?" — after the fact.</div>
+        </div>
+        <div class="prim">
+          <div class="k">Cost has no ceiling</div>
+          <div class="v">Budgets are enforced by the kernel (<code>SIGXCPU</code>), not by
+            hoping your retry loop is polite.</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section id="primitives">
     <div class="wrap">
       <div class="eyebrow">Primitives</div>
       <h2>A small kernel, borrowed from the best.</h2>
       <p class="sub">
-        Eleven kernel modules. Nineteen syscalls. Three driver interfaces.
+        Eleven kernel modules. Twenty-four syscalls. Three driver interfaces.
         Everything here has a fifty-year-old precedent — that's the point.
       </p>
       <div class="grid">
@@ -339,22 +378,34 @@ npx tsx src/cli/index.ts diff 2 3</pre>
       <div class="eyebrow">Status</div>
       <h2>Built in the open, documented honestly.</h2>
       <div class="status">
+        <div class="stat"><div class="n">1.0</div><div class="l">syscall ABI frozen</div></div>
         <div class="stat"><div class="n">11</div><div class="l">kernel modules</div></div>
-        <div class="stat"><div class="n">19</div><div class="l">syscalls</div></div>
+        <div class="stat"><div class="n">24</div><div class="l">syscalls</div></div>
         <div class="stat"><div class="n">7</div><div class="l">drivers (LLM · MCP · FS · memory)</div></div>
-        <div class="stat"><div class="n">479</div><div class="l">smoke checks, all green</div></div>
+        <div class="stat"><div class="n">525</div><div class="l">smoke checks, all green</div></div>
       </div>
+      <p class="sub">
+        Phases 0–5 are complete: the kernel boots, all drivers ship, the whole CLI
+        works, and all three demos reproduce.
+        <b>As of 1.0 the syscall ABI is frozen</b> — a breaking change needs a major
+        version, an additive one lands in a minor. That is the difference between
+        a project you can evaluate and one you can depend on.
+      </p>
       <p class="sub" style="margin-bottom:0">
-        Phases 0–4 are complete: the kernel boots, all drivers ship, the whole CLI
-        works, and all three demos reproduce. Known v0 gaps are recorded in the
-        backlog, not hidden.
+        1.0 also closed the two things the ABI had deferred to "v1": a
+        <b>capability system</b> (<code>acquire</code> / <code>release</code> /
+        <code>caps</code>, so an agent can run with less authority than the kernel
+        would give it) and the <b>explicit channel lifecycle</b>
+        (<code>channel_open</code> / <code>channel_close</code>).
       </p>
       <div class="caveat">
-        <b>Honest about what v0 is.</b> A checkpoint captures the process <i>image</i> —
-        state, memory, budgets, lineage — not the live JS call stack, so a restored
-        agent re-runs from the top and skips completed work via a memory marker.
-        <code>attach</code> follows the on-disk syscall log; the interactive send-half
-        lands with a first-class daemon.
+        <b>Honest about what 1.0 is not.</b> A checkpoint captures the process
+        <i>image</i> — state, memory, budgets, lineage — not the live JS call stack,
+        so a restored agent re-runs from the top and skips completed work via a
+        memory marker. <code>attach</code> follows the on-disk syscall log; the
+        interactive send-half lands with a first-class daemon. Capability defaults are
+        <i>full privilege</i>, not least privilege — narrowing is opt-in, because
+        defaulting to least privilege would have broken every agent written before 1.0.
       </div>
     </div>
   </section>
