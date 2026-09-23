@@ -1,6 +1,6 @@
 {
   "name": "cortex-agent-os",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "An operating system for AI agents.",
   "type": "module",
   "license": "MIT",
@@ -39,7 +39,8 @@
     "README.zh-CN.md",
     "CHANGELOG.md",
     "assets",
-    "docs"
+    "docs",
+    "examples"
   ],
   "scripts": {
     "prepublishOnly": "npm run build",

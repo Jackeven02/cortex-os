@@ -38,6 +38,29 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ---
 
+## [1.0.1] — 2026-09-23
+
+### Fixed — the README's demos did not work for an npm user
+
+`examples/` was deliberately left out of the published tarball, but every demo
+in the README runs `cortex spawn --module ./examples/<something>.ts`. So anyone
+who did `npm i -g cortex-agent-os` and followed the README hit *module not
+found* on the very first thing it asked them to do — which also broke the
+BACKLOG's own Phase 4 exit criterion ("a stranger reproduces all three demos
+from the README in under 10 minutes"). `examples/` now ships in the package.
+
+Shipping them surfaced one caveat, now documented in both READMEs: the examples
+are `.ts`, loaded by Node's type stripping. That is on by default from **Node
+22.18+**; earlier 22.x needs `NODE_OPTIONS=--experimental-strip-types`. And
+`cortex spawn --role x --task "..."` needs no `.ts` at all, if you would rather
+not think about it.
+
+### Fixed
+
+- README / README.zh-CN said 513 assertions; the suite is 525.
+
+No kernel or ABI change — this is a packaging and documentation patch.
+
 ## [1.0.0] — 2026-09-23
 
 **The syscall ABI is frozen.** This is the release that settles the contract
@@ -671,6 +694,7 @@ These are deliberate `v0` boundaries, not oversights. Each is recorded in
 - Sandbox fork, shadow process, `cortex gc`, and `cortex doctor` are post-v0.
 
 [0.1.8]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.8
+[1.0.1]: https://github.com/Jackeven02/cortex-os/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Jackeven02/cortex-os/releases/tag/v1.0.0
 [0.2.1]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.2.0

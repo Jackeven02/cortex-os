@@ -2,7 +2,7 @@
 
 > An operating system for AI agents.
 
-[![release](https://img.shields.io/badge/release-v1.0.0-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v1.0.1-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -97,13 +97,19 @@ npx cortex-agent-os help
 Requires **Node 22+**. One runtime dependency (`cborg`, for the syscall log), and
 no API key is needed to try it — the mock driver is deterministic and offline.
 
+`examples/` ships **inside the package**, so the demos below work straight after
+`npm i -g`. They are `.ts` files, loaded by Node's type stripping: that is on by
+default from **Node 22.18+**, so on earlier 22.x prefix your command with
+`NODE_OPTIONS=--experimental-strip-types`. If you would rather not think about
+it at all, `cortex spawn --role coder --task "..."` needs no `.ts` file.
+
 Working on Cortex itself instead? Clone it and run the suite:
 
 ```bash
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 513 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 525 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

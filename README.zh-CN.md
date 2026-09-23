@@ -2,7 +2,7 @@
 
 > AI agent 的操作系统。
 
-[![release](https://img.shields.io/badge/release-v1.0.0-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v1.0.1-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -96,13 +96,17 @@ npx cortex-agent-os help
 
 要求 **Node 22+**。只有一个运行时依赖（`cborg`，用于 syscall 日志）。想试一下**不需要任何 API key** —— mock 驱动是确定性的、完全离线。
 
+`examples/` 目录**随包发布**，所以 `npm i -g` 之后下面的 demo 直接能跑。它们是 `.ts` 文件，靠 Node 的类型剥离加载：**Node 22.18+ 默认支持**，更早的 22.x 请在命令前加
+`NODE_OPTIONS=--experimental-strip-types`。完全不想管这件事的话，
+`cortex spawn --role coder --task "..."` 不需要任何 `.ts` 文件。
+
 想改 Cortex 本身？克隆下来跑测试套件：
 
 ```bash
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 513 项断言，0 失败
+npx tsx scripts/smoke.ts                # 525 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
