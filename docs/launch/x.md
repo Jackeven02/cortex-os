@@ -27,6 +27,8 @@ spawn · ps · kill · wait · fork · diff · checkpoint · restore · trace ·
 24 syscalls. 11 kernel modules. Pure TypeScript, Node 22+, exactly one runtime
 dep (cborg, for the CBOR syscall log), MIT.
 
+The syscall ABI is frozen at 1.0 — breaking changes need a major version.
+
 ---
 
 **3/8**
@@ -84,13 +86,15 @@ Debugging an agent should not be harder than debugging a program.
 
 **7/8**
 
-Honest about v0:
+Honest about 1.0:
 
 • A checkpoint captures the process *image*, not the JS call stack → a restored
   agent re-runs from the top and skips done work via a memory marker.
 • Single host. No distribution.
+• Capabilities default to *full* privilege, not least — narrowing is opt-in,
+  so agents written before 1.0 don't start trapping EPERM on upgrade.
 
-Design docs written before the code. Gaps are in the repo, not hidden.
+Design docs written before the code. Caveats are in the repo, not hidden.
 
 ---
 

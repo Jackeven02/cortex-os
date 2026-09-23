@@ -25,7 +25,7 @@ trace · attach · limit · daemon · audit
 24 个 syscall，11 个内核模块，纯 TypeScript，Node 22+，MIT，唯一的运行时依赖是
 `cborg`（用来编码 append-only 的 CBOR syscall 日志）。
 
-**现在已经能跑的东西**（v0，`npm install` 后全离线跑，走确定性 mock driver，不需要 API key）：
+**现在已经能跑的东西**（1.0，`npm install` 后全离线跑，走确定性 mock driver，不需要 API key）：
 
 - **进程控制**：`spawn` / `ps` / `kill`（13 种信号）/ `wait`，包括
   `wait(pid, { timeoutMs })` —— 超时是内核报给你的一个**观测**，杀不杀是你的事，
@@ -33,9 +33,18 @@ trace · attach · limit · daemon · audit
 - **状态**：`fork`（认知分叉）、`checkpoint`、`restore`。fork 的返回值里带**两个分支
   分叉的字节偏移**，`cortex diff` 就是靠它把两份 syscall 日志对齐的。
 - **认知 / 记忆 / IPC**：`llm_call` / `tool_call` / `memory_read` / `memory_write` /
-  `send` / `recv` / `sleep` / `now` / `random` / `on_signal` / `budget`。
+  `send` / `recv` / `channel_open` / `channel_close` / `sleep` / `now` / `random` /
+  `on_signal` / `budget`。
+- **最小权限**：`acquire` / `release` / `caps` 加六个能力，让一个 Agent 能带着
+  **比内核想给的更少**的权限运行。杀自己的子进程、调用可逆工具永远不需要能力 ——
+  否则 `kill` 会发给每一个监督者，那它就什么也不意味着了。
 - 7 个驱动：mock / deepseek / openai（LLM）、filesystem / MCP（工具）、
   inmem / sqlite（记忆）。
+
+**1.0 的意思：syscall ABI 冻结了。** 这条我想放在前面说。`0.x` 阶段小版本是允许改
+syscall 契约的，现在不行了 —— 破坏性变更要大版本，新增式的进小版本，规则写在
+`ABI.md` 里。我宁可交付一个更小、但我愿意长期负责的接口，也不想交付一个更大、
+但我一直在挪动的接口。
 
 **三个 demo，README 里都能从零复现：**
 
@@ -48,11 +57,13 @@ trace · attach · limit · daemon · audit
    `wait` 发现它，kill 掉，重启，最后汇总 —— 大约 40 行普通 `async/await`，
    没有任何外部编排器。
 
-**我自己先泼的冷水，v0 的真实缺口（都在 repo 里写着，没藏）：**
+**我自己先泼的冷水，1.0 还不是什么（都在 repo 里写着，没藏）：**
 
 - checkpoint 存的是进程**镜像**（记忆、预算、血缘），**不是活的 JS 调用栈**。
   恢复出来的 Agent 是从头重跑、靠 memory 标记跳过已完成的工作的。真正的
-  continuation 捕获是 post-v0。这是最硬的一个限制，我也很想被说服换一个更好的设计。
+  continuation 捕获还没做。这是最硬的一个限制，我也很想被说服换一个更好的设计。
+- 能力系统的默认是**全权限**而不是最小权限 —— 收窄要显式指定。因为默认最小权限
+  会让所有 1.0 之前写的 Agent 一升级就撞 `EPERM`。
 - `attach` 目前是**跟磁盘上的 syscall 日志**，不是连到一个活着的内存进程。
   `cortex daemon run` 今天已经能监督一个长命 Agent，但 CLI 平时还是"短命进程"模型。
 - 单机、单进程。没有分布式，没有 k8s。
@@ -82,4 +93,11 @@ Repo: https://github.com/Jackeven02/cortex-os
 - **预备回答**（大概率被问）：*"这跟 Temporal 有啥区别？"*、*"Erlang 早就能干了吧？"*、
   *"为什么用 TypeScript？"*、*"内核多少行？"*、*"一台机器能跑两个 Agent 吗？"*
   （诚实答：一个 state dir 一个内核，目前没有跨内核 IPC）。
+- **"凭什么信一个没听过的 1.0？"** —— 用**冻结**回答，不要用功能列表回答。有意思
+  的说法不是"它有 24 个 syscall"，而是"syscall 契约冻结了，并且什么能改、什么不能改
+  写成了明文规则"。发 1.0 谁都会发；冻结是关于未来的承诺，而且是潜在用户光看 repo
+  无法自己验证的那部分。
+- **被问"那直接用 Temporal 不就行了？"** —— 比对方更快地同意他。这东西确实可以建在
+  Temporal 上（icebox 里就有一个 Temporal 持久化驱动的条目）。争论点在抽象层，
+  不在谁的基础设施更好。
 - **别用的词**："颠覆"、"革命性"、"10x"。说清楚它做了什么就行。V2EX 对营销腔很敏感。

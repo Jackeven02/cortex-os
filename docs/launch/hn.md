@@ -22,7 +22,7 @@ process.** A process has identity that outlives its caller, a parent that
 supervises it, a log of everything it did, and the ability to be paused,
 forked, and resumed.
 
-**What actually runs today** (v0; `npm install`; everything below runs offline
+**What actually runs today** (1.0; `npm install`; everything below runs offline
 against a deterministic mock driver, no API key):
 
 - **Process control:** `spawn`, `ps`, `kill` (13 signals), `wait` — including
@@ -32,10 +32,21 @@ against a deterministic mock driver, no API key):
   carries the byte offset where two branches diverge, which `cortex diff` uses
   to align their syscall logs.
 - **Cognition / memory / IPC:** `llm_call`, `tool_call`, `memory_read/write`,
-  `send`, `recv`, `sleep`, `now`, `random`, `on_signal`, `budget`.
+  `send`, `recv`, `channel_open`, `channel_close`, `sleep`, `now`, `random`,
+  `on_signal`, `budget`.
+- **Least privilege:** `acquire` / `release` / `caps` over six capabilities, so
+  an agent can run with *less* authority than the kernel would give it. Killing
+  your own children and calling reversible tools never need a capability —
+  otherwise `kill` would be handed to every supervisor and mean nothing.
 - 11 kernel modules, 24 syscalls, 7 drivers (mock/deepseek/openai LLMs;
-  filesystem + MCP tools; inmem + sqlite memory), 479 assertions in the test
+  filesystem + MCP tools; inmem + sqlite memory), 525 assertions in the test
   suite.
+
+**1.0 means the syscall ABI is frozen.** This is the part I'd want a skeptic to
+hear first. Through `0.x` a minor bump was allowed to break the syscall
+contract; that is over. Breaking changes now need a major version, additive
+ones land in a minor, and the rule is written into `ABI.md`. I'd rather ship a
+smaller surface I'm willing to stand behind than a larger one I keep moving.
 
 **Three demos, each reproducible end-to-end from the README:**
 
@@ -51,12 +62,12 @@ against a deterministic mock driver, no API key):
    notices via a bounded `wait`, kills it, respawns it, and assembles the
    result — ~40 lines of ordinary `async`/`await`, no orchestrator.
 
-**Where I'd push back on myself — the honest v0 gaps** (all in the repo, not
+**Where I'd push back on myself — what 1.0 still is not** (all in the repo, not
 hidden):
 
 - A checkpoint captures the process *image* — memory, budgets, lineage — **not
   the live JS call stack.** A restored agent re-runs from the top and skips
-  completed work via a memory marker. True continuation capture is post-v0.
+  completed work via a memory marker. True continuation capture is still open.
   This is the sharpest limitation; I'd like to be argued out of the design or
   into a better one.
 - `attach` follows the on-disk syscall log; the interactive *"pipe stdin into a
@@ -100,4 +111,14 @@ that collapses under real workloads.
   Temporal?"*, *"doesn't Erlang already do this?"*, *"why TypeScript?"*,
   *"what's the actual kernel LOC?"*, *"can I run two agents on one box?"*
   (answer honestly: one kernel per state dir, no cross-kernel IPC yet).
+- **"Why should I trust a 1.0 from someone I've never heard of?"** — lead with
+  the freeze, not the feature list. The interesting claim is not "it has 24
+  syscalls" but "the syscall contract is frozen and here is the written rule for
+  what is allowed to change". Anyone can publish a 1.0; the freeze is a
+  commitment about the future, and it is the only part a potential user cannot
+  verify by skimming the repo.
+- **If someone asks "why not just use Temporal?"** — agree with them faster than
+  they expect. You *can* build this on Temporal; there is even a
+  Temporal-backed persistence driver in the icebox. The claim is about the
+  abstraction, not about who has better infrastructure.
 - **Don't** say "revolutionary", "game-changing", or "10x". State what it does.
