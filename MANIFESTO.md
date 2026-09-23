@@ -2,7 +2,7 @@
 
 *An operating system for AI agents.*
 
-> **Status:** `v0.2.1` — all four of the v0 gaps the documents promised are now closed: `sleep()` really parks, a restored process runs on its own, the synchronous syscalls are recorded, and the persistence layout is now the per-process subtree ARCHITECTURE §7 described (`processes/<pid>/{log.crec, meta.json, checkpoints/}`). Plus `cortex top`, one view a stranger can read in five minutes. Phases 0–5 are complete: the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. This document is the *why*, and it has not changed.
+> **Status:** `v1.0.0` — **the syscall ABI is frozen.** Phase 0–5 are complete: the kernel boots, all seven drivers ship, the CLI is complete, and the three demos run end to end. `1.0` settles the two things the ABI had deferred to "v1": a **capability system** (`acquire` / `release` / `caps` over six capabilities, so a process can run with less authority than the kernel would give it) and the **explicit channel lifecycle** (`channel_open` / `channel_close`, so a typo'd channel name no longer silently mints a channel nobody reads). Twenty-four syscalls. Breaking changes now require a major version. This document is the *why*, and it has not changed.
 
 **English** | [简体中文](./MANIFESTO.zh-CN.md)
 
@@ -135,7 +135,7 @@ This document is the **why**. The next documents are the **how**:
 |---|---|---|
 | `docs/STATE.md` | What agent state *is*; fork & checkpoint semantics | **implemented — read this first** |
 | `docs/PROCESS.md` | The agent lifecycle and state machine | **implemented — 8 states, 12 transitions** |
-| `docs/ABI.md` | The syscall contract, in TypeScript types | **implemented — 19 syscalls** |
+| `docs/ABI.md` | The syscall contract, in TypeScript types | **implemented — 24 syscalls** |
 | `docs/ARCHITECTURE.md` | Kernel modules and data flow | **implemented — 11 modules, full syscall lifecycle** |
 | `docs/HACKING.md` | How to contribute, how to write a driver | **done** |
 | `docs/COOKBOOK.md` | Recipes: supervision, pause/resume, fork, daemons | **done** |

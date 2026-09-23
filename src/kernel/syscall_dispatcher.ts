@@ -69,6 +69,7 @@
 import {
   type AgentSpec,
   type BudgetCounters,
+  type Capability,
   type ChainId,
   type ChannelId,
   type CheckpointOptions,
@@ -106,11 +107,13 @@ import {
   type WaitResult,
   asProcessId,
   unbrand,
+  CAPABILITIES,
+  DEFAULT_CAPABILITIES,
 } from './types.js';
 import { CortexError, isCortexError, trap } from './errors.js';
 import { PID_KERNEL, type ProcessTable } from './process_table.js';
 import type { SignalManager } from './signals.js';
-import type { IpcManager } from './ipc.js';
+import type { IpcManager, ChannelOpenOptions } from './ipc.js';
 import type { MemoryManager } from './memory.js';
 import type { CheckpointManager } from './checkpoint.js';
 import type { ForkManager } from './fork.js';
@@ -124,8 +127,13 @@ import type { SyscallRecordInput } from './recorder.js';
 // =============================================================================
 
 /**
- * The nineteen v0 syscalls (docs/ABI.md §4). `forkable()` is a structured
+ * The twenty-four 1.0 syscalls (docs/ABI.md §4). `forkable()` is a structured
  * wrapper, not a syscall, and is exposed separately as `runForkable`.
+ *
+ * `acquire` / `release` / `caps` are the capability system of §4.9, which
+ * docs/ABI.md §9.2 promised for v1. `channel_open` / `channel_close` are the
+ * explicit channel lifecycle §9.3 promised (and §10 predicted would land by
+ * 0.2 — it did not; it lands here).
  */
 export type SyscallName =
   | 'spawn'
@@ -146,7 +154,12 @@ export type SyscallName =
   | 'now'
   | 'random'
   | 'on_signal'
-  | 'budget';
+  | 'budget'
+  | 'acquire'
+  | 'release'
+  | 'caps'
+  | 'channel_open'
+  | 'channel_close';
 
 /** Every syscall name as a runtime array (for tooling and validation). */
 export const SYSCALL_NAMES: readonly SyscallName[] = Object.freeze([
@@ -169,6 +182,11 @@ export const SYSCALL_NAMES: readonly SyscallName[] = Object.freeze([
   'random',
   'on_signal',
   'budget',
+  'acquire',
+  'release',
+  'caps',
+  'channel_open',
+  'channel_close',
 ]);
 
 /**
@@ -197,6 +215,11 @@ export interface SyscallArgs {
   random: [opts?: RandomOptions];
   on_signal: [signal: Signal, handler: SignalHandler | 'default' | 'ignore'];
   budget: [];
+  acquire: [cap: Capability];
+  release: [cap: Capability];
+  caps: [];
+  channel_open: [opts?: ChannelOpenOptions];
+  channel_close: [channel: ChannelId];
 }
 
 /** Return type per syscall (docs/ABI.md §8). */
@@ -220,6 +243,11 @@ export interface SyscallReturn {
   random: number;
   on_signal: void;
   budget: BudgetCounters;
+  acquire: void;
+  release: void;
+  caps: readonly Capability[];
+  channel_open: { readonly channelId: ChannelId };
+  channel_close: void;
 }
 
 // =============================================================================
@@ -264,6 +292,11 @@ export const SYSCALL_ALLOWED_STATES: Readonly<Record<SyscallName, readonly Proce
     random: ANY_LIVE_STATE,
     on_signal: ['running'],
     budget: ANY_LIVE_STATE,
+    acquire: ['running'],
+    release: ANY_LIVE_STATE,
+    caps: ANY_LIVE_STATE,
+    channel_open: ['running'],
+    channel_close: ['running'],
   });
 
 /**
@@ -292,6 +325,11 @@ export const SYSCALL_REVERSIBILITY: Readonly<Record<SyscallName, Reversibility>>
   random: 'idempotent',
   on_signal: 'reversible',
   budget: 'idempotent',
+  acquire: 'reversible',
+  release: 'reversible',
+  caps: 'idempotent',
+  channel_open: 'reversible',
+  channel_close: 'reversible',
 });
 
 /**
@@ -333,7 +371,36 @@ export const SELF_RECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallN
 ]);
 
 /** Syscalls never recorded (docs/ABI.md §4.8). */
-export const UNRECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName>(['budget']);
+export const UNRECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName>([
+  'budget',
+  'caps',
+]);
+
+/**
+ * Capability required for a syscall, when the requirement does not depend on
+ * the arguments (docs/ABI.md §4.9).
+ *
+ * Only the unconditional gates live here. Three syscalls gate on *who or what*
+ * you are touching rather than on the mere fact of the call, and are checked
+ * inside their handlers where the argument is available:
+ *
+ * - `kill`  → `kill` capability only when the target is not your descendant
+ *             and not in your process group. Killing your own children and
+ *             your own group is always allowed; that is what makes a
+ *             supervision tree work without handing out a capability.
+ * - `tool_call` → `tool:dangerous` only when the driver tagged the tool
+ *             `irreversible` (docs/STATE.md §5.1). Reversible tools stay
+ *             callable by an unprivileged leaf.
+ * - `send`  → `ipc:any` only when the target is a stranger, same rule as
+ *             `kill`.
+ *
+ * A syscall absent from this table needs no capability.
+ */
+export const SYSCALL_REQUIRED_CAPABILITY: Readonly<Partial<Record<SyscallName, Capability>>> =
+  Object.freeze({
+    spawn: 'spawn',
+    fork: 'fork',
+  });
 
 // =============================================================================
 // §3. Exit sentinel
@@ -513,6 +580,12 @@ export class SyscallDispatcher {
   #sleepHandles = new Map<number, unknown>();
   /** pid → records of synchronous syscalls awaiting their next flush. */
   #syncPending = new Map<number, SyscallRecordInput[]>();
+  /**
+   * Capability state lives on the process-table entry (`entry.capabilities`
+   * / `entry.grantable`), **not** here — it is process state, so it has to
+   * survive `checkpoint` → `restore` and be visible to `ps` without going
+   * through the dispatcher. See docs/ABI.md §4.9.
+   */
 
   #callCounter = 0;
 
@@ -573,6 +646,12 @@ export class SyscallDispatcher {
 
     // §4.10 step 2 — the uniform state gate.
     assertStateIn(stateBefore, SYSCALL_ALLOWED_STATES[syscall], syscall);
+
+    // §4.10 step 2.5 — the capability gate (docs/ABI.md §4.9). Runs before
+    // the forkable check and before any side effect. Conditional gates (kill /
+    // send / tool_call) are inside their handlers, where the argument that
+    // decides them is in scope.
+    this.#checkCapability(pid, syscall);
 
     // §4.10 step 4 — forkable-region enforcement (static tag; `tool_call`
     // and `kill` refine theirs inside the handler before any side effect).
@@ -748,6 +827,93 @@ export class SyscallDispatcher {
   }
 
   // ---------------------------------------------------------------------------
+  // §7.3b Capabilities (docs/ABI.md §4.9)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Seed a process's capabilities at creation time.
+   *
+   * Called by `#spawn` for children and by boot for the top-level process.
+   * **Both arguments omitted means "leave it fully privileged"** — the
+   * caller said nothing about capabilities, so the process behaves exactly as
+   * it would have before 1.0. Passing either argument narrows it.
+   */
+  setCapabilities(
+    pid: ProcessId,
+    capabilities?: readonly Capability[],
+    grantable?: readonly Capability[],
+  ): void {
+    if (capabilities === undefined && grantable === undefined) return;
+    const entry = this.#table.get(pid);
+    if (entry === undefined) return;
+    entry.capabilities = new Set(capabilities ?? []);
+    entry.grantable = new Set(grantable ?? []);
+  }
+
+  /** Capabilities `pid` currently holds. Unnarrowed processes hold all. */
+  capabilitiesOf(pid: ProcessId): readonly Capability[] {
+    const entry = this.#table.get(pid);
+    if (entry === undefined || entry.capabilities === null) return DEFAULT_CAPABILITIES;
+    return [...entry.capabilities];
+  }
+
+  /**
+   * Whether `pid` holds `cap`. Unnarrowed processes hold everything.
+   *
+   * `admin` is deliberately *not* treated as "holds everything": it governs
+   * `acquire` (it may raise any capability, ignoring the grantable pool), not
+   * the checks themselves. Conflating the two would make `admin` impossible
+   * to reason about — you could never tell whether an action was permitted or
+   * merely acquirable.
+   */
+  hasCapability(pid: ProcessId, cap: Capability): boolean {
+    const entry = this.#table.get(pid);
+    if (entry === undefined || entry.capabilities === null) return true;
+    return entry.capabilities.has(cap);
+  }
+
+  /** Trap `EPERM` unless `pid` holds `cap`. */
+  #requireCapability(pid: ProcessId, syscall: SyscallName, cap: Capability): void {
+    if (this.hasCapability(pid, cap)) return;
+    trap('EPERM', syscall, {
+      pid: unbrand(pid),
+      capability: cap,
+      held: [...this.capabilitiesOf(pid)],
+    });
+  }
+
+  /** The unconditional capability gate, run for every syscall. */
+  #checkCapability(pid: ProcessId, syscall: SyscallName): void {
+    const cap = SYSCALL_REQUIRED_CAPABILITY[syscall];
+    if (cap !== undefined) this.#requireCapability(pid, syscall, cap);
+  }
+
+  /**
+   * Whether `target` is someone `pid` may reach without the `kill` / `ipc:any`
+   * capability: itself, a descendant, or a member of its own process group.
+   *
+   * This is the "you may always discipline your own children" rule. Without
+   * it, a supervision tree would need the `kill` capability for the single
+   * most ordinary thing it does — killing the child that missed its deadline —
+   * and the capability would be handed out so widely that it stopped meaning
+   * anything. The capability governs reaching *across* the tree.
+   */
+  #isKin(pid: ProcessId, target: ProcessId): boolean {
+    if (unbrand(pid) === unbrand(target)) return true;
+    const self = this.#table.get(pid);
+    const other = this.#table.get(target);
+    if (self === undefined || other === undefined) return false;
+    if (unbrand(self.pgid) === unbrand(other.pgid)) return true;
+    // Walk the target's ancestry looking for `pid`.
+    let cur = other.ppid;
+    for (let guard = 0; cur !== null && guard < 64; guard += 1) {
+      if (unbrand(cur) === unbrand(pid)) return true;
+      cur = this.#table.get(cur)?.ppid ?? null;
+    }
+    return false;
+  }
+
+  // ---------------------------------------------------------------------------
   // §7.3 Routing
   // ---------------------------------------------------------------------------
 
@@ -818,6 +984,16 @@ export class SyscallDispatcher {
         return this.#onSignal(pid, args[0] as Signal, args[1] as SignalHandler | 'default' | 'ignore');
       case 'budget':
         return this.#budget(pid);
+      case 'acquire':
+        return this.#acquire(pid, args[0] as Capability);
+      case 'release':
+        return this.#release(pid, args[0] as Capability);
+      case 'caps':
+        return this.caps(pid);
+      case 'channel_open':
+        return this.#channelOpen(pid, args[0] as ChannelOpenOptions | undefined);
+      case 'channel_close':
+        return this.#channelClose(pid, args[0] as ChannelId);
       default: {
         // Exhaustiveness guard: adding a SyscallName without a case is a
         // compile error here, not a silent runtime hole.
@@ -848,6 +1024,10 @@ export class SyscallDispatcher {
       ...(opts.signals !== undefined ? { signals: opts.signals } : {}),
       ...(opts.exitTimeoutMs !== undefined ? { exitTimeoutMs: opts.exitTimeoutMs } : {}),
       ...(opts.group !== undefined ? { pgid: opts.group } : {}),
+      // Least privilege, when the spawner asked for it (docs/ABI.md §4.9).
+      // Both omitted ⇒ the child is unnarrowed, as before 1.0.
+      ...(opts.capabilities !== undefined ? { capabilities: opts.capabilities } : {}),
+      ...(opts.grantable !== undefined ? { grantable: opts.grantable } : {}),
     });
 
     // NEW → READY so the scheduler's reconcile adopts it. The agent module is
@@ -1184,8 +1364,19 @@ export class SyscallDispatcher {
     const raw = unbrand(target);
     if (raw < 0) {
       // Unix convention: negative pid signals the whole process group.
+      // Reaching into someone else's group needs `kill`; your own does not.
+      const ownGroup = this.#table.get(pid)?.pgid;
+      if (ownGroup === undefined || unbrand(ownGroup) !== -raw) {
+        this.#requireCapability(pid, 'kill', 'kill');
+      }
       await this.#signals.sendGroup(asProcessId(-raw), signal, pid);
       return;
+    }
+    // Killing your own descendant or group-mate always works — that is what
+    // makes a supervision tree expressible without handing out `kill`. The
+    // capability governs reaching across the tree (docs/ABI.md §4.9).
+    if (!this.#isKin(pid, target)) {
+      this.#requireCapability(pid, 'kill', 'kill');
     }
     await this.#signals.send(target, signal, pid);
   }
@@ -1309,6 +1500,14 @@ export class SyscallDispatcher {
       });
     }
 
+    // An irreversible tool is the one thing an agent can do that reaches
+    // outside the sandbox for real, so it is gated on `tool:dangerous`
+    // (docs/ABI.md §4.9). Reversible tools stay callable by a narrowed leaf,
+    // which is what makes least privilege usable rather than merely safe.
+    if (descriptor.reversibility === 'irreversible') {
+      this.#requireCapability(pid, 'tool_call', 'tool:dangerous');
+    }
+
     const timeoutMs = opts?.timeoutMs ?? descriptor.timeoutMs ?? this.#defaultToolTimeoutMs;
     const abort = new AbortController();
     const timer = this.#setTimeoutFn(() => abort.abort(), timeoutMs);
@@ -1381,7 +1580,40 @@ export class SyscallDispatcher {
     if (this.#ipc === null) {
       trap('EDRIVER', 'send', { reason: 'ipc engine not configured' });
     }
+    // `ipc:any` governs messaging a stranger. A channel is not a process and
+    // has no owner, so only the process-target form is gated — messaging your
+    // own descendants and group-mates always works (docs/ABI.md §4.9).
+    const raw = unbrand(target) as number | string;
+    if (typeof raw === 'number' && !this.#isKin(pid, asProcessId(raw))) {
+      this.#requireCapability(pid, 'send', 'ipc:any');
+    }
     await this.#ipc.send(pid, target, message, opts ?? {});
+  }
+
+  /**
+   * Explicit channel creation (docs/ABI.md §4.5, §9.3). Returns a fresh
+   * `ChannelId` — anonymous unless a `name` was claimed.
+   */
+  #channelOpen(
+    pid: ProcessId,
+    opts?: ChannelOpenOptions,
+  ): { readonly channelId: ChannelId } {
+    if (this.#ipc === null) {
+      trap('EDRIVER', 'channel_open', { reason: 'ipc engine not configured' });
+    }
+    return { channelId: this.#ipc.openChannel(pid, opts ?? {}) };
+  }
+
+  /**
+   * Retire a channel: queued messages are dropped, parked `recv()` waiters
+   * are rejected `EBADF`, and later use traps `EBADF` (or raises `SIGPIPE` on
+   * the sender). Idempotent — closing a closed channel is a no-op.
+   */
+  #channelClose(pid: ProcessId, channel: ChannelId): void {
+    if (this.#ipc === null) {
+      trap('EDRIVER', 'channel_close', { reason: 'ipc engine not configured' });
+    }
+    this.#ipc.closeChannel(channel);
   }
 
   async #recv(
@@ -1469,6 +1701,73 @@ export class SyscallDispatcher {
   #budget(pid: ProcessId): BudgetCounters {
     const entry = this.#table.mustGet(pid, 'budget');
     return { ...entry.budgetsSpent };
+  }
+
+  // ---------------------------------------------------------------------------
+  // §7.10b Capability syscalls (docs/ABI.md §4.9)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Raise `cap` from the grantable pool into the held set.
+   *
+   * Idempotent when already held, `EINVAL` for a name that is not a
+   * capability at all, `EPERM` when it is neither held nor grantable.
+   *
+   * A fully-privileged process (no capability state at all) trivially
+   * succeeds: it already holds everything, so escalation is a no-op rather
+   * than a permission error. That keeps `acquire` safe to call unconditionally
+   * in an agent that may or may not have been narrowed.
+   */
+  #acquire(pid: ProcessId, cap: Capability): void {
+    if (!(CAPABILITIES as readonly string[]).includes(cap)) {
+      trap('EINVAL', 'acquire', {
+        pid: unbrand(pid),
+        capability: String(cap),
+        reason: 'unknown capability',
+      });
+    }
+    const entry = this.#table.get(pid);
+    if (entry === undefined || entry.capabilities === null) return;
+    if (entry.capabilities.has(cap)) return;
+    if (!entry.grantable.has(cap) && !entry.capabilities.has('admin')) {
+      trap('EPERM', 'acquire', {
+        pid: unbrand(pid),
+        capability: cap,
+        held: [...entry.capabilities],
+        grantable: [...entry.grantable],
+      });
+    }
+    entry.capabilities.add(cap);
+    entry.grantable.delete(cap);
+  }
+
+  /**
+   * Drop `cap`. Never fails, including for a capability the process never
+   * held: giving up a privilege you do not have is not an error, and making
+   * it one only breaks cleanup paths.
+   *
+   * On a fully-privileged process this *narrows* it — the process stops
+   * holding everything and starts holding everything except `cap`, with the
+   * full set retained as grantable so the drop is reversible via `acquire`.
+   */
+  #release(pid: ProcessId, cap: Capability): void {
+    const entry = this.#table.get(pid);
+    if (entry === undefined) return;
+    if (entry.capabilities === null) {
+      // Narrowing a fully-privileged process: it now holds everything except
+      // `cap`, with the full set kept grantable so `acquire` can undo this.
+      const held = new Set(DEFAULT_CAPABILITIES);
+      held.delete(cap);
+      entry.capabilities = held;
+      entry.grantable = new Set(DEFAULT_CAPABILITIES);
+      return;
+    }
+    entry.capabilities.delete(cap);
+  }
+
+  /** The capabilities `pid` holds (docs/ABI.md §4.9). */
+  caps(pid: ProcessId): readonly Capability[] {
+    return this.capabilitiesOf(pid);
   }
 
   // ---------------------------------------------------------------------------

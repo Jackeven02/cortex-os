@@ -14,7 +14,7 @@
 进程是：有 PID、有父进程管它、干的每件事都有日志、可以暂停、可以 fork、可以明天接着跑。
 
 Cortex 就是把 Unix 1975 年给程序的那套东西，给到 Agent —— `spawn` / `kill` / `wait` /
-`fork` / `checkpoint` / `restore` / `trace`。19 个 syscall，纯 TypeScript，MIT。
+`fork` / `checkpoint` / `restore` / `trace`。24 个 syscall，纯 TypeScript，MIT。
 
 开源了 👉 github.com/Jackeven02/cortex-os
 

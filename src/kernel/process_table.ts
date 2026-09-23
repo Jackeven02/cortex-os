@@ -50,6 +50,7 @@ import {
   type BlockedReason,
   type BudgetCounters,
   type BudgetLimits,
+  type Capability,
   type ChainId,
   type MemoryRegionPolicy,
   type ProcessFilter,
@@ -65,6 +66,7 @@ import {
   asProcessId,
   asSyscallOffset,
   unbrand,
+  DEFAULT_CAPABILITIES,
 } from './types.js';
 import { CortexError, isCortexError, trap } from './errors.js';
 import { type Recorder, type SyscallRecordInput } from './recorder.js';
@@ -209,6 +211,18 @@ export interface ProcessEntry {
   finalLogOffset: SyscallOffset | null;
   /** Syscall log offset at time of spawn; used by reap() for range. */
   initialLogOffset: SyscallOffset;
+  /**
+   * Capabilities this process holds (docs/ABI.md §4.9), or **`null` for
+   * "unnarrowed"** — a process nobody said anything about holds everything,
+   * which is what keeps pre-1.0 agents working after the upgrade.
+   *
+   * Stored on the entry rather than beside the dispatcher because it *is*
+   * process state: it must survive a `checkpoint`/`restore` round-trip, and
+   * `ps` must be able to report it without asking the dispatcher.
+   */
+  capabilities: Set<Capability> | null;
+  /** Capabilities this process may raise later via `acquire(cap)`. */
+  grantable: Set<Capability>;
 }
 
 // =============================================================================
@@ -242,6 +256,13 @@ export interface AllocateOptions {
   readonly exitTimeoutMs?: number;
   readonly startedAt?: Timestamp;
   readonly initialLogOffset?: SyscallOffset;
+  /**
+   * Capabilities the new process holds from birth (docs/ABI.md §4.9).
+   * Omitted — along with `grantable` — means fully privileged.
+   */
+  readonly capabilities?: readonly Capability[];
+  /** Capabilities the new process may raise later via `acquire(cap)`. */
+  readonly grantable?: readonly Capability[];
 }
 
 /**
@@ -463,6 +484,12 @@ export class ProcessTable {
       diedAt: null,
       finalLogOffset: null,
       initialLogOffset: opts.initialLogOffset ?? asSyscallOffset(0),
+      // null = unnarrowed = holds everything (docs/ABI.md §4.9).
+      capabilities:
+        opts.capabilities === undefined && opts.grantable === undefined
+          ? null
+          : new Set(opts.capabilities ?? []),
+      grantable: new Set(opts.grantable ?? []),
     };
 
     // Open the recorder before registering, so a factory failure does not
@@ -1090,6 +1117,8 @@ function entryToInfo(entry: ProcessEntry): ProcessInfo {
     exitReason: entry.exitReason,
     checkpointChain: [...entry.checkpointChain],
     pendingSignals: [...entry.pendingSignals],
+    capabilities:
+      entry.capabilities === null ? DEFAULT_CAPABILITIES : [...entry.capabilities],
   };
 }
 

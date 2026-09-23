@@ -2,7 +2,7 @@
 
 > AI agent 的操作系统。
 
-[![release](https://img.shields.io/badge/release-v0.2.1-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v1.0.0-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -111,7 +111,16 @@ npx tsx scripts/smoke.ts                # 513 项断言，0 失败
 
 ## 当前状态
 
-**已发布 [`v0.2.1`](./CHANGELOG.md)**（2026-09-20）—— 文档承诺的四个 v0 缺口现已全部补上。`v0.1.x` 做的是正确性加固（复审 `0.1.2` 发现的九个缺陷、文件系统 symlink 沙箱逃逸、SQLite region 名冲突、wall-clock 预算扣减、原子化的 `send()`、可用的 memory 写入上限）。`0.2.0` 让其中三件「文档早就承诺、代码却没做到」的事成真：`sleep()` 真的挂起进程而不是让它保持在 RUNNING；restore 出来的进程自己会跑而不是卡在 NEW；同步 syscall（`now` / `random` / `on_signal`）写进 `.crec`，回放不必再相信注入的时钟；另外新增 **`cortex top`**。`0.2.1` 补上最后一个：持久化布局现在是 ARCHITECTURE §7 描述的「每进程一棵子树」（`processes/<pid>/{log.crec, meta.json, checkpoints/}`），删掉一个进程就是 `rm -rf processes/<pid>`，而 `0.2.1` 之前写的 `.cortex` 在首次读取时会自动升级。这个 `0.x` 是诚实的：syscall ABI 到 `1.0.0` 才冻结，所以小版本提升可能带破坏性变更 —— 这次就有（`blockedOn` 多了一个 `sleep` 变体）。今天要基于 Cortex 开发的话，请锁死确切版本。（Phase 是建设阶段，版本号才是发布。）
+**已发布 [`v1.0.0`](./CHANGELOG.md)**（2026-09-23）—— **syscall ABI 已冻结。**
+
+`0.2.1` 及之前做的是「把东西建出来，然后补上文档早就承诺过的缺口」：`sleep()` 真的挂起进程、restore 出来的进程自己会跑、同步 syscall 写进日志、持久化布局变成 ARCHITECTURE §7 的每进程子树、`cortex top` 能说出阻塞中的进程在等什么。
+
+`1.0.0` 是另一种发布 —— 它**把契约定下来**。ABI 里两条明写「留给 v1」的事，现在做完了：
+
+- **能力系统（§4.9）** —— `acquire` / `release` / `caps`，六个封闭的能力（`spawn`、`kill`、`fork`、`tool:dangerous`、`ipc:any`、`admin`）。一个进程现在可以带着**比内核想给的更少的权限**运行。默认是「全权限」而不是「最小权限」，因为默认最小权限会让所有 1.0 之前的 agent 一升级就撞 `EPERM`；要收窄就在 `spawn` 时显式指定。有两道门是刻意做成「按条件触发」的：杀**自己的**子进程、调用**可逆**工具，永远不需要能力 —— 否则 `kill` 会发给每一个监督者，那它就什么也不意味着了。
+- **显式 channel（§4.5）** —— `channel_open` / `channel_close`。`send` 时的隐式创建为兼容性保留，但它不再是拿到 channel 的唯一方式，channel 名打错也不再会悄悄造出一个没人读的 channel。
+
+syscall 从 19 个变成 24 个。**从此以后**：破坏性变更需要大版本；新增式变更进小版本。见 [ABI.md「ABI status」](./docs/ABI.md)。
 
 **Phase 0 — 设计（完成）。** 四份文档 v0 落地：`STATE.md`（最难的那份）、`PROCESS.md`（生命周期）、`ABI.md`（syscall 契约）、`ARCHITECTURE.md`（内核模块）。每份文档末尾的 open questions 是有意滚动记录的，会随着实现逼出决定而解决。
 
@@ -205,7 +214,7 @@ $ cortex diff 2 3
 | [MANIFESTO.md](./MANIFESTO.md) | cortex 为什么存在。先读这个。（[中文](./MANIFESTO.zh-CN.md)） |
 | [docs/STATE.md](./docs/STATE.md) | **最难的部分。** agent state 是什么，fork 时复制什么，什么根本不能复制。（[中文](./docs/STATE.zh-CN.md)） |
 | [docs/PROCESS.md](./docs/PROCESS.md) | agent 生命周期：8 个状态、12 个合法转换、signals、调度 |
-| [docs/ABI.md](./docs/ABI.md) | syscall 契约：19 个 syscall、3 个 driver 接口、错误模型、记录格式 |
+| [docs/ABI.md](./docs/ABI.md) | syscall 契约：24 个 syscall、3 个 driver 接口、错误模型、记录格式 |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 内核模块和数据流：11 个模块、syscall 生命周期、持久化布局、并发模型 |
 | [docs/HACKING.md](./docs/HACKING.md) | 贡献者指南：开发环境、约定、怎么写驱动 / agent / syscall、测试。 |
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | 配方：监督树、暂停与恢复、fork 对比、daemon、工具、IPC、预算。 |

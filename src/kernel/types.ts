@@ -426,6 +426,11 @@ export interface ProcessInfo {
   readonly exitReason: string | null;
   readonly checkpointChain: readonly ChainId[];
   readonly pendingSignals: readonly Signal[];
+  /**
+   * Capabilities this process currently holds (docs/ABI.md §4.9). Every
+   * capability when the spawner said nothing — see `DEFAULT_CAPABILITIES`.
+   */
+  readonly capabilities: readonly Capability[];
 }
 
 /**
@@ -538,6 +543,110 @@ export interface SpawnOptions {
   readonly memory?: Readonly<Record<string, MemoryRegionPolicy>>;
   readonly signals?: Partial<Record<Signal, SignalDisposition>>;
   readonly exitTimeoutMs?: number;
+  /**
+   * Capabilities the process holds from birth (docs/ABI.md §4.9).
+   *
+   * **Omitted means "every capability"** — the pre-1.0 behaviour, kept so
+   * that an existing agent cannot start failing `EPERM` just because it was
+   * written before capabilities existed. Least privilege is therefore
+   * *opt-in*: pass an explicit list to narrow the child.
+   */
+  readonly capabilities?: readonly Capability[];
+  /**
+   * Capabilities the process may raise itself later via `acquire(cap)`, but
+   * does not hold yet. This is what makes a narrowed process usable: it can
+   * run unprivileged and escalate for the one operation that needs it, and
+   * the escalation is recorded in the `.crec` log like any other syscall.
+   *
+   * Capabilities outside this set (and outside `capabilities`) can never be
+   * acquired. Default: none.
+   */
+  readonly grantable?: readonly Capability[];
+}
+
+// =============================================================================
+// §9.5 Capabilities (docs/ABI.md §4.9)
+// =============================================================================
+
+/**
+ * A named permission a process must hold to perform a privileged operation.
+ *
+ * The model is deliberately small and deliberately **not** a general ACL
+ * system: a capability is either held or not, and the only things that can
+ * change that are `spawn` (which seeds it), `acquire` (which raises it from
+ * the `grantable` pool), and `release` (which drops it). There is no
+ * "delegate to another process" — that is a capability marketplace, and it
+ * belongs in the icebox.
+ *
+ * The set is closed on purpose. Anything that needs finer-grained control
+ * (per-tool, per-channel) should be expressed by narrowing at `spawn` time,
+ * not by inventing new capability names at runtime.
+ *
+ * - `spawn`           — create child processes. Without it a process is a
+ *                       leaf: it cannot build a supervision tree.
+ * - `kill`            — signal a process that is neither your descendant nor
+ *                       in your process group. Killing your own children and
+ *                       your own group always works; this governs reaching
+ *                       *across* the tree, which is what makes one agent able
+ *                       to disrupt another's work.
+ * - `fork`            — cognitive fork (docs/STATE.md §3.1). Gated because a
+ *                       fork duplicates the process's world and is the most
+ *                       expensive thing an agent can ask for.
+ * - `tool:dangerous`  — call a tool the driver tagged `irreversible`
+ *                       (docs/STATE.md §5.1). A process without this can
+ *                       still call reversible tools, so a narrowed leaf can
+ *                       read and compute while being structurally unable to
+ *                       touch the outside world.
+ * - `ipc:any`         — `send` to a process that is neither your descendant
+ *                       nor in your group, i.e. talk to strangers.
+ * - `admin`           — may `acquire` any capability, ignoring the
+ *                       `grantable` pool. Held by init; grant it sparingly.
+ *
+ * See: docs/ABI.md §4.9
+ */
+export type Capability =
+  | 'spawn'
+  | 'kill'
+  | 'fork'
+  | 'tool:dangerous'
+  | 'ipc:any'
+  | 'admin';
+
+/** Every capability, as a runtime array (for CLI validation and `ps`). */
+export const CAPABILITIES: readonly Capability[] = Object.freeze([
+  'spawn',
+  'kill',
+  'fork',
+  'tool:dangerous',
+  'ipc:any',
+  'admin',
+]);
+
+/**
+ * What a process holds when its spawner said nothing.
+ *
+ * **Full privileges, not least privilege** — and that is the compatibility
+ * decision, not an oversight. Every agent, example and smoke check written
+ * before 1.0 predates capabilities; defaulting to empty would turn them all
+ * into `EPERM` traps on upgrade. Least privilege is opt-in via
+ * `SpawnOptions.capabilities`.
+ */
+export const DEFAULT_CAPABILITIES: readonly Capability[] = CAPABILITIES;
+
+/** Parse untrusted input (CLI flags, config) into a validated capability set. */
+export function parseCapabilities(
+  raw: readonly string[],
+): readonly Capability[] {
+  const out: Capability[] = [];
+  for (const s of raw) {
+    if (!(CAPABILITIES as readonly string[]).includes(s)) {
+      throw new Error(
+        `unknown capability '${s}' (expected one of: ${CAPABILITIES.join(', ')})`,
+      );
+    }
+    if (!out.includes(s as Capability)) out.push(s as Capability);
+  }
+  return out;
 }
 
 // =============================================================================
@@ -799,6 +908,20 @@ export interface IpcMessage {
 }
 
 /**
+ * Options for `channel_open` (docs/ABI.md §4.5, §9.3).
+ *
+ * Omitting `name` mints an anonymous channel with a kernel-generated id,
+ * which is the right default: most channels are a private wire between two
+ * processes that already know each other, and naming them only creates
+ * collisions. `name` exists for the case where the channel is a shared
+ * rendezvous point that unrelated processes must find by convention.
+ */
+export interface ChannelOpenOptions {
+  /** Claim a specific name. Must be unique; empty is invalid. */
+  readonly name?: string;
+}
+
+/**
  * Optional parameters for `send`. v0 supports non-blocking mode and a
  * queue-depth limit.
  */
@@ -966,7 +1089,7 @@ export interface SyscallRecord {
  * The entire kernel surface available to an agent function. There is no
  * other way to talk to the kernel.
  *
- * Eighteen syscalls plus four identity properties plus `forkable()` as a
+ * Twenty-two syscalls plus four identity properties plus `forkable()` as a
  * structured wrapper around reversibility enforcement.
  *
  * See: docs/ABI.md §2.1, §8
@@ -1032,6 +1155,21 @@ export interface CortexContext {
     opts?: SendOptions,
   ): Promise<void>;
   recv(source?: ChannelId, opts?: RecvOptions): Promise<IpcMessage>;
+  /**
+   * Explicitly create a channel (docs/ABI.md §4.5, §9.3). Returns a fresh
+   * id — anonymous unless `opts.name` claims one.
+   *
+   * Implicit creation on `send` still works, so old agents are unaffected;
+   * this is what you use when you need to know the channel exists *before*
+   * anyone sends to it.
+   */
+  channel_open(opts?: ChannelOpenOptions): Promise<{ readonly channelId: ChannelId }>;
+  /**
+   * Retire a channel: parked `recv()` waiters are rejected `EBADF`, queued
+   * messages are dropped, later use traps `EBADF` (or `SIGPIPE` for the
+   * sender). Idempotent.
+   */
+  channel_close(channel: ChannelId): Promise<void>;
 
   // ---------------------------------------------------------------------------
   // §4.6 Time and determinism
@@ -1052,6 +1190,31 @@ export interface CortexContext {
   // §4.8 Budgets
   // ---------------------------------------------------------------------------
   budget(): BudgetCounters;
+
+  // ---------------------------------------------------------------------------
+  // §4.9 Capabilities
+  // ---------------------------------------------------------------------------
+  /**
+   * Raise `cap` from this process's `grantable` pool into its held set.
+   * Traps `EPERM` if the capability is neither already held nor grantable
+   * (and the process does not hold `admin`).
+   *
+   * Recorded like any other syscall, so "when did this agent escalate, and
+   * what did it do next" is answerable from the `.crec` log — which is the
+   * whole reason escalation is a syscall instead of a config flag.
+   */
+  acquire(cap: Capability): Promise<void>;
+  /**
+   * Drop `cap` from the held set. Always succeeds, including when the
+   * process never held it: dropping a privilege you do not have is not an
+   * error, and demanding otherwise just makes cleanup code fail.
+   */
+  release(cap: Capability): Promise<void>;
+  /**
+   * The capabilities this process currently holds. Synchronous and unrecorded
+   * (docs/ABI.md §4.8: readable introspection is derivable, like `budget`).
+   */
+  caps(): readonly Capability[];
 
   // ---------------------------------------------------------------------------
   // Forkable regions (docs/STATE.md §5.2)

@@ -24,7 +24,8 @@ import {
 } from '../index.js';
 import type { ProcessMeta } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
-import type { AgentSpec, ProcessState, MemoryRegionPolicy } from '../../kernel/types.js';
+import type { AgentSpec, Capability, ProcessState, MemoryRegionPolicy } from '../../kernel/types.js';
+import { parseCapabilities } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
 
 /** Default time to let an agent run before giving up (ms). */
@@ -44,6 +45,8 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       'token-budget': { type: 'string' },
       'max-region-entries': { type: 'string' },
       memory: { type: 'string' },
+      cap: { type: 'string' },
+      grantable: { type: 'string' },
       timeout: { type: 'string', short: 't' },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -99,6 +102,27 @@ export async function cmdSpawn(args: string[]): Promise<number> {
     regionPolicies = mergeRegionPolicies(DEFAULT_MEMORY_REGIONS, overrides);
   }
 
+  // Least privilege (docs/ABI.md §4.9). Omitting both flags leaves the
+  // process fully privileged, which is what every pre-1.0 agent expects.
+  let capabilities: readonly Capability[] | undefined;
+  if (values.cap !== undefined) {
+    try {
+      capabilities = parseCapabilities(String(values.cap).split(',').map((s) => s.trim()).filter((s) => s !== ''));
+    } catch (err) {
+      console.error(`cortex spawn: invalid --cap: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+  let grantable: readonly Capability[] | undefined;
+  if (values.grantable !== undefined) {
+    try {
+      grantable = parseCapabilities(String(values.grantable).split(',').map((s) => s.trim()).filter((s) => s !== ''));
+    } catch (err) {
+      console.error(`cortex spawn: invalid --grantable: ${(err as Error).message}`);
+      return 1;
+    }
+  }
+
   const dir = defaultKernelDir();
   ensureKernelDirs(dir);
   const kernel = await bootCliKernel(
@@ -149,6 +173,8 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       agent: agentSpec,
       memory: regionPolicies,
       ...(tokenBudget !== undefined ? { budgets: { tokens: tokenBudget } } : {}),
+      ...(capabilities !== undefined ? { capabilities } : {}),
+      ...(grantable !== undefined ? { grantable } : {}),
     });
     console.log(`[pid ${unbrand(pid)}]`);
 
@@ -293,11 +319,26 @@ OPTIONS
                           maxEntries: <int>                (optional;
                              -1 = unlimited, 0+ = hard write cap,
                              absent = inherit --max-region-entries)
+  --cap <list>          Capabilities the agent holds from birth: a
+                        comma-separated subset of
+                        spawn,kill,fork,tool:dangerous,ipc:any,admin.
+                        OMIT FOR FULL PRIVILEGE — omitting both --cap and
+                        --grantable leaves the agent holding everything,
+                        which is what pre-1.0 agents expect.
+  --grantable <list>    Capabilities the agent may raise later with
+                        ctx.acquire() but does not hold yet.
   -t, --timeout <ms>    Max wall time (default 30000)
   -h, --help            Show this help
 
 EXAMPLES
   cortex spawn --role coder --task "fix issue #42"
+
+  # Least privilege: may read and think, structurally unable to touch
+  # the outside world (no irreversible tools) or fork its world:
+  cortex spawn --role coder --task "analyze" --cap tool:dangerous,spawn
+
+  # Run unprivileged, escalate for the one call that needs it:
+  cortex spawn --role coder --task "ship it" --cap spawn --grantable kill
   cortex spawn --role reviewer --system "You review code for bugs."
   cortex spawn --role coder --task "analyze" --model gpt-4o-mini -t 60000
 

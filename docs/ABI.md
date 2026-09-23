@@ -4,6 +4,30 @@
 >
 > **If a behavior is not in this document, it does not exist.**
 
+> ## 🔒 ABI status: **FROZEN** since `1.0.0`
+>
+> Before `1.0.0` the ABI was deliberately unsettled: the version line said
+> `0.x`, and a minor bump was allowed to change a syscall, its arguments, or
+> the state model. That is over.
+>
+> From `1.0.0`:
+>
+> - **Breaking** changes require a **major** bump (`2.0.0`). A breaking change
+>   is one that could stop an existing agent from working: removing or
+>   renaming a syscall, changing what an argument *means*, changing a
+>   syscall's errno contract, changing a field in `ProcessInfo`, or changing
+>   the on-disk `.crec` / `.csnap` format.
+> - **Additive** changes land in a **minor** bump (`1.1.0`) and must not be
+>   able to break an agent that exists today: a new syscall, a new *optional*
+>   argument field, a new errno for a condition that previously could not
+>   occur, a new capability.
+> - The kernel carries `KERNEL_ABI_VERSION`, and every `.crec` record carries
+>   `kernel_abi_version`, so a replay engine can tell which contract a log was
+>   written under (§9.6).
+>
+> The freeze is why `1.0` also had to settle the questions §9 had deferred to
+> "v1" — capabilities (§9.2) and the channel lifecycle (§9.3). Both are in.
+
 Read [`STATE.md`](./STATE.md) and [`PROCESS.md`](./PROCESS.md) first. This document defines what agents can *ask the kernel to do*; the other two define what they *are* and how they *change over time*.
 
 ---
@@ -12,7 +36,9 @@ Read [`STATE.md`](./STATE.md) and [`PROCESS.md`](./PROCESS.md) first. This docum
 
 Every OS lives or dies by its syscall ABI. POSIX is ~300 syscalls and fifty years of compatibility. Plan 9 fit the whole world into ~30. seL4 fits a verifiable kernel into ~20.
 
-Cortex aims for **nineteen** in v0. Not because nineteen is magic, but because every syscall we add is one more thing every driver, every test, every recording, every replay engine has to handle. Syscalls are forever. We pick carefully.
+Cortex ships **twenty-four** in 1.0. Not because twenty-four is magic, but because every syscall we add is one more thing every driver, every test, every recording, every replay engine has to handle. Syscalls are forever. We pick carefully.
+
+`0.x` shipped nineteen. `1.0` adds five: three for the capability system (§4.9, promised by §9.2) and two for the explicit channel lifecycle (§4.5, promised by §9.3). Nineteen was the number we could defend without having watched anyone use it; twenty-four is the number we can defend after having done so. The freeze means the next one has to be worth a major version.
 
 This document is the contract. The kernel implements it. Agents depend on it. Drivers conform to it. The recording format encodes it. If we get it right, third parties can build cortex-compatible tooling without ever talking to us. If we get it wrong, we will spend years apologizing.
 
@@ -352,6 +378,35 @@ Receive a message. Blocking by default.
 - **Reversibility:** `irreversible` once consumed (the message is gone from the queue). Recording captures the message so replay can re-deliver.
 - **Recording:** source, message, wait duration
 
+#### `channel_open(opts?: ChannelOpenOptions): Promise<{ channelId: ChannelId }>`
+
+Create a channel explicitly and get its id back (§9.3). Anonymous unless you claim a name.
+
+```typescript
+const { channelId } = await ctx.channel_open();                  // ch-1, ch-2, …
+const { channelId } = await ctx.channel_open({ name: 'reviews' }); // claim a name
+```
+
+- **Allowed states:** RUNNING
+- **Returns:** the new `ChannelId`
+- **Errors:** `EINVAL` (name is empty, or already claimed), `EDRIVER` (no IPC engine)
+- **Reversibility:** `reversible` (the channel can be closed)
+- **Recording:** the channel id, and whether it was named
+
+Why this exists when `send` already creates channels implicitly: implicit creation is a convenience that hides a class of bug. A typo in a channel name used to silently mint a channel nobody was listening on, and there was no way to ask whether a channel existed. `channel_open` makes the channel knowable *before* anyone sends to it.
+
+**Implicit creation is retained on purpose.** Making it an error would break every agent written before `1.0`, and that is exactly the kind of change the freeze now forbids. What changed is that implicit creation is no longer the *only* way to get a channel.
+
+#### `channel_close(channel: ChannelId): Promise<void>`
+
+Retire a channel. Queued messages are dropped, parked `recv()` waiters are rejected `EBADF`, and later `send` traps `EBADF` (and raises `SIGPIPE` on the sender). Idempotent — closing a closed channel is a no-op, so cleanup paths do not need to track state.
+
+- **Allowed states:** RUNNING
+- **Returns:** nothing
+- **Errors:** `EDRIVER` (no IPC engine)
+- **Reversibility:** `reversible`
+- **Recording:** the channel id
+
 ### 4.6 Time and determinism
 
 #### `sleep(ms: number): Promise<void>`
@@ -426,6 +481,69 @@ Return current budget state (spent and remaining). Read-only.
 - **Errors:** none
 - **Reversibility:** `idempotent`
 - **Recording:** not recorded (would bloat logs); derived from other syscalls' recordings
+
+### 4.9 Capabilities
+
+Three syscalls that let a process run with **less** authority than the kernel would otherwise give it. This is the section §9.2 promised for v1.
+
+```typescript
+export type Capability =
+  | 'spawn'           // create child processes
+  | 'kill'            // signal a process that is not yours
+  | 'fork'            // cognitive fork
+  | 'tool:dangerous'  // call a tool tagged `irreversible`
+  | 'ipc:any'         // send to a process that is not yours
+  | 'admin';          // may acquire any capability
+```
+
+#### The model
+
+A process has two sets:
+
+- **held** — what it can do right now.
+- **grantable** — what it may raise later with `acquire()`, but does not hold yet.
+
+`spawn` seeds both. `acquire` moves a capability from grantable to held. `release` drops one. There is no way to delegate a capability to another process — that is a marketplace, and it is in the icebox.
+
+**Default is full privilege, not least privilege.** A process whose spawner said nothing holds every capability. This is the compatibility decision, stated plainly: every agent, example and smoke check written before `1.0` predates capabilities, and defaulting to empty would turn all of them into `EPERM` traps on upgrade. Least privilege is opt-in — pass `capabilities` (and optionally `grantable`) to `spawn`.
+
+#### What each capability gates
+
+| Capability | Gates | Not required for |
+|---|---|---|
+| `spawn` | creating any child process | — |
+| `kill` | signalling a process that is not your descendant and not in your group | **killing your own children** |
+| `fork` | cognitive fork | — |
+| `tool:dangerous` | calling a tool the driver tagged `irreversible` | every reversible tool |
+| `ipc:any` | `send` to a process that is not yours | your children, your group, any channel |
+| `admin` | lets `acquire` ignore the grantable pool | — |
+
+The "not required for" column is the design. A supervision tree kills the child that missed its deadline — if that needed `kill`, the capability would be handed out so widely that it would stop meaning anything. The capability governs reaching *across* the tree, not disciplining your own. Likewise a narrowed leaf can still read, compute and call reversible tools; it is structurally unable to touch the outside world.
+
+#### `acquire(cap: Capability): Promise<void>`
+
+Raise `cap` from grantable to held.
+
+- **Allowed states:** RUNNING
+- **Returns:** nothing
+- **Errors:** `EPERM` (neither held nor grantable), `EINVAL` (not a capability name)
+- **Reversibility:** `reversible` (`release` undoes it)
+- **Recording:** recorded, like any other syscall
+
+Recorded on purpose: "when did this agent escalate, and what did it do next" has to be answerable from the `.crec` log. That is the whole reason escalation is a syscall rather than a config flag. Idempotent when already held, and a no-op on a fully-privileged process — so an agent can call it unconditionally whether or not it was narrowed.
+
+#### `release(cap: Capability): Promise<void>`
+
+Drop `cap`. Never fails, including for a capability the process never held: giving up a privilege you do not have is not an error, and making it one only breaks cleanup paths. On a fully-privileged process this *narrows* it — it then holds everything except `cap`, with the full set retained as grantable so `acquire` can undo it.
+
+- **Allowed states:** any
+- **Returns:** nothing
+- **Errors:** none
+- **Reversibility:** `reversible`
+
+#### `caps(): readonly Capability[]`
+
+The capabilities this process currently holds. Synchronous and unrecorded, like `budget()` (§4.8) — readable introspection is derivable.
 
 ---
 
@@ -662,17 +780,21 @@ true if the agent makes the same calls in the same order.
 
 **v0 answer:** no streaming. v1 may add `llm_call(..., { stream: true })` returning an `AsyncIterable`. The recording format already supports it (multiple `exit` phases per `call_id`).
 
-### 9.2 Capability / permission syscalls
+### 9.2 Capability / permission syscalls — **RESOLVED in 1.0**
 
 PROCESS.md demoted capabilities to icebox. But some syscalls (`kill` cross-group, `tool_call` dangerous tools) will eventually need permission checks.
 
 **v0 answer:** no capability syscalls. Kernel uses simple group membership rules. v1 introduces `acquire(cap)` / `release(cap)` if real workloads demand it.
 
-### 9.3 Channel creation
+**1.0 answer (§4.9):** shipped, as promised — `acquire` / `release` / `caps`, over a closed set of six capabilities (`spawn`, `kill`, `fork`, `tool:dangerous`, `ipc:any`, `admin`). The default is **full privilege**, because defaulting to least privilege would have turned every pre-1.0 agent into an `EPERM` trap; privilege is narrowed explicitly at `spawn` time. Two gates are deliberately *conditional* rather than blanket: `kill` and `ipc:any` apply only to processes that are not your descendant and not in your group, and `tool:dangerous` applies only to `irreversible` tools. Without that, `kill` would have been handed to every supervisor and meant nothing.
+
+### 9.3 Channel creation — **RESOLVED in 1.0**
 
 `send` and `recv` reference channels by `ChannelId`, but how are channels created?
 
 **v0 answer:** implicit. Sending to a non-existent channel creates it. This is convenient but messy. v1 may add explicit `channel_open()` / `channel_close()`.
+
+**1.0 answer (§4.5):** `channel_open` / `channel_close` shipped. Implicit creation on `send` is **kept** — removing it would break every agent written before 1.0, which the freeze now forbids — but it is no longer the only way to obtain a channel. `channel_open` returns an id you can hold before anyone has sent to it, and can claim a name; duplicate names are `EINVAL`.
 
 ### 9.4 Synchronous tool calls
 
@@ -707,6 +829,7 @@ Predictions:
 - **Reversibility tagging will be inconsistent across drivers.** Some authors will tag everything `reversible` to avoid friction. We will need a `cortex audit` tool to surface this and shame them gently.
   - **Worse than predicted, and already hit:** MCP (§7.2) has *no reversibility field at all*. A third-party server cannot declare whether its tools mutate the world, so the driver must invent a tag. `drivers/tool/mcp.ts` defaults every undeclared tool to `irreversible` — an untagged tool therefore refuses to run inside `forkable()` rather than silently corrupting a fork. Operators override per tool name; `declaredReversibility` records which names were declared so `cortex audit` can surface the rest. The default is safe, not correct, and the audit loop is what makes it temporary.
 - **`recv` semantics will turn out to need explicit channels.** The "implicit channel creation" decision (§9.3) will bite us. We will add `channel_open` in v0.2.
+  - **Verdict: right problem, wrong date — and it landed in `1.0`, not `0.2`.** `channel_open` / `channel_close` shipped with the capability work (§4.5, §9.3). The part we got right was the diagnosis: a typo'd channel name silently minting a channel nobody reads. The part we got wrong was the timeline, by four minor versions — a useful calibration for how much to trust the dates in this section.
 - **`now()` and `random()` recording will bloat logs.** Agents that call them in tight loops will produce gigabytes of `.crec`. We will add a "compact recording" mode that elides repeated identical calls.
 - **`fork()` from BLOCKED state will be the source of three subtle bugs.** We will document the workarounds, then fix the kernel.
 - **We will need a syscall we did not anticipate.** Likely candidates: `migrate` (move process to another kernel), `observe` (subscribe to another process's syscall stream), `attest` (cryptographically sign a checkpoint).
@@ -717,10 +840,15 @@ These are not failures. The ABI is a living document. v1 will look different. Th
 
 ## 11. What comes next
 
-ABI.md is the last design document blocking Phase 1. After this:
+*(This section was written when ABI.md was the last document blocking Phase 1. All of that is done — the kernel, the drivers, the CLI and the demos shipped in `0.x`. What follows replaces it.)*
 
-- **`docs/ARCHITECTURE.md`** — how the kernel is internally organized. Modules, data flow, where each syscall is implemented, how drivers are loaded. Less normative than ABI.md, more descriptive.
-- **Phase 1: kernel skeleton** — `src/kernel/process.ts`, `scheduler.ts`, `syscall.ts`, `ipc.ts`, `signals.ts`, `checkpoint.ts`, `recorder.ts`, `memory.ts`, `fork.ts`, `init.ts`. ~1500 lines of TypeScript.
+The ABI is now frozen, which changes what "what comes next" means.
+
+**Within `1.x` (additive only):** new syscalls, new optional argument fields, new capabilities, new errnos for conditions that could not previously occur. Each must be impossible to break an agent that exists today. The live candidates from §10 are `llm_stream` (§9.1), `observe`, `attest` and `migrate`.
+
+**Requiring `2.0`:** anything that removes or renames a syscall, changes what an argument means, changes the errno contract, changes `ProcessInfo`, or changes the `.crec` / `.csnap` format.
+
+**Deliberately deferred to `1.1`, because it is *not* an ABI change:** collapsing the self-recorded syscalls (`memory_read`, `memory_write`, `send`, `recv`, `fork`, `checkpoint`, `restore`) onto the dispatcher's single recording path. Those modules predate the dispatcher and still write their own `.crec` frames; the on-disk format is identical either way, so this is internal tidying rather than a contract change — and `send`'s atomicity (a failed record must not leave a phantom message) depends on the module controlling when it records. It is worth doing and worth doing carefully, so it does not hold the freeze hostage.
 
 The ABI is the contract. The architecture is how we keep that contract. The kernel is the implementation. In that order.
 

@@ -33,7 +33,7 @@ against a deterministic mock driver, no API key):
   to align their syscall logs.
 - **Cognition / memory / IPC:** `llm_call`, `tool_call`, `memory_read/write`,
   `send`, `recv`, `sleep`, `now`, `random`, `on_signal`, `budget`.
-- 11 kernel modules, 19 syscalls, 7 drivers (mock/deepseek/openai LLMs;
+- 11 kernel modules, 24 syscalls, 7 drivers (mock/deepseek/openai LLMs;
   filesystem + MCP tools; inmem + sqlite memory), 479 assertions in the test
   suite.
 

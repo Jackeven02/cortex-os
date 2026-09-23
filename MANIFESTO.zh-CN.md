@@ -2,12 +2,12 @@
 
 *An operating system for AI agents. / 一个给 AI Agent 用的操作系统。*
 
-> **状态：** `v0.2.1` —— 文档承诺的四个 v0 缺口现已全部补上：`sleep()`
-> 真的会挂起进程，restore 出来的进程自己会跑，同步 syscall 开始写进日志；`0.2.1`
-> 把第四件事也补上了——持久化布局现在是 ARCHITECTURE §7 描述的每进程子树
-> （`processes/<pid>/{log.crec, meta.json, checkpoints/}`）。另外新增
-> `cortex top`，一个陌生人五分钟能看懂的视图。Phase 0–5 全部完成：内核能启动，
-> 七个驱动全部交付，CLI 完整，三个 demo 端到端跑通。这份文档讲的是**为什么**，
+> **状态：** `v1.0.0` —— **syscall ABI 已冻结。** Phase 0–5 全部完成：内核能启动，
+> 七个驱动全部交付，CLI 完整，三个 demo 端到端跑通。`1.0` 定下了 ABI 里两条明写
+> 「留给 v1」的事：**能力系统**（`acquire` / `release` / `caps` 与六个能力，
+> 让一个进程能带着比内核想给的更少的权限运行）与**显式 channel 生命周期**
+> （`channel_open` / `channel_close`，channel 名打错不再会悄悄造出没人读的
+> channel）。24 个 syscall。破坏性变更从此需要大版本号。这份文档讲的是**为什么**，
 > 它没有变过。
 
 > 英文原文见 [MANIFESTO.md](./MANIFESTO.md)。若两者有出入，以英文版为准。
@@ -189,7 +189,7 @@ PR，第三个起草她的周报。它们跑在一台 5 美元的 VPS 上，能�
 |---|---|---|
 | `docs/STATE.md` | Agent 状态*到底是*什么；fork 与 checkpoint 的语义 | **已实现 —— 先读这个** |
 | `docs/PROCESS.md` | Agent 生命周期与状态机 | **已实现 —— 8 个状态、12 个迁移** |
-| `docs/ABI.md` | syscall 契约，以 TypeScript 类型给出 | **已实现 —— 19 个 syscall** |
+| `docs/ABI.md` | syscall 契约，以 TypeScript 类型给出 | **已实现 —— 24 个 syscall** |
 | `docs/ARCHITECTURE.md` | 内核模块与数据流 | **已实现 —— 11 个模块、完整 syscall 生命周期** |
 | `docs/HACKING.md` | 如何贡献、如何写一个驱动 | **已完成** |
 | `docs/COOKBOOK.md` | 配方：监督、暂停/恢复、fork、daemon | **已完成** |

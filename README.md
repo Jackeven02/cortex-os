@@ -2,7 +2,7 @@
 
 > An operating system for AI agents.
 
-[![release](https://img.shields.io/badge/release-v0.2.1-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v1.0.0-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -115,7 +115,16 @@ npx tsx scripts/smoke.ts                # 513 assertions, 0 failures
 
 ## Status
 
-**Released as [`v0.2.1`](./CHANGELOG.md)** (2026-09-20) — all four of the v0 gaps the documents promised are now closed. `v0.1.x` was correctness and hardening (nine defects found reviewing `0.1.2`, a filesystem symlink sandbox escape, a SQLite region-name collision, wall-clock budget draining, an atomic `send()`, a reachable per-region memory ceiling). `0.2.0` made three of them true: `sleep()` really parks a process instead of leaving it RUNNING, a restored process runs on its own instead of sitting in NEW, and the synchronous syscalls (`now` / `random` / `on_signal`) are written to `.crec` so replay does not have to trust the injected clock; it also added **`cortex top`**. `0.2.1` closes the last one — the persistence layout is now the per-process subtree ARCHITECTURE §7 described (`processes/<pid>/{log.crec, meta.json, checkpoints/}`), so removing a process is `rm -rf processes/<pid>` and a pre-`0.2.1` home upgrades transparently on first read. The `0.x` is honest: the syscall ABI is not frozen until `1.0.0`, so a minor bump may carry a breaking change to the ABI or the state model — this one does (`blockedOn` gained a `sleep` variant). If you build against Cortex today, pin the exact version. (Phases are build milestones; the versions are the releases.)
+**Released as [`v1.0.0`](./CHANGELOG.md)** (2026-09-23) — **the syscall ABI is frozen.**
+
+Everything through `0.2.1` was building the thing and then closing the gaps the documents had promised: `sleep()` really parks a process, a restored process runs on its own, the synchronous syscalls are recorded, the persistence layout is the per-process subtree ARCHITECTURE §7 described, and `cortex top` shows what a blocked process is waiting on.
+
+`1.0.0` is a different kind of release — it settles the contract. Two things the ABI had explicitly deferred to "v1" are now in:
+
+- **Capabilities (§4.9)** — `acquire` / `release` / `caps` over a closed set of six (`spawn`, `kill`, `fork`, `tool:dangerous`, `ipc:any`, `admin`). A process can now run with *less* authority than the kernel would give it. The default is full privilege, not least privilege, because defaulting to least privilege would turn every pre-1.0 agent into an `EPERM` trap; you narrow a child explicitly at `spawn`. Two gates are conditional by design: killing your own children and calling reversible tools never need a capability — otherwise `kill` would be handed to every supervisor and mean nothing.
+- **Explicit channels (§4.5)** — `channel_open` / `channel_close`. Implicit creation on `send` is kept for compatibility, but it is no longer the only way to get a channel, and a typo'd channel name no longer silently mints one nobody reads.
+
+That is 24 syscalls, up from 19. **From here:** breaking changes need a major bump; additive changes land in a minor. See [ABI.md §"ABI status"](./docs/ABI.md).
 
 **Phase 0 — Design (complete).** Four documents drafted v0: `STATE.md` (the hard part), `PROCESS.md` (lifecycle), `ABI.md` (syscall contract), `ARCHITECTURE.md` (kernel modules). Open questions in each doc are logged and resolve as implementation forces decisions.
 
@@ -209,7 +218,7 @@ See **[BACKLOG.md](./BACKLOG.md)** for the full list, prioritized.
 | [MANIFESTO.md](./MANIFESTO.md) | Why cortex exists. Start here. |
 | [docs/STATE.md](./docs/STATE.md) | **The hard part.** What agent state is, what gets copied on fork, what cannot be copied at all. |
 | [docs/PROCESS.md](./docs/PROCESS.md) | Agent lifecycle: 8 states, 12 transitions, signals, scheduling |
-| [docs/ABI.md](./docs/ABI.md) | Syscall contract: 18 syscalls, 3 driver interfaces, error model, recording format |
+| [docs/ABI.md](./docs/ABI.md) | Syscall contract: 24 syscalls, 3 driver interfaces, error model, recording format |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow: 11 modules, syscall lifecycle, persistence layout, concurrency model |
 | [docs/HACKING.md](./docs/HACKING.md) | Contributor guide: dev setup, conventions, how to write a driver / agent / syscall, testing. |
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | Recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC, budgets. |

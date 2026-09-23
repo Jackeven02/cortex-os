@@ -96,6 +96,7 @@
 
 import {
   type ChannelId,
+  type ChannelOpenOptions,
   type IpcMessage,
   type ProcessId,
   type ProcessState,
@@ -106,6 +107,9 @@ import {
   unbrand,
 } from './types.js';
 import { CortexError, isCortexError, trap } from './errors.js';
+
+// Re-exported so callers can take the channel surface from either module.
+export type { ChannelOpenOptions };
 import type { ProcessTable } from './process_table.js';
 import type { SignalManager } from './signals.js';
 import type { WakeGate } from './wake_gate.js';
@@ -253,6 +257,9 @@ export interface IpcManagerOptions {
 /**
  * Options for `IpcManager.closeChannel`.
  */
+/**
+ * Options for `IpcManager.closeChannel`.
+ */
 export interface CloseChannelOptions {
   /**
    * If true, drain remaining messages to nowhere (default) — i.e. drop
@@ -289,6 +296,8 @@ export class IpcManager {
   #channels = new Map<string, Channel>();
   /** Per-PID set of channels the process has touched (sent or received). */
   #memberships = new Map<number, Set<string>>();
+  /** Monotonic counter backing anonymous `channel_open` ids. */
+  #channelCounter = 0;
   #callCounter = 0;
 
   constructor(opts: IpcManagerOptions) {
@@ -320,6 +329,53 @@ export class IpcManager {
   ensureChannel(id: ChannelId, createdBy: ProcessId | null = null): ChannelInfo {
     const channel = this.#ensureChannelInternal(id, createdBy);
     return channelToInfo(channel);
+  }
+
+  /**
+   * Explicitly create a channel and return its id (docs/ABI.md §4.5, §9.3).
+   *
+   * v0 created channels **implicitly** on first `send`, which was convenient
+   * and messy: a typo in a channel name silently created a channel nobody was
+   * listening on, and there was no way to ask whether a channel existed. This
+   * is the explicit half of the fix — `channel_open` mints a fresh id (or
+   * claims a name), and `channel_close` retires it.
+   *
+   * Implicit creation on `send` is retained for compatibility: making it an
+   * error would break every agent written before 1.0. What changes is that
+   * implicit creation is no longer the *only* way to get a channel.
+   *
+   * A named channel must be unique; claiming an existing name is `EINVAL`.
+   *
+   * @throws CortexError EINVAL if `opts.name` is already taken
+   */
+  openChannel(pid: ProcessId, opts: ChannelOpenOptions = {}): ChannelId {
+    let id: ChannelId;
+    if (opts.name !== undefined) {
+      if (opts.name === '') {
+        trap('EINVAL', 'channel_open', {
+          pid: unbrand(pid),
+          reason: 'channel name must not be empty',
+        });
+      }
+      const named = asChannelId(opts.name);
+      if (this.#channels.has(unbrand(named))) {
+        trap('EINVAL', 'channel_open', {
+          pid: unbrand(pid),
+          channel: opts.name,
+          reason: 'a channel with this name already exists',
+        });
+      }
+      id = named;
+    } else {
+      this.#channelCounter += 1;
+      id = asChannelId(`ch-${this.#channelCounter}`);
+    }
+    this.#ensureChannelInternal(id, pid);
+    // Membership makes the channel show up in `channelsOf(pid)` — and
+    // therefore in supervisor cleanup — from the moment it is opened,
+    // without waiting for a first send.
+    this.#trackMembership(pid, id);
+    return id;
   }
 
   /**

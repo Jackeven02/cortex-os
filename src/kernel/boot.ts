@@ -115,6 +115,8 @@ import {
   type AgentSpec,
   asProcessId,
   type BudgetCounters,
+  type Capability,
+  type ChannelOpenOptions,
   type ChainId,
   type ChannelId,
   type CheckpointOptions,
@@ -802,6 +804,22 @@ export class Kernel {
       budget: (): BudgetCounters => {
         this.#gateSync(pid, 'budget');
         return { ...this.table.mustGet(pid, 'budget').budgetsSpent };
+      },
+
+      // §4.5 IPC channel lifecycle (docs/ABI.md §9.3)
+      channel_open: (opts?: ChannelOpenOptions): Promise<{ readonly channelId: ChannelId }> =>
+        d.invoke(pid, 'channel_open', opts),
+      channel_close: (channel: ChannelId): Promise<void> =>
+        d.invoke(pid, 'channel_close', channel),
+
+      // §4.9 Capabilities
+      acquire: (cap: Capability): Promise<void> => d.invoke(pid, 'acquire', cap),
+      release: (cap: Capability): Promise<void> => d.invoke(pid, 'release', cap),
+      // Sync fast-path, like `budget`: readable introspection is derivable
+      // from the log, so it is not recorded (docs/ABI.md §4.8).
+      caps: (): readonly Capability[] => {
+        this.#gateSync(pid, 'caps');
+        return d.capabilitiesOf(pid);
       },
 
       // Forkable regions (docs/STATE.md §5.2)

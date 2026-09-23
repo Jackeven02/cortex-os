@@ -25,13 +25,96 @@ The docs use **`v0`** as a generation label, not as a version number: when
 this generation of the design," not "not in 0.1.0". Wherever a *specific*
 version matters, it is written as a semver like `0.1.0`.
 
-**On the `0.x`:** the syscall ABI is not frozen yet. A `0.x` minor bump may
-carry a breaking change to the ABI or the state model — `0.1.0` → `0.2.0` is
-allowed to hurt. The ABI freezes at `1.0.0`, and after that the usual semver
-rules apply without exception. If you are building against Cortex today, pin the
-exact version.
+**On the `0.x` (history, now closed):** the syscall ABI was not frozen during
+`0.x`. A minor bump was allowed to carry a breaking change to the ABI or the
+state model — `0.1.0` → `0.2.0` was allowed to hurt, and `0.2.0` did
+(`blockedOn` gained a `sleep` variant).
+
+**From `1.0.0` the ABI is frozen.** Breaking changes — removing or renaming a
+syscall, changing what an argument means, changing an errno contract, changing
+a `ProcessInfo` field, or changing the `.crec` / `.csnap` format — require a
+major bump. Additive changes that cannot break an existing agent land in a
+minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ---
+
+## [1.0.0] — 2026-09-23
+
+**The syscall ABI is frozen.** This is the release that settles the contract
+rather than adding to it, and it exists mainly to close two things the ABI had
+explicitly deferred to "v1".
+
+### Added — capabilities (docs/ABI.md §4.9, promised by §9.2)
+
+Three syscalls: `acquire(cap)`, `release(cap)`, `caps()`. Six capabilities in a
+closed set — `spawn`, `kill`, `fork`, `tool:dangerous`, `ipc:any`, `admin`. A
+process now has two sets, *held* (what it can do now) and *grantable* (what it
+may raise later), seeded by `spawn` and adjusted by the two syscalls.
+
+- **Default is full privilege, not least privilege.** Every agent, example and
+  smoke check written before 1.0 predates capabilities; defaulting to empty
+  would turn all of them into `EPERM` traps on upgrade. Least privilege is
+  opt-in via `SpawnOptions.capabilities` / `grantable`, and via
+  `cortex spawn --cap` / `--grantable`.
+- **Two gates are conditional, by design.** `kill` and `ipc:any` apply only to
+  processes that are not your descendant and not in your own process group;
+  `tool:dangerous` applies only to tools the driver tagged `irreversible`. A
+  supervision tree can always kill the child that missed its deadline, and a
+  narrowed leaf can still read, compute and call reversible tools. Without
+  this, `kill` would be handed to every supervisor and would mean nothing.
+- **Escalation is recorded.** `acquire` writes a `.crec` frame like any other
+  syscall, so "when did this agent escalate, and what did it do next" is
+  answerable from the log. That is why it is a syscall and not a config flag.
+- Capability state lives on the process-table entry, not beside the
+  dispatcher, so it survives `checkpoint` → `restore` and shows up in `ps`
+  without going through the dispatcher.
+
+### Added — explicit channel lifecycle (docs/ABI.md §4.5, promised by §9.3)
+
+Two syscalls: `channel_open(opts?)`, `channel_close(channel)`. `channel_open`
+returns a fresh `ChannelId` — anonymous, or a claimed `name` (duplicate names
+are `EINVAL`) — so a channel is knowable *before* anyone sends to it.
+`channel_close` retires it: queued messages are dropped, parked `recv()`
+waiters are rejected `EBADF`, later `send` traps `EBADF`. Idempotent.
+
+**Implicit creation on `send` is kept.** Removing it would break every agent
+written before 1.0 — exactly the kind of change the freeze now forbids. What
+changed is that implicit creation is no longer the *only* way to get a channel.
+(Worth noting: ABI §10 predicted this would land in `0.2`. It was right about
+the problem and four minor versions wrong about the date.)
+
+### Changed
+
+- **24 syscalls, up from 19.** `SYSCALL_NAMES` and every policy table
+  (`SYSCALL_ALLOWED_STATES`, `SYSCALL_REVERSIBILITY`, `SyscallArgs`,
+  `SyscallReturn`) are exhaustive over the new set, so adding one without
+  updating all seven sites is a compile error.
+- `ProcessInfo` gained a required `capabilities` field.
+- `SpawnOptions` gained optional `capabilities` / `grantable`.
+- `CortexContext` gained five methods (`acquire`, `release`, `caps`,
+  `channel_open`, `channel_close`).
+
+### Deliberately deferred to 1.1 (not an ABI change, so it does not block the freeze)
+
+Collapsing the self-recorded syscalls (`memory_read`, `memory_write`, `send`,
+`recv`, `fork`, `checkpoint`, `restore`) onto the dispatcher's single recording
+path. Those modules predate the dispatcher and still write their own `.crec`
+frames; the on-disk format is identical either way, so this is internal
+tidying rather than a contract change — and `send`'s atomicity (a failed
+record must not leave a phantom message) depends on the module controlling
+when it records. Worth doing, worth doing carefully, not worth holding the
+freeze hostage.
+
+### Tests
+
+Smoke **513 → 525 checks, 0 failures.** Nine new checks cover the capability
+model (default-full-privilege, `EPERM` on spawn without `spawn`, `acquire`
+from the grantable pool, `EPERM` outside the pool, `EINVAL` for a non-capability
+name, `release`, killing your own child without `kill`, and `EPERM` for
+killing a stranger), and three cover the channel lifecycle (open → exists
+before any send, named channels + duplicate-name `EINVAL`, close → `EBADF`).
+The syscall-count assertion now also names the five new syscalls, so a future
+addition cannot silently change the surface.
 
 ## [0.2.1] — 2026-09-20
 
@@ -588,6 +671,7 @@ These are deliberate `v0` boundaries, not oversights. Each is recorded in
 - Sandbox fork, shadow process, `cortex gc`, and `cortex doctor` are post-v0.
 
 [0.1.8]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.8
+[1.0.0]: https://github.com/Jackeven02/cortex-os/releases/tag/v1.0.0
 [0.2.1]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.2.1
 [0.2.0]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.2.0
 [0.1.7]: https://github.com/Jackeven02/cortex-os/releases/tag/v0.1.7

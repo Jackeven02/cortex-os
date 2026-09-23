@@ -163,6 +163,8 @@ Three demos that prove the abstraction matters. Each one becomes a GIF in the RE
 
 Phase 5 is done, so the work history above is complete through the first release.
 
+- [x] **`v1.0.0`** — 2026-09-23. **The syscall ABI is frozen.** Breaking changes now require a major bump; additive changes land in a minor. The rule is in [`docs/ABI.md`](./docs/ABI.md) under "ABI status". This release exists to close the two things the ABI had deferred to "v1": **capabilities** (`acquire` / `release` / `caps` over six capabilities, §4.9, promised by §9.2) and the **explicit channel lifecycle** (`channel_open` / `channel_close`, §4.5, promised by §9.3). 19 → 24 syscalls; `ProcessInfo` gained `capabilities`; `SpawnOptions` gained `capabilities` / `grantable`; `CortexContext` gained five methods. Default is full privilege, not least privilege, so pre-1.0 agents cannot start trapping `EPERM`; the `kill` / `ipc:any` / `tool:dangerous` gates are conditional so a supervision tree still works unprivileged. Smoke 513 → 525. Artifacts: [`CHANGELOG.md`](./CHANGELOG.md) and [`docs/release/v1.0.0.md`](./docs/release/v1.0.0.md). **Deferred to 1.1** (not an ABI change, so it does not block the freeze): collapsing the seven self-recorded syscalls onto the dispatcher's recording path.
+
 - [x] **`v0.1.0`** — 2026-09-19. First tagged release; covers Phases 0–5. `package.json` bumped `0.0.1` → `0.1.0`, annotated tag pushed. Artifacts: [`CHANGELOG.md`](./CHANGELOG.md) (full, itemised, including the known-limitations list) and [`docs/release/v0.1.0.md`](./docs/release/v0.1.0.md) (the GitHub release body — `gh` is not installed locally, so paste it into the Releases UI or `gh release create v0.1.0 --notes-file docs/release/v0.1.0.md`). The `0.x` is deliberate: the syscall ABI is not frozen until `1.0.0`, so a minor bump before then may break the ABI or the state model.
 
 - [x] **npm publish `0.1.0`** — 2026-09-19, published as `cortex-agent-os@0.1.0` (maintainer `jackeven`; verified by installing it into a scratch dir from the real registry and running `npx cortex-agent-os help`). **Naming:** the package ships as `cortex-agent-os`, not `cortex-os`. The exact name `cortex-os` *was* free on the real registry, but npm's typosquatting guard rejects it as too similar to the existing `cortexos` (the two are identical once punctuation is stripped), and that rule only fires at publish time — there is no API to query it in advance. A de-punctuated availability check is now step 1 of the runbook. Pre-flight is green: `npm run build` writes `dist/`, `npm publish --dry-run` is silent apart from the expected "not logged in" warning, and the tarball (204 files, 424 kB) carries the doc set and both `bin` entries. Two traps were found and defused: (1) this machine's global registry is the read-only `registry.npmmirror.com`, which cannot accept publishes — `publishConfig.registry` now pins publishing to `registry.npmjs.org`; (2) `npm login` ignores `publishConfig`, so it must be given `--registry https://registry.npmjs.org` explicitly. `scripts.prepublishOnly` was added so a stale `dist/` can never ship. Full runbook in [`docs/PUBLISHING.md`](./docs/PUBLISHING.md). `examples/` is deliberately excluded from the tarball (they import `../src/index.js`, which is not published). **Known defect in the published `0.1.0`:** the CLI reports its own version from three hardcoded literals — `VERSION` in `src/index.ts`, plus the banner in `src/cli/index.ts` and `src/cli/commands/help.ts` — and they were never bumped with the `0.0.1` → `0.1.0` release, so `cortex --version` and `cortex help` both print `v0.0.1` while the registry says `0.1.0`. The smoke check only asserts `VERSION` is a non-empty string, so it passed. **Fixed in `0.1.1`** by deriving `VERSION` from `package.json` (single source of truth, `new URL('../package.json', import.meta.url)` resolves correctly from both `src/index.ts` and `dist/index.js`) and ship as `0.1.1`.
@@ -184,7 +186,9 @@ Phase 5 is done, so the work history above is complete through the first release
 
 **Release-material gap in `0.1.3`–`0.1.8` — closed 2026-09-20.** It was: none of them had the `docs/release/v<version>.md` GitHub-release body that step 4 of [`docs/PUBLISHING.md`](./docs/PUBLISHING.md) calls for, and npm still served `0.1.2`, so six tagged versions existed only as git tags. Now: `main` and `v0.1.8` are pushed, npm serves `0.1.8`, and `v0.1.8` carries a release body written retrospectively for readers jumping straight from `0.1.2`. `0.1.3`–`0.1.7` stay tagged-only — they never reached the registry and have no release page; their content is folded into the `v0.1.8` notes rather than backfilled. **The rule to keep: tag, release body, and `npm publish` land together — a tag on its own is not a release.**
 
-Next release (`0.2.1`): whatever comes out of the Icebox below.
+**Next release:** `1.1` — additive work only. The leading candidate is the
+self-recorded-syscall cleanup (see the `1.0.0` entry above); the rest comes out
+of the Icebox below.
 
 ---
 
@@ -193,7 +197,7 @@ Next release (`0.2.1`): whatever comes out of the Icebox below.
 Things we want, but not yet:
 
 **From the v0 design:**
-- Capability / permission system (was Phase 1, demoted)
+- ~~Capability / permission system (was Phase 1, demoted)~~ → **shipped in `1.0.0`** as `acquire` / `release` / `caps` over six capabilities (ABI §4.9). Demoting it in v0 was right — nobody had a workload that needed it yet — and §9.2's "v1 may introduce it" is now closed.
 - Sandbox fork (STATE.md §3.2) — copy-on-write filesystem overlay
 - Shadow process (STATE.md §3.4) — same state, different driver config
 - Two-phase tool pattern (`stage` / `commit`) for irreversible actions

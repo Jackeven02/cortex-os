@@ -112,6 +112,7 @@ import {
   SYSCALL_NAMES,
   SYSCALL_ALLOWED_STATES,
   SYSCALL_REVERSIBILITY,
+  SYSCALL_REQUIRED_CAPABILITY,
   SELF_RECORDED_SYSCALLS,
   UNRECORDED_SYSCALLS,
   killReversibility,
@@ -202,7 +203,7 @@ import {
   type JsonRpcResponse,
 } from '../src/drivers/tool/mcp.js';
 
-import type { ToolInvokeContext } from '../src/kernel/types.js';
+import { CAPABILITIES, type ToolInvokeContext, type Capability } from '../src/kernel/types.js';
 
 import {
   diffRecords,
@@ -5163,10 +5164,21 @@ async function runDispatcherChecks(): Promise<void> {
 
   // --- constants / policy tables -------------------------------------------
 
-  check('dispatcher exports 19 syscall names, no duplicates', () => {
-    assert(SYSCALL_NAMES.length === 19, `expected 19 syscalls, got ${SYSCALL_NAMES.length}`);
+  check('dispatcher exports 24 syscall names, no duplicates', () => {
+    assert(SYSCALL_NAMES.length === 24, `expected 24 syscalls, got ${SYSCALL_NAMES.length}`);
     const uniq = new Set(SYSCALL_NAMES);
     assert(uniq.size === SYSCALL_NAMES.length, 'duplicate syscall names');
+    // The v1 promises from docs/ABI.md §9: capabilities (§9.2) and the
+    // explicit channel lifecycle (§9.3).
+    for (const s of [
+      'acquire',
+      'release',
+      'caps',
+      'channel_open',
+      'channel_close',
+    ] as const) {
+      assert(SYSCALL_NAMES.includes(s), `missing syscall '${s}'`);
+    }
   });
 
   check('policy tables cover every syscall exactly', () => {
@@ -6820,6 +6832,248 @@ async function runMockLLMChecks(): Promise<void> {
       resolveTool: reg.toolResolver(),
     });
   }
+
+  // --- §9 capabilities (docs/ABI.md §4.9) ----------------------------------
+
+  async function runningPidWithCaps(
+    table: ProcessTable,
+    caps?: readonly Capability[],
+    grantable?: readonly Capability[],
+  ): Promise<ProcessIdAlias> {
+    const pid = await table.allocate({
+      ppid: null,
+      role: 'worker',
+      agent,
+      ...(caps !== undefined ? { capabilities: caps } : {}),
+      ...(grantable !== undefined ? { grantable } : {}),
+    });
+    await table.setState(pid, 'ready', { trigger: 'test' });
+    await table.setState(pid, 'running', { trigger: 'test' });
+    return pid;
+  }
+  const errnoOf = (e: unknown): string => (e as { errno?: string }).errno ?? '';
+
+  await checkAsync('capabilities: a process nobody narrowed holds everything', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const d = makeDispatcher(table, reg);
+    const pid = await runningPid(table);
+    // The compatibility contract: pre-1.0 agents must not start trapping
+    // EPERM just because capabilities now exist.
+    assert(
+      d.capabilitiesOf(pid).length === CAPABILITIES.length,
+      `expected all capabilities, got ${d.capabilitiesOf(pid).length}`,
+    );
+    assert(d.hasCapability(pid, 'kill') && d.hasCapability(pid, 'spawn'), 'kill + spawn held');
+    await reg.closeAll();
+  });
+
+  await checkAsync('capabilities: spawn is refused without the spawn capability', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const d = makeDispatcher(table, reg);
+    const pid = await runningPidWithCaps(table, []);
+    let errno = '';
+    try {
+      await d.invoke(pid, 'spawn', { role: 'child', agent });
+    } catch (e) {
+      errno = errnoOf(e);
+    }
+    assert(errno === 'EPERM', `expected EPERM, got ${errno || 'no error'}`);
+    await reg.closeAll();
+  });
+
+  await checkAsync('capabilities: acquire raises a grantable capability and it then works', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const d = makeDispatcher(table, reg);
+    const pid = await runningPidWithCaps(table, [], ['spawn']);
+
+    let errno = '';
+    try {
+      await d.invoke(pid, 'spawn', { role: 'child', agent });
+    } catch (e) {
+      errno = errnoOf(e);
+    }
+    assert(errno === 'EPERM', 'narrowed process cannot spawn before acquiring');
+
+    await d.invoke(pid, 'acquire', 'spawn');
+    assert(d.hasCapability(pid, 'spawn'), 'acquire granted spawn');
+    const res = await d.invoke(pid, 'spawn', { role: 'child', agent });
+    assert(res.pid !== undefined, 'spawn succeeded after acquire');
+    await reg.closeAll();
+  });
+
+  await checkAsync('capabilities: acquire refuses a capability outside the grantable pool', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const d = makeDispatcher(table, reg);
+    // grantable holds only 'fork', so 'spawn' can never be raised.
+    const pid = await runningPidWithCaps(table, [], ['fork']);
+    let errno = '';
+    try {
+      await d.invoke(pid, 'acquire', 'spawn');
+    } catch (e) {
+      errno = errnoOf(e);
+    }
+    assert(errno === 'EPERM', `expected EPERM, got ${errno || 'no error'}`);
+    assert(!d.hasCapability(pid, 'spawn'), 'still does not hold spawn');
+    await reg.closeAll();
+  });
+
+  await checkAsync('capabilities: acquire traps EINVAL for a name that is not a capability', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const d = makeDispatcher(table, reg);
+    const pid = await runningPidWithCaps(table, []);
+    let errno = '';
+    try {
+      await d.invoke(pid, 'acquire', 'superuser' as Capability);
+    } catch (e) {
+      errno = errnoOf(e);
+    }
+    assert(errno === 'EINVAL', `expected EINVAL, got ${errno || 'no error'}`);
+    await reg.closeAll();
+  });
+
+  await checkAsync('capabilities: release drops a capability', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const d = makeDispatcher(table, reg);
+    const pid = await runningPidWithCaps(table, ['spawn']);
+    const first = await d.invoke(pid, 'spawn', { role: 'child', agent });
+    assert(first.pid !== undefined, 'spawn works while spawn is held');
+    await d.invoke(pid, 'release', 'spawn');
+    assert(!d.hasCapability(pid, 'spawn'), 'spawn dropped');
+    let errno = '';
+    try {
+      await d.invoke(pid, 'spawn', { role: 'child2', agent });
+    } catch (e) {
+      errno = errnoOf(e);
+    }
+    assert(errno === 'EPERM', `expected EPERM after release, got ${errno || 'no error'}`);
+    await reg.closeAll();
+  });
+
+  await checkAsync('capabilities: killing your own child needs no kill capability', async () => {
+    // The regression that matters most: a supervision tree kills the child
+    // that missed its deadline. If that needed `kill`, the capability would
+    // be handed out so widely it would stop meaning anything.
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const d = makeDispatcher(table, reg);
+    const parent = await runningPidWithCaps(table, ['spawn']);
+    const { pid: child } = await d.invoke(parent, 'spawn', { role: 'coder', agent });
+    // No EPERM: the child is a descendant.
+    await d.invoke(parent, 'kill', child as ProcessIdAlias, 'SIGTERM');
+    assert(true, 'killing a descendant succeeded without the kill capability');
+    await reg.closeAll();
+  });
+
+  await checkAsync('capabilities: killing a stranger needs the kill capability', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const d = makeDispatcher(table, reg);
+    const attacker = await runningPidWithCaps(table, ['spawn']);
+    const stranger = await runningPidWithCaps(table, ['spawn']);
+
+    let errno = '';
+    try {
+      await d.invoke(attacker, 'kill', stranger as ProcessIdAlias, 'SIGTERM');
+    } catch (e) {
+      errno = errnoOf(e);
+    }
+    assert(errno === 'EPERM', `expected EPERM for a stranger, got ${errno || 'no error'}`);
+
+    // Grant it, and the same call is allowed.
+    await d.invoke(attacker, 'acquire', 'kill').catch(() => {});
+    d.setCapabilities(attacker as ProcessIdAlias, ['spawn', 'kill']);
+    await d.invoke(attacker, 'kill', stranger as ProcessIdAlias, 'SIGTERM');
+    assert(true, 'killing a stranger succeeds once kill is held');
+    await reg.closeAll();
+  });
+
+  await checkAsync('capabilities: the required-capability table is keyed to real syscalls', async () => {
+    for (const [syscall, cap] of Object.entries(SYSCALL_REQUIRED_CAPABILITY)) {
+      assert(
+        SYSCALL_NAMES.includes(syscall as never),
+        `SYSCALL_REQUIRED_CAPABILITY references unknown syscall '${syscall}'`,
+      );
+      assert(
+        (CAPABILITIES as readonly string[]).includes(cap),
+        `SYSCALL_REQUIRED_CAPABILITY['${syscall}'] is not a capability: '${cap}'`,
+      );
+    }
+  });
+
+  // --- §9b explicit channel lifecycle (docs/ABI.md §4.5, §9.3) -------------
+
+  function makeIpcDispatcher(table: ProcessTable, reg: DriverRegistry): {
+    d: SyscallDispatcher;
+    ipc: IpcManager;
+  } {
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const ipc = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const d = new SyscallDispatcher({
+      table,
+      signals,
+      ipc,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      resolveLLM: reg.llmResolver(),
+      resolveTool: reg.toolResolver(),
+    });
+    return { d, ipc };
+  }
+
+  await checkAsync('channels: channel_open mints a fresh id that exists before any send', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const { d, ipc } = makeIpcDispatcher(table, reg);
+    const pid = await runningPid(table);
+    const { channelId } = await d.invoke(pid, 'channel_open');
+    // The whole point of §9.3: the channel is knowable before anyone sends.
+    assert(ipc.hasChannel(channelId), 'channel exists immediately after open');
+    assert(!ipc.getChannel(channelId)?.closed, 'new channel is not closed');
+    await reg.closeAll();
+  });
+
+  await checkAsync('channels: a named channel is claimable and duplicate names are refused', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const { d } = makeIpcDispatcher(table, reg);
+    const pid = await runningPid(table);
+    const first = await d.invoke(pid, 'channel_open', { name: 'work-queue' });
+    assert(unbrand(first.channelId) === 'work-queue', 'claimed the requested name');
+    let errno = '';
+    try {
+      await d.invoke(pid, 'channel_open', { name: 'work-queue' });
+    } catch (e) {
+      errno = errnoOf(e);
+    }
+    assert(errno === 'EINVAL', `expected EINVAL for a duplicate name, got ${errno || 'no error'}`);
+    await reg.closeAll();
+  });
+
+  await checkAsync('channels: channel_close retires the channel and later send traps EBADF', async () => {
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    const table = await makeTable();
+    const { d } = makeIpcDispatcher(table, reg);
+    const pid = await runningPid(table);
+    const { channelId } = await d.invoke(pid, 'channel_open', { name: 'pipe' });
+    // Idempotent: closing twice is not an error.
+    await d.invoke(pid, 'channel_close', channelId);
+    await d.invoke(pid, 'channel_close', channelId);
+
+    let errno = '';
+    try {
+      await d.invoke(pid, 'send', channelId, { hello: true });
+    } catch (e) {
+      errno = errnoOf(e);
+    }
+    assert(errno === 'EBADF', `expected EBADF on a closed channel, got ${errno || 'no error'}`);
+    await reg.closeAll();
+  });
 
   await checkAsync('E2E: llm_call through the registry resolver returns the mock reply', async () => {
     const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });

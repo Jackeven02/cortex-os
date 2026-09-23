@@ -24,7 +24,7 @@ The primitives, borrowed verbatim from Unix:
 
 spawn · ps · kill · wait · fork · diff · checkpoint · restore · trace · attach · limit · daemon
 
-19 syscalls. 11 kernel modules. Pure TypeScript, Node 22+, exactly one runtime
+24 syscalls. 11 kernel modules. Pure TypeScript, Node 22+, exactly one runtime
 dep (cborg, for the CBOR syscall log), MIT.
 
 ---

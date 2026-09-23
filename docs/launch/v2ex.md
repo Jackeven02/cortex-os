@@ -22,7 +22,7 @@ spawn · ps · kill · wait · fork · diff · checkpoint · restore
 trace · attach · limit · daemon · audit
 ```
 
-19 个 syscall，11 个内核模块，纯 TypeScript，Node 22+，MIT，唯一的运行时依赖是
+24 个 syscall，11 个内核模块，纯 TypeScript，Node 22+，MIT，唯一的运行时依赖是
 `cborg`（用来编码 append-only 的 CBOR syscall 日志）。
 
 **现在已经能跑的东西**（v0，`npm install` 后全离线跑，走确定性 mock driver，不需要 API key）：
