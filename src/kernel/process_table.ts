@@ -133,7 +133,14 @@ const LEGAL_TRANSITIONS: ReadonlySet<string> = new Set([
   'stopped->ready', // SIGCONT
   'running->checkpointing', // SIGUSR2 or checkpoint() syscall
   'blocked->checkpointing', // SIGUSR2 delivered while blocked
-  'checkpointing->ready', // snapshot done, no --detach
+  // Snapshot done, no --detach. The process goes straight back to RUNNING,
+  // not to READY: the agent body is still live and its `await ctx.checkpoint()`
+  // resolves inline, so the very next statement issues a syscall. Leaving it
+  // READY meant that next syscall trapped ESTATE — the body was executing
+  // while the process claimed not to be running. (READY means "dispatchable
+  // but not yet dispatched", which is simply not true here.)
+  'checkpointing->running', // snapshot done, no --detach
+  'checkpointing->ready', // retained for the best-effort abort path
   'checkpointing->suspended', // snapshot done with --detach
   'running->exiting', // exit() or terminating signal
   'blocked->exiting', // SIGKILL or SIGTERM with handler

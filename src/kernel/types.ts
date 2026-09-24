@@ -434,6 +434,35 @@ export interface ProcessInfo {
 }
 
 /**
+ * The subset of `ProcessInfo` the kernel persists to disk when a process
+ * exits, so a later CLI invocation (`ps` / `top` / `trace`) can show the full
+ * supervision tree — including processes spawned *inside* an agent via
+ * `ctx.spawn()` (docs/ABI.md §4.2, issue C2).
+ *
+ * The CLI's `ProcessMeta` (cli/process_store.ts) extends this with a couple of
+ * optional, CLI-only fields (`memory`, `blockedOn`); because those are
+ * optional, a `PersistedProcessMeta` is structurally assignable to
+ * `ProcessMeta`, so the kernel can hand this object straight to the CLI's
+ * `writeMeta` through the `KernelOptions.onProcessExit` hook without the
+ * kernel ever importing a CLI type.
+ */
+export interface PersistedProcessMeta {
+  readonly pid: number;
+  readonly ppid: number | null;
+  readonly pgid: number;
+  readonly role: string;
+  readonly state: ProcessState;
+  readonly exitCode: number | null;
+  readonly exitReason: string | null;
+  readonly startedAt: string;
+  readonly lastTransitionAt: string;
+  readonly budgetsSpent: BudgetCounters;
+  readonly budgetsRemaining: BudgetLimits;
+  readonly agent: AgentSpec;
+  readonly kernelAbiVersion: string;
+}
+
+/**
  * Filter for `ps()`. All fields are ANDed. Missing fields match anything.
  */
 export interface ProcessFilter {

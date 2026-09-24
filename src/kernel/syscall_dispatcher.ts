@@ -85,6 +85,7 @@ import {
   type MemoryEntry,
   type MemoryQuery,
   type MemoryWriteOptions,
+  type PersistedProcessMeta,
   type ProcessFilter,
   type ProcessId,
   type ProcessInfo,
@@ -504,6 +505,14 @@ export interface DispatcherOptions {
   ) => void | Promise<void>;
 
   /**
+   * Persist a process's metadata at exit (see `KernelOptions.onProcessExit`).
+   * The kernel calls this at the ZOMBIE transition — before `init` reaps the
+   * entry — so every process (including those an agent spawned internally via
+   * `ctx.spawn()`) lands a `meta.json` the read-only CLI commands can show.
+   */
+  readonly onProcessExit?: (meta: PersistedProcessMeta) => void | Promise<void>;
+
+  /**
    * The kernel's wake gate. When present, a parked `wait()` is *not* resolved
    * the instant its child zombifies — the resolution is deferred until the
    * scheduler puts the parent back on the CPU, so the agent's next syscall sees
@@ -568,6 +577,7 @@ export class SyscallDispatcher {
   #setTimeoutFn: (cb: () => void, ms: number) => unknown;
   #clearTimeoutFn: (handle: unknown) => void;
   #onBudgetExhausted: DispatcherOptions['onBudgetExhausted'];
+  #onProcessExit: DispatcherOptions['onProcessExit'];
   #wakeGate: WakeGate | null;
 
   /** pid → forkable-region nesting depth. */
@@ -610,6 +620,9 @@ export class SyscallDispatcher {
       opts.clearTimeoutFn ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
     if (opts.onBudgetExhausted !== undefined) {
       this.#onBudgetExhausted = opts.onBudgetExhausted;
+    }
+    if (opts.onProcessExit !== undefined) {
+      this.#onProcessExit = opts.onProcessExit;
     }
     this.#wakeGate = opts.wakeGate ?? null;
     const explicitCallId = opts.nextCallId;
@@ -1320,6 +1333,34 @@ export class SyscallDispatcher {
     this.#table.setExitInfo(pid, code, exitReason, finalLogOffset);
     await this.#table.setState(pid, 'zombie', { trigger: 'exit', code });
 
+    // Persist metadata NOW, before `init.handleZombie` may reap the entry.
+    // This is what makes agent-internal `ctx.spawn()` children visible to
+    // `ps` / `top` in a later CLI invocation (issue C2): every process lands a
+    // `meta.json` at exit, not just the single PID the CLI spawned directly.
+    if (this.#onProcessExit !== undefined) {
+      const meta: PersistedProcessMeta = {
+        pid: unbrand(pid),
+        ppid: entry.ppid === null ? null : unbrand(entry.ppid),
+        pgid: unbrand(entry.pgid),
+        role: entry.role,
+        state: 'zombie',
+        exitCode: entry.exitCode,
+        exitReason: entry.exitReason,
+        startedAt: entry.startedAt,
+        lastTransitionAt: entry.lastTransitionAt,
+        budgetsSpent: { ...entry.budgetsSpent },
+        budgetsRemaining: { ...entry.budgetsRemaining },
+        agent: entry.agent,
+        kernelAbiVersion: this.kernelAbiVersion,
+      };
+      try {
+        await this.#onProcessExit(meta);
+      } catch {
+        // Meta persistence is best-effort: a failure here must not turn a
+        // clean exit into a teardown crash.
+      }
+    }
+
     // Hand off to the supervisor: reparent orphans, SIGCHLD, conditional reap,
     // daemon restart. Then wake any parent parked in wait().
     if (this.#init !== null) {
@@ -1908,10 +1949,19 @@ function assertStateIn(
   syscall: string,
 ): void {
   if (!allowed.includes(current)) {
-    trap('ESTATE', syscall, {
-      currentState: current,
-      allowedStates: [...allowed],
-    });
+    // The message states the constraint outright. The generic errno text
+    // ("syscall not allowed in current process state") is true but useless on
+    // its own: it names neither the state you are in nor the states that would
+    // have worked, which turns a five-second read into a full debugging round.
+    trap(
+      'ESTATE',
+      syscall,
+      {
+        currentState: current,
+        allowedStates: [...allowed],
+      },
+      `${syscall} requires one of [${allowed.join(', ')}]; current state: ${current}`,
+    );
   }
 }
 

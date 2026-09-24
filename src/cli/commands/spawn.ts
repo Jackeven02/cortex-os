@@ -47,6 +47,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       memory: { type: 'string' },
       cap: { type: 'string' },
       grantable: { type: 'string' },
+      args: { type: 'string' },
       timeout: { type: 'string', short: 't' },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -155,13 +156,39 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       }
     }
 
-    // --module spawns a user agent module (it drives its own llm_call, so the
-    // LLM flags below do not apply to it). Otherwise use the built-in prompt
-    // agent, forwarding --driver/--model/--max-tokens as request defaults.
-    const agentSpec: AgentSpec =
-      values.module !== undefined
-        ? { module: pathToFileURL(resolvePath(values.module)).href }
-        : {
+  // --args hands a JSON object to the agent as `AgentSpec.args`, so one agent
+  // module can be reused for different work without editing it. It is the only
+  // channel: `parseArgs` runs with `allowPositionals: false`, so an ad-hoc
+  // `--topic mcp` is rejected as an unknown option.
+  let agentArgs: Record<string, unknown> | undefined;
+  if (values.args !== undefined) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(values.args);
+    } catch {
+      console.error(
+        `cortex spawn: invalid --args: '${values.args}' is not valid JSON`,
+      );
+      console.error(`(expected an object, e.g. --args '{"topic":"mcp","depth":2}')`);
+      return 1;
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      console.error(`cortex spawn: --args must be a JSON object, got ${Array.isArray(parsed) ? 'an array' : typeof parsed}`);
+      return 1;
+    }
+    agentArgs = parsed as Record<string, unknown>;
+  }
+
+  // --module spawns a user agent module (it drives its own llm_call, so the
+  // LLM flags below do not apply to it). Otherwise use the built-in prompt
+  // agent, forwarding --driver/--model/--max-tokens as request defaults.
+  const agentSpec: AgentSpec =
+    values.module !== undefined
+      ? {
+          module: pathToFileURL(resolvePath(values.module)).href,
+          ...(agentArgs !== undefined ? { args: agentArgs } : {}),
+        }
+      : {
             system,
             ...(driver !== undefined ? { driver } : {}),
             ...(model !== undefined ? { model } : {}),
@@ -327,6 +354,9 @@ OPTIONS
                         which is what pre-1.0 agents expect.
   --grantable <list>    Capabilities the agent may raise later with
                         ctx.acquire() but does not hold yet.
+  --args <json>         A JSON object handed to the agent as its "args", so one
+                        module can be reused for different work. Only applies
+                        with --module. e.g. --args '{"topic":"mcp","depth":2}'
   -t, --timeout <ms>    Max wall time (default 30000)
   -h, --help            Show this help
 

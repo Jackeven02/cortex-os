@@ -56,6 +56,11 @@ ENVIRONMENT
   CORTEX_HOME          Kernel state directory (default: ./.cortex)
   DEEPSEEK_API_KEY     If set, the deepseek LLM driver is registered
   OPENAI_API_KEY       If set, the openai LLM driver is registered
+  OPENAI_BASE_URL      Override the OpenAI endpoint (default api.openai.com);
+                       point it at OpenRouter / vLLM / any compatible proxy
+  OPENAI_MODEL         Default model for the openai driver when omitted
+  DEEPSEEK_BASE_URL    Same endpoint override for the deepseek driver
+  DEEPSEEK_MODEL       Same default-model override for deepseek
   CORTEX_MCP_COMMAND   Mount an MCP server as a tool namespace, e.g. npx
   CORTEX_MCP_ARGS      Whitespace-separated args for that server
   CORTEX_MCP_NAMESPACE Tool-name prefix for MCP tools (default: mcp)

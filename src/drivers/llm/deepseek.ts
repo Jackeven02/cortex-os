@@ -444,8 +444,19 @@ export class DeepSeekLLMDriver implements ILLMDriver {
     } catch (err) {
       // Transport failure or the kernel's timeout tripping the abort signal.
       if (isAbortError(err) || ctx.abortSignal.aborted) {
-        throw new CortexError('ETIMEDOUT', syscall, {
-          message: `deepseek llm_call timed out`,
+        // Past the deadline ⇒ genuine timeout; earlier ⇒ interrupted by a
+        // signal/teardown (EINTR). Reporting the latter as ETIMEDOUT used to
+        // drown the real failure during host-level retries (issue C6).
+        const pastDeadline = Date.parse(ctx.deadline) <= Date.now();
+        if (pastDeadline) {
+          throw new CortexError('ETIMEDOUT', syscall, {
+            message: `deepseek llm_call timed out (deadline ${ctx.deadline})`,
+            details: { driver: this.name, model, deadline: ctx.deadline as Timestamp },
+            cause: err,
+          });
+        }
+        throw new CortexError('EINTR', syscall, {
+          message: `deepseek llm_call interrupted before deadline ${ctx.deadline} (process abort / signal)`,
           details: { driver: this.name, model, deadline: ctx.deadline as Timestamp },
           cause: err,
         });

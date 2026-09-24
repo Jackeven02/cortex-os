@@ -173,18 +173,100 @@ export const MCP_ENV = {
 } as const;
 
 /**
+ * Read an env var, treating empty/whitespace-only as absent.
+ *
+ * `OPENAI_BASE_URL=` (set but empty) is a common way to accidentally blank a
+ * setting in a shell profile; passing `''` as a baseUrl would make every
+ * request go to a relative URL and fail confusingly.
+ */
+function envOrUndefined(name: string): string | undefined {
+  const v = process.env[name];
+  if (v === undefined) return undefined;
+  const trimmed = v.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
+ * Build `{ baseUrl, defaultModel }` overrides from two env vars, omitting each
+ * key entirely when unset. Read into locals first so `exactOptionalPropertyTypes`
+ * sees a narrowed `string` rather than `string | undefined`.
+ */
+function llmOverrides(
+  baseUrlVar: string,
+  modelVar: string,
+): { baseUrl?: string; defaultModel?: string } {
+  const baseUrl = envOrUndefined(baseUrlVar);
+  const model = envOrUndefined(modelVar);
+  return {
+    ...(baseUrl !== undefined ? { baseUrl } : {}),
+    ...(model !== undefined ? { defaultModel: model } : {}),
+  };
+}
+
+/** Options for {@link defaultLoadDrivers}. */
+export interface LoadDriverOptions {
+  /**
+   * Force a specific built-in LLM driver to load and become the default, even
+   * when its env key is absent. Used by `cortex restore --driver` so a restored
+   * agent whose original driver was custom or env-specific does not silently
+   * fall back to the mock (issue C4). When the key is missing the driver still
+   * loads and fails *clearly* at call time ("no API key") instead of echoing
+   * deterministic output.
+   */
+  readonly forceLLM?: string;
+  /** Reserved for symmetry with `spawn --model`; currently advisory only. */
+  readonly forceModel?: string;
+}
+
+/**
  * Build the default driver-loading hook for the kernel. Registers built-in
  * LLM, tool, and memory drivers. LLM driver selection is env-driven:
  * `DEEPSEEK_API_KEY` → deepseek, `OPENAI_API_KEY` → openai, else mock.
  *
+ * Both LLM drivers accept `OPENAI_BASE_URL` / `DEEPSEEK_BASE_URL` and
+ * `OPENAI_MODEL` / `DEEPSEEK_MODEL` so any OpenAI-compatible endpoint
+ * (OpenRouter, vLLM, a corporate proxy) is reachable without leaving the CLI.
+ *
  * MCP is opt-in via `CORTEX_MCP_COMMAND` (see `MCP_ENV`).
  */
-export async function defaultLoadDrivers(registry: import('../kernel/driver_registry.js').DriverRegistry): Promise<void> {
-  if (process.env['DEEPSEEK_API_KEY'] !== undefined) {
-    registry.registerLLM(deepseekLLM());
+export async function defaultLoadDrivers(
+  registry: import('../kernel/driver_registry.js').DriverRegistry,
+  opts: LoadDriverOptions = {},
+): Promise<void> {
+  const forced = opts.forceLLM;
+  // Force the requested LLM driver to load (and default to it) so a restored
+  // agent does not silently fall back to the mock (issue C4). A name that is
+  // neither deepseek nor openai is not built in: warn and fall back to mock,
+  // since the CLI genuinely cannot load a host's custom driver here.
+  if (forced === 'deepseek') {
+    registry.registerLLM(deepseekLLM(llmOverrides('DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL')));
+  } else if (forced === 'openai') {
+    registry.registerLLM(openaiLLM(llmOverrides('OPENAI_BASE_URL', 'OPENAI_MODEL')));
+  } else if (forced !== undefined) {
+    process.stderr.write(
+      `cortex: warning: unknown --driver '${forced}'; no such LLM driver is built in. ` +
+        `The CLI cannot load a custom driver, so the process will use the mock.\n`,
+    );
+    registry.registerLLM(mockLLM());
   }
-  if (process.env['OPENAI_API_KEY'] !== undefined) {
-    registry.registerLLM(openaiLLM());
+  if (forced !== undefined) {
+    try {
+      registry.setDefaultLLM(forced === 'deepseek' || forced === 'openai' ? forced : 'mock');
+    } catch {
+      /* setDefaultLLM traps if the name is somehow unregistered; mock is always present */
+    }
+  }
+
+  if (forced !== 'deepseek' && process.env['DEEPSEEK_API_KEY'] !== undefined) {
+    registry.registerLLM(deepseekLLM(llmOverrides('DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL')));
+  }
+  if (forced !== 'openai' && process.env['OPENAI_API_KEY'] !== undefined) {
+    // OpenAI-compatible endpoints (OpenRouter, vLLM, LiteLLM, any proxy).
+    // Without this the only way to reach one was to bypass the CLI and call
+    // bootKernel() yourself — and the failure mode was hostile: an OpenRouter
+    // key sent to api.openai.com comes back 401 with nothing hinting that a
+    // baseUrl was the missing piece.
+    registry.registerLLM(openaiLLM(llmOverrides('OPENAI_BASE_URL', 'OPENAI_MODEL')));
   }
   // Always register the mock so tests and `--driver mock` work.
   registry.registerLLM(mockLLM());
@@ -266,14 +348,24 @@ export const DEFAULT_MEMORY_REGIONS: Readonly<Record<string, MemoryRegionPolicy>
 
 export async function bootCliKernel(
   dir: string,
-  opts: { readonly maxRegionEntries?: number } = {},
+  opts: {
+    readonly maxRegionEntries?: number;
+    /** Force a built-in LLM driver to load + default (issue C4). */
+    readonly forceLLM?: string;
+    /** Reserved; advisory only for now. */
+    readonly forceModel?: string;
+  } = {},
 ): Promise<Kernel> {
   ensureKernelDirs(dir);
   const kernel = await bootKernel({
     kernelAbiVersion: KERNEL_ABI_VERSION,
     dir,
-    loadDrivers: defaultLoadDrivers,
-    defaultLLM: defaultLLMName(),
+    loadDrivers: (registry) =>
+      defaultLoadDrivers(registry, {
+        ...(opts.forceLLM !== undefined ? { forceLLM: opts.forceLLM } : {}),
+        ...(opts.forceModel !== undefined ? { forceModel: opts.forceModel } : {}),
+      }),
+    defaultLLM: opts.forceLLM ?? defaultLLMName(),
     defaultMemory: DEFAULT_MEMORY_BACKING,
     defaultMemoryBacking: DEFAULT_MEMORY_BACKING,
     ...(opts.maxRegionEntries !== undefined ? { maxRegionEntries: opts.maxRegionEntries } : {}),
@@ -297,6 +389,15 @@ export async function bootCliKernel(
         memory: meta.memory ?? DEFAULT_MEMORY_REGIONS,
         ppid: cp.parentPid,
       };
+    },
+    // Persist a meta.json for EVERY process as it exits — including the
+    // children an agent spawns internally via ctx.spawn() (issue C2). Without
+    // this, `cortex ps` / `cortex top` only ever saw the single top-level PID
+    // the CLI booted itself; the supervision tree was invisible. The kernel
+    // calls this at the ZOMBIE transition, before the entry is reaped, so the
+    // full exit info is still on the entry.
+    onProcessExit: (meta) => {
+      writeMeta(dir, meta as unknown as Parameters<typeof writeMeta>[1]);
     },
   });
   // Seed the PID counter past anything already persisted, so this invocation

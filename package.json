@@ -1,6 +1,6 @@
 {
   "name": "cortex-agent-os",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "An operating system for AI agents.",
   "type": "module",
   "license": "MIT",

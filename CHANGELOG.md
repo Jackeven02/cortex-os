@@ -38,6 +38,55 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ---
 
+## [1.0.3] — 2026-09-24
+
+Bug-fix release. All eight issues from the `v1.0.1` field report are now
+resolved; seven were code bugs (C5 was already fixed by the `1.0.2` packaging
+work). No syscall, `.crec`, or `.csnap` format change — the ABI frozen at
+`1.0.0` is untouched, so this is a drop-in patch.
+
+### Fixed
+
+- **C1 — `checkpoint()` left the process in `ready`, trapping `ESTATE` on the
+  next syscall.** The non-`detach` snapshot now returns the process to
+  `running` (matching [docs/ABI.md](./docs/ABI.md)), and `checkpointing→running`
+  is a legal transition. `RUNNING`↔`RUNNING` is preserved; a checkpoint taken
+  from `BLOCKED` still returns to `READY`.
+- **C2 — subprocesses were invisible to `ps` / `top`.** `cortex spawn` only
+  persisted a meta for the single PID it booted; the children an agent spawned
+  internally via `ctx.spawn()` had no `meta.json`, so `cortex top`'s "process
+  tree" was a single node. The kernel now fires an `onProcessExit` hook (a new,
+  optional `KernelOptions` field) at the ZOMBIE transition — *before* `init`
+  reaps the entry — and the CLI writes a `meta.json` for **every** process,
+  including internal children. `ps` / `top` now draw the real supervision tree.
+- **C3 — the CLI could not target an OpenAI-compatible endpoint.** `bootCliKernel`
+  now reads `OPENAI_BASE_URL` / `OPENAI_MODEL` (and the existing
+  `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`) and forwards them to the LLM drivers,
+  so OpenRouter / vLLM / any proxy works without bypassing the CLI. Documented
+  in `cortex help`'s ENVIRONMENT section.
+- **C4 — `cortex restore` silently fell back to the mock driver.** Restored
+  processes now honor `--driver <name>` (and the original agent's declared
+  driver is force-loaded so a missing key fails *clearly* rather than echoing
+  deterministic output). When the restored agent declared a driver that is not
+  loaded in the current environment, `restore` prints an explicit warning
+  instead of silently swapping in the default.
+- **C6 — an already-aborted call was reported as `ETIMEDOUT`.** The LLM drivers
+  conflated a real deadline timeout with an interrupt raised by process
+  teardown. They now compare against `ctx.deadline`: past the deadline ⇒
+  `ETIMEDOUT`; aborted earlier ⇒ `EINTR` — so the genuine failure cause is no
+  longer drowned out during host-level retries.
+- **C7 — `ESTATE` errors carried no context.** The dispatcher now reports the
+  current state and the allowed states in the error (`spawn requires one of
+  [running]; current state: ready`).
+- **C8 — `cortex spawn` could not pass arguments to an agent.** New `--args
+  <json>` flag hands a JSON object to the agent as `AgentSpec.args` (only with
+  `--module`), so one agent module serves many tasks.
+
+### Added
+
+- `KernelOptions.onProcessExit` (kernel) and `PersistedProcessMeta` (kernel
+  types) — both additive and optional, so they do not affect the frozen ABI.
+
 ## [1.0.2] — 2026-09-23
 
 ### Fixed — the bundled demos actually load for an npm user

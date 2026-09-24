@@ -383,8 +383,23 @@ export class OpenAiLLMDriver implements ILLMDriver {
       });
     } catch (err) {
       if (isAbortError(err) || ctx.abortSignal.aborted) {
-        throw new CortexError('ETIMEDOUT', syscall, {
-          message: `openai llm_call timed out`,
+        // Distinguish a genuine deadline timeout from an interrupt raised by
+        // kernel teardown (a process being killed / a quantum torn down). A
+        // fetch that aborts once we are past its deadline is a real timeout;
+        // one aborted *before* the deadline was interrupted by a signal, which
+        // is a different failure and must not be reported as ETIMEDOUT — doing
+        // so drowned the genuine cause (e.g. EDRIVER) under a pile of spurious
+        // timeouts during host-level retry loops (issue C6).
+        const pastDeadline = Date.parse(ctx.deadline) <= Date.now();
+        if (pastDeadline) {
+          throw new CortexError('ETIMEDOUT', syscall, {
+            message: `openai llm_call timed out (deadline ${ctx.deadline})`,
+            details: { driver: this.name, model, deadline: ctx.deadline as Timestamp },
+            cause: err,
+          });
+        }
+        throw new CortexError('EINTR', syscall, {
+          message: `openai llm_call interrupted before deadline ${ctx.deadline} (process abort / signal)`,
           details: { driver: this.name, model, deadline: ctx.deadline as Timestamp },
           cause: err,
         });

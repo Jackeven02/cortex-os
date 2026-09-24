@@ -129,6 +129,7 @@ import {
   type MemoryRegionPolicy,
   type MemoryWriteOptions,
   type Message,
+  type PersistedProcessMeta,
   type ProcessFilter,
   type ProcessId,
   type RandomOptions,
@@ -303,6 +304,19 @@ export interface KernelOptions {
   /** Supervisor hooks. */
   readonly onAlarm?: OnAlarmHook;
   readonly onBudgetExhausted?: (pid: ProcessId, kind: 'tokens' | 'usd' | 'wallTime') => void | Promise<void>;
+
+  /**
+   * Persist a process's metadata when it exits. Called by the dispatcher at
+   * the ZOMBIE transition — *before* the entry is reaped — so the callback
+   * sees the full, final `ProcessInfo` (exit code, reason, budgets, agent).
+   *
+   * The CLI uses this to write a `meta.json` for every process, including
+   * ones an agent spawned internally via `ctx.spawn()` (issue C2): without
+   * it, `cortex ps` / `cortex top` only ever saw the single top-level PID the
+   * CLI spawned itself. Optional; when absent the kernel does not touch the
+   * disk beyond its own `.crec` logs.
+   */
+  readonly onProcessExit?: (meta: PersistedProcessMeta) => void | Promise<void>;
 
   /**
    * Start the scheduler's auto-loop at the end of `boot()`. Defaults to
@@ -619,6 +633,7 @@ export class Kernel {
       ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
       ...(opts.clearTimeoutFn !== undefined ? { clearTimeoutFn: opts.clearTimeoutFn } : {}),
       ...(opts.onBudgetExhausted !== undefined ? { onBudgetExhausted: opts.onBudgetExhausted } : {}),
+      ...(opts.onProcessExit !== undefined ? { onProcessExit: opts.onProcessExit } : {}),
       wakeGate: this.#gate,
     });
   }

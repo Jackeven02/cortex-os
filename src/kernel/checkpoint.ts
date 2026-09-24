@@ -43,7 +43,7 @@
  *
  * ## State machine (PROCESS.md §3.5, §10)
  *
- * `take()` drives RUNNING|BLOCKED → CHECKPOINTING → READY (or → SUSPENDED
+ * `take()` drives RUNNING|BLOCKED → CHECKPOINTING → RUNNING (or → SUSPENDED
  * with `detach: true`). Those are the only legal edges into CHECKPOINTING;
  * a checkpoint from STOPPED or any other state traps `EINVAL`, because
  * `take()` defers to `ProcessTable.setState` and the transition table is the
@@ -51,9 +51,10 @@
  * dispatcher's job, #014). Note the ABI §4.2 "allowed states" list mentions
  * STOPPED but the v0 transition table has no `stopped->checkpointing` edge —
  * a known doc/impl gap tracked in BACKLOG #011. If anything fails after
- * entering CHECKPOINTING, take() best-effort returns the process to READY so
- * it is never stranded; an illegal *source* state never enters CHECKPOINTING
- * and is therefore left exactly as it was.
+ * entering CHECKPOINTING, take() best-effort returns the process to the state
+ * a successful checkpoint would have produced, so it is never stranded; an
+ * illegal *source* state never enters CHECKPOINTING and is therefore left
+ * exactly as it was.
  *
  * `restoreAs()` creates a NEW process with a NEW PID in state NEW
  * (PROCESS.md §3.6, §11.3 — "restore is morally a fork from the past"). It
@@ -275,7 +276,23 @@ export class CheckpointManager {
     const entry = this.#table.mustGet(pid, 'checkpoint'); // traps ESRCH
 
     const detach = opts?.detach === true;
-    const finalState = detach ? 'suspended' : 'ready';
+    // Where the process goes after a non-detach checkpoint.
+    //
+    // From RUNNING it returns to RUNNING, matching docs/ABI.md §4.2 ("State
+    // briefly enters CHECKPOINTING then returns to RUNNING"). It used to be
+    // READY, which contradicted the documented contract and stranded the
+    // agent: the body is still live and `await ctx.checkpoint()` resolves
+    // inline, so the very next statement issues a syscall — and spawn, sleep,
+    // memory_write and llm_call all allow only RUNNING, so it trapped ESTATE
+    // with no way back (even `sleep` requires RUNNING).
+    //
+    // From BLOCKED it still goes to READY, deliberately. A blocked body is
+    // parked on something (recv/wait/sleep); only a signal reaches it here.
+    // Returning it to RUNNING would resume a body that is supposed to be
+    // waiting, and returning it to BLOCKED would need its `blockedOn` reason
+    // restored, which this path does not carry. READY lets the scheduler
+    // re-dispatch it, which is the pre-existing behaviour.
+    const finalState = detach ? 'suspended' : entry.state === 'blocked' ? 'ready' : 'running';
     let enteredCheckpointing = false;
 
     try {
@@ -357,7 +374,7 @@ export class CheckpointManager {
 
       await this.#recordCheckpoint(pid, chainId, opts, fileBytes.byteLength, syscallLogOffset, finalState);
 
-      // CHECKPOINTING → READY (or SUSPENDED with detach).
+      // CHECKPOINTING → RUNNING (or SUSPENDED with detach).
       await this.#table.setState(pid, finalState, { trigger: 'checkpoint' });
 
       return { chainId, path };
@@ -366,7 +383,12 @@ export class CheckpointManager {
       // if we actually entered it — an ESTATE from the initial transition
       // means the process never moved and must be left alone.
       if (enteredCheckpointing) {
-        await this.#table.setState(pid, 'ready', { trigger: 'checkpoint-abort' }).catch(() => {});
+        // Return to the same state a successful checkpoint would have —
+        // READY would strand the body on its very next syscall, which is a
+        // worse outcome than the failure that got us here.
+        await this.#table
+          .setState(pid, finalState, { trigger: 'checkpoint-abort' })
+          .catch(() => {});
       }
       // A raw throw from cognitiveSource / driverStateSource / memory dump is
       // a driver serialization failure (ABI.md §4.2 → EDRIVER).
@@ -644,7 +666,7 @@ export class CheckpointManager {
     opts: CheckpointOptions | undefined,
     byteSize: number,
     syscallLogOffset: SyscallOffset,
-    finalState: 'ready' | 'suspended',
+    finalState: 'running' | 'suspended' | 'ready',
   ): Promise<void> {
     const recorder = this.#table.recorderFor(pid);
     if (recorder === null) return;

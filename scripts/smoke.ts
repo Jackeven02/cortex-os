@@ -3024,14 +3024,17 @@ async function runCheckpointChecks(): Promise<void> {
 
   // --- take -----------------------------------------------------------------
 
-  await checkAsync('take from RUNNING returns to READY and writes a .csnap file', async () => {
+  await checkAsync('take from RUNNING returns to RUNNING and writes a .csnap file', async () => {
     const table = await makeTable();
     const pid = await spawnRunning(table);
     assert(table.get(pid)!.state === 'running', 'starts running');
     const { ckpt, dir } = makeCkpt(table);
     const { chainId, path } = await ckpt.take(pid);
     tick();
-    assert(table.get(pid)!.state === 'ready', 'back to READY after take');
+    // RUNNING, not READY: docs/ABI.md §4.2 says the process "returns to
+    // RUNNING", and the agent body resumes inline — leaving it READY would
+    // make its next syscall trap ESTATE. (Regression test for the C1 report.)
+    assert(table.get(pid)!.state === 'running', 'back to RUNNING after take');
     assert(typeof unbrand(chainId) === 'string' && unbrand(chainId).length > 0, 'chainId returned');
     assert(path.startsWith(dir), 'file written into the checkpoint dir');
     const st = await stat(path);
@@ -3102,8 +3105,8 @@ async function runCheckpointChecks(): Promise<void> {
     }
     assert(isCortexError(err) && err.errno === 'EDRIVER', 'raw throw wrapped as EDRIVER');
     assert(
-      table.get(pid)!.state === 'ready',
-      'recovered to READY, never stranded in CHECKPOINTING',
+      table.get(pid)!.state === 'running',
+      'recovered to RUNNING, never stranded in CHECKPOINTING',
     );
   });
 
@@ -3273,7 +3276,7 @@ async function runCheckpointChecks(): Promise<void> {
     const newPid = await ckpt.restoreAs(chainId);
     assert(unbrand(newPid) !== unbrand(pid), 'restore allocates a fresh pid');
     assert(table.get(newPid)!.state === 'new', 'new process starts in NEW');
-    assert(table.get(pid)!.state === 'ready', 'source process is unaffected');
+    assert(table.get(pid)!.state === 'running', 'source process is unaffected');
     assert(
       table.get(newPid)!.checkpointChain.some((c) => unbrand(c) === unbrand(chainId)),
       'new process continues the same chain',
@@ -3355,7 +3358,7 @@ async function runCheckpointChecks(): Promise<void> {
     assert(ck[0]!.phase === 'exit', 'exit phase');
     assert(ck[0]!.reversibility === 'idempotent', 'checkpoint is idempotent');
     assert(
-      ck[0]!.stateBefore === 'checkpointing' && ck[0]!.stateAfter === 'ready',
+      ck[0]!.stateBefore === 'checkpointing' && ck[0]!.stateAfter === 'running',
       'state transition recorded',
     );
     const res = ck[0]!.result as { chainId: string; byteSize: number; syscallLogOffset: number };

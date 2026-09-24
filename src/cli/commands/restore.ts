@@ -25,6 +25,8 @@ export async function cmdRestore(args: string[]): Promise<number> {
     options: {
       tag: { type: 'string' },
       chain: { type: 'string' },
+      driver: { type: 'string' },
+      model: { type: 'string' },
       timeout: { type: 'string', short: 't' },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -41,15 +43,28 @@ USAGE
 OPTIONS
   --chain <string>   Checkpoint chain ID to restore from
   --tag <string>     Tag name to resolve (finds the latest matching checkpoint)
+  --driver <name>    Force a built-in LLM driver (deepseek | openai | mock) to
+                     load and become the default for the restored process. Use
+                     this when the original process ran with a specific driver,
+                     otherwise the restored process may silently fall back to the
+                     mock driver (issue C4).
+  --model <name>     Advisory model name (accepted for symmetry with spawn).
   -t, --timeout <ms>  Max wall time for the restored process (default 30000)
   -h, --help         Show this help
 
 EXAMPLES
   cortex restore --chain "a1b2c3d4-..."
   cortex restore --tag "before risky edit"
-  cortex restore --tag "before risky edit" -t 60000
+  cortex restore --tag "before risky edit" --driver deepseek
 `);
     return values.help ? 0 : 1;
+  }
+
+  if (values.driver !== undefined && !['deepseek', 'openai', 'mock'].includes(values.driver)) {
+    console.error(
+      `cortex restore: invalid --driver '${values.driver}' (expected one of deepseek, openai, mock)`,
+    );
+    return 1;
   }
 
   const dir = defaultKernelDir();
@@ -84,7 +99,9 @@ EXAMPLES
     chainId = asChainId(found);
   }
 
-  const kernel = await bootCliKernel(dir);
+  const kernel = await bootCliKernel(dir, {
+    ...(values.driver !== undefined ? { forceLLM: values.driver } : {}),
+  });
 
   try {
     // Restore through init (PID 1), which owns the spawn surface.
@@ -109,6 +126,30 @@ EXAMPLES
     const restoredPpid = restored?.ppid !== undefined && restored.ppid !== null
       ? unbrand(restored.ppid)
       : 1;
+
+    // Warn if the original agent declared a driver that is not actually loaded
+    // in THIS environment. Without --driver (issue C4) the restored process
+    // would silently fall back to the default driver (often the mock), so the
+    // user thinks it is talking to a real model when it is getting deterministic
+    // echoes. A custom (non built-in) driver can never be loaded by the CLI, so
+    // we surface that explicitly rather than letting it fail quietly.
+    const declaredDriver =
+      restoredAgent !== undefined && 'driver' in restoredAgent
+        ? (restoredAgent as { driver?: string }).driver
+        : undefined;
+    if (
+      declaredDriver !== undefined &&
+      declaredDriver !== 'mock' &&
+      values.driver === undefined &&
+      kernel.registry.tryResolveLLM(declaredDriver) === null
+    ) {
+      console.error(
+        `cortex restore: warning: the restored agent declared driver '${declaredDriver}', ` +
+          `which is not loaded here. It will use the default driver (likely mock) instead of ` +
+          `the model it originally ran against. Pass --driver ${declaredDriver} to load it, ` +
+          `or set the matching API key (e.g. DEEPSEEK_API_KEY / OPENAI_API_KEY).`,
+      );
+    }
 
     console.log(`restored as pid ${unbrand(newPid)} (chain ${chainId})`);
 
