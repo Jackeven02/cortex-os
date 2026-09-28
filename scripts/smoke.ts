@@ -8510,6 +8510,10 @@ async function runDashboardChecks(): Promise<void> {
       `${JSON.stringify({ type: 'llm.end', at: '2026-09-28T00:00:04.000Z', runId: 'lc-1', name: 'ChatOpenAI', pid: 2, durationMs: 50 })}\n`,
       'utf8',
     );
+    // Seed one checkpoint file named like the kernel writes them:
+    // `<safeTimestamp>_<chainId>.csnap` under processes/<pid>/checkpoints/.
+    await mkdir(join(tmp, 'processes', '2', 'checkpoints'), { recursive: true });
+    await writeFile(join(tmp, 'processes', '2', 'checkpoints', '2026-09-28T00-00-05-000Z_550e8400-e29b-41d4-a716-446655440000.csnap'), 'CRTX-fake-snapshot-bytes');
 
     const dash = await startDashboard({ dir: tmp, port: 0 });
     try {
@@ -8547,6 +8551,167 @@ async function runDashboardChecks(): Promise<void> {
         assert(metas.length === 1 && metas[0]!['role'] === 'hello', 'persisted meta served');
         const post = await fetch(`${dash.url}/api/processes`, { method: 'POST' });
         assert(post.status === 405, `POST status ${post.status}`);
+      });
+
+      await checkAsync('dashboard serves the supervision tree and budget panels', async () => {
+        const res = await fetch(`${dash.url}/`);
+        assert(res.status === 200, `status ${res.status}`);
+        const html = await res.text();
+        assert(html.includes('processTreeWrap') && html.includes('viewTree'), 'supervision tree panel present');
+        assert(html.includes('budgetRows') && html.includes('budgetsPanel'), 'budget rollup panel present');
+        assert(html.includes('checkpointRows'), 'checkpoints panel present');
+      });
+
+      await checkAsync('dashboard /api/checkpoints lists seeded snapshots', async () => {
+        const res = await fetch(`${dash.url}/api/checkpoints`);
+        assert(res.status === 200, `status ${res.status}`);
+        const list = (await res.json()) as Array<Record<string, unknown>>;
+        assert(list.length === 1, `expected 1 checkpoint, got ${list.length}`);
+        assert(list[0]!['pid'] === 2, 'pid parsed from directory');
+        assert(list[0]!['chainId'] === '550e8400-e29b-41d4-a716-446655440000', 'chainId parsed from filename');
+        assert(String(list[0]!['createdAt']) === '2026-09-28T00-00-05-000Z', 'createdAt parsed from filename');
+        assert((list[0]!['sizeBytes'] as number) > 0, 'size from stat');
+      });
+
+      await checkAsync('dashboard ops are disabled by default', async () => {
+        const meta = (await (await fetch(`${dash.url}/api/ops`)).json()) as { allowOps?: boolean };
+        assert(meta.allowOps === false, 'allowOps defaults to false');
+        const post = await fetch(`${dash.url}/api/ops/restore`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ chain: '550e8400-e29b-41d4-a716-446655440000' }),
+        });
+        assert(post.status === 403, `status ${post.status}`);
+      });
+
+      await checkAsync('dashboard /api/events supports time filtering, offset, and total count', async () => {
+        const all = await fetch(`${dash.url}/api/events?limit=50`);
+        assert((all.headers.get('x-total-count') ?? '') === '3', `total header, got ${all.headers.get('x-total-count')}`);
+        const win = await fetch(`${dash.url}/api/events?from=${encodeURIComponent('2026-09-28T00:00:03.000Z')}&limit=50`);
+        const list = (await win.json()) as unknown[];
+        assert(list.length === 2, `expected 2 events from 00:00:03, got ${list.length}`);
+        const p1 = (await (await fetch(`${dash.url}/api/events?limit=1`)).json()) as Array<{ runId: string }>;
+        const p2 = (await (await fetch(`${dash.url}/api/events?limit=1&offset=1`)).json()) as Array<{ runId: string }>;
+        assert(p1.length === 1 && p2.length === 1 && p1[0]!.runId !== p2[0]!.runId, 'offset paginates distinct events');
+      });
+
+      await checkAsync('dashboard --allow-ops runs restore and surfaces CLI output', async () => {
+        const opsDash = await startDashboard({ dir: tmp, port: 0, allowOps: true });
+        try {
+          const meta = (await (await fetch(`${opsDash.url}/api/ops`)).json()) as { allowOps?: boolean };
+          assert(meta.allowOps === true, 'allowOps on');
+          const res = await fetch(`${opsDash.url}/api/ops/restore`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ chain: '550e8400-e29b-41d4-a716-446655440000' }),
+          });
+          assert(res.status === 200, `status ${res.status}`);
+          const data = (await res.json()) as { ok?: boolean; output?: string };
+          assert(data.ok === false, `fake snapshot must fail restore, got ok=${String(data.ok)}`);
+          assert((data.output ?? '').length > 0, 'CLI output surfaced to the caller');
+        } finally {
+          await opsDash.close();
+        }
+      });
+
+      await checkAsync('dashboard ops are fine-grained via allowOps list', async () => {
+        const opsDash = await startDashboard({ dir: tmp, port: 0, allowOps: ['kill', 'spawn'] });
+        try {
+          const meta = (await (await fetch(`${opsDash.url}/api/ops`)).json()) as { allowOps?: boolean; ops?: string[] };
+          assert(meta.allowOps === true, 'allowOps true when list non-empty');
+          assert(
+            Array.isArray(meta.ops) && meta.ops.includes('kill') && meta.ops.includes('spawn') && !meta.ops.includes('restore'),
+            `ops list respected, got ${JSON.stringify(meta.ops)}`,
+          );
+          const post = await fetch(`${opsDash.url}/api/ops/restore`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ chain: '550e8400-e29b-41d4-a716-446655440000' }),
+          });
+          assert(post.status === 403, `restore not in list must 403, got ${post.status}`);
+        } finally {
+          await opsDash.close();
+        }
+      });
+
+      await checkAsync('dashboard kill marks a running process zombie via CLI semantics', async () => {
+        writeMeta(tmp, {
+          pid: 7, ppid: 1, pgid: 7, role: 'victim', state: 'running',
+          exitCode: null, exitReason: null,
+          startedAt: '2026-09-28T00:00:06.000Z', lastTransitionAt: '2026-09-28T00:00:06.000Z',
+          budgetsSpent: { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 5, syscallCount: 1 },
+          budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+          agent: { module: './agents/noop.js' } as ProcessMeta['agent'],
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        });
+        const killDash = await startDashboard({ dir: tmp, port: 0, allowOps: ['kill'] });
+        try {
+          const res = await fetch(`${killDash.url}/api/ops/kill`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ pid: 7 }),
+          });
+          assert(res.status === 200, `status ${res.status}`);
+          const data = (await res.json()) as { ok?: boolean; output?: string };
+          assert(data.ok === true, `kill must succeed, got ${JSON.stringify(data)}`);
+          assert((data.output ?? '').includes('SIGTERM'), 'CLI output mentions SIGTERM');
+          const meta = readMeta(tmp, asProcessId(7));
+          assert(meta?.state === 'zombie', `meta state ${String(meta?.state)}`);
+          assert(String(meta?.exitReason).includes('killed'), 'exitReason notes the kill');
+        } finally {
+          await killDash.close();
+        }
+      });
+
+      await checkAsync('dashboard spawn runs a mock agent end-to-end', async () => {
+        const spawnDash = await startDashboard({ dir: tmp, port: 0, allowOps: ['spawn'] });
+        try {
+          const bad = await fetch(`${spawnDash.url}/api/ops/spawn`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ task: 'no role given' }),
+          });
+          assert(bad.status === 400, `missing role must 400, got ${bad.status}`);
+          const res = await fetch(`${spawnDash.url}/api/ops/spawn`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ role: 'greeter', task: 'greet briefly', driver: 'mock', timeoutMs: 15000 }),
+          });
+          assert(res.status === 200, `status ${res.status}`);
+          const data = (await res.json()) as { ok?: boolean; output?: string };
+          assert(data.ok === true, `spawn must succeed, got ${data.output ?? ''}`);
+          assert(/\[pid \d+\]/.test(data.output ?? ''), 'output includes the pid line');
+        } finally {
+          await spawnDash.close();
+        }
+      });
+
+      await checkAsync('dashboard /api/stream pushes initial snapshot and reacts to changes', async () => {
+        const res = await fetch(`${dash.url}/api/stream?limit=10`);
+        assert(res.ok, `status ${res.status}`);
+        assert((res.headers.get('content-type') ?? '').includes('text/event-stream'), 'sse content-type');
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        const readChunk = async (ms: number): Promise<void> => {
+          const timeout = new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), ms));
+          const chunk = await Promise.race([reader.read(), timeout]);
+          if (chunk?.value !== undefined) buf += decoder.decode(chunk.value, { stream: true });
+        };
+        await readChunk(1500);
+        assert(buf.includes('event: processes'), `initial push missing, got: ${buf.slice(0, 120)}`);
+        // Touch the state directory: the watcher should trigger a fresh push.
+        await writeFile(join(tmp, 'processes', '2', 'checkpoints', '2026-09-28T00-00-09-000Z_00000000-0000-4000-8000-000000000000.csnap'), 'x');
+        const deadline = Date.now() + 6000;
+        while (Date.now() < deadline) {
+          await readChunk(400);
+          if ((buf.match(/event: processes/g) ?? []).length >= 2) break;
+        }
+        assert(
+          (buf.match(/event: processes/g) ?? []).length >= 2,
+          `watcher-driven push missing after change (received ${buf.length} bytes)`,
+        );
+        await reader.cancel().catch(() => {});
       });
     } finally {
       await dash.close();

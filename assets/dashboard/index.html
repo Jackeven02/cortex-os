@@ -62,7 +62,8 @@
     .icon-button:hover { border-color: #cbd2de; background: var(--surface-soft); }
     .content { width: min(1440px, 100%); margin: 0 auto; padding: 31px 34px 48px; }
     .main[data-section="processes"] .metrics, .main[data-section="processes"] .events-panel,
-    .main[data-section="events"] .metrics, .main[data-section="events"] .columns { display: none; }
+    .main[data-section="events"] .metrics, .main[data-section="events"] .columns,
+    .main[data-section="events"] .budgets-panel { display: none; }
     .page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin-bottom: 23px; }
     .overline { margin-bottom: 7px; color: #8a93a1; font-size: 10px; font-weight: 650; letter-spacing: .11em; text-transform: uppercase; }
     h1 { margin: 0; font-size: 24px; font-weight: 650; letter-spacing: -.045em; }
@@ -127,6 +128,27 @@
     .state-fill.stopped { background: #d4767b; }
     .state-number { color: #4c5665; text-align: right; font-variant-numeric: tabular-nums; }
     .runtime-foot { display: flex; align-items: center; justify-content: space-between; margin-top: auto; padding: 11px 16px; border-top: 1px solid #eff0f3; color: #8a93a1; font-size: 9px; }
+    .view-toggle { display: flex; border: 1px solid #e7e9ed; border-radius: 6px; overflow: hidden; }
+    .view-toggle button { min-height: 27px; padding: 0 10px; border: 0; background: #fff; color: #6d7684; font-size: 10px; font-weight: 560; }
+    .view-toggle button + button { border-left: 1px solid #e7e9ed; }
+    .view-toggle button.active { background: var(--blue-soft); color: var(--blue); }
+    .tree-wrap { padding: 10px 16px 14px; }
+    .tree-node { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 0 8px; border-radius: 6px; cursor: pointer; }
+    .tree-node:hover { background: #f8f9fc; }
+    .tree-role { color: #273244; font-size: 11px; font-weight: 570; }
+    .tree-pid { color: #53627a; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
+    .tree-meta { margin-left: auto; display: flex; align-items: center; gap: 10px; color: #77808e; font-size: 9px; }
+    .budgets-panel { margin-bottom: 14px; }
+    .budget-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 14px 16px 10px; }
+    .budget-stat { padding: 10px 12px; border: 1px solid #eef0f3; border-radius: 8px; background: var(--surface-soft); }
+    .budget-stat .label { color: #8a93a1; font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }
+    .budget-stat .value { margin-top: 4px; font-size: 17px; font-weight: 640; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+    .budget-share { display: inline-block; height: 4px; border-radius: 4px; background: #9aa8c4; vertical-align: middle; }
+    .event-filters { display: flex; align-items: center; gap: 8px; padding: 10px 16px 0; color: #8a93a1; font-size: 10px; }
+    .spawn-bar { display: flex; align-items: center; gap: 8px; padding: 10px 16px 0; }
+    .spawn-bar input { flex: 1; min-width: 0; height: 30px; padding: 0 8px; border: 1px solid #e7e9ed; border-radius: 6px; background: #fff; color: var(--ink); font-size: 11px; }
+    .event-filters input[type="datetime-local"] { height: 27px; padding: 0 6px; border: 1px solid #e7e9ed; border-radius: 6px; background: #fff; color: var(--ink); font-size: 10px; }
+    .ops-output { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; font-size: 10px; color: #4b5665; }
     .events-panel { margin-bottom: 14px; }
     .event-table td { height: 42px; }
     .event-name { color: #344052; font-weight: 550; }
@@ -195,8 +217,10 @@
 
         <div class="columns">
           <section class="panel" id="processes">
-            <div class="panel-head"><div><div class="panel-title">Agent 进程 <span class="nav-count" id="processCountLabel"></span></div><div class="panel-note">进程状态与最近资源使用</div></div><div class="table-tools"><input class="search" id="processSearch" type="search" placeholder="筛选进程…" aria-label="筛选进程"><button class="icon-button" id="processRefresh" title="刷新进程">↻</button></div></div>
-            <div class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th>PID</th><th>PPID</th><th>Token</th><th>启动时间</th></tr></thead><tbody id="processRows"><tr><td colspan="6" class="empty">正在读取进程…</td></tr></tbody></table></div>
+            <div class="panel-head"><div><div class="panel-title">Agent 进程 <span class="nav-count" id="processCountLabel"></span></div><div class="panel-note">进程状态与最近资源使用</div></div><div class="table-tools"><div class="view-toggle"><button id="viewTable" class="active" type="button">表格</button><button id="viewTree" type="button">监督树</button></div><input class="search" id="processSearch" type="search" placeholder="筛选进程…" aria-label="筛选进程"><button class="icon-button" id="processRefresh" title="刷新进程">↻</button></div></div>
+            <div class="spawn-bar" id="spawnBar" hidden><input type="text" id="spawnRole" placeholder="角色（必填，如 coder）" aria-label="角色"><input type="text" id="spawnModule" placeholder="模块路径（可选，如 ./examples/hello.js）" aria-label="模块路径"><input type="text" id="spawnTask" placeholder="任务（可选）" aria-label="任务"><button class="button" id="spawnGo" type="button">启动机器人</button></div>
+            <div id="processTableWrap" class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th>PID</th><th>PPID</th><th>Token</th><th>启动时间</th><th></th></tr></thead><tbody id="processRows"><tr><td colspan="7" class="empty">正在读取进程…</td></tr></tbody></table></div>
+            <div id="processTreeWrap" class="tree-wrap" hidden><div id="processTree"></div></div>
           </section>
 
           <section class="panel runtime">
@@ -204,10 +228,27 @@
             <div class="runtime-body"><div class="runtime-total"><strong id="runtimeTotal">—</strong><span>个进程</span></div><div class="state-list" id="stateList"></div></div>
             <div class="runtime-foot"><span>内核 ABI</span><span class="mono">1.0.0</span></div>
           </section>
+
+          <section class="panel" id="checkpointsPanel">
+            <div class="panel-head"><div><div class="panel-title">检查点</div><div class="panel-note">.csnap 快照 · 按 PID 分组</div></div><span class="state">只读</span></div>
+            <div class="table-scroll"><table><thead><tr><th>PID</th><th>创建时间</th><th>Chain</th><th>大小</th><th>操作</th></tr></thead><tbody id="checkpointRows"><tr><td colspan="5" class="empty">正在读取…</td></tr></tbody></table></div>
+          </section>
         </div>
 
+        <section class="panel budgets-panel" id="budgetsPanel">
+          <div class="panel-head"><div><div class="panel-title">资源预算</div><div class="panel-note">按角色聚合的 token / 成本 / 时长 / syscall 消耗</div></div></div>
+          <div class="budget-summary">
+            <div class="budget-stat"><div class="label">Token 总量</div><div class="value" id="budgetTokens">—</div></div>
+            <div class="budget-stat"><div class="label">输入 / 输出</div><div class="value" id="budgetSplit">—</div></div>
+            <div class="budget-stat"><div class="label">USD 成本</div><div class="value" id="budgetUsd">—</div></div>
+            <div class="budget-stat"><div class="label">墙钟 · Syscalls</div><div class="value" id="budgetTime">—</div></div>
+          </div>
+          <div class="table-scroll"><table><thead><tr><th>角色</th><th>进程</th><th>Token in</th><th>Token out</th><th>USD</th><th>墙钟</th><th>Syscalls</th><th>Token 占比</th></tr></thead><tbody id="budgetRows"><tr><td colspan="8" class="empty">正在读取进程…</td></tr></tbody></table></div>
+        </section>
+
         <section class="panel events-panel" id="events">
-          <div class="panel-head"><div><div class="panel-title">最近执行事件</div><div class="panel-note">Cortex 模型 / 工具 / syscall 与 LangChain 回调 · 不含 prompt 内容</div></div><button class="text-button" id="viewAllEvents">查看全部 <span aria-hidden="true">→</span></button></div>
+          <div class="panel-head"><div><div class="panel-title">最近执行事件</div><div class="panel-note">Cortex 模型 / 工具 / syscall 与 LangChain 回调 · 不含 prompt 内容</div></div><span class="nav-count" id="eventTotal"></span><button class="text-button" id="eventMore">加载更多</button></div>
+          <div class="event-filters"><span>时间范围</span><input type="datetime-local" id="eventFrom" aria-label="开始时间"><span>→</span><input type="datetime-local" id="eventTo" aria-label="结束时间"><button class="button" id="eventFilter" type="button">筛选</button><button class="text-button" id="eventClear" type="button">清除</button></div>
           <div class="table-scroll"><table class="event-table"><thead><tr><th>类型</th><th>名称 / 关联记录</th><th>PID</th><th>耗时</th><th>时间</th><th>错误</th></tr></thead><tbody id="eventRows"><tr><td colspan="6" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr></tbody></table></div>
         </section>
         <footer class="page-footer"><span>Cortex Agent OS</span><span id="footerUpdated">自动刷新 · 每 3 秒</span></footer>
@@ -219,6 +260,16 @@
   <script>
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+    // Disk stores UTC ISO strings; checkpoint file names encode UTC with the
+    // colons replaced by dashes (2026-09-28T10-21-26-246Z). Render both as
+    // the viewer's local time instead of raw UTC.
+    function fmtLocal(iso) {
+      if (!iso) return '—';
+      const normal = String(iso).replace(/^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/, '$1T$2:$3:$4.$5Z');
+      const date = new Date(normal);
+      return isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
     const processTokens = (process) => Number(process.budgetsSpent ? (process.budgetsSpent.tokensIn ?? 0) + (process.budgetsSpent.tokensOut ?? 0) : process.tokens ?? 0) || 0;
     let processData = [];
     let eventData = [];
@@ -228,10 +279,13 @@
       const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state}`.toLowerCase().includes(query));
       $('processRows').innerHTML = visible.length ? visible.map((process) => {
         const initial = String(process.role ?? '?').slice(0, 1).toUpperCase();
-        const time = (process.startedAt ?? '').replace('T', ' ').slice(0, 16) || '—';
-        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td><td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td>${esc(time)}</td></tr>`;
-      }).join('') : `<tr><td colspan="6" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
+        const time = fmtLocal(process.startedAt);
+        const canKill = opsList.includes('kill') && process.state !== 'zombie' && process.state !== 'exiting';
+        const opsCell = canKill ? `<td><button class="text-button" data-kill="${esc(process.pid)}">停止</button></td>` : '<td></td>';
+        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td><td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td>${esc(time)}</td>${opsCell}</tr>`;
+      }).join('') : `<tr><td colspan="7" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
       $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
+      $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
     }
 
     function renderStates() {
@@ -253,11 +307,13 @@
     }
 
     function renderEvents() {
-      const rows = eventData.slice(0, 8);
+      const rows = eventData;
+      $('eventTotal').textContent = eventsTotal ? `共 ${eventsTotal.toLocaleString()} 条` : '';
+      $('eventMore').disabled = eventData.length >= eventsTotal;
       $('eventRows').innerHTML = rows.length ? rows.map((event) => {
         const label = eventLabel(event);
         const kind = label === '工具' ? 'tool' : label === 'Chain' ? 'chain' : label === '错误' ? 'error' : '';
-        const time = event.at ? new Date(event.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+        const time = event.at ? fmtLocal(event.at) : '—';
         const audit = (event.audit && typeof event.audit === 'object') ? event.audit : null;
         const auditText = audit ? Object.entries(audit).slice(0, 3).map(([k, v]) => `${k}=${String(v).slice(0, 12)}`).join(' · ') : '';
         const auditTitle = audit ? JSON.stringify(audit) : '';
@@ -265,30 +321,233 @@
       }).join('') : '<tr><td colspan="6" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr>';
     }
 
-    async function refresh() {
+    let processView = 'table';
+
+    function renderTree() {
+      const query = $('processSearch').value.trim().toLowerCase();
+      const byId = new Map(processData.map((process) => [process.pid, process]));
+      const kids = new Map();
+      const roots = [];
+      for (const process of processData) {
+        const parent = process.ppid === null || process.ppid === undefined ? undefined : byId.get(process.ppid);
+        if (parent && parent !== process) {
+          if (!kids.has(parent.pid)) kids.set(parent.pid, []);
+          kids.get(parent.pid).push(process);
+        } else {
+          roots.push(process);
+        }
+      }
+      const matches = (process) => `${process.pid} ${process.role} ${process.state}`.toLowerCase().includes(query);
+      const keep = (process) => !query || matches(process) || (kids.get(process.pid) ?? []).some(keep);
+      const byPid = (a, b) => a.pid - b.pid;
+      roots.sort(byPid);
+      kids.forEach((list) => list.sort(byPid));
+      const renderNode = (process, depth) => {
+        const tokens = processTokens(process);
+        const children = (kids.get(process.pid) ?? []).map((child) => renderNode(child, depth + 1)).join('');
+        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${tokens.toLocaleString()} tok</span></span></div>${children}`;
+      };
+      const visible = roots.filter(keep);
+      $('processTree').innerHTML = visible.length ? visible.map((process) => renderNode(process, 0)).join('') : `<div class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，监督树会显示在这里。'}</div>`;
+      $('processTree').querySelectorAll('.tree-node').forEach((node) => node.addEventListener('click', () => showTrace(node.dataset.pid)));
+    }
+
+    function renderBudgets() {
+      const totals = processData.reduce((acc, process) => {
+        const spent = process.budgetsSpent ?? {};
+        acc.tokensIn += spent.tokensIn ?? 0;
+        acc.tokensOut += spent.tokensOut ?? 0;
+        acc.usd += spent.usdSpent ?? 0;
+        acc.wall += spent.wallTimeMs ?? 0;
+        acc.syscalls += spent.syscallCount ?? 0;
+        return acc;
+      }, { tokensIn: 0, tokensOut: 0, usd: 0, wall: 0, syscalls: 0 });
+      const fmtWall = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`);
+      const fmtUsd = (usd) => (usd > 0 ? `$${usd.toFixed(4)}` : '$0');
+      $('budgetTokens').textContent = (totals.tokensIn + totals.tokensOut).toLocaleString();
+      $('budgetSplit').textContent = `${totals.tokensIn.toLocaleString()} / ${totals.tokensOut.toLocaleString()}`;
+      $('budgetUsd').textContent = fmtUsd(totals.usd);
+      $('budgetTime').textContent = `${fmtWall(totals.wall)} · ${totals.syscalls}`;
+      const byRole = new Map();
+      for (const process of processData) {
+        const role = process.role ?? '—';
+        if (!byRole.has(role)) byRole.set(role, { count: 0, tokensIn: 0, tokensOut: 0, usd: 0, wall: 0, syscalls: 0 });
+        const row = byRole.get(role);
+        const spent = process.budgetsSpent ?? {};
+        row.count += 1;
+        row.tokensIn += spent.tokensIn ?? 0;
+        row.tokensOut += spent.tokensOut ?? 0;
+        row.usd += spent.usdSpent ?? 0;
+        row.wall += spent.wallTimeMs ?? 0;
+        row.syscalls += spent.syscallCount ?? 0;
+      }
+      const grand = totals.tokensIn + totals.tokensOut || 1;
+      const rows = [...byRole.entries()].sort((a, b) => (b[1].tokensIn + b[1].tokensOut) - (a[1].tokensIn + a[1].tokensOut));
+      $('budgetRows').innerHTML = rows.length ? rows.map(([role, r]) => {
+        const tokens = r.tokensIn + r.tokensOut;
+        const share = Math.round((tokens / grand) * 100);
+        const shareCell = tokens > 0 ? `<span class="budget-share" style="width:${Math.max(2, Math.min(100, share))}px"></span> ${share}%` : '—';
+        return `<tr><td class="role-cell">${esc(role)}</td><td>${r.count}</td><td>${r.tokensIn.toLocaleString()}</td><td>${r.tokensOut.toLocaleString()}</td><td>${fmtUsd(r.usd)}</td><td>${fmtWall(r.wall)}</td><td>${r.syscalls}</td><td>${shareCell}</td></tr>`;
+      }).join('') : '<tr><td colspan="8" class="empty">暂无进程数据。</td></tr>';
+    }
+
+    function setProcessView(view) {
+      processView = view;
+      $('viewTable').classList.toggle('active', view === 'table');
+      $('viewTree').classList.toggle('active', view === 'tree');
+      $('processTableWrap').hidden = view !== 'table';
+      $('processTreeWrap').hidden = view !== 'tree';
+      if (view === 'tree') renderTree();
+    }
+
+    let checkpointData = [];
+    let pollTimer = null;
+    let opsEnabled = false;
+    let opsList = [];
+    let eventsOffset = 0;
+    let eventsTotal = 0;
+    const EVENTS_PAGE = 100;
+
+    function renderCheckpoints() {
+      $('checkpointRows').innerHTML = checkpointData.length ? checkpointData.map((cp) => {
+        const created = fmtLocal(cp.createdAt ?? cp.modifiedAt);
+        const chain = String(cp.chainId ?? '');
+        const opsCell = opsEnabled && chain ? `<button class="text-button" data-chain="${esc(chain)}">恢复</button>` : '';
+        return `<tr><td class="pid-cell">${esc(cp.pid)}</td><td class="mono">${esc(created)}</td><td class="pid-cell">${esc(chain ? chain.slice(0, 13) : '—')}</td><td>${(Number(cp.sizeBytes ?? 0) / 1024).toFixed(1)} KB</td><td>${opsCell}</td></tr>`;
+      }).join('') : '<tr><td colspan="5" class="empty">暂无检查点。对进程执行 cortex checkpoint &lt;pid&gt; 后会显示在这里。</td></tr>';
+      $('checkpointRows').querySelectorAll('button[data-chain]').forEach((button) => button.addEventListener('click', () => restoreOps(button.dataset.chain)));
+    }
+
+    async function restoreOps(chain) {
+      if (!confirm(`从检查点 ${chain.slice(0, 13)}… 恢复？将在当前目录创建新进程。`)) return;
+      $('traceTitle').textContent = '恢复结果';
+      $('traceBody').innerHTML = '<div class="empty">正在恢复…</div>';
+      $('traceDialog').showModal();
       try {
-        const responses = await Promise.all([fetch('/api/processes', { cache: 'no-store' }), fetch('/api/events?limit=100', { cache: 'no-store' })]);
+        const res = await fetch('/api/ops/restore', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ chain }) });
+        const data = await res.json();
+        if (!res.ok && data.error) throw new Error(data.error);
+        $('traceBody').innerHTML = `<div class="ops-output">${esc(data.output ?? JSON.stringify(data))}</div>`;
+        pollOnce();
+      } catch (error) {
+        $('traceBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+      }
+    }
+
+    async function killOps(pid) {
+      if (!confirm(`停止进程 #${pid}？将在元数据中把它标记为已退出。`)) return;
+      $('traceTitle').textContent = '停止结果';
+      $('traceBody').innerHTML = '<div class="empty">正在发送信号…</div>';
+      $('traceDialog').showModal();
+      try {
+        const res = await fetch('/api/ops/kill', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pid }) });
+        const data = await res.json();
+        if (!res.ok && data.error) throw new Error(data.error);
+        $('traceBody').innerHTML = `<div class="ops-output">${esc(data.output ?? JSON.stringify(data))}</div>`;
+        pollOnce();
+      } catch (error) {
+        $('traceBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+      }
+    }
+
+    async function spawnOps() {
+      const role = $('spawnRole').value.trim();
+      if (!role) { alert('请先填写角色名。'); return; }
+      const payload = { role };
+      const modulePath = $('spawnModule').value.trim();
+      if (modulePath) payload.module = modulePath;
+      const task = $('spawnTask').value.trim();
+      if (task) payload.task = task;
+      $('traceTitle').textContent = '启动结果';
+      $('traceBody').innerHTML = '<div class="empty">正在启动机器人…（会等到它跑完或超时）</div>';
+      $('traceDialog').showModal();
+      try {
+        const res = await fetch('/api/ops/spawn', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+        const data = await res.json();
+        if (!res.ok && data.error) throw new Error(data.error);
+        $('traceBody').innerHTML = `<div class="ops-output">${esc(data.output ?? JSON.stringify(data))}</div>`;
+        pollOnce();
+      } catch (error) {
+        $('traceBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+      }
+    }
+
+    function eventQuery(offset) {
+      const params = new URLSearchParams({ limit: String(EVENTS_PAGE), offset: String(offset) });
+      const from = $('eventFrom').value;
+      const to = $('eventTo').value;
+      if (from) params.set('from', new Date(from).toISOString());
+      if (to) params.set('to', new Date(to).toISOString());
+      return params;
+    }
+
+    async function loadEvents(append) {
+      const res = await fetch(`/api/events?${eventQuery(eventsOffset)}`, { cache: 'no-store' });
+      if (!res.ok) throw new Error('事件读取失败');
+      eventsTotal = Number(res.headers.get('x-total-count') ?? 0);
+      const page = await res.json();
+      eventData = append ? eventData.concat(page) : page;
+    }
+
+    function applyData() {
+      const active = processData.filter((process) => ['running', 'ready', 'blocked'].includes(process.state));
+      const tokens = processData.reduce((sum, process) => sum + processTokens(process), 0);
+      $('count').textContent = processData.length.toLocaleString();
+      $('running').textContent = active.length.toLocaleString();
+      $('tokens').textContent = tokens.toLocaleString();
+      $('eventCount').textContent = eventData.length.toLocaleString();
+      $('navProcessCount').textContent = processData.length;
+      $('navEventCount').textContent = eventData.length;
+      $('processCountLabel').textContent = processData.length ? `(${processData.length})` : '';
+      $('runtimeTotal').textContent = processData.length.toLocaleString();
+      $('updated').textContent = `已同步 ${new Date().toLocaleTimeString()}`;
+      $('footerUpdated').textContent = `最近更新 ${new Date().toLocaleTimeString()}`;
+      renderProcesses();
+      renderStates();
+      renderEvents();
+      renderBudgets();
+      renderCheckpoints();
+      if (processView === 'tree') renderTree();
+    }
+
+    async function pollOnce() {
+      try {
+        const responses = await Promise.all([
+          fetch('/api/processes', { cache: 'no-store' }),
+          fetch('/api/checkpoints', { cache: 'no-store' }),
+          fetch('/api/ops', { cache: 'no-store' }),
+        ]);
         if (responses.some((response) => !response.ok)) throw new Error('API 请求失败');
-        [processData, eventData] = await Promise.all(responses.map((response) => response.json()));
-        const active = processData.filter((process) => ['running', 'ready', 'blocked'].includes(process.state));
-        const tokens = processData.reduce((sum, process) => sum + processTokens(process), 0);
-        $('count').textContent = processData.length.toLocaleString();
-        $('running').textContent = active.length.toLocaleString();
-        $('tokens').textContent = tokens.toLocaleString();
-        $('eventCount').textContent = eventData.length.toLocaleString();
-        $('navProcessCount').textContent = processData.length;
-        $('navEventCount').textContent = eventData.length;
-        $('processCountLabel').textContent = processData.length ? `(${processData.length})` : '';
-        $('runtimeTotal').textContent = processData.length.toLocaleString();
-        $('updated').textContent = `已同步 ${new Date().toLocaleTimeString()}`;
-        $('footerUpdated').textContent = `最近更新 ${new Date().toLocaleTimeString()} · 自动刷新每 3 秒`;
-        renderProcesses();
-        renderStates();
-        renderEvents();
+        [processData, checkpointData] = await Promise.all([
+          responses[0].json(),
+          responses[1].json(),
+        ]);
+        const opsData = await responses[2].json();
+        opsList = Array.isArray(opsData.ops) ? opsData.ops : (opsData.allowOps === true ? ['restore'] : []);
+        opsEnabled = opsList.length > 0;
+        $('spawnBar').hidden = !opsList.includes('spawn');
+        eventsOffset = 0;
+        await loadEvents(false);
+        applyData();
       } catch (error) {
         $('updated').textContent = `连接失败：${error.message}`;
         document.querySelector('.connection .live-dot').style.background = '#d65b62';
       }
+    }
+
+    function startPolling() {
+      if (pollTimer === null) pollTimer = setInterval(pollOnce, 3000);
+    }
+
+    function startStream() {
+      if (typeof EventSource === 'undefined') return false;
+      const source = new EventSource('/api/stream?limit=100');
+      source.addEventListener('processes', (event) => { processData = JSON.parse(event.data); applyData(); });
+      source.addEventListener('events', (event) => { eventData = JSON.parse(event.data); eventsTotal = Math.max(eventsTotal, eventData.length); applyData(); });
+      source.onopen = () => { $('updated').textContent = '实时连接（SSE）'; document.querySelector('.connection .live-dot').style.background = '#25a879'; };
+      source.onerror = () => { source.close(); $('updated').textContent = 'SSE 不可用，已回退到轮询'; startPolling(); };
+      setInterval(pollOnce, 30000);
+      return true;
     }
 
     async function showTrace(pid) {
@@ -305,10 +564,17 @@
       }
     }
 
-    $('processSearch').addEventListener('input', renderProcesses);
-    ['refreshTop', 'refreshPage', 'processRefresh', 'refreshNav'].forEach((id) => $(id).addEventListener('click', refresh));
+    $('processSearch').addEventListener('input', () => { renderProcesses(); if (processView === 'tree') renderTree(); });
+    $('viewTable').addEventListener('click', () => setProcessView('table'));
+    $('viewTree').addEventListener('click', () => setProcessView('tree'));
+    ['refreshTop', 'refreshPage', 'processRefresh', 'refreshNav'].forEach((id) => $(id).addEventListener('click', pollOnce));
     $('closeDialog').addEventListener('click', () => $('traceDialog').close());
-    $('viewAllEvents').addEventListener('click', () => document.querySelector('#events').scrollIntoView({ behavior: 'smooth' }));
+    $('eventFilter').addEventListener('click', pollOnce);
+    $('eventClear').addEventListener('click', () => { $('eventFrom').value = ''; $('eventTo').value = ''; pollOnce(); });
+    $('eventMore').addEventListener('click', async () => {
+      eventsOffset += EVENTS_PAGE;
+      try { await loadEvents(true); renderEvents(); } catch { eventsOffset = Math.max(0, eventsOffset - EVENTS_PAGE); }
+    });
     const sectionCopy = {
       overview: ['Agent 总览', '查看进程状态、资源使用和最近的执行记录。'],
       processes: ['Agent 进程', '查看所有 Agent 进程状态、资源使用，并点击进程查看 syscall 时间线。'],
@@ -331,9 +597,11 @@
       $('copyApi').innerHTML = '<span class="button-icon">✓</span><span>已复制</span>';
       setTimeout(() => { $('copyApi').innerHTML = '<span class="button-icon">⌘</span><span>API 地址</span>'; }, 1400);
     });
-    refresh();
+    $('spawnGo').addEventListener('click', spawnOps);
+    pollOnce();
     if (sectionCopy[location.hash.slice(1)]) selectSection(location.hash.slice(1));
-    setInterval(refresh, 3000);
+    if (new URLSearchParams(location.search).get('view') === 'tree') setProcessView('tree');
+    if (!startStream()) startPolling();
   </script>
 </body>
 </html>

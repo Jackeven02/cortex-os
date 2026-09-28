@@ -40,6 +40,22 @@ console.info(`Cortex console: ${dashboard.url}`);
 await dashboard.close();
 ```
 
-The dashboard is read-only, refreshes automatically, and binds to `127.0.0.1` by default. It shows live processes when given a `processes` callback, persisted process metadata otherwise, recent LangChain callback events, and a redacted syscall timeline. The API is available at `GET /api/processes`, `GET /api/events`, and `GET /api/trace/:pid`.
+The dashboard is read-only, refreshes automatically, and binds to `127.0.0.1` by default. It shows live processes when given a `processes` callback, persisted process metadata otherwise, a supervision tree built from `ppid` links, a per-role budget rollup, checkpoint snapshots, recent LangChain callback events, and a redacted syscall timeline.
 
-For a standalone local console, run `cortex dashboard` from a project using Cortex, or pass `--dir` to select the state directory. Use `--host` only when you intentionally want to expose the dashboard beyond the local machine.
+Updates are pushed over Server-Sent Events at `GET /api/stream` (file-watch based, 15s heartbeat); the UI falls back to polling automatically when SSE is unavailable.
+
+The API is available at:
+
+- `GET /api/processes` — process table (live or persisted).
+- `GET /api/trace/:pid` — redacted syscall timeline.
+- `GET /api/events?from=&to=&offset=&limit=` — merged callback + syscall events, newest first. `from`/`to` are millisecond timestamps; results are paginated and the total count is returned in the `x-total-count` header.
+- `GET /api/checkpoints` — checkpoints under `processes/<pid>/checkpoints/`, parsed from file names (`createdAt`/`chainId`) plus on-disk size.
+- `GET /api/ops` — reports which write operations are enabled: `{ allowOps: boolean, ops: string[] }`.
+
+By default every write operation is rejected. Opt in from the CLI with `--allow-ops` (enable everything) or `--ops spawn,kill,restore` (enable exactly the listed ops), or pass `startDashboard({ allowOps: true | ['spawn', 'kill'] })` when embedding. Enabled ops are served as `POST /api/ops/<op>` and run the matching CLI command in-process against the dashboard's own state directory, so all CLI validation still applies:
+
+- `POST /api/ops/spawn` with `{ "role": "...", "module"?, "task"?, "driver"?, "timeoutMs"? }` — starts a new agent (waits until it finishes, self-checkpoints, or times out).
+- `POST /api/ops/kill` with `{ "pid": 7, "signal"? }` — marks the process as zombie in its on-disk meta, exactly like `cortex kill`.
+- `POST /api/ops/restore` with `{ "chain": "<chainId>" }` — restores a checkpointed process, exactly like `cortex restore`.
+
+The standalone CLI accepts `--dir` to select the state directory. Use `--host` only when you intentionally want to expose the dashboard beyond the local machine, and prefer `--ops` with the narrowest list over `--allow-ops`.

@@ -9,12 +9,20 @@ export async function cmdDashboard(args: string[]): Promise<number> {
       host: { type: 'string', default: '127.0.0.1' },
       port: { type: 'string', default: '4173' },
       dir: { type: 'string' },
+      'allow-ops': { type: 'boolean', default: false },
+      ops: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: false,
   });
   if (values.help) {
-    console.log('cortex dashboard [--host 127.0.0.1] [--port 4173] [--dir .cortex]');
+    console.log(`cortex dashboard [--host 127.0.0.1] [--port 4173] [--dir .cortex] [--allow-ops | --ops <list>]
+
+OPS
+  Write operations are disabled unless opted in:
+    --allow-ops               enable every op (spawn, kill, restore)
+    --ops spawn,kill          enable exactly the listed ops
+  Ops are served as POST /api/ops/<op> from the same origin.`);
     return 0;
   }
   const port = Number(values.port);
@@ -26,6 +34,11 @@ export async function cmdDashboard(args: string[]): Promise<number> {
     dir: values.dir ?? defaultKernelDir(),
     host: values.host,
     port,
+    allowOps: values['allow-ops']
+      ? true
+      : values.ops !== undefined
+        ? String(values.ops).split(',').map((op) => op.trim()).filter((op) => op.length > 0)
+        : false,
   });
   console.log(`Cortex dashboard listening at ${dashboard.url}`);
   console.log('Press Ctrl+C to stop.');
