@@ -1,6 +1,6 @@
 {
   "name": "cortex-agent-os",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "description": "An operating system for AI agents.",
   "type": "module",
   "license": "MIT",
@@ -29,6 +29,14 @@
     "./drivers": {
       "types": "./dist/drivers/index.d.ts",
       "import": "./dist/drivers/index.js"
+    },
+    "./integrations/langchain": {
+      "types": "./dist/integrations/langchain.d.ts",
+      "import": "./dist/integrations/langchain.js"
+    },
+    "./dashboard": {
+      "types": "./dist/dashboard/index.d.ts",
+      "import": "./dist/dashboard/index.js"
     }
   },
   "files": [

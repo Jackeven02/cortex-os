@@ -16,6 +16,10 @@ This directory holds the technical specifications. **Read them in this order:**
 
 7. **[COOKBOOK.md](./COOKBOOK.md)** — recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC (+ explicit channels), budgets, least privilege (capabilities), testing.
 
+8. **[INTEGRATIONS.md](./INTEGRATIONS.md)** — embed Cortex in a Node.js application, instrument LangChain callbacks, and mount the monitoring dashboard.
+
+9. **[DRIVERS.md](./DRIVERS.md)** — the built-in LLM drivers (mock / deepseek / openai): selection order, environment variables, and endpoint overrides.
+
 ---
 
 ## Status

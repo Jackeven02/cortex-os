@@ -68,3 +68,5 @@ export const KERNEL_ABI_VERSION = '1.0.0' as const;
 
 // Re-export the kernel public surface (types + errors + boot).
 export * from './kernel/index.js';
+export * from './integrations/index.js';
+export * from './dashboard/index.js';

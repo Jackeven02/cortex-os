@@ -18,6 +18,7 @@ import {
   defaultKernelDir,
   ensureKernelDirs,
   writeMeta,
+  readMeta,
   readExitRecord,
   unbrand,
   DEFAULT_MEMORY_REGIONS,
@@ -228,6 +229,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
 
     // Collect final state.
     const entry = kernel.table.get(pid);
+    const persistedMeta = entry === undefined ? readMeta(dir, pid) : undefined;
     const elapsed = Date.now() - startTime;
 
     let state: ProcessState;
@@ -281,11 +283,11 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       console.log(`process still ${state} after ${elapsed}ms — consider increasing --timeout`);
     }
 
-    const spent = entry?.budgetsSpent ?? {
+    const spent = entry?.budgetsSpent ?? persistedMeta?.budgetsSpent ?? {
       tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0,
       wallTimeMs: elapsed, syscallCount: 0,
     };
-    const remaining = entry?.budgetsRemaining ?? { tokens: -1, usd: -1, wallTimeMs: -1 };
+    const remaining = entry?.budgetsRemaining ?? persistedMeta?.budgetsRemaining ?? { tokens: -1, usd: -1, wallTimeMs: -1 };
     console.log(`tokens: ${spent.tokensIn + spent.tokensOut} (in ${spent.tokensIn}, out ${spent.tokensOut})`);
 
     // Write the meta.json so ps/trace can see this process later.
@@ -297,8 +299,8 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       state,
       exitCode,
       exitReason,
-      startedAt: entry?.startedAt ?? new Date(startTime).toISOString(),
-      lastTransitionAt: entry?.lastTransitionAt ?? new Date().toISOString(),
+      startedAt: entry?.startedAt ?? persistedMeta?.startedAt ?? new Date(startTime).toISOString(),
+      lastTransitionAt: entry?.lastTransitionAt ?? persistedMeta?.lastTransitionAt ?? new Date().toISOString(),
       budgetsSpent: { ...spent, wallTimeMs: elapsed },
       budgetsRemaining: remaining,
       agent: agentSpec,

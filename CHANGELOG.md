@@ -38,6 +38,53 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ---
 
+## [1.1.0] — 2026-09-28
+
+First minor release on the frozen ABI: additive only. Adds a local read-only
+monitoring dashboard, a dependency-free LangChain integration, and a budget
+reporting fix in `cortex spawn`. No syscall, `.crec`, or `.csnap` format
+change — `KERNEL_ABI_VERSION` stays `1.0.0`.
+
+### Added
+
+- **`cortex dashboard` — a local read-only monitoring console.** Serves a
+  single-page UI (default `http://127.0.0.1:4173`) plus three JSON endpoints:
+  `GET /api/processes` (persisted process metadata, or a live kernel snapshot
+  when embedded), `GET /api/events` (model / tool / kernel syscalls merged
+  with LangChain callback events, newest first), and `GET /api/trace/:pid`
+  (a redacted per-process syscall timeline). Read-only by construction: GET
+  handlers only, and any other method answers `405`. Binds to `127.0.0.1`
+  unless `--host` says otherwise. The dashboard reads only from disk (meta
+  files, `.crec` logs, integration event files), so it works across the
+  CLI's short-lived process model and never requires a running kernel.
+- **LangChain callback integration — `CortexLangChainCallbackHandler`.** A
+  dependency-free handler implementing LangChain's callback protocol without
+  importing LangChain. Records chain, model, tool, retriever, and agent
+  lifecycle events as metadata only (type, timing, duration, token counts,
+  error *name*) to `.cortex/integrations/langchain/events.jsonl`. Prompts,
+  model outputs, tool inputs, and retrieved documents are deliberately
+  omitted. Set `metadata: { cortexPid: <pid> }` on an invocation to
+  associate events with a Cortex process. Concurrent handler calls are
+  serialized, so the JSONL stays line-valid. `await handler.flush()` before
+  process exit.
+- **New package exports** `cortex-agent-os/dashboard`
+  (`startDashboard` / `RunningDashboard`) and
+  `cortex-agent-os/integrations/langchain`
+  (`CortexLangChainCallbackHandler`), both documented in the new
+  [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md).
+- **[docs/DRIVERS.md](./docs/DRIVERS.md)** — the built-in LLM drivers
+  (mock / deepseek / openai): selection order, environment variables, and
+  endpoint overrides, collected in one page.
+
+### Fixed
+
+- **`cortex spawn` reported zeroed budgets when the kernel entry was already
+  reaped.** When the process finished (and was reaped) before the CLI
+  collected final state, the token counters and timestamps fell back to
+  defaults. `spawn` now falls back to the persisted `meta.json` (written by
+  the kernel's `onProcessExit` hook in 1.0.3) before giving up, so budgets
+  and timestamps survive.
+
 ## [1.0.3] — 2026-09-24
 
 Bug-fix release. All eight issues from the `v1.0.1` field report are now

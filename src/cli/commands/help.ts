@@ -29,6 +29,7 @@ COMMANDS
   limit        Set or show resource budgets per process
   audit        Surface tools untagged for reversibility
   daemon       Register/run long-lived supervised agents (install/list/uninstall/run)
+  dashboard   Open the local read-only monitoring UI
   example      Run one of the agent modules bundled with cortex
   help         Show this help
 
@@ -51,12 +52,13 @@ EXAMPLES
   cortex audit
   cortex example hello
   cortex example supervision-tree
+  cortex dashboard
 
 ENVIRONMENT
-  CORTEX_HOME          Kernel state directory (default: ./.cortex)
-  DEEPSEEK_API_KEY     If set, the deepseek LLM driver is registered
-  OPENAI_API_KEY       If set, the openai LLM driver is registered
-  OPENAI_BASE_URL      Override the OpenAI endpoint (default api.openai.com);
+   CORTEX_HOME          Kernel state directory (default: ./.cortex)
+   DEEPSEEK_API_KEY     If set, the deepseek LLM driver is registered
+   OPENAI_API_KEY       If set, the openai LLM driver is registered
+   OPENAI_BASE_URL      Override the OpenAI endpoint (default api.openai.com);
                        point it at OpenRouter / vLLM / any compatible proxy
   OPENAI_MODEL         Default model for the openai driver when omitted
   DEEPSEEK_BASE_URL    Same endpoint override for the deepseek driver

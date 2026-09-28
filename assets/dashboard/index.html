@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f7f9">
+  <title>Cortex — Agent Runtime</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --canvas: #f5f6f8;
+      --surface: #fff;
+      --surface-soft: #f8f9fb;
+      --ink: #18212f;
+      --muted: #7b8492;
+      --line: #e9ebef;
+      --blue: #4263eb;
+      --blue-soft: #edf1ff;
+      --green: #17845d;
+      --green-soft: #e8f6ef;
+      --amber: #a3650c;
+      --amber-soft: #fff4df;
+      --red: #c53b43;
+      --sidebar: #151c2b;
+      --sidebar-muted: #9aa4b5;
+      --shadow: 0 1px 2px #17203308, 0 7px 24px #17203305;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--canvas); color: var(--ink); font-size: 13px; -webkit-font-smoothing: antialiased; }
+    button, input { font: inherit; }
+    button { cursor: pointer; }
+    .app { min-height: 100vh; }
+    .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 5; display: flex; width: 236px; flex-direction: column; background: var(--sidebar); color: #f5f7fb; padding: 22px 14px 14px; }
+    .brand { display: flex; align-items: center; gap: 11px; padding: 0 10px 27px; }
+    .brand-mark { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 10px; background: #d7f36a; color: #1e2932; font-size: 18px; font-weight: 800; letter-spacing: -2px; }
+    .brand-name { font-size: 15px; font-weight: 680; letter-spacing: -.03em; }
+    .brand-sub { margin-top: 2px; color: var(--sidebar-muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+    .nav-label { padding: 11px 11px 8px; color: #778397; font-size: 10px; font-weight: 650; letter-spacing: .1em; text-transform: uppercase; }
+    .nav { display: grid; gap: 4px; }
+    .nav-item { display: flex; align-items: center; gap: 11px; width: 100%; padding: 10px 11px; border: 0; border-radius: 7px; background: transparent; color: #b6bfcd; text-align: left; transition: background .15s, color .15s; }
+    .nav-item:hover { background: #ffffff0c; color: #fff; }
+    .nav-item.active { background: #29344a; color: #fff; box-shadow: inset 2px 0 #d7f36a; }
+    .nav-icon { display: grid; width: 17px; place-items: center; color: #96a2b5; font-size: 15px; }
+    .nav-item.active .nav-icon { color: #d7f36a; }
+    .nav-count { margin-left: auto; color: #98a5b7; font-size: 11px; font-variant-numeric: tabular-nums; }
+    .side-spacer { flex: 1; }
+    .workspace { margin: 0 4px 14px; padding: 12px; border: 1px solid #ffffff16; border-radius: 9px; background: #ffffff08; }
+    .workspace-label { color: #91a0b4; font-size: 10px; }
+    .workspace-name { display: flex; align-items: center; gap: 7px; margin-top: 8px; font-size: 12px; font-weight: 550; }
+    .workspace-dot { width: 7px; height: 7px; border-radius: 50%; background: #92d879; box-shadow: 0 0 9px #92d87970; }
+    .side-footer { display: flex; align-items: center; gap: 8px; padding: 11px 9px 2px; color: #97a3b5; font-size: 11px; }
+    .side-footer .version { margin-left: auto; color: #68758a; font-size: 10px; }
+    .main { min-height: 100vh; margin-left: 236px; }
+    .topbar { position: sticky; top: 0; z-index: 4; display: flex; height: 58px; align-items: center; justify-content: space-between; padding: 0 34px; border-bottom: 1px solid var(--line); background: #ffffffed; backdrop-filter: blur(12px); }
+    .crumb { display: flex; align-items: center; gap: 9px; color: #8b93a0; font-size: 12px; }
+    .crumb strong { color: #354052; font-weight: 560; }
+    .top-actions { display: flex; align-items: center; gap: 12px; }
+    .connection { display: flex; align-items: center; gap: 7px; color: #697486; font-size: 11px; }
+    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #25a879; box-shadow: 0 0 0 3px #25a8791c; }
+    .icon-button { display: grid; width: 31px; height: 31px; place-items: center; border: 1px solid var(--line); border-radius: 7px; background: #fff; color: #5e6877; font-size: 15px; }
+    .icon-button:hover { border-color: #cbd2de; background: var(--surface-soft); }
+    .content { width: min(1440px, 100%); margin: 0 auto; padding: 31px 34px 48px; }
+    .main[data-section="processes"] .metrics, .main[data-section="processes"] .events-panel,
+    .main[data-section="events"] .metrics, .main[data-section="events"] .columns { display: none; }
+    .page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin-bottom: 23px; }
+    .overline { margin-bottom: 7px; color: #8a93a1; font-size: 10px; font-weight: 650; letter-spacing: .11em; text-transform: uppercase; }
+    h1 { margin: 0; font-size: 24px; font-weight: 650; letter-spacing: -.045em; }
+    .subtitle { margin-top: 6px; color: var(--muted); font-size: 12px; }
+    .heading-actions { display: flex; align-items: center; gap: 8px; }
+    .button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 33px; padding: 0 11px; border: 1px solid #dfe3e9; border-radius: 7px; background: #fff; color: #414c5d; font-size: 11px; font-weight: 550; box-shadow: 0 1px 1px #18212f05; }
+    .button:hover { border-color: #c8cfda; background: #fbfcfd; }
+    .button.primary { border-color: #344fc8; background: var(--blue); color: #fff; }
+    .button.primary:hover { background: #3554d7; }
+    .button-icon { font-size: 14px; line-height: 1; }
+    .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 13px; margin-bottom: 17px; }
+    .metric, .panel { border: 1px solid var(--line); border-radius: 9px; background: var(--surface); box-shadow: var(--shadow); }
+    .metric { position: relative; min-height: 113px; overflow: hidden; padding: 16px 17px; }
+    .metric-top { display: flex; align-items: center; justify-content: space-between; color: #707b8a; font-size: 11px; }
+    .metric-icon { display: grid; width: 27px; height: 27px; place-items: center; border-radius: 7px; background: var(--surface-soft); color: #687487; font-size: 13px; }
+    .metric-value { margin-top: 9px; font-size: 25px; font-weight: 650; letter-spacing: -.05em; font-variant-numeric: tabular-nums; }
+    .metric-foot { margin-top: 2px; color: #929aa6; font-size: 10px; }
+    .metric-foot .positive { color: var(--green); }
+    .metric.blue .metric-icon { background: var(--blue-soft); color: var(--blue); }
+    .metric.green .metric-icon { background: var(--green-soft); color: var(--green); }
+    .metric.amber .metric-icon { background: var(--amber-soft); color: var(--amber); }
+    .columns { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(260px, .8fr); gap: 14px; align-items: stretch; margin-bottom: 14px; }
+    .panel { min-width: 0; }
+    .panel-head { display: flex; min-height: 54px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 16px; border-bottom: 1px solid #eff0f3; }
+    .panel-title { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 640; }
+    .panel-note { margin-top: 3px; color: #98a0ac; font-size: 10px; font-weight: 400; }
+    .text-button { padding: 5px 2px; border: 0; background: none; color: var(--blue); font-size: 10px; font-weight: 560; }
+    .text-button:hover { color: #2947c5; }
+    .table-tools { display: flex; align-items: center; gap: 7px; }
+    .search { width: 150px; height: 29px; padding: 0 9px; border: 1px solid #e7e9ed; border-radius: 6px; outline: 0; background: #fff; color: var(--ink); font-size: 10px; }
+    .search:focus { border-color: #9aabf6; box-shadow: 0 0 0 2px #4263eb18; }
+    .search::placeholder { color: #a3aab5; }
+    .table-scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; text-align: left; white-space: nowrap; }
+    th { height: 34px; padding: 0 13px; color: #9199a6; font-size: 9px; font-weight: 620; letter-spacing: .045em; text-transform: uppercase; }
+    td { height: 46px; padding: 0 13px; border-top: 1px solid #f0f1f4; color: #4b5665; font-size: 10px; }
+    tbody tr { cursor: pointer; transition: background .12s; }
+    tbody tr:hover { background: #f8f9fc; }
+    .pid-cell { color: #53627a; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
+    .role-cell { color: #273244; font-size: 11px; font-weight: 570; }
+    .role-wrap { display: flex; align-items: center; gap: 8px; }
+    .role-avatar { display: grid; width: 23px; height: 23px; place-items: center; border: 1px solid #e1e6f3; border-radius: 6px; background: #f1f4ff; color: #4b5fb6; font-size: 9px; font-weight: 700; }
+    .state { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px; border-radius: 5px; background: #f1f3f6; color: #667181; font-size: 9px; font-weight: 560; }
+    .state::before { width: 5px; height: 5px; border-radius: 50%; background: currentColor; content: ""; }
+    .state-running, .state-ready { background: var(--green-soft); color: var(--green); }
+    .state-blocked { background: var(--amber-soft); color: var(--amber); }
+    .state-stopped { background: #fff0f0; color: var(--red); }
+    .state-zombie, .state-exiting, .state-suspended { background: #f0f1f3; color: #737b87; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .empty { height: 120px; color: #929aa7; text-align: center; }
+    .runtime { display: flex; flex-direction: column; }
+    .runtime-body { padding: 15px 16px 12px; }
+    .runtime-total { display: flex; align-items: baseline; gap: 7px; margin-bottom: 16px; }
+    .runtime-total strong { font-size: 25px; font-weight: 640; letter-spacing: -.05em; }
+    .runtime-total span { color: #8d96a3; font-size: 10px; }
+    .state-list { display: grid; gap: 13px; }
+    .state-row { display: grid; grid-template-columns: 76px 1fr 22px; align-items: center; gap: 8px; color: #6f7988; font-size: 10px; }
+    .state-track { height: 5px; overflow: hidden; border-radius: 9px; background: #eef0f4; }
+    .state-fill { height: 100%; min-width: 0; border-radius: inherit; background: #9aa8c4; transition: width .25s ease; }
+    .state-fill.running { background: #36a77d; }
+    .state-fill.blocked { background: #e7ad48; }
+    .state-fill.stopped { background: #d4767b; }
+    .state-number { color: #4c5665; text-align: right; font-variant-numeric: tabular-nums; }
+    .runtime-foot { display: flex; align-items: center; justify-content: space-between; margin-top: auto; padding: 11px 16px; border-top: 1px solid #eff0f3; color: #8a93a1; font-size: 9px; }
+    .events-panel { margin-bottom: 14px; }
+    .event-table td { height: 42px; }
+    .event-name { color: #344052; font-weight: 550; }
+    .event-kind { display: inline-flex; align-items: center; min-width: 76px; padding: 4px 7px; border-radius: 5px; background: var(--blue-soft); color: #536bd1; font-size: 9px; font-weight: 560; }
+    .event-kind.tool { background: var(--amber-soft); color: #a3650c; }
+    .event-kind.chain { background: #f0ebff; color: #7855bb; }
+    .event-kind.error { background: #fff0f0; color: var(--red); }
+    .event-time { color: #929aa6; font-size: 9px; }
+    .duration { color: #536071; font-variant-numeric: tabular-nums; }
+    .page-footer { display: flex; align-items: center; justify-content: space-between; padding: 8px 2px; color: #9aa1ac; font-size: 9px; }
+    dialog { width: min(620px, calc(100vw - 28px)); max-height: 78vh; padding: 0; overflow: hidden; border: 1px solid #dfe3e9; border-radius: 11px; background: #fff; color: var(--ink); box-shadow: 0 20px 80px #0e172533; }
+    dialog::backdrop { background: #18212f55; backdrop-filter: blur(2px); }
+    .dialog-head { display: flex; align-items: center; justify-content: space-between; padding: 15px 18px; border-bottom: 1px solid var(--line); }
+    .dialog-head strong { font-size: 13px; }
+    .dialog-body { max-height: calc(78vh - 52px); overflow: auto; padding: 14px 18px; }
+    .trace-list { display: grid; gap: 6px; }
+    .trace-item { display: grid; grid-template-columns: 82px 1fr auto; gap: 10px; padding: 8px 9px; border: 1px solid #eef0f3; border-radius: 6px; color: #556171; font-size: 10px; }
+    .trace-time { color: #929aa7; }
+    .trace-syscall { color: #344052; font-weight: 570; }
+    .trace-phase { color: #858e9b; }
+    @media (max-width: 1080px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .columns { grid-template-columns: minmax(0, 1.5fr) minmax(235px, .8fr); } .content { padding-right: 22px; padding-left: 22px; } .topbar { padding: 0 22px; } }
+    @media (max-width: 760px) { .sidebar { width: 58px; padding: 16px 8px; } .brand { justify-content: center; padding: 0 0 23px; } .brand-copy, .nav-label, .nav-text, .nav-count, .workspace, .side-footer .version { display: none; } .nav-item { justify-content: center; padding: 11px 0; } .nav-icon { font-size: 17px; } .side-footer { justify-content: center; padding: 12px 0; } .main { margin-left: 58px; } .topbar { height: 52px; padding: 0 15px; } .content { padding: 23px 14px 34px; } .page-heading { align-items: flex-start; } h1 { font-size: 21px; } .columns { grid-template-columns: 1fr; } .heading-actions .button span:not(.button-icon) { display: none; } .heading-actions .button { width: 34px; padding: 0; } .search { width: 115px; } .metrics { gap: 9px; } .metric { min-height: 101px; padding: 13px; } .metric-value { font-size: 22px; } .panel-head { padding: 0 12px; } .table-wrap { max-width: calc(100vw - 84px); } }
+    @media (max-width: 420px) { .connection { font-size: 0; } .connection .live-dot { width: 8px; height: 8px; } .crumb { font-size: 10px; } .content { padding-right: 10px; padding-left: 10px; } .metric-top { font-size: 10px; } .metric-icon { width: 23px; height: 23px; } .metric-foot { font-size: 9px; } }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">cx</div>
+        <div class="brand-copy"><div class="brand-name">cortex</div><div class="brand-sub">Agent runtime</div></div>
+      </div>
+      <div class="nav-label">Workspace</div>
+      <nav class="nav" aria-label="主导航">
+        <button class="nav-item active" data-section="overview"><span class="nav-icon">⌂</span><span class="nav-text">总览</span></button>
+        <button class="nav-item" data-section="processes"><span class="nav-icon">◫</span><span class="nav-text">进程</span><span class="nav-count" id="navProcessCount">—</span></button>
+        <button class="nav-item" data-section="events"><span class="nav-icon">⌁</span><span class="nav-text">执行事件</span><span class="nav-count" id="navEventCount">—</span></button>
+      </nav>
+      <div class="nav-label" style="margin-top:18px">System</div>
+      <nav class="nav">
+        <button class="nav-item" id="refreshNav"><span class="nav-icon">↻</span><span class="nav-text">刷新数据</span></button>
+      </nav>
+      <div class="side-spacer"></div>
+      <div class="workspace"><div class="workspace-label">当前工作目录</div><div class="workspace-name"><span class="workspace-dot"></span><span id="workspaceName">Cortex workspace</span></div></div>
+      <div class="side-footer"><span class="workspace-dot"></span><span>本地节点已连接</span><span class="version">ABI 1.0</span></div>
+    </aside>
+
+    <main class="main" data-section="overview">
+      <header class="topbar">
+        <div class="crumb"><span>Workspace</span><span>›</span><strong id="crumbSection">总览</strong></div>
+        <div class="top-actions"><div class="connection"><span class="live-dot"></span><span id="updated">正在连接</span></div><button class="icon-button" id="refreshTop" title="刷新数据" aria-label="刷新数据">↻</button></div>
+      </header>
+
+      <div class="content">
+        <section class="page-heading" id="overview">
+          <div><div class="overline">运行时监控</div><h1 id="pageTitle">Agent 总览</h1><div class="subtitle" id="pageSubtitle">查看进程状态、资源使用和最近的执行记录。</div></div>
+          <div class="heading-actions"><button class="button" id="copyApi"><span class="button-icon">⌘</span><span>API 地址</span></button><button class="button primary" id="refreshPage"><span class="button-icon">↻</span><span>立即刷新</span></button></div>
+        </section>
+
+        <section class="metrics" aria-label="运行指标">
+          <article class="metric blue"><div class="metric-top"><span>Agent 进程</span><span class="metric-icon">◫</span></div><div class="metric-value" id="count">—</div><div class="metric-foot">当前工作区记录</div></article>
+          <article class="metric green"><div class="metric-top"><span>活跃进程</span><span class="metric-icon">↗</span></div><div class="metric-value" id="running">—</div><div class="metric-foot"><span class="positive">运行中 / 就绪 / 等待中</span></div></article>
+          <article class="metric amber"><div class="metric-top"><span>Token 消耗</span><span class="metric-icon">✳</span></div><div class="metric-value" id="tokens">—</div><div class="metric-foot">已记录的输入与输出 token</div></article>
+          <article class="metric"><div class="metric-top"><span>近期事件</span><span class="metric-icon">⌁</span></div><div class="metric-value" id="eventCount">—</div><div class="metric-foot">内核与 LangChain 调用</div></article>
+        </section>
+
+        <div class="columns">
+          <section class="panel" id="processes">
+            <div class="panel-head"><div><div class="panel-title">Agent 进程 <span class="nav-count" id="processCountLabel"></span></div><div class="panel-note">进程状态与最近资源使用</div></div><div class="table-tools"><input class="search" id="processSearch" type="search" placeholder="筛选进程…" aria-label="筛选进程"><button class="icon-button" id="processRefresh" title="刷新进程">↻</button></div></div>
+            <div class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th>PID</th><th>PPID</th><th>Token</th><th>启动时间</th></tr></thead><tbody id="processRows"><tr><td colspan="6" class="empty">正在读取进程…</td></tr></tbody></table></div>
+          </section>
+
+          <section class="panel runtime">
+            <div class="panel-head"><div><div class="panel-title">运行状态</div><div class="panel-note">按进程状态分类</div></div><span class="state">只读监控</span></div>
+            <div class="runtime-body"><div class="runtime-total"><strong id="runtimeTotal">—</strong><span>个进程</span></div><div class="state-list" id="stateList"></div></div>
+            <div class="runtime-foot"><span>内核 ABI</span><span class="mono">1.0.0</span></div>
+          </section>
+        </div>
+
+        <section class="panel events-panel" id="events">
+          <div class="panel-head"><div><div class="panel-title">最近执行事件</div><div class="panel-note">Cortex 模型 / 工具 / syscall 与 LangChain 回调 · 不含 prompt 内容</div></div><button class="text-button" id="viewAllEvents">查看全部 <span aria-hidden="true">→</span></button></div>
+          <div class="table-scroll"><table class="event-table"><thead><tr><th>类型</th><th>名称 / 关联记录</th><th>PID</th><th>耗时</th><th>时间</th><th>错误</th></tr></thead><tbody id="eventRows"><tr><td colspan="6" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr></tbody></table></div>
+        </section>
+        <footer class="page-footer"><span>Cortex Agent OS</span><span id="footerUpdated">自动刷新 · 每 3 秒</span></footer>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="traceDialog"><div class="dialog-head"><strong id="traceTitle">进程记录</strong><button class="icon-button" id="closeDialog" aria-label="关闭">×</button></div><div class="dialog-body" id="traceBody"></div></dialog>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+    const processTokens = (process) => Number(process.budgetsSpent ? (process.budgetsSpent.tokensIn ?? 0) + (process.budgetsSpent.tokensOut ?? 0) : process.tokens ?? 0) || 0;
+    let processData = [];
+    let eventData = [];
+
+    function renderProcesses() {
+      const query = $('processSearch').value.trim().toLowerCase();
+      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state}`.toLowerCase().includes(query));
+      $('processRows').innerHTML = visible.length ? visible.map((process) => {
+        const initial = String(process.role ?? '?').slice(0, 1).toUpperCase();
+        const time = (process.startedAt ?? '').replace('T', ' ').slice(0, 16) || '—';
+        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td><td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td>${esc(time)}</td></tr>`;
+      }).join('') : `<tr><td colspan="6" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
+      $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
+    }
+
+    function renderStates() {
+      const states = ['running', 'ready', 'blocked', 'stopped', 'zombie'];
+      const counts = Object.fromEntries(states.map((state) => [state, processData.filter((process) => process.state === state).length]));
+      const max = Math.max(1, ...Object.values(counts));
+      const labels = { running: '运行中', ready: '就绪', blocked: '等待中', stopped: '已停止', zombie: '已退出' };
+      $('stateList').innerHTML = states.map((state) => `<div class="state-row"><span>${labels[state]}</span><div class="state-track"><div class="state-fill ${state}" style="width:${counts[state] / max * 100}%"></div></div><span class="state-number">${counts[state]}</span></div>`).join('');
+    }
+
+    function eventLabel(event) {
+      const type = String(event.type ?? 'event');
+      if (type.startsWith('llm.')) return '模型';
+      if (type.startsWith('tool.')) return '工具';
+      if (type.startsWith('chain.')) return 'Chain';
+      if (type.startsWith('retriever.')) return '检索';
+      if (type.includes('error')) return '错误';
+      return 'Agent';
+    }
+
+    function renderEvents() {
+      const rows = eventData.slice(0, 8);
+      $('eventRows').innerHTML = rows.length ? rows.map((event) => {
+        const label = eventLabel(event);
+        const kind = label === '工具' ? 'tool' : label === 'Chain' ? 'chain' : label === '错误' ? 'error' : '';
+        const time = event.at ? new Date(event.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+        const audit = (event.audit && typeof event.audit === 'object') ? event.audit : null;
+        const auditText = audit ? Object.entries(audit).slice(0, 3).map(([k, v]) => `${k}=${String(v).slice(0, 12)}`).join(' · ') : '';
+        const auditTitle = audit ? JSON.stringify(audit) : '';
+        return `<tr><td><span class="event-kind ${kind}">${label} · ${esc(String(event.type ?? '').split('.').at(-1))}</span></td><td class="event-name" title="${esc(auditTitle)}">${esc(event.name ?? event.runId ?? '—')}${auditText ? ` · ${esc(auditText)}` : ''}</td><td class="pid-cell">${esc(event.pid ?? '—')}</td><td class="duration">${event.durationMs === undefined ? '—' : `${esc(event.durationMs)} ms`}</td><td class="event-time">${esc(time)}</td><td>${esc(event.error ?? '—')}</td></tr>`;
+      }).join('') : '<tr><td colspan="6" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr>';
+    }
+
+    async function refresh() {
+      try {
+        const responses = await Promise.all([fetch('/api/processes', { cache: 'no-store' }), fetch('/api/events?limit=100', { cache: 'no-store' })]);
+        if (responses.some((response) => !response.ok)) throw new Error('API 请求失败');
+        [processData, eventData] = await Promise.all(responses.map((response) => response.json()));
+        const active = processData.filter((process) => ['running', 'ready', 'blocked'].includes(process.state));
+        const tokens = processData.reduce((sum, process) => sum + processTokens(process), 0);
+        $('count').textContent = processData.length.toLocaleString();
+        $('running').textContent = active.length.toLocaleString();
+        $('tokens').textContent = tokens.toLocaleString();
+        $('eventCount').textContent = eventData.length.toLocaleString();
+        $('navProcessCount').textContent = processData.length;
+        $('navEventCount').textContent = eventData.length;
+        $('processCountLabel').textContent = processData.length ? `(${processData.length})` : '';
+        $('runtimeTotal').textContent = processData.length.toLocaleString();
+        $('updated').textContent = `已同步 ${new Date().toLocaleTimeString()}`;
+        $('footerUpdated').textContent = `最近更新 ${new Date().toLocaleTimeString()} · 自动刷新每 3 秒`;
+        renderProcesses();
+        renderStates();
+        renderEvents();
+      } catch (error) {
+        $('updated').textContent = `连接失败：${error.message}`;
+        document.querySelector('.connection .live-dot').style.background = '#d65b62';
+      }
+    }
+
+    async function showTrace(pid) {
+      $('traceTitle').textContent = `进程 ${pid} · Syscall 时间线`;
+      $('traceBody').innerHTML = '<div class="empty">正在读取记录…</div>';
+      $('traceDialog').showModal();
+      try {
+        const response = await fetch(`/api/trace/${encodeURIComponent(pid)}`);
+        const records = await response.json();
+        if (!response.ok) throw new Error(records.error ?? '读取失败');
+        $('traceBody').innerHTML = records.length ? `<div class="trace-list">${records.map((record) => `<div class="trace-item"><span class="trace-time">${esc(new Date(record.timestamp).toLocaleTimeString())}</span><span class="trace-syscall">${esc(record.syscall)}</span><span class="trace-phase">${esc(record.phase)}${record.durationMs === undefined ? '' : ` · ${esc(record.durationMs)} ms`}</span></div>`).join('')}</div>` : '<div class="empty">这个进程还没有 syscall 记录。</div>';
+      } catch (error) {
+        $('traceBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+      }
+    }
+
+    $('processSearch').addEventListener('input', renderProcesses);
+    ['refreshTop', 'refreshPage', 'processRefresh', 'refreshNav'].forEach((id) => $(id).addEventListener('click', refresh));
+    $('closeDialog').addEventListener('click', () => $('traceDialog').close());
+    $('viewAllEvents').addEventListener('click', () => document.querySelector('#events').scrollIntoView({ behavior: 'smooth' }));
+    const sectionCopy = {
+      overview: ['Agent 总览', '查看进程状态、资源使用和最近的执行记录。'],
+      processes: ['Agent 进程', '查看所有 Agent 进程状态、资源使用，并点击进程查看 syscall 时间线。'],
+      events: ['执行事件', '查看最近记录的模型、工具与链路回调事件。'],
+    };
+    function selectSection(section) {
+      if (!sectionCopy[section]) return;
+      document.querySelectorAll('.nav-item[data-section]').forEach((nav) => nav.classList.remove('active'));
+      document.querySelector(`.nav-item[data-section="${section}"]`)?.classList.add('active');
+      document.querySelector('.main').dataset.section = section;
+      $('pageTitle').textContent = sectionCopy[section][0];
+      $('pageSubtitle').textContent = sectionCopy[section][1];
+      $('crumbSection').textContent = sectionCopy[section][0].replace('Agent ', '');
+      document.querySelector('.main').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      history.replaceState(null, '', section === 'overview' ? location.pathname : `#${section}`);
+    }
+    document.querySelectorAll('.nav-item[data-section]').forEach((item) => item.addEventListener('click', () => selectSection(item.dataset.section)));
+    $('copyApi').addEventListener('click', async () => {
+      await navigator.clipboard.writeText(`${location.origin}/api/processes`);
+      $('copyApi').innerHTML = '<span class="button-icon">✓</span><span>已复制</span>';
+      setTimeout(() => { $('copyApi').innerHTML = '<span class="button-icon">⌘</span><span>API 地址</span>'; }, 1400);
+    });
+    refresh();
+    if (sectionCopy[location.hash.slice(1)]) selectSection(location.hash.slice(1));
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>

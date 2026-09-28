@@ -218,6 +218,8 @@ $ cortex diff 2 3
 | [docs/STATE.md](./docs/STATE.md) | **最难的部分。** agent state 是什么，fork 时复制什么，什么根本不能复制。（[中文](./docs/STATE.zh-CN.md)） |
 | [docs/PROCESS.md](./docs/PROCESS.md) | agent 生命周期：8 个状态、12 个合法转换、signals、调度 |
 | [docs/ABI.md](./docs/ABI.md) | syscall 契约：24 个 syscall、3 个 driver 接口、错误模型、记录格式 |
+| [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md) | 将 LangChain 事件和只读 Dashboard 接入现有 Node.js 项目 |
+| [docs/DRIVERS.md](./docs/DRIVERS.md) | 内置 LLM 驱动（mock / deepseek / openai）：选择顺序、环境变量、端点覆盖 |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 内核模块和数据流：11 个模块、syscall 生命周期、持久化布局、并发模型 |
 | [docs/HACKING.md](./docs/HACKING.md) | 贡献者指南：开发环境、约定、怎么写驱动 / agent / syscall、测试。 |
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | 配方：监督树、暂停与恢复、fork 对比、daemon、工具、IPC（含显式 channel）、预算、最小权限（能力系统）、测试。 |

@@ -182,6 +182,10 @@ import {
   type FetchResponseLike as OpenAiFetchResponseLike,
 } from '../src/drivers/llm/openai.js';
 
+import { CortexLangChainCallbackHandler } from '../src/integrations/langchain.js';
+import { startDashboard } from '../src/dashboard/server.js';
+import { writeMeta, type ProcessMeta } from '../src/cli/process_store.js';
+
 import {
   FsToolDriver,
   fsTool,
@@ -8401,6 +8405,158 @@ async function runOpenAiChecks(): Promise<void> {
 }
 
 // =============================================================================
+// LangChain integration checks
+// =============================================================================
+
+async function runLangchainChecks(): Promise<void> {
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-lc-'));
+  try {
+    const handler = new CortexLangChainCallbackHandler({ dir: tmp });
+
+    await checkAsync('llm start/end round-trips metadata-only events to disk', async () => {
+      await handler.handleLLMStart({}, ['secret prompt text'], 'run-1', undefined, undefined, undefined, { cortexPid: 7 }, 'ChatOpenAI');
+      await handler.handleLLMEnd({ usage_metadata: { input_tokens: 5, output_tokens: 3 } }, 'run-1');
+      await handler.flush();
+      const lines = (await readFile(join(tmp, 'integrations', 'langchain', 'events.jsonl'), 'utf8')).trim().split('\n');
+      assert(lines.length === 2, `expected 2 events, got ${lines.length}`);
+      const start = JSON.parse(lines[0]!) as Record<string, unknown>;
+      const end = JSON.parse(lines[1]!) as Record<string, unknown>;
+      assert(start['type'] === 'llm.start' && start['pid'] === 7 && start['name'] === 'ChatOpenAI', 'start event fields');
+      assert(!JSON.stringify(start).includes('secret prompt text'), 'prompt text must not be recorded');
+      assert(end['type'] === 'llm.end' && end['inputTokens'] === 5 && end['outputTokens'] === 3, 'usage extracted');
+      assert(typeof end['durationMs'] === 'number' && (end['durationMs'] as number) >= 0, 'duration measured');
+    });
+
+    await checkAsync('llm error path records the error name, not the message', async () => {
+      await handler.handleLLMError(new Error('secret failure detail'), 'run-2');
+      await handler.flush();
+      const lines = (await readFile(join(tmp, 'integrations', 'langchain', 'events.jsonl'), 'utf8')).trim().split('\n');
+      const evt = JSON.parse(lines[lines.length - 1]!) as Record<string, unknown>;
+      assert(evt['type'] === 'llm.error' && evt['error'] === 'Error', 'error name only');
+      assert(!JSON.stringify(evt).includes('secret failure detail'), 'error message must not be recorded');
+    });
+
+    await checkAsync('concurrent events serialize (one JSON object per line)', async () => {
+      const parallel = new CortexLangChainCallbackHandler({ dir: tmp });
+      await Promise.all(
+        Array.from({ length: 20 }, (_, i) => parallel.handleChainStart({}, null, `chain-${i}`)),
+      );
+      await parallel.flush();
+      const lines = (await readFile(join(tmp, 'integrations', 'langchain', 'events.jsonl'), 'utf8')).trim().split('\n');
+      assert(lines.length === 23, `expected 23 total lines, got ${lines.length}`);
+      for (const line of lines) {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        assert(typeof parsed['type'] === 'string', 'every line is a valid event');
+      }
+    });
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
+// Dashboard server checks
+// =============================================================================
+
+async function runDashboardChecks(): Promise<void> {
+  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-dash-'));
+  try {
+    // Seed one real syscall log (enter + exit + tool exit) via the Recorder.
+    const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
+    const base = {
+      pid: asProcessId(2),
+      stateBefore: 'running' as const,
+      stateAfter: 'running' as const,
+      reversibility: 'reversible' as const,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+    };
+    await rec.append({ ...base, timestamp: '2026-09-28T00:00:01.000Z', syscall: 'llm_call', callId: 'c1', phase: 'enter', args: {} });
+    await rec.append({ ...base, timestamp: '2026-09-28T00:00:02.000Z', syscall: 'llm_call', callId: 'c1', phase: 'exit', durationMs: 12 });
+    // A tool_call whose structured output carries a domain-specific audit
+    // object: the dashboard must pass it through generically, without
+    // hard-coding any of the domain's field names.
+    await rec.append({
+      ...base,
+      timestamp: '2026-09-28T00:00:03.000Z',
+      syscall: 'tool_call',
+      callId: 'c2',
+      phase: 'exit',
+      result: { output: { structured: { audit: { correlation_id: 'abc', product_count: 3 } } } },
+    });
+    await rec.close();
+
+    // Seed a persisted meta so the events scan finds the .crec, and a
+    // LangChain callback event so both sources merge.
+    writeMeta(tmp, {
+      pid: 2, ppid: 1, pgid: 2, role: 'hello', state: 'zombie',
+      exitCode: 0, exitReason: 'done',
+      startedAt: '2026-09-28T00:00:00.000Z', lastTransitionAt: '2026-09-28T00:00:03.000Z',
+      budgetsSpent: { tokensIn: 1, tokensOut: 1, tokensCached: 0, usdSpent: 0, wallTimeMs: 10, syscallCount: 3 },
+      budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+      agent: { module: './agents/noop.js' } as ProcessMeta['agent'],
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+    });
+    await mkdir(join(tmp, 'integrations', 'langchain'), { recursive: true });
+    await writeFile(
+      join(tmp, 'integrations', 'langchain', 'events.jsonl'),
+      `${JSON.stringify({ type: 'llm.end', at: '2026-09-28T00:00:04.000Z', runId: 'lc-1', name: 'ChatOpenAI', pid: 2, durationMs: 50 })}\n`,
+      'utf8',
+    );
+
+    const dash = await startDashboard({ dir: tmp, port: 0 });
+    try {
+      await checkAsync('dashboard /api/events merges .crec and LangChain events', async () => {
+        const res = await fetch(`${dash.url}/api/events?limit=50`);
+        assert(res.status === 200, `status ${res.status}`);
+        const events = (await res.json()) as Array<Record<string, unknown>>;
+        assert(events.some((e) => e['type'] === 'llm.call'), 'syscall-derived llm.call present');
+        assert(events.some((e) => e['type'] === 'llm.end'), 'LangChain llm.end present');
+        assert(events.some((e) => e['type'] === 'tool.call'), 'tool.call present');
+        const tool = events.find((e) => e['type'] === 'tool.call')!;
+        const audit = tool['audit'] as Record<string, unknown> | undefined;
+        assert(audit !== undefined && audit['correlation_id'] === 'abc', 'audit passed through generically');
+        const raw = JSON.stringify(events);
+        assert(!raw.includes('commercePid') && !raw.includes('evidenceCount'), 'no domain-specific field names leak');
+      });
+
+      await checkAsync('dashboard /api/trace/:pid returns the syscall timeline', async () => {
+        const res = await fetch(`${dash.url}/api/trace/2`);
+        assert(res.status === 200, `status ${res.status}`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        assert(rows.length === 3, `expected 3 records, got ${rows.length}`);
+        assert(rows[0]!['syscall'] === 'tool_call', 'newest first');
+      });
+
+      await checkAsync('dashboard trace for an unknown pid is 404', async () => {
+        const res = await fetch(`${dash.url}/api/trace/999`);
+        assert(res.status === 404, `status ${res.status}`);
+      });
+
+      await checkAsync('dashboard serves processes, rejects mutations', async () => {
+        const res = await fetch(`${dash.url}/api/processes`);
+        assert(res.status === 200, `GET status ${res.status}`);
+        const metas = (await res.json()) as Array<Record<string, unknown>>;
+        assert(metas.length === 1 && metas[0]!['role'] === 'hello', 'persisted meta served');
+        const post = await fetch(`${dash.url}/api/processes`, { method: 'POST' });
+        assert(post.status === 405, `POST status ${post.status}`);
+      });
+    } finally {
+      await dash.close();
+    }
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // FS tool driver checks
 // =============================================================================
 
@@ -10282,6 +10438,8 @@ await runDriverRegistryChecks();
 await runMockLLMChecks();
 await runDeepseekChecks();
 await runOpenAiChecks();
+await runLangchainChecks();
+await runDashboardChecks();
 await runFsChecks();
 await runMcpChecks();
 await runDiffChecks();
