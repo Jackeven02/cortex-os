@@ -249,7 +249,7 @@
         <section class="panel events-panel" id="events">
           <div class="panel-head"><div><div class="panel-title">最近执行事件</div><div class="panel-note">Cortex 模型 / 工具 / syscall 与 LangChain 回调 · 不含 prompt 内容</div></div><span class="nav-count" id="eventTotal"></span><button class="text-button" id="eventMore">加载更多</button></div>
           <div class="event-filters"><span>时间范围</span><input type="datetime-local" id="eventFrom" aria-label="开始时间"><span>→</span><input type="datetime-local" id="eventTo" aria-label="结束时间"><button class="button" id="eventFilter" type="button">筛选</button><button class="text-button" id="eventClear" type="button">清除</button></div>
-          <div class="table-scroll"><table class="event-table"><thead><tr><th>类型</th><th>名称 / 关联记录</th><th>PID</th><th>耗时</th><th>时间</th><th>错误</th></tr></thead><tbody id="eventRows"><tr><td colspan="6" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr></tbody></table></div>
+          <div class="table-scroll"><table class="event-table"><thead><tr><th>类型</th><th>名称 / 关联记录</th><th>PID</th><th>耗时</th><th>Token / 模型</th><th>时间</th><th>错误</th></tr></thead><tbody id="eventRows"><tr><td colspan="7" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr></tbody></table></div>
         </section>
         <footer class="page-footer"><span>Cortex Agent OS</span><span id="footerUpdated">自动刷新 · 每 3 秒</span></footer>
       </div>
@@ -317,8 +317,10 @@
         const audit = (event.audit && typeof event.audit === 'object') ? event.audit : null;
         const auditText = audit ? Object.entries(audit).slice(0, 3).map(([k, v]) => `${k}=${String(v).slice(0, 12)}`).join(' · ') : '';
         const auditTitle = audit ? JSON.stringify(audit) : '';
-        return `<tr><td><span class="event-kind ${kind}">${label} · ${esc(String(event.type ?? '').split('.').at(-1))}</span></td><td class="event-name" title="${esc(auditTitle)}">${esc(event.name ?? event.runId ?? '—')}${auditText ? ` · ${esc(auditText)}` : ''}</td><td class="pid-cell">${esc(event.pid ?? '—')}</td><td class="duration">${event.durationMs === undefined ? '—' : `${esc(event.durationMs)} ms`}</td><td class="event-time">${esc(time)}</td><td>${esc(event.error ?? '—')}</td></tr>`;
-      }).join('') : '<tr><td colspan="6" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr>';
+        const tokenSummary = event.tokensIn === undefined && event.tokensOut === undefined ? (event.model ?? '—') : `${Number(event.tokensIn ?? 0).toLocaleString()} in / ${Number(event.tokensOut ?? 0).toLocaleString()} out${event.model ? ` · ${event.model}` : ''}`;
+        const errorSummary = event.errorMessage ? `${event.error ?? '错误'}: ${event.errorMessage}` : (event.error ?? '—');
+        return `<tr><td><span class="event-kind ${kind}">${label} · ${esc(String(event.type ?? '').split('.').at(-1))}</span></td><td class="event-name" title="${esc(auditTitle)}">${esc(event.name ?? event.runId ?? '—')}${auditText ? ` · ${esc(auditText)}` : ''}</td><td class="pid-cell">${esc(event.pid ?? '—')}</td><td class="duration">${event.durationMs === undefined ? '—' : `${esc(event.durationMs)} ms`}</td><td title="${event.usd === undefined ? '' : `$${Number(event.usd).toFixed(6)}"`}>${esc(tokenSummary)}</td><td class="event-time">${esc(time)}</td><td title="${esc(errorSummary)}">${esc(errorSummary)}</td></tr>`;
+      }).join('') : '<tr><td colspan="7" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr>';
     }
 
     let processView = 'table';
@@ -558,7 +560,7 @@
         const response = await fetch(`/api/trace/${encodeURIComponent(pid)}`);
         const records = await response.json();
         if (!response.ok) throw new Error(records.error ?? '读取失败');
-        $('traceBody').innerHTML = records.length ? `<div class="trace-list">${records.map((record) => `<div class="trace-item"><span class="trace-time">${esc(new Date(record.timestamp).toLocaleTimeString())}</span><span class="trace-syscall">${esc(record.syscall)}</span><span class="trace-phase">${esc(record.phase)}${record.durationMs === undefined ? '' : ` · ${esc(record.durationMs)} ms`}</span></div>`).join('')}</div>` : '<div class="empty">这个进程还没有 syscall 记录。</div>';
+        $('traceBody').innerHTML = records.length ? `<div class="trace-list">${records.map((record) => `<div class="trace-item"><span class="trace-time">${esc(new Date(record.timestamp).toLocaleTimeString())}</span><span class="trace-syscall">${esc(record.syscall)}${record.tokensIn === undefined ? '' : ` · ${esc(record.tokensIn)} in / ${esc(record.tokensOut ?? 0)} out`}${record.model ? ` · ${esc(record.model)}` : ''}${record.errorMessage ? ` · ${esc(record.error)}: ${esc(record.errorMessage)}` : ''}</span><span class="trace-phase">${esc(record.phase)}${record.durationMs === undefined ? '' : ` · ${esc(record.durationMs)} ms`}</span></div>`).join('')}</div>` : '<div class="empty">这个进程还没有 syscall 记录。</div>';
       } catch (error) {
         $('traceBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
       }

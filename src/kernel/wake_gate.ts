@@ -58,6 +58,11 @@ import { unbrand } from './types.js';
 /** The deferred half of a wake: "let the parked continuation proceed." */
 export type WakeFn = () => void;
 
+interface PendingWake {
+  readonly resume: WakeFn;
+  readonly cancel?: WakeFn;
+}
+
 /**
  * Per-process queue of deferred wake callbacks.
  *
@@ -67,7 +72,7 @@ export type WakeFn = () => void;
  * it happens after the gate has opened.
  */
 export class WakeGate {
-  #pending = new Map<number, WakeFn[]>();
+  #pending = new Map<number, PendingWake[]>();
 
   /**
    * Park `fn` until `pid` is next dispatched. Used by the wakers
@@ -82,10 +87,23 @@ export class WakeGate {
     const key = unbrand(pid);
     const list = this.#pending.get(key);
     if (list === undefined) {
-      this.#pending.set(key, [fn]);
+      this.#pending.set(key, [{ resume: fn }]);
     } else {
-      list.push(fn);
+      list.push({ resume: fn });
     }
+  }
+
+  waitForDispatch(pid: ProcessId): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const key = unbrand(pid);
+      const list = this.#pending.get(key);
+      const wake: PendingWake = {
+        resume: () => resolve(true),
+        cancel: () => resolve(false),
+      };
+      if (list === undefined) this.#pending.set(key, [wake]);
+      else list.push(wake);
+    });
   }
 
   /**
@@ -107,7 +125,7 @@ export class WakeGate {
       return 0;
     }
     this.#pending.delete(key);
-    for (const fn of list) fn();
+    for (const wake of list) wake.resume();
     return list.length;
   }
 
@@ -123,6 +141,8 @@ export class WakeGate {
    * leak a callback into a later dispatch of a recycled PID.
    */
   clear(pid: ProcessId): void {
+    const list = this.#pending.get(unbrand(pid));
     this.#pending.delete(unbrand(pid));
+    for (const wake of list ?? []) wake.cancel?.();
   }
 }

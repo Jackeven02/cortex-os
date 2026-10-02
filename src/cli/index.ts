@@ -40,7 +40,7 @@ import { mockLLM } from '../drivers/llm/mock.js';
 import { deepseekLLM } from '../drivers/llm/deepseek.js';
 import { openaiLLM } from '../drivers/llm/openai.js';
 import { fsTool } from '../drivers/tool/fs.js';
-import { mcpTool } from '../drivers/tool/mcp.js';
+import { mcpTool, parseMcpDefaultReversibility, parseMcpReversibilityMap } from '../drivers/tool/mcp.js';
 import { inmemMemory } from '../drivers/memory/inmem.js';
 import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type MemoryRegionPolicy } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
@@ -173,6 +173,8 @@ export const MCP_ENV = {
   command: 'CORTEX_MCP_COMMAND',
   args: 'CORTEX_MCP_ARGS',
   namespace: 'CORTEX_MCP_NAMESPACE',
+  defaultReversibility: 'CORTEX_MCP_DEFAULT_REVERSIBILITY',
+  reversibility: 'CORTEX_MCP_REVERSIBILITY',
 } as const;
 
 /**
@@ -285,8 +287,15 @@ export async function defaultLoadDrivers(
       .filter((s) => s.length > 0);
     const namespace = process.env[MCP_ENV.namespace] ?? 'mcp';
     try {
+      const defaultReversibility = envOrUndefined(MCP_ENV.defaultReversibility);
       await registry.registerTool(
-        mcpTool({ name: 'mcp', namespace, command: mcpCommand.trim(), args }),
+        mcpTool({
+          name: 'mcp', namespace, command: mcpCommand.trim(), args,
+          ...(defaultReversibility !== undefined
+            ? { defaultReversibility: parseMcpDefaultReversibility(defaultReversibility) }
+            : {}),
+          reversibility: parseMcpReversibilityMap(envOrUndefined(MCP_ENV.reversibility)),
+        }),
       );
     } catch (err) {
       // A dead MCP server must not brick unrelated commands (`ps`, `trace`).

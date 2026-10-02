@@ -8479,7 +8479,25 @@ async function runDashboardChecks(): Promise<void> {
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
     await rec.append({ ...base, timestamp: '2026-09-28T00:00:01.000Z', syscall: 'llm_call', callId: 'c1', phase: 'enter', args: {} });
-    await rec.append({ ...base, timestamp: '2026-09-28T00:00:02.000Z', syscall: 'llm_call', callId: 'c1', phase: 'exit', durationMs: 12 });
+    await rec.append({
+      ...base,
+      timestamp: '2026-09-28T00:00:02.000Z',
+      syscall: 'llm_call',
+      callId: 'c1',
+      phase: 'exit',
+      durationMs: 12,
+      result: { text: 'hi', model: 'gpt-test', usage: { inputTokens: 7, outputTokens: 3, cachedTokens: 0, usd: 0.001 } },
+    });
+    // A trapped syscall whose error message leaks an API key: the dashboard
+    // must surface a sanitized errorMessage, never the raw secret.
+    await rec.append({
+      ...base,
+      timestamp: '2026-09-28T00:00:03.500Z',
+      syscall: 'llm_call',
+      callId: 'c3',
+      phase: 'trap',
+      error: { errno: 'EHTTP', message: 'auth failed for key sk-livekey123456789' },
+    });
     // A tool_call whose structured output carries a domain-specific audit
     // object: the dashboard must pass it through generically, without
     // hard-coding any of the domain's field names.
@@ -8529,14 +8547,27 @@ async function runDashboardChecks(): Promise<void> {
         assert(audit !== undefined && audit['correlation_id'] === 'abc', 'audit passed through generically');
         const raw = JSON.stringify(events);
         assert(!raw.includes('commercePid') && !raw.includes('evidenceCount'), 'no domain-specific field names leak');
+        // LLM calls surface model + usage; trapped syscalls surface a
+        // sanitized errorMessage with secrets stripped.
+        const llm = events.find((e) => e['type'] === 'llm.call' && e['model'] !== undefined)!;
+        assert(llm['model'] === 'gpt-test', `model surfaced, got ${String(llm['model'])}`);
+        assert(llm['tokensIn'] === 7 && llm['tokensOut'] === 3 && llm['usd'] === 0.001, 'usage surfaced verbatim');
+        const trapped = events.find((e) => e['error'] !== undefined);
+        assert(trapped !== undefined && trapped['error'] === 'EHTTP', 'trap errno surfaced');
+        assert(trapped['errorMessage'] === 'auth failed for key [REDACTED]', `sanitized errorMessage, got ${String(trapped['errorMessage'])}`);
+        assert(!raw.includes('sk-livekey123456789'), 'raw secret never leaves the API');
       });
 
       await checkAsync('dashboard /api/trace/:pid returns the syscall timeline', async () => {
         const res = await fetch(`${dash.url}/api/trace/2`);
         assert(res.status === 200, `status ${res.status}`);
         const rows = (await res.json()) as Array<Record<string, unknown>>;
-        assert(rows.length === 3, `expected 3 records, got ${rows.length}`);
+        assert(rows.length === 4, `expected 4 records, got ${rows.length}`);
         assert(rows[0]!['syscall'] === 'tool_call', 'newest first');
+        const trap = rows.find((r) => r['phase'] === 'trap')!;
+        assert(trap['errorMessage'] === 'auth failed for key [REDACTED]', `trace sanitizes secrets, got ${String(trap['errorMessage'])}`);
+        const exit = rows.find((r) => r['phase'] === 'exit' && r['syscall'] === 'llm_call')!;
+        assert(exit['model'] === 'gpt-test' && exit['tokensIn'] === 7, 'trace surfaces model and usage');
       });
 
       await checkAsync('dashboard trace for an unknown pid is 404', async () => {
@@ -8586,10 +8617,10 @@ async function runDashboardChecks(): Promise<void> {
 
       await checkAsync('dashboard /api/events supports time filtering, offset, and total count', async () => {
         const all = await fetch(`${dash.url}/api/events?limit=50`);
-        assert((all.headers.get('x-total-count') ?? '') === '3', `total header, got ${all.headers.get('x-total-count')}`);
+        assert((all.headers.get('x-total-count') ?? '') === '4', `total header, got ${all.headers.get('x-total-count')}`);
         const win = await fetch(`${dash.url}/api/events?from=${encodeURIComponent('2026-09-28T00:00:03.000Z')}&limit=50`);
         const list = (await win.json()) as unknown[];
-        assert(list.length === 2, `expected 2 events from 00:00:03, got ${list.length}`);
+        assert(list.length === 3, `expected 3 events from 00:00:03, got ${list.length}`);
         const p1 = (await (await fetch(`${dash.url}/api/events?limit=1`)).json()) as Array<{ runId: string }>;
         const p2 = (await (await fetch(`${dash.url}/api/events?limit=1&offset=1`)).json()) as Array<{ runId: string }>;
         assert(p1.length === 1 && p2.length === 1 && p1[0]!.runId !== p2[0]!.runId, 'offset paginates distinct events');

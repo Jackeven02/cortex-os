@@ -45,6 +45,14 @@ const inRange = (atMs: number, range: TimeRange): boolean =>
 
 const MAX_SCAN = 5000;
 
+function safeErrorMessage(message: string): string {
+  return message
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
+    .replace(/(authorization|api[_-]?key|token|secret)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
+    .slice(0, 240);
+}
+
 async function readEvents(dir: string, range: TimeRange): Promise<unknown[]> {
   const path = join(dir, 'integrations', 'langchain', 'events.jsonl');
   if (!existsSync(path)) return [];
@@ -74,6 +82,11 @@ async function readSyscallEvents(dir: string, range: TimeRange): Promise<unknown
     name: string;
     durationMs?: number;
     error?: string;
+    errorMessage?: string;
+    model?: string;
+    tokensIn?: number;
+    tokensOut?: number;
+    usd?: number;
     audit?: Record<string, unknown>;
   }> = [];
   const filtering = range.from !== undefined || range.to !== undefined;
@@ -94,6 +107,10 @@ async function readSyscallEvents(dir: string, range: TimeRange): Promise<unknown
         // know (or care) what domains put inside it.
         const toolResult = record.result as { output?: { structured?: { audit?: Record<string, unknown> } } } | undefined;
         const audit = record.syscall === 'tool_call' ? toolResult?.output?.structured?.audit : undefined;
+        const llmResult = record.syscall === 'llm_call' ? record.result as {
+          model?: string;
+          usage?: { inputTokens?: number; outputTokens?: number; usd?: number };
+        } | undefined : undefined;
         events.push({
           type,
           at: record.timestamp,
@@ -102,6 +119,11 @@ async function readSyscallEvents(dir: string, range: TimeRange): Promise<unknown
           name: record.syscall,
           ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
           ...(record.error !== undefined ? { error: record.error.errno } : {}),
+          ...(record.error !== undefined ? { errorMessage: safeErrorMessage(record.error.message) } : {}),
+          ...(llmResult?.model !== undefined ? { model: llmResult.model } : {}),
+          ...(llmResult?.usage?.inputTokens !== undefined ? { tokensIn: llmResult.usage.inputTokens } : {}),
+          ...(llmResult?.usage?.outputTokens !== undefined ? { tokensOut: llmResult.usage.outputTokens } : {}),
+          ...(llmResult?.usage?.usd !== undefined ? { usd: llmResult.usage.usd } : {}),
           ...(audit !== undefined ? { audit } : {}),
         });
       }
@@ -385,11 +407,20 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         }
         const records = [];
         for await (const record of readRecords(path)) {
+          const result = record.syscall === 'llm_call' ? record.result as {
+            model?: string;
+            usage?: { inputTokens?: number; outputTokens?: number; usd?: number };
+          } | undefined : undefined;
           records.push({
             timestamp: record.timestamp, pid: Number(record.pid), syscall: record.syscall,
             callId: record.callId, phase: record.phase, durationMs: record.durationMs,
             stateBefore: record.stateBefore, stateAfter: record.stateAfter,
             reversibility: record.reversibility, error: record.error?.errno,
+            ...(record.error !== undefined ? { errorMessage: safeErrorMessage(record.error.message) } : {}),
+            ...(result?.model !== undefined ? { model: result.model } : {}),
+            ...(result?.usage?.inputTokens !== undefined ? { tokensIn: result.usage.inputTokens } : {}),
+            ...(result?.usage?.outputTokens !== undefined ? { tokensOut: result.usage.outputTokens } : {}),
+            ...(result?.usage?.usd !== undefined ? { usd: result.usage.usd } : {}),
           });
           if (records.length > 1000) records.shift();
         }

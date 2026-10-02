@@ -366,6 +366,44 @@ export const MCP_DEFAULTS = {
   defaultReversibility: 'irreversible' as Reversibility,
 } as const;
 
+const MCP_REVERSIBILITY_VALUES: readonly Reversibility[] = ['idempotent', 'reversible', 'irreversible'];
+
+export function parseMcpDefaultReversibility(value: string | undefined): Reversibility {
+  if (value === undefined || value.trim() === '') return MCP_DEFAULTS.defaultReversibility;
+  const parsed = value.trim();
+  if (!MCP_REVERSIBILITY_VALUES.includes(parsed as Reversibility)) {
+    throw new CortexError('EINVAL', 'tool_call', {
+      message: 'CORTEX_MCP_DEFAULT_REVERSIBILITY must be idempotent, reversible, or irreversible',
+      details: { value: parsed },
+    });
+  }
+  return parsed as Reversibility;
+}
+
+export function parseMcpReversibilityMap(value: string | undefined): Readonly<Record<string, Reversibility>> {
+  if (value === undefined || value.trim() === '') return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new CortexError('EINVAL', 'tool_call', { message: 'CORTEX_MCP_REVERSIBILITY must be a JSON object' });
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new CortexError('EINVAL', 'tool_call', { message: 'CORTEX_MCP_REVERSIBILITY must be a JSON object' });
+  }
+  const reversibility = Object.create(null) as Record<string, Reversibility>;
+  for (const [name, tag] of Object.entries(parsed)) {
+    if (name.trim() === '' || !MCP_REVERSIBILITY_VALUES.includes(tag as Reversibility)) {
+      throw new CortexError('EINVAL', 'tool_call', {
+        message: 'Each MCP reversibility entry needs a tool name and a valid reversibility tag',
+        details: { tool: name, value: tag },
+      });
+    }
+    reversibility[name] = tag as Reversibility;
+  }
+  return Object.freeze(reversibility);
+}
+
 // =============================================================================
 // §5. McpToolDriver
 // =============================================================================
@@ -390,6 +428,7 @@ export class McpToolDriver implements IToolDriver {
   readonly #timeoutMs: number;
   readonly #handshakeTimeoutMs: number;
   readonly #defaultReversibility: Reversibility;
+  readonly #defaultReversibilityDeclared: boolean;
   readonly #reversibility: Readonly<Record<string, Reversibility>>;
   readonly #ownsTransport: boolean;
 
@@ -416,6 +455,7 @@ export class McpToolDriver implements IToolDriver {
     this.#handshakeTimeoutMs = opts.handshakeTimeoutMs ?? MCP_DEFAULTS.handshakeTimeoutMs;
     this.#defaultReversibility =
       opts.defaultReversibility ?? MCP_DEFAULTS.defaultReversibility;
+    this.#defaultReversibilityDeclared = opts.defaultReversibility !== undefined;
     this.#reversibility = opts.reversibility ?? {};
     this.declaredReversibility = {};
 
@@ -497,7 +537,8 @@ export class McpToolDriver implements IToolDriver {
       }
       const descriptor = this.#toDescriptor(tool);
       descriptors.push(descriptor);
-      declared[descriptor.name] = this.#reversibility[tool.name] !== undefined;
+      declared[descriptor.name] =
+        this.#reversibility[tool.name] !== undefined || this.#defaultReversibilityDeclared;
       this.#byExposed.set(descriptor.name, { raw: tool.name, descriptor });
     }
     Object.assign(this.declaredReversibility as Record<string, boolean>, declared);

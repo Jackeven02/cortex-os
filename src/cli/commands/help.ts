@@ -66,6 +66,8 @@ ENVIRONMENT
   CORTEX_MCP_COMMAND   Mount an MCP server as a tool namespace, e.g. npx
   CORTEX_MCP_ARGS      Whitespace-separated args for that server
   CORTEX_MCP_NAMESPACE Tool-name prefix for MCP tools (default: mcp)
+  CORTEX_MCP_DEFAULT_REVERSIBILITY Default tag for undeclared MCP tools (default: irreversible)
+  CORTEX_MCP_REVERSIBILITY JSON map of server tool names to idempotent/reversible/irreversible
 
 DOCUMENTATION
   MANIFESTO.md         Why cortex exists

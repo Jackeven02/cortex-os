@@ -38,6 +38,64 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ---
 
+## [1.2.0] — 2026-10-02
+
+Dashboard grows from read-only monitor to ops console; budget exhaustion now
+truly halts the agent instead of merely signalling it. No syscall, `.crec`,
+or `.csnap` format change — `KERNEL_ABI_VERSION` stays `1.0.0`.
+
+### Added
+
+- **Dashboard supervision tree + budget rollup** (`166b728`): a tree view
+  built from `ppid` links (search keeps ancestor chains, `?view=tree` deep
+  link), and a per-role budget panel aggregating tokens / USD / wall time /
+  syscalls.
+- **Dashboard live updates over SSE** (`GET /api/stream`): file-watch driven
+  pushes with a 15s heartbeat; the UI falls back to polling automatically.
+- **Dashboard checkpoints panel**: lists `.csnap` snapshots (parsed from file
+  names) and offers one-click restore.
+- **Dashboard events filtering and pagination**: `GET /api/events` accepts
+  `from`/`to`/`offset`/`limit` and reports `x-total-count`.
+- **Dashboard write operations, gated and fine-grained**: every op is off by
+  default; enable with `--allow-ops` (all) or `--ops spawn,kill,restore`
+  (exact list). Ops run the matching CLI command in-process against the
+  dashboard's state directory, so CLI validation still applies:
+  - `POST /api/ops/spawn` — start an agent (waits until it finishes,
+    self-checkpoints, or times out; default 30s bound).
+  - `POST /api/ops/kill` — mark a process zombie in its on-disk meta,
+    exactly like `cortex kill` (v0 disk semantics).
+  - `POST /api/ops/restore` — restore a checkpointed process, exactly like
+    `cortex restore`.
+  `GET /api/ops` reports `{ allowOps, ops }`; the UI only renders buttons
+  for enabled ops.
+- **Dashboard usage and error visibility**: the events table and syscall
+  trace now carry `model` / `tokensIn` / `tokensOut` / `usd` from completed
+  LLM calls, plus a sanitized `errorMessage` for trapped syscalls — Bearer
+  tokens, `sk-…` keys, and `key=…` pairs are stripped and the message is
+  capped at 240 characters. Prompts and model outputs are never returned.
+- **MCP reversibility via environment**: `CORTEX_MCP_DEFAULT_REVERSIBILITY`
+  sets the conservative default tag (`irreversible`, `reversible`, or
+  `idempotent`); `CORTEX_MCP_REVERSIBILITY` takes a JSON map of tool names
+  to tags (prototype-injection safe). Declared tools stay visible to
+  `cortex audit`.
+- **A real test suite**: `npm test` now runs `node --test` over `tests/`
+  (wake gate, budget resume/kill, MCP reversibility) alongside the smoke
+  runner.
+
+### Changed
+
+- **Budget exhaustion gates the syscall return.** Previously a budget breach
+  fired `SIGXCPU` (which stops the process) but let the in-flight syscall
+  return normally, so the agent body kept running with an exhausted budget.
+  Now the dispatcher holds the return: if the process was killed meanwhile
+  the continuation receives a clean `ProcessExitSignal(152)`
+  (128 + SIGXCPU), and if it was stopped it parks on the wake gate until a
+  later dispatch (top up the budget, then `SIGCONT`). The budget hook is
+  arbitrary user code, so the dispatcher re-reads the process table after
+  the hook and keeps the `SIGXCPU` send best-effort.
+- Dashboard timestamps render in the viewer's local timezone (previously
+  raw UTC ISO strings).
+
 ## [1.1.0] — 2026-09-28
 
 First minor release on the frozen ABI: additive only. Adds a local read-only

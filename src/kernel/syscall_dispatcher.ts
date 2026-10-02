@@ -699,7 +699,7 @@ export class SyscallDispatcher {
       const result = (await this.#route(pid, syscall, args, callId)) as SyscallReturn[S];
 
       // §4.10 step 9 — budget accounting (skipped for `exit`, which throws).
-      this.#account(pid, syscall, result);
+      const budgetExhausted = await this.#account(pid, syscall, result);
 
       const stateAfter = this.#table.get(pid)?.state ?? stateBefore;
       if (recorded) {
@@ -710,6 +710,18 @@ export class SyscallDispatcher {
           result: recordResult(syscall, result),
           durationMs: Date.now() - startedAt,
         });
+      }
+      if (budgetExhausted && this.#wakeGate !== null) {
+        const current = this.#table.get(pid);
+        // 152 = 128 + SIGXCPU(24): terminated as a consequence of budget
+        // exhaustion, not by an external SIGKILL (which would be 137).
+        if (current === undefined || current.state === 'zombie' || current.state === 'exiting') {
+          throw new ProcessExitSignal(152, 'process terminated after budget exhaustion');
+        }
+        if (current.state === 'stopped') {
+          const resumed = await this.#wakeGate.waitForDispatch(pid);
+          if (!resumed) throw new ProcessExitSignal(152, 'process terminated while stopped for budget exhaustion');
+        }
       }
       return result;
     } catch (err) {
@@ -1821,8 +1833,8 @@ export class SyscallDispatcher {
    * the tokens and USD reported by the driver (docs/ABI.md §4.3, §5 of
    * ARCHITECTURE.md). When a finite budget hits zero we fire `SIGXCPU`.
    */
-  #account(pid: ProcessId, syscall: SyscallName, result: unknown): void {
-    if (!this.#table.has(pid)) return;
+  async #account(pid: ProcessId, syscall: SyscallName, result: unknown): Promise<boolean> {
+    if (!this.#table.has(pid)) return false;
 
     const llmUsage =
       syscall === 'llm_call' && isLLMResponse(result) ? result.usage : null;
@@ -1841,20 +1853,22 @@ export class SyscallDispatcher {
     this.#table.spend(pid, delta);
 
     const check = this.#table.checkBudget(pid);
-    if (check !== 'ok') {
-      const entry = this.#table.get(pid);
+    if (check === 'ok') return false;
+    {
       if (this.#onBudgetExhausted !== undefined) {
-        void Promise.resolve(this.#onBudgetExhausted(pid, check.kind)).catch(() => {
-          /* hook errors are swallowed */
-        });
+        await Promise.resolve(this.#onBudgetExhausted(pid, check.kind)).catch(() => undefined);
       }
-      // Fire SIGXCPU only from RUNNING (running→stopped is the legal edge).
+      // The hook is arbitrary user code: it may have killed or reaped the
+      // process while we awaited it, so re-read the table entry instead of
+      // trusting anything captured before the await. Fire SIGXCPU only from
+      // RUNNING (running→stopped is the legal edge), and keep the send
+      // best-effort — the scheduler's own budget gate is the backstop.
+      const entry = this.#table.get(pid);
       if (entry !== undefined && entry.state === 'running') {
-        void this.#signals.send(pid, 'SIGXCPU', PID_KERNEL).catch(() => {
-          /* best-effort; the scheduler's own gate is the backstop */
-        });
+        await this.#signals.send(pid, 'SIGXCPU', PID_KERNEL).catch(() => undefined);
       }
     }
+    return true;
   }
 
   /** Reversibility actually recorded, refining the static tag where needed. */
