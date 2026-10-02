@@ -848,7 +848,15 @@ The ABI is now frozen, which changes what "what comes next" means.
 
 **Requiring `2.0`:** anything that removes or renames a syscall, changes what an argument means, changes the errno contract, changes `ProcessInfo`, or changes the `.crec` / `.csnap` format.
 
-**Deliberately deferred to `1.1`, because it is *not* an ABI change:** collapsing the self-recorded syscalls (`memory_read`, `memory_write`, `send`, `recv`, `fork`, `checkpoint`, `restore`) onto the dispatcher's single recording path. Those modules predate the dispatcher and still write their own `.crec` frames; the on-disk format is identical either way, so this is internal tidying rather than a contract change — and `send`'s atomicity (a failed record must not leave a phantom message) depends on the module controlling when it records. It is worth doing and worth doing carefully, so it does not hold the freeze hostage.
+**Recording ownership — resolved in stages, because none of it is an ABI change:** the modules `memory.ts`, `ipc.ts`, `fork.ts` and `checkpoint.ts` predate the dispatcher and used to write their own `.crec` frames (`memory_read`, `memory_write`, `send`, `recv`, `fork`, `checkpoint`, `restore`). The on-disk format is identical either way, so this is internal tidying rather than a contract change — which is exactly why it was not allowed to hold the freeze hostage.
+
+`memory_read` and `memory_write` now record through the dispatcher like every other syscall: they gain the missing `enter` frame, their `trap` frames come from the dispatcher's uniform path, and their redaction rules are unchanged because the dispatcher applies the same shaping the manager used to — a read records `{count, valuesHash}` instead of the returned values, and a write hashes any value above the manager's `largeValueBytes` threshold (or any value whose caller set `recordHashOnly`). `MemoryManager` no longer owns a recorder or a call-ID counter.
+
+The remaining five stay self-recorded for concrete reasons, not for tidiness debt:
+
+- `fork` writes into **two** logs (the parent's and the child's), and only the module knows about the child.
+- `send` needs the record ordered inside its own atomicity window: a failed record must not leave a phantom, half-committed message, so the module must control exactly when it records.
+- `recv`, `checkpoint` and `restore` are recorded at points the generic path cannot express (the message consumption, the snapshot's own log offset, and the restored process's lineage respectively).
 
 The ABI is the contract. The architecture is how we keep that contract. The kernel is the implementation. In that order.
 

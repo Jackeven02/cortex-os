@@ -226,8 +226,6 @@ export interface MemoryManagerOptions {
   readonly drivers?: Readonly<Record<string, IMemoryDriver>> | ReadonlyMap<string, IMemoryDriver>;
   /** Wall-clock source. Injectable for tests. */
   readonly now?: () => Timestamp;
-  /** Monotonic counter for call IDs. Injectable for tests. */
-  readonly nextCallId?: () => string;
   /** Per-region entry-count ceiling for `ENOMEM`. `-1` = unbounded. */
   readonly maxRegionEntries?: number;
   /** Values larger than this (bytes) are recorded as a hash. */
@@ -250,7 +248,6 @@ export class MemoryManager {
 
   #table: ProcessTable;
   #now: () => Timestamp;
-  #nextCallId: () => string;
   #maxRegionEntries: number;
   #largeValueBytes: number;
 
@@ -262,7 +259,6 @@ export class MemoryManager {
   /** physical key → approximate write count (for ENOMEM). */
   #sizes = new Map<string, number>();
   #uid = 0;
-  #callCounter = 0;
 
   constructor(opts: MemoryManagerOptions) {
     this.#table = opts.table;
@@ -270,12 +266,6 @@ export class MemoryManager {
     this.#now = opts.now ?? (() => new Date().toISOString());
     this.#maxRegionEntries = opts.maxRegionEntries ?? DEFAULT_MAX_REGION_ENTRIES;
     this.#largeValueBytes = opts.largeValueBytes ?? DEFAULT_LARGE_VALUE_BYTES;
-    this.#nextCallId =
-      opts.nextCallId ??
-      (() => {
-        this.#callCounter++;
-        return `mem-${this.#callCounter}`;
-      });
 
     if (opts.drivers !== undefined) {
       const entries =
@@ -314,6 +304,16 @@ export class MemoryManager {
    */
   get maxRegionEntries(): number {
     return this.#maxRegionEntries;
+  }
+
+  /**
+   * The byte size above which a written value is recorded as a hash + byte
+   * count instead of verbatim (ABI.md §4.4). Public so the dispatcher's
+   * single recording path can apply the same redaction the manager used to
+   * apply for itself.
+   */
+  get largeValueBytes(): number {
+    return this.#largeValueBytes;
   }
 
   /**
@@ -489,7 +489,6 @@ export class MemoryManager {
     region: string,
     query: MemoryQuery,
   ): Promise<readonly MemoryEntry[]> {
-    const callId = this.#nextCallId();
 
     let binding: RegionBinding;
     let driver: IMemoryDriver;
@@ -498,7 +497,6 @@ export class MemoryManager {
       driver = this.#driverFor(binding.policy.backing, 'memory_read');
     } catch (err) {
       if (isCortexError(err)) {
-        await this.#recordTrap(pid, 'memory_read', callId, err, { region });
       }
       throw err;
     }
@@ -508,14 +506,12 @@ export class MemoryManager {
       raw = await driver.read(binding.physical, query);
     } catch (err) {
       const wrapped = wrapDriverError('memory_read', binding.policy.backing, err);
-      await this.#recordTrap(pid, 'memory_read', callId, wrapped, { region });
       throw wrapped;
     }
 
     // Remap physical region names back to the logical name the agent used.
     const entries = raw.map((e) => ({ ...e, region }));
 
-    await this.#recordRead(pid, region, query, entries, callId);
     return entries;
   }
 
@@ -537,14 +533,12 @@ export class MemoryManager {
     value: unknown,
     opts?: MemoryWriteOptions,
   ): Promise<void> {
-    const callId = this.#nextCallId();
 
     let binding: RegionBinding;
     try {
       binding = this.#mustBind(pid, region, 'memory_write');
     } catch (err) {
       if (isCortexError(err)) {
-        await this.#recordTrap(pid, 'memory_write', callId, err, { region, key });
       }
       throw err;
     }
@@ -554,7 +548,6 @@ export class MemoryManager {
         message: `region '${region}' is read-only`,
         details: { region },
       });
-      await this.#recordTrap(pid, 'memory_write', callId, err, { region, key });
       throw err;
     }
 
@@ -563,7 +556,6 @@ export class MemoryManager {
       driver = this.#driverFor(binding.policy.backing, 'memory_write');
     } catch (err) {
       if (isCortexError(err)) {
-        await this.#recordTrap(pid, 'memory_write', callId, err, { region, key });
       }
       throw err;
     }
@@ -591,7 +583,6 @@ export class MemoryManager {
           message: `region '${region}' exceeded entry limit ${cap}`,
           details: { region, limit: cap, ...(perRegion ? { scope: 'region' } : { scope: 'global' }) },
         });
-        await this.#recordTrap(pid, 'memory_write', callId, err, { region, key });
         throw err;
       }
 
@@ -610,11 +601,9 @@ export class MemoryManager {
     } catch (err) {
       if (isCortexError(err)) throw err; // already recorded above
       const wrapped = wrapDriverError('memory_write', binding.policy.backing, err);
-      await this.#recordTrap(pid, 'memory_write', callId, wrapped, { region, key });
       throw wrapped;
     }
 
-    await this.#recordWrite(pid, region, key, value, binding.policy, opts, callId);
   }
 
   /**
@@ -792,135 +781,5 @@ export class MemoryManager {
     }
 
     return this.regionsOf(childPid);
-  }
-
-  // ---------------------------------------------------------------------------
-  // §7.7 Recording
-  // ---------------------------------------------------------------------------
-
-  async #recordRead(
-    pid: ProcessId,
-    region: string,
-    query: MemoryQuery,
-    entries: readonly MemoryEntry[],
-    callId: string,
-  ): Promise<void> {
-    const recorder = this.#table.recorderFor(pid);
-    if (recorder === null) return;
-    const state = this.#stateOf(pid);
-
-    const record: SyscallRecordInput = {
-      timestamp: this.#now(),
-      pid,
-      syscall: 'memory_read',
-      callId,
-      phase: 'exit',
-      args: { region, query },
-      // Hash the returned values, not the values themselves (ABI.md §4.4).
-      result: {
-        count: entries.length,
-        valuesHash: hashValue(entries.map((e) => e.value)),
-      },
-      stateBefore: state,
-      stateAfter: state,
-      reversibility: 'idempotent',
-      kernelAbiVersion: this.kernelAbiVersion,
-    };
-
-    await this.#append(recorder, record, 'memory_read');
-  }
-
-  async #recordWrite(
-    pid: ProcessId,
-    region: string,
-    key: string,
-    value: unknown,
-    policy: MemoryRegionPolicy,
-    opts: MemoryWriteOptions | undefined,
-    callId: string,
-  ): Promise<void> {
-    const recorder = this.#table.recorderFor(pid);
-    if (recorder === null) return;
-    const state = this.#stateOf(pid);
-
-    const bytes = valueByteSize(value);
-    const hashOnly = opts?.recordHashOnly === true || bytes > this.#largeValueBytes;
-    const valueField: Record<string, unknown> = hashOnly
-      ? { valueHash: hashValue(value), valueBytes: bytes }
-      : { value };
-
-    const record: SyscallRecordInput = {
-      timestamp: this.#now(),
-      pid,
-      syscall: 'memory_write',
-      callId,
-      phase: 'exit',
-      args: {
-        region,
-        key,
-        policyKind: policy.kind,
-        ...(opts?.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
-        ...valueField,
-      },
-      stateBefore: state,
-      stateAfter: state,
-      // Every write is logged and can be undone from the log (ABI.md §4.4).
-      reversibility: 'reversible',
-      kernelAbiVersion: this.kernelAbiVersion,
-    };
-
-    await this.#append(recorder, record, 'memory_write');
-  }
-
-  async #recordTrap(
-    pid: ProcessId,
-    syscall: 'memory_read' | 'memory_write',
-    callId: string,
-    err: CortexError,
-    extraArgs: Record<string, unknown>,
-  ): Promise<void> {
-    const recorder = this.#table.recorderFor(pid);
-    if (recorder === null) return;
-    const state = this.#stateOf(pid);
-
-    const record: SyscallRecordInput = {
-      timestamp: this.#now(),
-      pid,
-      syscall,
-      callId,
-      phase: 'trap',
-      args: extraArgs,
-      error: {
-        errno: err.errno,
-        message: err.message,
-        ...(err.details !== undefined ? { details: err.details } : {}),
-      },
-      stateBefore: state,
-      stateAfter: state,
-      reversibility: 'idempotent',
-      kernelAbiVersion: this.kernelAbiVersion,
-    };
-
-    await this.#append(recorder, record, syscall);
-  }
-
-  #stateOf(pid: ProcessId): ProcessState {
-    return this.#table.get(pid)?.state ?? 'running';
-  }
-
-  async #append(
-    recorder: NonNullable<ReturnType<ProcessTable['recorderFor']>>,
-    record: SyscallRecordInput,
-    syscall: string,
-  ): Promise<void> {
-    try {
-      await recorder.append(record);
-    } catch (err) {
-      if (isCortexError(err)) throw err;
-      throw new CortexError('ERECORD', syscall, {
-        message: `failed to record ${syscall}`,
-        cause: err,
-      });
-    }
   }
 }

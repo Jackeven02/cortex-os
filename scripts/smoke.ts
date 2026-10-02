@@ -2830,9 +2830,20 @@ async function runMemoryChecks(): Promise<void> {
     tables.push(table);
     const pid = await spawnRunning(table);
     const mgr = makeManager(table);
+    mgr.syncFromTable(pid);
     mgr.attachRegion(pid, 'episodic', priv);
-    await mgr.write(pid, 'episodic', 'k', { small: true });
-    await mgr.read(pid, 'episodic', { key: 'k' });
+    // Recording now belongs to the dispatcher's single path, so these memory
+    // syscalls are driven through it exactly like every other syscall.
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const dispatcher = new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      memory: mgr,
+    });
+    await dispatcher.invoke(pid, 'memory_write', 'episodic', 'k', { small: true });
+    await dispatcher.invoke(pid, 'memory_read', 'episodic', { key: 'k' });
 
     const rec = table.recorderFor(pid)!;
     await rec.flush();
@@ -2841,20 +2852,25 @@ async function runMemoryChecks(): Promise<void> {
 
     const writes = records.filter((r) => r.syscall === 'memory_write');
     const reads = records.filter((r) => r.syscall === 'memory_read');
-    assert(writes.length === 1, `expected 1 write record, got ${writes.length}`);
-    assert(reads.length === 1, `expected 1 read record, got ${reads.length}`);
+    // Uniform with every dispatcher-owned syscall: one enter + one exit.
+    assert(writes.length === 2, `expected enter+exit write frames, got ${writes.length}`);
+    assert(reads.length === 2, `expected enter+exit read frames, got ${reads.length}`);
+    assert(writes[0]!.phase === 'enter' && writes[1]!.phase === 'exit', 'write frames are enter then exit');
 
-    assert(writes[0]!.reversibility === 'reversible', 'memory_write is reversible');
-    assert(writes[0]!.phase === 'exit', 'write record is exit phase');
+    assert(writes[1]!.reversibility === 'reversible', 'memory_write is reversible');
     const wArgs = writes[0]!.args as { region: string; key: string; policyKind: string; value: unknown };
     assert(wArgs.region === 'episodic' && wArgs.key === 'k', 'write args capture region+key');
     assert(wArgs.policyKind === 'private', 'write args capture policy kind');
     assert((wArgs.value as { small: boolean }).small === true, 'small value recorded inline');
 
-    assert(reads[0]!.reversibility === 'idempotent', 'memory_read is idempotent');
-    const rResult = reads[0]!.result as { count: number; valuesHash: string };
+    assert(reads[1]!.reversibility === 'idempotent', 'memory_read is idempotent');
+    const rResult = reads[1]!.result as { count: number; valuesHash: string };
     assert(rResult.count === 1, 'read result captures count');
     assert(typeof rResult.valuesHash === 'string' && rResult.valuesHash.length === 64, 'read result hashes values');
+    // The only copy of the small value is the write's enter frame; the read
+    // never echoes values back into the log (ABI.md §4.4).
+    const valueMentions = records.filter((r) => JSON.stringify(r).includes('{"small":true}'));
+    assert(valueMentions.length === 1, `value recorded once, got ${valueMentions.length}`);
   });
 
   await checkAsync('large values and recordHashOnly log a hash, not the value', async () => {
@@ -2868,23 +2884,36 @@ async function runMemoryChecks(): Promise<void> {
     tables.push(table);
     const pid = await spawnRunning(table);
     const mgr = makeManager(table, { largeValueBytes: 8 });
+    mgr.syncFromTable(pid);
     mgr.attachRegion(pid, 'big', priv);
-    await mgr.write(pid, 'big', 'huge', 'this value is definitely larger than eight bytes');
-    await mgr.write(pid, 'big', 'small', 1, { recordHashOnly: true });
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const dispatcher = new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      memory: mgr,
+    });
+    await dispatcher.invoke(pid, 'memory_write', 'big', 'huge', 'this value is definitely larger than eight bytes');
+    await dispatcher.invoke(pid, 'memory_write', 'big', 'small', 1, { recordHashOnly: true });
 
     const rec = table.recorderFor(pid)!;
     await rec.flush();
     const writes: SyscallRecord[] = [];
     for await (const r of readRecords(rec.path)) {
-      if (r.syscall === 'memory_write') writes.push(r);
+      // Only the enter frames carry args; each write produces enter + exit.
+      if (r.syscall === 'memory_write' && r.phase === 'enter') writes.push(r);
     }
-    assert(writes.length === 2, `expected 2 write records, got ${writes.length}`);
+    assert(writes.length === 2, `expected 2 write enter frames, got ${writes.length}`);
     for (const w of writes) {
       const a = w.args as Record<string, unknown>;
       assert(a.value === undefined, 'hashed write must not record the raw value');
       assert(typeof a.valueHash === 'string', 'hashed write records a valueHash');
       assert(typeof a.valueBytes === 'number' && (a.valueBytes as number) > 0, 'hashed write records byte size');
     }
+    // The large payload must not appear anywhere in the log.
+    const raw = JSON.stringify(writes);
+    assert(!raw.includes('larger than eight bytes'), 'large value never reaches the log');
   });
 
   await checkAsync('trap records land in .crec on ENOENT', async () => {
@@ -2898,8 +2927,17 @@ async function runMemoryChecks(): Promise<void> {
     tables.push(table);
     const pid = await spawnRunning(table);
     const mgr = makeManager(table);
+    mgr.syncFromTable(pid);
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const dispatcher = new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      memory: mgr,
+    });
     try {
-      await mgr.write(pid, 'ghost', 'k', 1);
+      await dispatcher.invoke(pid, 'memory_write', 'ghost', 'k', 1);
     } catch {
       /* expected */
     }
@@ -5219,7 +5257,12 @@ async function runDispatcherChecks(): Promise<void> {
       assert(!SELF_RECORDED_SYSCALLS.has(s), `${s} both self-recorded and unrecorded`);
     }
     assert(UNRECORDED_SYSCALLS.has('budget'), 'budget is unrecorded');
-    assert(SELF_RECORDED_SYSCALLS.has('memory_write'), 'memory_write is self-recorded');
+    // memory_read / memory_write collapsed onto the dispatcher's single
+    // recording path in 1.2.x; the rest still own their frames for reasons
+    // ABI.md § records (fork writes to two logs; send needs the record
+    // ordered inside its own atomicity window).
+    assert(!SELF_RECORDED_SYSCALLS.has('memory_read'), 'memory_read records through the dispatcher');
+    assert(!SELF_RECORDED_SYSCALLS.has('memory_write'), 'memory_write records through the dispatcher');
   });
 
   check('killReversibility maps signals correctly', () => {
@@ -5519,8 +5562,18 @@ async function runDispatcherChecks(): Promise<void> {
     await dispatcher.invoke(pid, 'memory_write', 'scratch', 'k', 1);
     const records = await readLog(table, pid);
     const mw = records.filter((r) => r.syscall === 'memory_write');
-    assert(mw.length === 1, `exactly one memory_write record, got ${mw.length}`);
-    assert(mw[0].phase === 'exit', 'memory.ts owns the exit-phase record');
+    // Uniform with every other dispatcher-owned syscall: enter + exit.
+    assert(mw.length === 2, `enter + exit frames, got ${mw.length}`);
+    assert(mw[0]!.phase === 'enter', 'enter frame first');
+    assert(mw[1]!.phase === 'exit', 'exit frame last');
+    // …and the value is recorded once, in the enter frame's args. The exit
+    // frame carries no args at all, so it cannot duplicate them.
+    assert(mw[1]!.args === undefined, 'exit frame carries no args');
+    const enterArgs = mw[0]!.args as { region: string; key: string; value: unknown };
+    assert(enterArgs.region === 'scratch' && enterArgs.key === 'k', 'enter args capture region+key');
+    assert(enterArgs.value === 1, 'small value recorded inline');
+    const valueMentions = (JSON.stringify(records).match(/"value":1/g) ?? []).length;
+    assert(valueMentions === 1, `value recorded exactly once, got ${valueMentions}`);
   });
 
   // --- ipc routing ----------------------------------------------------------

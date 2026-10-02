@@ -38,6 +38,29 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **`memory_read` / `memory_write` now record through the dispatcher's single
+  recording path** (instead of `MemoryManager` writing its own frames). Both
+  syscalls therefore gain the `enter` frame they never had, which makes
+  `cortex trace` and any replay read them like every other syscall, and their
+  `trap` frames now come from the dispatcher's uniform path too. The redaction
+  rules are unchanged by design — a read records `{count, valuesHash}` rather
+  than the values themselves, and a write hashes any value above the
+  manager's `largeValueBytes` threshold or with `recordHashOnly` set — the
+  dispatcher simply applies the shaping the manager used to apply.
+  `MemoryManager` no longer holds a recorder or a call-ID counter.
+
+  This closes part of the follow-up recorded under the `1.1` entry below: the
+  remaining five self-recorded syscalls (`send`, `recv`, `fork`, `checkpoint`,
+  `restore`) keep their own frames for concrete reasons — `fork` writes into
+  two logs, `send` must order its record inside its own atomicity window, and
+  the last three are recorded at points the generic path cannot express.
+  No syscall, `.crec`, or `.csnap` format change: `KERNEL_ABI_VERSION` stays
+  `1.0.0`.
+
 ## [1.2.0] — 2026-10-02
 
 Dashboard grows from read-only monitor to ops console; budget exhaustion now

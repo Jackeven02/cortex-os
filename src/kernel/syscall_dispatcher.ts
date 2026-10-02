@@ -116,6 +116,7 @@ import { PID_KERNEL, type ProcessTable } from './process_table.js';
 import type { SignalManager } from './signals.js';
 import type { IpcManager, ChannelOpenOptions } from './ipc.js';
 import type { MemoryManager } from './memory.js';
+import { hashValue, valueByteSize } from './memory.js';
 import type { CheckpointManager } from './checkpoint.js';
 import type { ForkManager } from './fork.js';
 import type { InitProcess } from './init.js';
@@ -362,8 +363,6 @@ export function killReversibility(signal: Signal): Reversibility {
  * module header "Recording ownership".
  */
 export const SELF_RECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName>([
-  'memory_read',
-  'memory_write',
   'send',
   'recv',
   'fork',
@@ -691,7 +690,7 @@ export class SyscallDispatcher {
         stateBefore,
         stateAfter: stateBefore,
         reversibility: staticReversibility,
-        args: recordArgs(args),
+        args: this.#shapeArgs(pid, syscall, args),
       });
     }
 
@@ -707,7 +706,7 @@ export class SyscallDispatcher {
           stateBefore,
           stateAfter,
           reversibility: this.#actualReversibility(syscall, args, result),
-          result: recordResult(syscall, result),
+          result: shapeResult(syscall, result),
           durationMs: Date.now() - startedAt,
         });
       }
@@ -911,6 +910,21 @@ export class SyscallDispatcher {
   #checkCapability(pid: ProcessId, syscall: SyscallName): void {
     const cap = SYSCALL_REQUIRED_CAPABILITY[syscall];
     if (cap !== undefined) this.#requireCapability(pid, syscall, cap);
+  }
+
+  /**
+   * Argument shaping for one syscall's `enter` frame, with the memory manager
+   * supplying the two facts the generic path cannot know: the region's
+   * policy kind and the manager's configured large-value threshold.
+   */
+  #shapeArgs(pid: ProcessId, syscall: SyscallName, args: readonly unknown[]): unknown {
+    const memory = this.#memory;
+    return shapeArgs(syscall, args, {
+      policyKindOf: (region) => memory?.regionInfo(pid, region)?.kind,
+      // No manager means the write traps EDRIVER before a record lands, so
+      // the fallback only keeps the helper total.
+      largeValueBytes: memory?.largeValueBytes ?? Number.MAX_SAFE_INTEGER,
+    });
   }
 
   /**
@@ -1984,7 +1998,39 @@ function assertStateIn(
  * nothing; single-arg syscalls unwrap to the bare value for readability;
  * multi-arg syscalls record the positional tuple.
  */
-function recordArgs(args: readonly unknown[]): unknown {
+/**
+ * Shape recorded arguments for one syscall. Most are recorded verbatim; the
+ * exceptions are the syscalls whose owning module used to write its own
+ * `.crec` frames and had a reason to redact. `memory_write` never records a
+ * large value verbatim — above the manager's threshold (or when the caller
+ * asks via `recordHashOnly`) only a hash and a byte count land in the log
+ * (ABI.md §4.4). The region's policy kind is noted because it says whether
+ * the write hit a private, shared, or copy-on-write region.
+ */
+function shapeArgs(
+  syscall: SyscallName,
+  args: readonly unknown[],
+  lookup: { readonly policyKindOf: (region: string) => string | undefined; readonly largeValueBytes: number },
+): unknown {
+  if (syscall === 'memory_write') {
+    const region = args[0] as string;
+    const key = args[1] as string;
+    const value = args[2];
+    const opts = args[3] as { recordHashOnly?: boolean; ttlMs?: number } | undefined;
+    const bytes = valueByteSize(value);
+    const hashOnly = opts?.recordHashOnly === true || bytes > lookup.largeValueBytes;
+    const valueField: Record<string, unknown> = hashOnly
+      ? { valueHash: hashValue(value), valueBytes: bytes }
+      : { value };
+    const policyKind = lookup.policyKindOf(region);
+    return {
+      region,
+      key,
+      ...(policyKind !== undefined ? { policyKind } : {}),
+      ...(opts?.ttlMs !== undefined ? { ttlMs: opts.ttlMs } : {}),
+      ...valueField,
+    };
+  }
   if (args.length === 0) return undefined;
   if (args.length === 1) return args[0];
   return [...args];
@@ -1992,11 +2038,19 @@ function recordArgs(args: readonly unknown[]): unknown {
 
 /**
  * Shape the `result` payload for an `exit` record. `ps` records only the
- * count (the full table would bloat logs); everything else records verbatim.
+ * count (the full table would bloat logs); `memory_read` records a count and
+ * a hash of the returned values rather than the values themselves
+ * (ABI.md §4.4); everything else records verbatim.
  */
-function recordResult(syscall: SyscallName, result: unknown): unknown {
+function shapeResult(syscall: SyscallName, result: unknown): unknown {
   if (syscall === 'ps' && Array.isArray(result)) {
     return { count: result.length };
+  }
+  if (syscall === 'memory_read' && Array.isArray(result)) {
+    return {
+      count: result.length,
+      valuesHash: hashValue(result.map((e) => (e as MemoryEntry).value)),
+    };
   }
   return result;
 }
