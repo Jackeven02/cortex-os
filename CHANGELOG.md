@@ -79,6 +79,34 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   `never`: a typo must not disable supervision, which is the one failure mode
   where the command still looks like it worked.
 
+  **`--tap` makes the child's LLM calls countable, and the contract is
+  explicit about what it costs.** The wrapper writes `CORTEX_TAP_DIR`,
+  `CORTEX_TAP_PID` and optionally `CORTEX_TAP_TOKEN_BUDGET` /
+  `CORTEX_TAP_BUDGET_ACTION`; the child reads them with one call near the top of
+  its entry point:
+
+  ```ts
+  import { installTapFromEnv } from 'cortex-agent-os/integrations/llm-tap';
+  await installTapFromEnv();
+  ```
+
+  An environment variable cannot make a process import anything — there is no
+  way for the parent to reach a child that has never heard of cortex, so
+  `cortex wrap --tap` prints that reminder on every run. A flag that silently
+  records nothing is worse than no flag. What the env var buys is that the
+  child stops hardcoding a directory and a pid: it asks "am I being tapped?"
+  and the answer is whatever the host decided. The child's pid does not exist
+  until `spawn` allocates it, so the parent writes the literal `@PID@` and the
+  wrapper — the only party that knows the answer — substitutes it at launch.
+
+  `--tap-token-budget` and `--tap-abort-on-budget` set the child's ceiling from
+  the outside. The tap **records** an overrun by default and lets the request
+  finish, because an audit trail beats a surprise crash; the abort flag makes
+  the call throw as if the driver returned `EDRIVER`, and the spend is still
+  written, so an aborted run stays auditable. `--tap-token-budget` without
+  `--tap` is rejected — a ceiling on a tap that was never requested is a limit
+  the user believes in and does not have.
+
   **What checkpoint means here, stated plainly:** a snapshot captures the
   *wrapper's* state, not the child's — the child is a separate OS process and
   no snapshot can reach into it. `restore` on a wrapped run therefore re-runs
@@ -95,7 +123,10 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
   Seven new smoke checks: argument validation, the unknown-restart rejection,
   a clean run, exit-code propagation, the 127 path, and two timeout cases
-  including the no-leaked-child assertion.
+  including the no-leaked-child assertion. Three more cover the `--tap` flag
+  contract — the two rejections above, and a check that the run still succeeds
+  *and* prints the `installTapFromEnv` reminder, since the reminder is part of
+  the feature rather than a nicety.
 
 - **`cortex-agent-os/integrations/llm-tap` — one line to see any LLM client.**
   The LangChain adapter only reaches LangChain, and only if the host wires a
@@ -152,6 +183,23 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   read its own responses back, a `/health` request on the same origin recorded
   nothing, and neither `CONFIDENTIAL PROMPT` nor the completion text appears
   anywhere in the decoded log.
+
+  **`installTapFromEnv()` — the tap as a cooperation channel.** It reads the
+  four `CORTEX_TAP_*` variables `cortex wrap --tap` sets and installs the tap if
+  one was requested, returning the uninstaller or `undefined`. The same line is
+  therefore safe in a project that is not being watched at all, which is what
+  makes the flag adoptable without a debug/production split.
+
+  `CORTEX_TAP_REQUIRED` changes the failure mode, and the difference is the
+  point. Without it a malformed budget is ignored, because a typo in someone's
+  `.env` should not take down a production run. With it — and `cortex wrap
+  --tap` always sets it — a configuration the host cannot honour is an **error**,
+  not a shrug, because silently skipping would hand back a run that looks
+  supervised and is not. Five more smoke checks cover the no-env no-op, a real
+  install from strings alone, the budget and abort action arriving from the
+  environment, all three malformed configs throwing under `CORTEX_TAP_REQUIRED`
+  (including a literal unsubstituted `@PID@`), and the same inputs degrading
+  quietly when it is absent.
 
 - **The LangChain adapter can now write a real `.crec`, so `cortex trace`
   reads an agent cortex did not spawn.** `CortexLangChainCallbackHandler` took

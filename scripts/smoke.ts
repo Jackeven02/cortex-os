@@ -183,7 +183,18 @@ import {
 } from '../src/drivers/llm/openai.js';
 
 import { CortexLangChainCallbackHandler } from '../src/integrations/langchain.js';
-import { tapFetch, llmTapStats, isLLMUrl, __resetLLMTapForTests, type TapCallInfo } from '../src/integrations/llm_tap.js';
+import {
+  tapFetch,
+  llmTapStats,
+  isLLMUrl,
+  installTapFromEnv,
+  __resetLLMTapForTests,
+  ENV_TAP_DIR,
+  ENV_TAP_PID,
+  ENV_TAP_TOKEN_BUDGET,
+  ENV_TAP_REQUIRED,
+  type TapCallInfo,
+} from '../src/integrations/llm_tap.js';
 import { startDashboard } from '../src/dashboard/server.js';
 import { writeMeta, type ProcessMeta } from '../src/cli/process_store.js';
 
@@ -8806,6 +8817,114 @@ async function runLLMTapChecks(): Promise<void> {
       await uninstall();
       assert(globalThis.fetch === before, 'fetch is put back on uninstall');
     });
+
+    // --- installTapFromEnv: the channel `cortex wrap --tap` actually uses -----
+    //
+    // These matter more than they look. The `--tap` flag's whole contract is
+    // "the parent writes env vars, the child reads them". If this half of the
+    // channel silently does nothing, `cortex wrap --tap` reports a supervised
+    // run that recorded nothing — the exact failure this project refuses to
+    // ship. So the no-op path, the strict path, and the real path all get
+    // asserted.
+
+    await checkAsync('installTapFromEnv does nothing when no tap was requested', async () => {
+      const before = globalThis.fetch;
+      const uninstall = await installTapFromEnv({});
+      assert(uninstall === undefined, 'a bare project gets no tap and no uninstaller');
+      assert(globalThis.fetch === before, 'and its fetch is left completely alone');
+    });
+
+    await checkAsync('installTapFromEnv installs a working tap from env alone', async () => {
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ model: 'gpt-4o-mini', usage: { prompt_tokens: 11, completion_tokens: 4 } }), {
+          status: 200,
+        })) as unknown as typeof globalThis.fetch;
+      // Exactly the four variables `cortex wrap --tap` writes, nothing else.
+      // No options object, no import of internal state: the child only ever
+      // sees strings.
+      const uninstall = await installTapFromEnv({
+        [ENV_TAP_DIR]: tmp,
+        [ENV_TAP_PID]: '7011',
+        [ENV_TAP_REQUIRED]: '1',
+      });
+      assert(uninstall !== undefined, 'the tap is installed');
+      await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      await uninstall();
+      const frames = await readTap(tmp, 7011);
+      assert(frames.length === 2, `the env-installed tap records a pair, got ${frames.length}`);
+      const result = frames[1]!.result as Record<string, unknown>;
+      assert(result['inputTokens'] === 11, 'and counts the same tokens as an in-process tap');
+    });
+
+    await checkAsync('installTapFromEnv reads the token budget and the abort action', async () => {
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ model: 'gpt-4o-mini', usage: { prompt_tokens: 100, completion_tokens: 5 } }), {
+          status: 200,
+        })) as unknown as typeof globalThis.fetch;
+      const uninstall = await installTapFromEnv({
+        [ENV_TAP_DIR]: tmp,
+        [ENV_TAP_PID]: '7012',
+        [ENV_TAP_REQUIRED]: '1',
+        [ENV_TAP_TOKEN_BUDGET]: '50',
+        CORTEX_TAP_BUDGET_ACTION: 'throw',
+      });
+      assert(uninstall !== undefined, 'the ceiling and the action both arrived from the environment');
+      let caught: Error | undefined;
+      try {
+        await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      } catch (err) {
+        caught = err as Error;
+      }
+      await uninstall();
+      assert(caught !== undefined && caught.message.includes('budget exceeded'), 'the child is stopped by its own ceiling');
+      const frames = await readTap(tmp, 7012);
+      assert((frames[1]!.result as Record<string, unknown>)['budget'] === 'exceeded', 'and the overrun is still on record');
+    });
+
+    await checkAsync('installTapFromEnv throws on malformed config when the host required a tap', async () => {
+      const before = globalThis.fetch;
+      // Local helper rather than a shared one: this is the only place in the
+      // file that needs "did it throw, and did the message say why".
+      const throwsWith = async (env: NodeJS.ProcessEnv, needle: string, why: string) => {
+        let caught: Error | undefined;
+        try {
+          await installTapFromEnv(env);
+        } catch (err) {
+          caught = err as Error;
+        }
+        assert(caught !== undefined, why);
+        assert(caught!.message.includes(needle), `the error names ${needle}: ${caught!.message}`);
+      };
+      // A bad pid. Silently skipping here would hand back a run that looks
+      // supervised and is not — so `cortex wrap --tap` sets CORTEX_TAP_REQUIRED
+      // precisely to turn this from a shrug into a failure. The literal
+      // '@PID@' is the unsubstituted placeholder, which is exactly the shape of
+      // bug this guards: parent forgot to substitute, child must not go quiet.
+      await throwsWith(
+        { [ENV_TAP_DIR]: tmp, [ENV_TAP_PID]: '@PID@', [ENV_TAP_REQUIRED]: '1' },
+        ENV_TAP_PID,
+        'an unsubstituted pid placeholder is rejected, not ignored',
+      );
+      await throwsWith(
+        { [ENV_TAP_DIR]: tmp, [ENV_TAP_PID]: '7013', [ENV_TAP_REQUIRED]: '1', [ENV_TAP_TOKEN_BUDGET]: 'lots' },
+        ENV_TAP_TOKEN_BUDGET,
+        'an unparseable budget is rejected, not ignored',
+      );
+      await throwsWith(
+        { [ENV_TAP_DIR]: tmp, [ENV_TAP_PID]: '7013', [ENV_TAP_REQUIRED]: '1', CORTEX_TAP_BUDGET_ACTION: 'explode' },
+        'CORTEX_TAP_BUDGET_ACTION',
+        'an unknown budget action is rejected, not ignored',
+      );
+      assert(globalThis.fetch === before, 'and no half-installed tap is left behind');
+    });
+
+    await checkAsync('installTapFromEnv ignores malformed config when no tap was required', async () => {
+      // Same inputs, no CORTEX_TAP_REQUIRED: a typo in someone's .env must not
+      // take down a production run. The pid is still unusable, so there is no
+      // tap — but the failure is not an exception either.
+      const uninstall = await installTapFromEnv({ [ENV_TAP_DIR]: tmp, [ENV_TAP_PID]: 'not-a-pid' });
+      assert(uninstall === undefined, 'it declines quietly instead of throwing');
+    });
   } finally {
     await __resetLLMTapForTests();
     globalThis.fetch = realFetch;
@@ -8857,6 +8976,57 @@ async function runWrapChecks(): Promise<void> {
       // mode where the command looks like it worked.
       const code = await cmdWrap(['--role', 'demo', '--restart', 'on-falure', '--', 'echo', 'hi']);
       assert(code === 1, `expected exit 1, got ${code}`);
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('wrap rejects --tap-token-budget without --tap', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      // A ceiling on a tap that was never requested is a no-op the user
+      // believes in. Better to say so than to run without the budget they
+      // asked for.
+      const code = await cmdWrap(['--role', 'demo', '--tap-token-budget', '1000', '--', 'echo', 'hi']);
+      assert(code === 1, `expected exit 1, got ${code}`);
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('wrap rejects a non-numeric --tap-token-budget', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      const code = await cmdWrap(['--role', 'demo', '--tap', '--tap-token-budget', 'many', '--', 'echo', 'hi']);
+      assert(code === 1, `expected exit 1, got ${code}`);
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('wrap --tap tells the user the one line their project is missing', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      // The env-var channel is a cooperation channel, not magic: the child has
+      // to import and call installTapFromEnv(). If the user never learns that,
+      // `--tap` silently records nothing. So the reminder is part of the
+      // feature, and the run must still succeed meanwhile.
+      //
+      // The reminder goes to stdout, not stderr: it is guidance for a run that
+      // is working, not a diagnostic about one that is not.
+      const lines: string[] = [];
+      const realLog = console.log;
+      console.log = (...args: unknown[]) => void lines.push(args.map(String).join(' '));
+      try {
+        const code = await cmdWrap([
+          '--role',
+          'demo',
+          '--tap',
+          '--',
+          process.execPath,
+          '-e',
+          'process.exit(0)',
+        ]);
+        assert(code === 0, `the run still succeeds, got ${code}`);
+      } finally {
+        console.log = realLog;
+      }
+      const said = lines.join('\n');
+      assert(said.includes('installTapFromEnv'), `the child is told what to import: ${said}`);
       await rm(home, { recursive: true, force: true });
     });
 

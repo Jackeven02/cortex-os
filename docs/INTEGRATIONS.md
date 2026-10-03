@@ -163,6 +163,37 @@ time                  pid    syscall           phase   duration  reversibility
 
 **Timed-out runs are stopped, not abandoned.** When `--timeout` expires, cortex escalates `SIGTERM` → `SIGKILL` and waits for the child to actually die. A test asserts the child stops writing after the CLI exits, because a supervisor that leaks its child is not a supervisor.
 
+### `--tap`: the one line your project has to add
+
+`--tap` makes the child's LLM calls countable. It works by having the wrapper write four environment variables — `CORTEX_TAP_DIR`, `CORTEX_TAP_PID`, and optionally `CORTEX_TAP_TOKEN_BUDGET` / `CORTEX_TAP_BUDGET_ACTION` — and the child reading them.
+
+**An environment variable cannot make a process import anything.** There is no way for the parent to reach into a child that has never heard of cortex. So the child has to ask, once, near the top of its entry point:
+
+```ts
+import { installTapFromEnv } from 'cortex-agent-os/integrations/llm-tap';
+
+await installTapFromEnv();
+```
+
+It returns an uninstaller, or `undefined` when no tap was requested — so the same line is safe in production, where nobody is watching. **Call the uninstaller on shutdown** (or just let the process exit) so buffered frames reach the `.crec`.
+
+`cortex wrap --tap` prints this reminder on every run, precisely because a flag that silently records nothing is worse than no flag.
+
+Why an env var at all, if the child has to cooperate anyway? Because it moves both hardcoded values to the parent. The child stops hardcoding a directory and a pid; the parent stops hardcoding where the child lives. The child only asks "am I being tapped?", and the answer is whatever the host decided.
+
+The child's pid is not known until `spawn` allocates it, so the wrapper substitutes it at launch time — the parent writes the literal `@PID@` and the wrapper, the only party that knows the answer, replaces it.
+
+Two flags tune the ceiling from the outside:
+
+```bash
+cortex wrap --role agent --tap --tap-token-budget 500000 -- npx tsx my-agent.ts
+cortex wrap --role agent --tap --tap-token-budget 500000 --tap-abort-on-budget -- npx tsx my-agent.ts
+```
+
+By default the tap **records** an overrun and lets the request finish — an audit trail beats a surprise crash. `--tap-abort-on-budget` makes the call throw instead, as if the driver returned `EDRIVER`. The spend is still written either way, so an aborted run is still auditable.
+
+`CORTEX_TAP_REQUIRED` changes the failure mode on the child's side. Without it, a malformed budget is ignored, because a typo in someone's `.env` should not take down a production run. With it — and `cortex wrap --tap` always sets it — a configuration the host cannot honour is an **error**, not a shrug. Returning a run that looks supervised and is not is the one outcome this project will not ship.
+
 ### What checkpoint means here
 
 A snapshot captures the *wrapper's* state, not the child's. The child is a separate OS process with its own heap; no snapshot can reach into it. So **`restore` on a wrapped run re-runs the command from the start** rather than resuming it mid-flight.

@@ -63,6 +63,98 @@ export type TapBudgetAction =
   /** Abort the request by throwing, as if the driver returned EDRIVER. */
   | 'throw';
 
+/**
+ * Environment variables `cortex wrap --tap` sets on the child, and
+ * {@link installTapFromEnv} reads.
+ *
+ * This is a *cooperation* channel, not magic. A subprocess cannot be made to
+ * call `installTapFromEnv()` by the parent setting an env var — it has to
+ * import and call it. What the env var buys is that the parent stops having
+ * to hardcode a path and the child stops having to hardcode a directory:
+ * the child asks "am I being tapped?" and the answer is whatever the parent
+ * decided.
+ */
+export const ENV_TAP_DIR = 'CORTEX_TAP_DIR';
+export const ENV_TAP_PID = 'CORTEX_TAP_PID';
+export const ENV_TAP_TOKEN_BUDGET = 'CORTEX_TAP_TOKEN_BUDGET';
+export const ENV_TAP_REQUIRED = 'CORTEX_TAP_REQUIRED';
+
+/** What a budget action env var parses to. */
+function parseBudgetAction(raw: string | undefined): TapBudgetAction | undefined {
+  if (raw === undefined) return undefined;
+  if (raw === 'throw') return 'throw';
+  if (raw === 'record') return 'record';
+  return undefined;
+}
+
+/**
+ * Install a tap from the environment, if one was requested.
+ *
+ * Designed to be the first thing a wrapped project calls:
+ *
+ * ```ts
+ * import { installTapFromEnv } from 'cortex-agent-os/integrations/llm-tap';
+ * await installTapFromEnv();
+ * ```
+ *
+ * Returns the uninstaller, or `undefined` when no tap was requested — the
+ * caller does not need to know whether it is running under `cortex wrap` or
+ * on its own.
+ *
+ * **`CORTEX_TAP_REQUIRED` changes the failure mode.** Without it, a malformed
+ * budget is ignored (a typo should not take down a production run). With it,
+ * the host has explicitly asked for tap enforcement, so silently skipping
+ * would hand back a run that looks supervised and is not. That is the
+ * difference this project cares about: the failure must be visible, not
+ * convenient.
+ */
+export async function installTapFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { readonly match?: (url: string) => boolean } = {},
+): Promise<(() => Promise<void>) | undefined> {
+  const dir = env[ENV_TAP_DIR];
+  if (dir === undefined || dir.length === 0) return undefined;
+
+  const rawPid = env[ENV_TAP_PID];
+  if (rawPid === undefined || !/^\d+$/.test(rawPid)) {
+    if (env[ENV_TAP_REQUIRED] !== undefined) {
+      throw new Error(
+        `cortex llm_tap: ${ENV_TAP_DIR} is set but ${ENV_TAP_PID} is not a pid (got ${JSON.stringify(rawPid)})`,
+      );
+    }
+    return undefined;
+  }
+
+  const rawBudget = env[ENV_TAP_TOKEN_BUDGET];
+  let tokenBudget: number | undefined;
+  if (rawBudget !== undefined) {
+    const parsed = Number(rawBudget);
+    if (Number.isFinite(parsed) && parsed > 0) tokenBudget = parsed;
+    else if (env[ENV_TAP_REQUIRED] !== undefined) {
+      throw new Error(
+        `cortex llm_tap: ${ENV_TAP_TOKEN_BUDGET} is not a positive number (got ${JSON.stringify(rawBudget)})`,
+      );
+    }
+  }
+
+  const onBudget = parseBudgetAction(env['CORTEX_TAP_BUDGET_ACTION']);
+  if (onBudget === undefined && env['CORTEX_TAP_BUDGET_ACTION'] !== undefined) {
+    if (env[ENV_TAP_REQUIRED] !== undefined) {
+      throw new Error(
+        `cortex llm_tap: CORTEX_TAP_BUDGET_ACTION must be 'record' or 'throw' (got ${JSON.stringify(env['CORTEX_TAP_BUDGET_ACTION'])})`,
+      );
+    }
+  }
+
+  return tapFetch({
+    dir,
+    pid: Number(rawPid),
+    ...(tokenBudget !== undefined ? { tokenBudget } : {}),
+    ...(onBudget !== undefined ? { onBudget } : {}),
+    ...(options.match !== undefined ? { match: options.match } : {}),
+  });
+}
+
 export interface LLMTapOptions {
   /** Cortex state directory. Default `.cortex`. */
   readonly dir?: string;

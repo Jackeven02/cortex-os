@@ -79,6 +79,8 @@ export async function cmdWrap(args: string[]): Promise<number> {
       'max-region-entries': { type: 'string' },
       memory: { type: 'string' },
       tap: { type: 'boolean', default: false },
+      'tap-token-budget': { type: 'string' },
+      'tap-abort-on-budget': { type: 'boolean', default: false },
       timeout: { type: 'string', short: 't' },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -127,6 +129,19 @@ export async function cmdWrap(args: string[]): Promise<number> {
       console.error(`cortex wrap: invalid --kill-grace-ms: '${values['kill-grace-ms']}' (expected >= 0)`);
       return 1;
     }
+  }
+
+  let tapTokenBudget: number | undefined;
+  if (values['tap-token-budget'] !== undefined) {
+    tapTokenBudget = parseInt(values['tap-token-budget'], 10);
+    if (!Number.isFinite(tapTokenBudget) || tapTokenBudget <= 0) {
+      console.error(`cortex wrap: invalid --tap-token-budget: '${values['tap-token-budget']}'`);
+      return 1;
+    }
+  }
+  if (values['tap-token-budget'] !== undefined && values.tap !== true) {
+    console.error('cortex wrap: --tap-token-budget requires --tap');
+    return 1;
   }
 
   const restart = parseRestart(values.restart, values['max-restarts']);
@@ -180,7 +195,22 @@ export async function cmdWrap(args: string[]): Promise<number> {
       // wrapped project gets both process-level supervision and call-level
       // accounting without knowing cortex exists. It only has to cooperate by
       // reading one env var — and `integrations/llm-tap` does that for it.
-      ...(values.tap ? { env: { CORTEX_TAP_DIR: dir, CORTEX_TAP_REQUIRED: '1' } } : {}),
+      ...(values.tap
+        ? {
+            env: {
+              CORTEX_TAP_DIR: dir,
+              // The wrapper learns its own PID at runtime and substitutes the
+              // placeholder; the parent cannot know it before `spawn` allocates
+              // one, and guessing would be right only until the first reap.
+              CORTEX_TAP_PID: '@PID@',
+              CORTEX_TAP_REQUIRED: '1',
+              ...(tapTokenBudget !== undefined ? { CORTEX_TAP_TOKEN_BUDGET: String(tapTokenBudget) } : {}),
+              ...(values['tap-abort-on-budget'] === true
+                ? { CORTEX_TAP_BUDGET_ACTION: 'throw' }
+                : {}),
+            },
+          }
+        : {}),
     };
 
     const agentSpec: AgentSpec = { module: wrapperUrl, args: agentArgs };
@@ -200,8 +230,10 @@ export async function cmdWrap(args: string[]): Promise<number> {
     const shownPid = unbrand(pid);
     console.log(`[pid ${shownPid}] ${command.join(' ')}`);
     if (values.tap) {
-      console.log(`[pid ${shownPid}] tap requested: CORTEX_TAP_DIR=${dir}`);
-      console.log('[pid] note: the child records its own LLM calls only if it calls tapFetch()');
+      console.log(`[pid ${shownPid}] tap enabled — the child must call installTapFromEnv() to activate it`);
+      console.log('[pid] add this near the top of the child\'s entry point:');
+      console.log("[pid]   import { installTapFromEnv } from 'cortex-agent-os/integrations/llm-tap'");
+      console.log('[pid]   await installTapFromEnv()');
     }
 
     // Let the run finish. Same poll shape as `cortex spawn`: yield to the
@@ -364,8 +396,18 @@ OPTIONS
   --max-restarts <n>     Cap restarts; the kernel also detects restart storms
   --kill-grace-ms <n>    SIGTERM to SIGKILL grace period (default 5000)
   --token-budget <n>     Token ceiling for this run
-  --tap                  Pass CORTEX_TAP_DIR so a project that calls
-                         tapFetch() reports its LLM calls into this run's log
+  --tap                  Tell the child it is being tapped, by setting
+                         CORTEX_TAP_DIR / CORTEX_TAP_PID. The child activates
+                         it with one line at its entry point:
+                           import { installTapFromEnv } from
+                             'cortex-agent-os/integrations/llm-tap';
+                           await installTapFromEnv();
+                         Without that call the flag does nothing — an env
+                         var cannot make a process import anything.
+  --tap-token-budget <n> Token ceiling for the child's own LLM calls
+                         (requires --tap)
+  --tap-abort-on-budget  Abort the call when that ceiling is crossed, after
+                         recording it. Default is to record and continue.
   --memory <spec>        Memory region overrides, same syntax as \`cortex spawn\`
   --timeout <ms>         How long to let the run finish (default 120000)
 
@@ -373,7 +415,7 @@ EXAMPLES
   cortex wrap --role demo -- echo hello
   cortex wrap --role research --restart on-failure -- python research.py
   cortex wrap --role api --cwd ./service -- node dist/server.js
-  cortex wrap --role agent --tap -- npx tsx my-agent.ts
+  cortex wrap --role agent --tap --tap-token-budget 500000 -- npx tsx my-agent.ts
 
 WHAT CHECKPOINT MEANS HERE
   A snapshot captures the wrapper's state, not the child's — the child is a

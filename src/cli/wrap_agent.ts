@@ -24,6 +24,7 @@
 
 import { spawn } from 'node:child_process';
 import type { CortexContext } from '../kernel/index.js';
+import { unbrand } from '../kernel/types.js';
 
 /**
  * What the wrapper was asked to run. Passed through `ctx.args` by
@@ -44,13 +45,22 @@ export interface WrapArgs {
   readonly inheritStdio?: boolean;
   /**
    * Environment overrides applied on top of the wrapper's environment. Used
-   * by the tap integration to hand the child a `CORTEX_TAP_PID` and a state
+   * by the tap integration to hand the child a `CORTEX_TAP_DIR` and a state
    * directory so the child can report its own LLM calls back into this log.
+   *
+   * The value `@PID@` is replaced with this process's PID before the child
+   * starts. The wrapper cannot know its own PID when the parent builds these
+   * args — `spawn` allocates it — so the substitution happens here, at the one
+   * point where the answer is actually known. Hardcoding a number earlier
+   * would be a guess that happens to be right until the first init reap.
    */
   readonly env?: Readonly<Record<string, string>>;
 }
 
 const DEFAULT_KILL_GRACE_MS = 5_000;
+
+/** Placeholder the parent leaves for a value only the wrapper knows. */
+const PID_PLACEHOLDER = '@PID@';
 
 export default async function wrappedCommand(ctx: CortexContext, raw: unknown): Promise<void> {
   // `ctx.exit` returns `never`, so it throws `ProcessExitSignal` and the
@@ -72,7 +82,9 @@ export default async function wrappedCommand(ctx: CortexContext, raw: unknown): 
   const child = spawn(command, rest, {
     ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
     ...(args.inheritStdio === false ? { stdio: 'pipe' } : { stdio: 'inherit' }),
-    ...(args.env !== undefined ? { env: { ...process.env, ...args.env } } : {}),
+    ...(args.env !== undefined
+      ? { env: { ...process.env, ...substitutePid(args.env, unbrand(ctx.pid)) } }
+      : {}),
     shell: false,
     windowsHide: true,
   });
@@ -178,6 +190,21 @@ function parseArgs(raw: unknown): WrapArgs | undefined {
     ...(typeof obj['inheritStdio'] === 'boolean' ? { inheritStdio: obj['inheritStdio'] } : {}),
     ...(typeof obj['env'] === 'object' && obj['env'] !== null ? { env: obj['env'] as Record<string, string> } : {}),
   };
+}
+
+/**
+ * Replace `@PID@` in every env value with this process's PID.
+ *
+ * Values are allowed to embed the placeholder (`postgres://...@PID@`) so a
+ * child that embeds the pid in a URL or a filename does not need a second
+ * env var. Values without it pass through untouched.
+ */
+function substitutePid(env: Readonly<Record<string, string>>, pid: number): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    out[key] = value.includes(PID_PLACEHOLDER) ? value.replaceAll(PID_PLACEHOLDER, String(pid)) : value;
+  }
+  return out;
 }
 
 /** Signal name to number for the exit-code convention. */
