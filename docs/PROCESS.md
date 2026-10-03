@@ -25,7 +25,7 @@ It also costs us complexity. This document is the receipt.
 
 ## 2. The state machine
 
-A cortex process is always in exactly one of eight states.
+A cortex process is always in exactly one of nine states.
 
 ```
                         ┌──────────── spawn ─────────────┐
@@ -74,7 +74,11 @@ A cortex process is always in exactly one of eight states.
                         └──────────→ READY
 ```
 
-Eight states, twelve legal transitions, no hidden substates.
+Nine states, eighteen entries in `LEGAL_TRANSITIONS`, no hidden substates.
+(The table in §5 lists 16 of them. Two more live in the code and are not
+state-to-state edges: `checkpointing->ready` is retained only as a
+best-effort abort path, and §5's two "(gone)" rows — SUSPENDED and ZOMBIE
+disappearing — are entry removal, not transitions.)
 
 ---
 

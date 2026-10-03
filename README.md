@@ -2,7 +2,7 @@
 
 > An operating system for AI agents.
 
-[![release](https://img.shields.io/badge/release-v1.0.1-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v1.2.0-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -135,14 +135,13 @@ That is 24 syscalls, up from 19. **From here:** breaking changes need a major bu
 
 **Phase 0 — Design (complete).** Four documents drafted v0: `STATE.md` (the hard part), `PROCESS.md` (lifecycle), `ABI.md` (syscall contract), `ARCHITECTURE.md` (kernel modules). Open questions in each doc are logged and resolve as implementation forces decisions.
 
-**Phases 1–3 — largely complete.** The kernel boots; all ten kernel modules plus the driver registry are in; all seven drivers ship (mock / deepseek / openai LLM, MCP and filesystem tools, inmem and sqlite memory); most of the CLI works. `cortex spawn → llm_call → exit → reap` runs, and checkpoint/restore survives across separate CLI invocations. Known v0 gaps are recorded honestly in [BACKLOG.md](./BACKLOG.md), not hidden.
+**Phases 1–3 — largely complete.** The kernel boots; all twelve kernel modules plus the driver registry are in; all seven drivers ship (mock / deepseek / openai LLM, MCP and filesystem tools, inmem and sqlite memory); most of the CLI works. `cortex spawn → llm_call → exit → reap` runs, and checkpoint/restore survives across separate CLI invocations. Known v0 gaps are recorded honestly in [BACKLOG.md](./BACKLOG.md), not hidden.
 
-**Phase 4 — Killer demos.** All three are polished and captured as replays. Demo A (supervision tree): coders each generate one section of a README for a fictional library (see `examples/supervision-tree.ts`, [`docs/demo-a.html`](./docs/demo-a.html), `docs/demo-a.gif`). Demo B (pause across reboots): an inbox-watcher classifies tickets, checkpoints mid-run, and resumes after a reboot (see `examples/checkpoint-agent.ts`, [`docs/demo-b.html`](./docs/demo-b.html), `docs/demo-b.gif`). Demo C (fork and compare): a coder forks to explore two dedup strategies in parallel, then `cortex diff` lines up the branches so you keep the winner (see `examples/fork-compare-agent.ts`, [`docs/demo-c.html`](./docs/demo-c.html), `docs/demo-c.gif`). `cortex attach` ships as a follow-mode syscall trace (BACKLOG #031), and `cortex daemon install/run` registers and supervises long-lived agents, the piece that makes `attach`'s interactive send-half possible (BACKLOG #039). **Phase 3 is now complete** — every command in the demo above works.
+**Phase 4 — Killer demos.** All three are polished and captured as replays. Demo A (supervision tree): coders each generate one section of a README for a fictional library (see `examples/supervision-tree.ts`, [`docs/demo-a.html`](./docs/demo-a.html)). Demo B (pause across reboots): an inbox-watcher classifies tickets, checkpoints mid-run, and resumes after a reboot (see `examples/checkpoint-agent.ts`, [`docs/demo-b.html`](./docs/demo-b.html)). Demo C (fork and compare): a coder forks to explore two dedup strategies in parallel, then `cortex diff` lines up the branches so you keep the winner (see `examples/fork-compare-agent.ts`, [`docs/demo-c.html`](./docs/demo-c.html)). `cortex attach` ships as a follow-mode syscall trace (BACKLOG #031), and `cortex daemon install/run` registers and supervises long-lived agents, the piece that makes `attach`'s interactive send-half possible (BACKLOG #039). **Phase 3 is now complete** — every command in the demo above works.
 
 Demo A is worth calling out because it changed the kernel: agents used to run to completion inside the quantum that dispatched them, so a parent parked in `wait()` held its own tick and its children could never run — `wait()` deadlocked by construction, and a supervision tree could not be written at all. The continuation is now cooperative (see PROCESS.md §8.2), so this works with no orchestrator:
 
-![Demo A: a supervision tree](./docs/demo-a.gif)
-*(Live replay: [`docs/demo-a.html`](./docs/demo-a.html). The GIF is produced by `examples/make-demo-a-gif.py` once Pillow is installed.)*
+**Live replay: [`docs/demo-a.html`](./docs/demo-a.html)** — a self-contained, dependency-free page that replays the captured syscall log frame by frame.
 
 The planner spawns three coders, each of which generates one section of a real README for a fictional library ("tinylog") and publishes it to a shared `semantic` memory region. One coder ("api") hangs — a model call that never returns — so the planner notices a bounded `wait`, kills it, spawns a replacement, and assembles the finished README from the three sections:
 
@@ -159,8 +158,7 @@ process exited (code 0: planner complete: overview=ok(0),install=ok(0),api=respa
 
 Demo B makes the reboot story concrete. A checkpoint captures the *process image* — memory regions, budgets, lineage — not the live JS stack, so on `restore` the agent re-runs from the top and skips already-handled tickets by reading its own `episodic` marker (the documented idempotency pattern, not a kernel feature). The result is a long-running agent that survives a power cycle with zero work lost:
 
-![Demo B: pause across reboots](./docs/demo-b.gif)
-*(Live replay: [`docs/demo-b.html`](./docs/demo-b.html). The GIF is produced by `examples/make-demo-b-gif.py` once Pillow is installed.)*
+**Live replay: [`docs/demo-b.html`](./docs/demo-b.html)** — the checkpoint and reboot, replayed frame by frame.
 
 The inbox-watcher classifies each ticket (`bug` / `feature` / `question`), drafts a reply into the shared `semantic` region, and records the processed id in `episodic`. After three it checkpoints and detaches; after a reboot, `cortex restore` re-materialises it as a new PID, it reads back the `done` set, skips the three it already handled, and finishes the queue:
 
@@ -188,8 +186,7 @@ process exited (code 0: inbox cleared)
 
 Demo C is the atom of *agent search*: reach a decision point, `fork` to explore every branch at once, then `diff` and keep the winner. The coder commits to a requirement, forks, and the two branches each take a different dedup design (a counting Bloom filter vs an LRU-bounded hash set) — the child re-runs from the top and knows it is the fork because a `forked` marker was written *before* the fork (see the example header for the full pattern). The kernel guarantees the two tails diverge cleanly, and `cortex diff` aligns them from the shared causal past:
 
-![Demo C: fork and compare](./docs/demo-c.gif)
-*(Live replay: [`docs/demo-c.html`](./docs/demo-c.html). The GIF is produced by `examples/make-demo-c-gif.py` once Pillow is installed.)*
+**Live replay: [`docs/demo-c.html`](./docs/demo-c.html)** — both branches interleaving, then the `diff`.
 
 ```bash
 $ cortex example fork-compare-agent      # or: cortex example demo-c
@@ -214,6 +211,29 @@ $ cortex diff 2 3
     B: mock reply to: Design dedup with an LRU-bounded hash set.
 ```
 
+---
+
+## The dashboard
+
+`cortex dashboard` serves a dependency-free monitoring console on localhost. It is the one place you can watch a whole process tree breathe — and, with an explicit flag, drive it:
+
+```bash
+$ cortex dashboard                  # read-only: watch only
+$ cortex dashboard --ops spawn,kill,restore   # allow those three from the UI
+```
+
+Read-only by default. The dashboard has no resident kernel to talk to, so it does what any viewer of a filesystem can do: it reads `.cortex/processes/<pid>/meta.json`, decodes the `.crec` syscall logs, lists checkpoints, and renders the tree. `restore` is a pure disk write, which is why it works even in v0's no-daemon model.
+
+The three mutating operations are gated because they *do* boot a real kernel to do the work:
+
+- `spawn` — runs a new agent to completion (or until it self-suspends, or `--timeout`). Default cap: 30s, so the HTTP request never hangs.
+- `kill` — v0's `cortex kill` is a pure disk operation: it marks the entry a zombie. No kernel, no signal delivery.
+- `restore` — writes the snapshot back and re-materialises the process as a new PID.
+
+Ops are fine-grained: `--ops spawn` gives you a spawn button and nothing else. `GET /api/ops` reports what the current server was granted, and each `POST /api/ops/<op>` returns `403` for anything not granted. The server binds to `127.0.0.1` unless `--host` says otherwise, and serves a static, CSP-locked HTML file — no CDN, no build step, zero dependencies. You can also embed it in your own Node app via `cortex-agent-os/dashboard`. Full endpoint reference: [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md#embedded-dashboard).
+
+---
+
 See **[BACKLOG.md](./BACKLOG.md)** for the full list, prioritized.
 
 ---
@@ -224,9 +244,9 @@ See **[BACKLOG.md](./BACKLOG.md)** for the full list, prioritized.
 |---|---|
 | [MANIFESTO.md](./MANIFESTO.md) | Why cortex exists. Start here. |
 | [docs/STATE.md](./docs/STATE.md) | **The hard part.** What agent state is, what gets copied on fork, what cannot be copied at all. |
-| [docs/PROCESS.md](./docs/PROCESS.md) | Agent lifecycle: 8 states, 12 transitions, signals, scheduling |
+| [docs/PROCESS.md](./docs/PROCESS.md) | Agent lifecycle: 9 states, the legal-transition table, signals, scheduling |
 | [docs/ABI.md](./docs/ABI.md) | Syscall contract: 24 syscalls, 3 driver interfaces, error model, recording format |
-| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow: 11 modules, syscall lifecycle, persistence layout, concurrency model |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow: 12 modules, syscall lifecycle, persistence layout, concurrency model |
 | [docs/HACKING.md](./docs/HACKING.md) | Contributor guide: dev setup, conventions, how to write a driver / agent / syscall, testing. |
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | Recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC (+ explicit channels), budgets, least privilege (capabilities), testing. |
 | [docs/PUBLISHING.md](./docs/PUBLISHING.md) | Release runbook: pre-flight checks, npm login/publish (and the regional-mirror trap), version bumps. |

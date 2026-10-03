@@ -134,9 +134,9 @@ This document is the **why**. The next documents are the **how**:
 | Document | Purpose | Status |
 |---|---|---|
 | `docs/STATE.md` | What agent state *is*; fork & checkpoint semantics | **implemented — read this first** |
-| `docs/PROCESS.md` | The agent lifecycle and state machine | **implemented — 8 states, 12 transitions** |
+| `docs/PROCESS.md` | The agent lifecycle and state machine | **implemented — 9 states, the legal-transition table** |
 | `docs/ABI.md` | The syscall contract, in TypeScript types | **implemented — 24 syscalls** |
-| `docs/ARCHITECTURE.md` | Kernel modules and data flow | **implemented — 11 modules, full syscall lifecycle** |
+| `docs/ARCHITECTURE.md` | Kernel modules and data flow | **implemented — 12 modules, full syscall lifecycle** |
 | `docs/HACKING.md` | How to contribute, how to write a driver | **done** |
 | `docs/COOKBOOK.md` | Recipes: supervision, pause/resume, fork, daemons | **done** |
 | `BACKLOG.md` | The first issues, prioritized | live |

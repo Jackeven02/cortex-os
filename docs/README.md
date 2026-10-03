@@ -4,7 +4,7 @@ This directory holds the technical specifications. **Read them in this order:**
 
 1. **[STATE.md](./STATE.md)** — the agent state model. What gets copied on fork. What cannot be copied at all. The irreversible-action doctrine. **This is the hardest and most important document in the project.** Everything else depends on it.
 
-2. **[PROCESS.md](./PROCESS.md)** — the agent process lifecycle. Eight states, twelve legal transitions, full signal table, scheduling policy, daemon/supervision posture, TypeScript types, seven open questions.
+2. **[PROCESS.md](./PROCESS.md)** — the agent process lifecycle. Nine states, the legal-transition table, full signal table, scheduling policy, daemon/supervision posture, TypeScript types, seven open questions.
 
 3. **[ABI.md](./ABI.md)** — the syscall contract. **Twenty-four syscalls**, full TypeScript types, error model, recording format, three driver interfaces (LLM, Tool, Memory), seven open questions. If a behavior is not in the ABI, it does not exist.
 

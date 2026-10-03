@@ -188,9 +188,9 @@ PR，第三个起草她的周报。它们跑在一台 5 美元的 VPS 上，能�
 | 文档 | 作用 | 状态 |
 |---|---|---|
 | `docs/STATE.md` | Agent 状态*到底是*什么；fork 与 checkpoint 的语义 | **已实现 —— 先读这个** |
-| `docs/PROCESS.md` | Agent 生命周期与状态机 | **已实现 —— 8 个状态、12 个迁移** |
+| `docs/PROCESS.md` | Agent 生命周期与状态机 | **已实现 —— 9 个状态、合法迁移表** |
 | `docs/ABI.md` | syscall 契约，以 TypeScript 类型给出 | **已实现 —— 24 个 syscall** |
-| `docs/ARCHITECTURE.md` | 内核模块与数据流 | **已实现 —— 11 个模块、完整 syscall 生命周期** |
+| `docs/ARCHITECTURE.md` | 内核模块与数据流 | **已实现 —— 12 个模块、完整 syscall 生命周期** |
 | `docs/HACKING.md` | 如何贡献、如何写一个驱动 | **已完成** |
 | `docs/COOKBOOK.md` | 配方：监督、暂停/恢复、fork、daemon | **已完成** |
 | `BACKLOG.md` | 最初的那些 issue，按优先级排 | 持续更新 |

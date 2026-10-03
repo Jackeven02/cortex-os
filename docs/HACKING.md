@@ -6,7 +6,7 @@ predict what it does. This guide is how to change it without breaking the
 contracts it is built on.
 
 Read in this order if you are new: **[MANIFESTO.md](../MANIFESTO.md)** (why),
-**[ARCHITECTURE.md](./ARCHITECTURE.md)** (the ten kernel modules + the driver
+**[ARCHITECTURE.md](./ARCHITECTURE.md)** (the twelve kernel modules + the driver
 registry), **[STATE.md](./STATE.md)** (the hard part: what state is), and
 **[ABI.md](./ABI.md)** (the syscall contract).
 

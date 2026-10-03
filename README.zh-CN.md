@@ -2,7 +2,7 @@
 
 > AI agent 的操作系统。
 
-[![release](https://img.shields.io/badge/release-v1.0.1-brightgreen)](./CHANGELOG.md)
+[![release](https://img.shields.io/badge/release-v1.2.0-brightgreen)](./CHANGELOG.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![runtime](https://img.shields.io/badge/runtime-TypeScript%20%2F%20Node%2022%2B-3178c6)](./package.json)
 
@@ -127,14 +127,13 @@ syscall 从 19 个变成 24 个。**从此以后**：破坏性变更需要大版
 
 **Phase 0 — 设计（完成）。** 四份文档 v0 落地：`STATE.md`（最难的那份）、`PROCESS.md`（生命周期）、`ABI.md`（syscall 契约）、`ARCHITECTURE.md`（内核模块）。每份文档末尾的 open questions 是有意滚动记录的，会随着实现逼出决定而解决。
 
-**Phase 1–3 —— 大体完成。** 内核能启动；十个内核模块加上驱动注册表都在；七个驱动全部交付（mock / deepseek / openai 三个 LLM，MCP 与文件系统两个工具驱动，inmem 与 sqlite 两个记忆驱动）；CLI 大部分可用。`cortex spawn → llm_call → exit → reap` 能跑，checkpoint/restore 能跨不同的 CLI 调用存活。v0 的已知缺口都诚实地记录在 [BACKLOG.md](./BACKLOG.md) 里，没有藏。
+**Phase 1–3 —— 大体完成。** 内核能启动；十二个内核模块加上驱动注册表都在；七个驱动全部交付（mock / deepseek / openai 三个 LLM，MCP 与文件系统两个工具驱动，inmem 与 sqlite 两个记忆驱动）；CLI 大部分可用。`cortex spawn → llm_call → exit → reap` 能跑，checkpoint/restore 能跨不同的 CLI 调用存活。v0 的已知缺口都诚实地记录在 [BACKLOG.md](./BACKLOG.md) 里，没有藏。
 
-**Phase 4 —— 杀手级 demo。** 三个 demo 全部打磨完毕，并录成了回放。Demo A（监督树）：几个 coder 各自生成一个虚构库 README 的一个章节（见 `examples/supervision-tree.ts`、[`docs/demo-a.html`](./docs/demo-a.html)、`docs/demo-a.gif`）。Demo B（跨重启暂停）：一个收件箱监听器给工单分类，跑到一半 checkpoint，重启后恢复（见 `examples/checkpoint-agent.ts`、[`docs/demo-b.html`](./docs/demo-b.html)、`docs/demo-b.gif`）。Demo C（fork 对比）：一个 coder fork 出两个分支并行探索两种去重策略，然后 `cortex diff` 把两个分支对齐，好让你留下赢的那个（见 `examples/fork-compare-agent.ts`、[`docs/demo-c.html`](./docs/demo-c.html)、`docs/demo-c.gif`）。`cortex attach` 以 follow-mode syscall 追踪的形式交付（BACKLOG #031），`cortex daemon install/run` 能注册并监督长命 agent，正是它让 `attach` 的交互式发送成为可能（BACKLOG #039）。**Phase 3 至此完成** —— 上面 demo 里的每一条命令都能跑。
+**Phase 4 —— 杀手级 demo。** 三个 demo 全部打磨完毕，并录成了回放。Demo A（监督树）：几个 coder 各自生成一个虚构库 README 的一个章节（见 `examples/supervision-tree.ts`、[`docs/demo-a.html`](./docs/demo-a.html)）。Demo B（跨重启暂停）：一个收件箱监听器给工单分类，跑到一半 checkpoint，重启后恢复（见 `examples/checkpoint-agent.ts`、[`docs/demo-b.html`](./docs/demo-b.html)）。Demo C（fork 对比）：一个 coder fork 出两个分支并行探索两种去重策略，然后 `cortex diff` 把两个分支对齐，好让你留下赢的那个（见 `examples/fork-compare-agent.ts`、[`docs/demo-c.html`](./docs/demo-c.html)）。`cortex attach` 以 follow-mode syscall 追踪的形式交付（BACKLOG #031），`cortex daemon install/run` 能注册并监督长命 agent，正是它让 `attach` 的交互式发送成为可能（BACKLOG #039）。**Phase 3 至此完成** —— 上面 demo 里的每一条命令都能跑。
 
 Demo A 值得单独说一下，因为它改变了内核：以前 agent 会在派发它的那个 quantum 里跑到结束，所以一个停在 `wait()` 里的父进程会一直占着自己的 tick，它的子进程永远没法被调度 —— `wait()` 在结构上就死锁，监督树根本写不出来。现在 continuation 是协作式的（见 PROCESS.md §8.2），所以下面这些不需要任何编排器就能跑：
 
-![Demo A: a supervision tree](./docs/demo-a.gif)
-*（实时回放：[`docs/demo-a.html`](./docs/demo-a.html)。GIF 由 `examples/make-demo-a-gif.py` 生成，需要先装 Pillow。）*
+**实时回放：[`docs/demo-a.html`](./docs/demo-a.html)** —— 自带零依赖，逐帧回放捕获到的 syscall 日志。
 
 planner spawn 三个 coder，每个 coder 为一个虚构库（"tinylog"）生成一份真实 README 的一个章节，并把它发布到一个共享的 `semantic` 记忆区域。其中一个 coder（"api"）卡住了 —— 一次永不返回的模型调用 —— 于是 planner 通过一个带超时的 `wait` 察觉，把它 kill，spawn 一个替补，然后从三个章节组装出最终 README：
 
@@ -151,8 +150,7 @@ process exited (code 0: planner complete: overview=ok(0),install=ok(0),api=respa
 
 Demo B 把「重启」这个故事变得具体。一个 checkpoint 捕获的是**进程镜像** —— 记忆区域、预算、血缘 —— 而不是活的 JS 调用栈，所以在 `restore` 时 agent 会从头重跑，靠读自己的 `episodic` 标记来跳过已经处理过的工单（这是被文档化的幂等模式，不是内核特性）。结果就是一个扛过一次断电、零工作丢失的长命 agent：
 
-![Demo B: pause across reboots](./docs/demo-b.gif)
-*（实时回放：[`docs/demo-b.html`](./docs/demo-b.html)。GIF 由 `examples/make-demo-b-gif.py` 生成，需要先装 Pillow。）*
+**实时回放：[`docs/demo-b.html`](./docs/demo-b.html)** —— checkpoint 与重启，逐帧回放。
 
 收件箱监听器给每张工单分类（`bug` / `feature` / `question`），把回复草稿写进共享的 `semantic` 区域，并把已处理的 id 记到 `episodic`。处理完三张之后它 checkpoint 并 detach；重启之后，`cortex restore` 把它重新物化成一个新的 PID，它读回 `done` 集合，跳过那三张已经处理过的，然后把队列跑完：
 
@@ -180,8 +178,7 @@ process exited (code 0: inbox cleared)
 
 Demo C 是「agent 搜索」的原子操作：走到一个决策点，`fork` 一次性探索所有分支，然后 `diff` 并留下赢家。coder 确立一个需求，fork，两个分支各采用一种不同的去重设计（counting Bloom filter vs LRU 有界哈希集合）—— 子进程从头重跑，并通过一个在 fork **之前**写下的 `forked` 标记知道自己就是那个 fork（完整模式见示例文件头部）。内核保证两个 tail 干净地分叉，`cortex diff` 从共享因果历史开始对齐它们：
 
-![Demo C: fork and compare](./docs/demo-c.gif)
-*（实时回放：[`docs/demo-c.html`](./docs/demo-c.html)。GIF 由 `examples/make-demo-c-gif.py` 生成，需要先装 Pillow。）*
+**实时回放：[`docs/demo-c.html`](./docs/demo-c.html)** —— 两个分支交错执行，然后 `diff`。
 
 ```bash
 $ cortex example fork-compare-agent      # 或：cortex example demo-c
@@ -206,6 +203,29 @@ $ cortex diff 2 3
     B: mock reply to: Design dedup with an LRU-bounded hash set.
 ```
 
+---
+
+## 监控大屏（dashboard）
+
+`cortex dashboard` 在本机起一个零依赖的监控控制台。它是唯一能一眼看清整棵进程树在干什么的地方，加一个显式开关，还能顺手驱动它：
+
+```bash
+$ cortex dashboard                  # 只读：仅观察
+$ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
+```
+
+**默认只读。** 因为 v0 没有常驻内核可对话，大屏能做的就是任何"看文件系统的人"能做的事：读 `.cortex/processes/<pid>/meta.json`、解码 `.crec` syscall 日志、列出检查点、渲染进程树。`restore` 是纯写盘操作，所以它在 v0 的无守护进程模型下也能工作。
+
+三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
+
+- `spawn` —— 把新 agent 跑到终态（或自行挂起，或 `--timeout` 兜底）。默认上限 30 秒，避免 HTTP 请求长挂。
+- `kill` —— v0 的 `cortex kill` 本来就是纯磁盘操作：把进程标记为 zombie，不发信号。
+- `restore` —— 把快照写回，把进程以新 PID 重新实体化。
+
+授权是细粒度的：`--ops spawn` 只给你一个 spawn 按钮。`GET /api/ops` 回报当前服务器被授了哪些操作，未授权的 `POST /api/ops/<op>` 直接 `403`。服务器默认绑 `127.0.0.1`（除非 `--host` 指定），页面是静态 HTML + 严格 CSP，不挂 CDN、不需要构建、零依赖。也可以在自己的 Node 应用里通过 `cortex-agent-os/dashboard` 嵌入。完整接口见 [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md#embedded-dashboard)。
+
+---
+
 完整清单（按优先级排）见 **[BACKLOG.md](./BACKLOG.md)**。
 
 ---
@@ -216,11 +236,11 @@ $ cortex diff 2 3
 |---|---|
 | [MANIFESTO.md](./MANIFESTO.md) | cortex 为什么存在。先读这个。（[中文](./MANIFESTO.zh-CN.md)） |
 | [docs/STATE.md](./docs/STATE.md) | **最难的部分。** agent state 是什么，fork 时复制什么，什么根本不能复制。（[中文](./docs/STATE.zh-CN.md)） |
-| [docs/PROCESS.md](./docs/PROCESS.md) | agent 生命周期：8 个状态、12 个合法转换、signals、调度 |
+| [docs/PROCESS.md](./docs/PROCESS.md) | agent 生命周期：9 个状态、合法转换表、signals、调度 |
 | [docs/ABI.md](./docs/ABI.md) | syscall 契约：24 个 syscall、3 个 driver 接口、错误模型、记录格式 |
 | [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md) | 将 LangChain 事件和只读 Dashboard 接入现有 Node.js 项目 |
 | [docs/DRIVERS.md](./docs/DRIVERS.md) | 内置 LLM 驱动（mock / deepseek / openai）：选择顺序、环境变量、端点覆盖 |
-| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 内核模块和数据流：11 个模块、syscall 生命周期、持久化布局、并发模型 |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 内核模块和数据流：12 个模块、syscall 生命周期、持久化布局、并发模型 |
 | [docs/HACKING.md](./docs/HACKING.md) | 贡献者指南：开发环境、约定、怎么写驱动 / agent / syscall、测试。 |
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | 配方：监督树、暂停与恢复、fork 对比、daemon、工具、IPC（含显式 channel）、预算、最小权限（能力系统）、测试。 |
 | [docs/PUBLISHING.md](./docs/PUBLISHING.md) | 发版手册：飞行前检查、npm 登录/发布（含国内镜像的坑）、版本号提升流程。 |

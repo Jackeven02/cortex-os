@@ -77,8 +77,13 @@ All syscalls are async (ABI.md §2.2). The kernel uses Node's event loop. There 
 ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
 │  Process   │ │ Scheduler  │ │  Signals   │ │    IPC     │ │  Recorder  │
 │   Table    │ │            │ │            │ │ (channels) │ │ (.crec)    │
-└────────────┘ └────────────┘ └────────────┘ └────────────┘ └────────────┘
-       │              │
+└────────────┘ └─────┬──────┘ └────────────┘ └────────────┘ └────────────┘
+       │              │ dispatch
+       │              ↓
+       │      ┌───────────────┐
+       │      │  WakeGate     │  holds a woken process READY
+       │      │ wake_gate.ts  │  until the dispatch that runs it
+       │      └───────────────┘
        ↓              ↓
 ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐
 │   Memory   │ │ Checkpoint │ │    Fork    │ │    Init    │
@@ -101,7 +106,9 @@ All syscalls are async (ABI.md §2.2). The kernel uses Node's event loop. There 
               external world: LLM APIs, MCP servers, disk, network
 ```
 
-**Ten kernel modules + one driver registry.** That is the whole v0 kernel.
+**Twelve kernel modules + one driver registry.** That is the whole v1 kernel:/nthe eleven in §4.1–§4.11, plus `wake_gate.ts`, which has no section of its own
+because it is small and exists only to make §4.8's rule enforceable — it
+holds a woken process READY until the scheduler actually dispatches it.
 
 ---
 
@@ -603,7 +610,8 @@ src/
 │   ├── init.ts                       # §4.9
 │   ├── syscall_dispatcher.ts         # §4.10
 │   ├── driver_registry.ts            # §4.11
-│   └── boot.ts                       # §8 boot sequence
+│   ├── boot.ts                       # §8 boot sequence
+│   └── wake_gate.ts                  # §4.8 — resume only on dispatch
 ├── drivers/
 │   ├── llm/
 │   │   ├── mock.ts                   # built-in, deterministic

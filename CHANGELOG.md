@@ -40,6 +40,42 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ## [Unreleased]
 
+### Documentation
+
+- **The docs now match the code.** A line-by-line audit of every doc claim
+  against the implementation turned up no missing features — every syscall,
+  environment variable, CLI command, driver and bundled example promised in
+  the docs exists. What it did turn up was stale bookkeeping in eight files:
+
+  - **`cortex dashboard` is documented in both READMEs** (EN + zh-CN). It is
+    the headline feature of 1.1/1.2 and appeared only in
+    `docs/INTEGRATIONS.md`; the GitHub landing page did not mention it at all.
+    The new section covers the read-only default, the `--ops` gate, why
+    `restore`/`kill` work without a resident kernel and `spawn` does not, the
+    30s spawn cap, and the `cortex-agent-os/dashboard` export.
+  - **The release badge said `v1.0.1` while the package was `1.2.0`.** Now
+    `v1.2.0`, in both READMEs.
+  - **Three dead image links removed.** README (EN + zh-CN) embedded
+    `docs/demo-{a,b,c}.gif`, which were never produced — the capture logs and
+    the `make-demo-*-gif.py` renderers exist, but Pillow is not a dependency, so
+    the binaries are not in the repo. The images now point at
+    `docs/demo-{a,b,c}.html`, which do exist, ship with the package, and
+    replay the captured syscall log frame by frame with zero dependencies.
+  - **`wake_gate.ts` is now a documented kernel module.** It shipped in 1.2.0
+    and is load-bearing (§4.8's "a woken body resumes on a dispatch, not on the
+    wake" is unenforceable without it), but it was missing from the §3 module
+    diagram, the §11 file layout, and every module count. The count is now
+    twelve everywhere: ARCHITECTURE §3/§11, HACKING's reading list, both
+    READMEs, and both MANIFESTOs.
+  - **`PROCESS.md` no longer says "eight states, twelve legal transitions."**
+    There are nine states and eighteen `LEGAL_TRANSITIONS` entries; the doc now
+    says so and explains the three-way gap between that number, the sixteen rows
+    in its own §5 table, and the two "(gone)" rows that are entry removals
+    rather than transitions.
+
+  Also propagated the corrected counts to `docs/README.md`, `MANIFESTO.md` and
+  `MANIFESTO.zh-CN.md`. No code, ABI, or on-disk format change.
+
 ### Changed
 
 - **`memory_read` / `memory_write` / `recv` / `checkpoint` now record through
