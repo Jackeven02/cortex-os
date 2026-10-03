@@ -40,6 +40,46 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ## [Unreleased]
 
+### Added
+
+- **The LangChain adapter can now write a real `.crec`, so `cortex trace`
+  reads an agent cortex did not spawn.** `CortexLangChainCallbackHandler` took
+  a `pid` and wrote it into its own `events.jsonl` — a file nothing else in the
+  project reads. `cortex trace`, `cortex audit` and the dashboard all read
+  `log.crec`, so the one artifact meant to make an existing agent observable
+  was invisible to every tool that could show it.
+
+  Passing `pid` now defaults `sink` to `'crec'`: the handler opens a
+  `Recorder` on `.cortex/processes/<pid>/` (per ARCHITECTURE §7) and appends
+  real `SyscallRecord` frames. `llm.start`/`llm.end` pair as `langchain`,
+  `tool.start`/`tool.end` pair as `tool_call` tagged `irreversible`, and an
+  unpaired error becomes a `trap` frame — so `cortex trace <pid>` shows a
+  LangGraph run sitting next to kernel-spawned agents:
+
+  ```
+  time                  pid    syscall           phase   duration  reversibility
+  04:29:42.948  9001   langchain        enter   -         idempotent
+  04:29:42.960  9001   langchain        exit    12ms      idempotent
+  04:29:42.962  9001   tool_call        enter   -         irreversible
+  04:29:42.964  9001   tool_call        exit    2ms       irreversible
+  ```
+
+  Both sinks are written when `crec` is active: the jsonl file survives a
+  `.cortex` reset and holds the untruncated error name, so dropping it would
+  be a silent regression for anyone already parsing it. Without a `pid` the
+  handler stays on `jsonl` and `crecProcessDir()` throws rather than writing a
+  stray log. Added `close()` (flush + release the descriptor) alongside the
+  existing `flush()`.
+
+  Recording rules are unchanged in spirit: prompts, model output, tool inputs
+  and retrieved documents still never reach disk, now enforced by tests that
+  assert the strings are absent from the decoded `.crec`.
+
+  Five new smoke checks cover the frame pairing, the reversibility tag, the
+  trap path, jsonl coexistence, and the no-pid guard. All decode back through
+  the production `readRecords`, and the `cortex trace` output above is real
+  CLI output, not a fixture.
+
 ### Documentation
 
 - **The docs now match the code.** A line-by-line audit of every doc claim

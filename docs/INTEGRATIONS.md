@@ -4,24 +4,53 @@ Cortex can be embedded in a Node.js application or used as a read-only observer 
 
 ## LangChain callbacks
 
-`CortexLangChainCallbackHandler` implements LangChain's callback handler methods without importing LangChain. It records chain, model, tool, retriever, and agent lifecycle events to `.cortex/integrations/langchain/events.jsonl`. Prompts, model outputs, tool inputs, and retrieved documents are deliberately omitted.
+`CortexLangChainCallbackHandler` implements LangChain's callback handler methods without importing LangChain. It records chain, model, tool, retriever, and agent lifecycle events. Prompts, model outputs, tool inputs, and retrieved documents are deliberately omitted.
+
+### Two sinks
+
+| `sink` | Writes | Read by |
+|---|---|---|
+| `crec` *(default when `pid` is set)* | `.cortex/processes/<pid>/log.crec` **and** `.cortex/integrations/langchain/events.jsonl` | `cortex trace`, `cortex audit`, `cortex ps`, the dashboard |
+| `jsonl` *(default without `pid`)* | `.cortex/integrations/langchain/events.jsonl` | the integration's own consumers only |
+
+The `crec` sink is the point of this adapter: it makes an agent that cortex did *not* spawn readable by the same tools as one it did. Events become real `SyscallRecord` frames — `llm.start`/`llm.end` pair as `langchain`, `tool.start`/`tool.end` pair as `tool_call` tagged `irreversible`, and errors become a `trap` frame — so `cortex trace <pid>` shows a LangGraph run sitting next to kernel-spawned agents:
+
+```
+$ cortex trace 9001
+# tracing .cortex/processes/9001/log.crec
+time                  pid    syscall           phase   duration  reversibility
+-------------------------------------------------------------------------------------
+04:29:42.948  9001   langchain        enter   -         idempotent
+04:29:42.960  9001   langchain        exit    12ms      idempotent
+04:29:42.962  9001   tool_call        enter   -         irreversible
+04:29:42.964  9001   tool_call        exit    2ms       irreversible
+# 4 record(s)
+```
+
+Both sinks are written when `crec` is active: the jsonl file is the integration's own audit trail and survives a `.cortex` reset, so removing it would be a silent regression for anyone already parsing it.
 
 ```ts
 import { CortexLangChainCallbackHandler } from 'cortex-agent-os/integrations/langchain';
 
 const cortexCallbacks = new CortexLangChainCallbackHandler({
   dir: '.cortex',
+  pid: 42,                        // required for the crec sink
   onEvent: (event) => console.info(event.type, event.durationMs ?? ''),
 });
 
 const result = await chain.invoke(input, {
   callbacks: [cortexCallbacks],
-  metadata: { cortexPid: 42 }, // optional: associate events with a Cortex PID
+  metadata: { cortexPid: 42 },     // per-run override of the owning pid
 });
-await cortexCallbacks.flush();
+await cortexCallbacks.close();     // flush + release the file handle
 ```
 
-This adapter adds observability to an existing LangChain execution. The chain still runs in the host application's execution loop; callback instrumentation alone does not move its execution into a Cortex process or make its state checkpointable.
+Without `pid` the handler falls back to `jsonl`, because a `.crec` frame belongs to a process and there is nothing to attach it to. `close()` is worth calling on shutdown; `flush()` alone leaves the descriptor open.
+
+### What this is not
+
+This adapter adds **observability** to an existing execution. The chain still runs in the host application's event loop: callback instrumentation does not move it into a Cortex process, does not make its state checkpointable, and does not give it a PID of its own. It borrows one (`pid` above) so its records have somewhere to live. For checkpoint / fork / supervision, the agent has to be spawned by the kernel — see `cortex spawn --module`.
+
 
 ## Embedded dashboard
 

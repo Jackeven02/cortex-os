@@ -8533,6 +8533,87 @@ async function runLangchainChecks(): Promise<void> {
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
+
+  // ---------------------------------------------------------------------------
+  // crec sink: the point of this mode is that `cortex trace` can read an
+  // external agent. Assert the frames decode back through the real reader.
+  // ---------------------------------------------------------------------------
+  const crecTmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-lc-crec-'));
+  try {
+    const { readRecords } = await import('../src/kernel/recorder.js');
+    const { existingCrecPath } = await import('../src/index.js');
+    const { asProcessId } = await import('../src/kernel/types.js');
+
+    const handler = new CortexLangChainCallbackHandler({ dir: crecTmp, pid: 4242 });
+    assert(handler.crecProcessDir().endsWith(join('processes', '4242')), 'crec dir follows ARCHITECTURE §7 layout');
+
+    await checkAsync('crec sink writes enter+exit frames readable by cortex trace', async () => {
+      await handler.handleChatModelStart({}, [{ content: 'secret prompt' }], 'run-a', undefined, undefined, undefined, undefined, 'ChatOpenAI');
+      await handler.handleLLMEnd({ usage_metadata: { input_tokens: 11, output_tokens: 4 } }, 'run-a');
+      await handler.flush();
+
+      const records = [];
+      for await (const rec of readRecords(existingCrecPath(crecTmp, asProcessId(4242)))) records.push(rec);
+      assert(records.length === 2, `expected 2 frames, got ${records.length}`);
+      const [enter, exit] = records;
+      assert(enter!.phase === 'enter' && exit!.phase === 'exit', 'phases are enter then exit');
+      assert(enter!.callId === 'run-a' && exit!.callId === 'run-a', 'frames pair by callId so trace can match them');
+      assert(enter!.pid === 4242, 'frames carry the handler pid');
+      assert(enter!.args !== undefined && (enter!.args as Record<string, unknown>)['name'] === 'ChatOpenAI', 'enter records the run name');
+      const result = exit!.result as Record<string, unknown>;
+      assert(result['inputTokens'] === 11 && result['outputTokens'] === 4, 'token usage lands in the exit result');
+      assert(typeof exit!.durationMs === 'number', 'duration recorded');
+      assert(!JSON.stringify(records).includes('secret prompt'), 'prompt text still never recorded');
+    });
+
+    await checkAsync('crec frames carry a reversibility tag, tools are irreversible', async () => {
+      await handler.handleToolStart({ name: 'create_order' }, 'secret-arg', 'run-t');
+      await handler.handleToolEnd('secret-output', 'run-t');
+      await handler.flush();
+      const records = [];
+      for await (const rec of readRecords(existingCrecPath(crecTmp, asProcessId(4242)))) records.push(rec);
+      const toolFrames = records.filter((r) => r.callId === 'run-t');
+      assert(toolFrames.length === 2, 'tool start/end produced two frames');
+      assert(toolFrames[0]!.reversibility === 'irreversible', 'a tool call is tagged irreversible');
+      assert(!JSON.stringify(toolFrames).includes('secret-arg'), 'tool input never recorded');
+      assert(!JSON.stringify(toolFrames).includes('secret-output'), 'tool output never recorded');
+    });
+
+    await checkAsync('an error becomes an exit-trap pair, not a silent success', async () => {
+      await handler.handleLLMError(new Error('secret failure detail'), 'run-e');
+      await handler.flush();
+      const records = [];
+      for await (const rec of readRecords(existingCrecPath(crecTmp, asProcessId(4242)))) records.push(rec);
+      const frames = records.filter((r) => r.callId === 'run-e');
+      assert(frames.length === 1 && frames[0]!.phase === 'trap', 'an unpaired error records a trap frame');
+      assert(frames[0]!.error !== undefined, 'error field present');
+      assert(!JSON.stringify(frames).includes('secret failure detail'), 'error message body never recorded');
+    });
+
+    await checkAsync('crec sink still writes jsonl, and close() releases the fd', async () => {
+      const both = new CortexLangChainCallbackHandler({ dir: crecTmp, pid: 4242 });
+      await both.handleChainStart({}, null, 'run-c');
+      await both.handleChainEnd('ok', 'run-c');
+      await both.close();
+      const lines = (await readFile(join(crecTmp, 'integrations', 'langchain', 'events.jsonl'), 'utf8')).trim().split('\n');
+      assert(lines.length > 0, 'jsonl still written when crec is on');
+    });
+
+    await checkAsync('crecProcessDir throws without a pid rather than writing a stray log', () => {
+      const noPid = new CortexLangChainCallbackHandler({ dir: crecTmp });
+      let threw = false;
+      try {
+        noPid.crecProcessDir();
+      } catch {
+        threw = true;
+      }
+      assert(threw, 'no pid means no process dir — fail loudly');
+    });
+
+    await handler.close();
+  } finally {
+    await rm(crecTmp, { recursive: true, force: true });
+  }
 }
 
 // =============================================================================
