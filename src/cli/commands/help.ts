@@ -16,6 +16,7 @@ USAGE
 
 COMMANDS
   spawn        Start an agent as a background process
+  wrap         Run any command as a supervised process (no code changes)
   ps           List processes with state, tokens, age
   top          The process tree, and what each process is waiting for
   kill         Send a signal to a process
@@ -39,6 +40,7 @@ GLOBAL OPTIONS
 
 EXAMPLES
   cortex spawn --role coder --task "fix issue #42"
+  cortex wrap --role demo -- echo hello
   cortex ps
   cortex top
   cortex kill 1234 --signal SIGTERM

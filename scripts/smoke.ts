@@ -8814,6 +8814,163 @@ async function runLLMTapChecks(): Promise<void> {
 }
 
 // =============================================================================
+// cortex wrap checks — an unmodified command under kernel supervision
+// =============================================================================
+
+async function runWrapChecks(): Promise<void> {
+  const { mkdtemp, rm, readFile } = await import('node:fs/promises');
+  const { existsSync, readdirSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { cmdWrap } = await import('../src/cli/commands/wrap.js');
+  const { readMeta } = await import('../src/cli/process_store.js');
+  const { defaultKernelDir } = await import('../src/index.js');
+
+  // `cortex wrap` resolves the state directory the same way every other
+  // command does, so the test drives it through the environment rather than
+  // an option. Each case gets a fresh directory; a leftover meta.json from a
+  // previous run would make the assertions pass for the wrong reason.
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrapall-'));
+  const realHome = process.env['CORTEX_HOME'];
+  try {
+    // --- argument validation -------------------------------------------------
+    await checkAsync('wrap refuses to run without --role', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      const code = await cmdWrap(['--', 'echo', 'hi']);
+      assert(code === 1, `expected exit 1, got ${code}`);
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('wrap refuses to run without a command after --', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      const code = await cmdWrap(['--role', 'demo']);
+      assert(code === 1, `expected exit 1, got ${code}`);
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('wrap rejects an unknown --restart instead of defaulting to never', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      // A typo must not silently disable supervision; that is the one failure
+      // mode where the command looks like it worked.
+      const code = await cmdWrap(['--role', 'demo', '--restart', 'on-falure', '--', 'echo', 'hi']);
+      assert(code === 1, `expected exit 1, got ${code}`);
+      await rm(home, { recursive: true, force: true });
+    });
+
+    // --- the real thing ------------------------------------------------------
+    await checkAsync('wrap runs an unmodified command and reports its exit code', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      const code = await cmdWrap([
+        '--role',
+        'demo',
+        '--',
+        process.execPath,
+        '-e',
+        'console.log("wrapped hello"); process.exit(0)',
+      ]);
+      assert(code === 0, `expected 0, got ${code}`);
+
+      // The run must be visible to `cortex ps` afterwards, which is the whole
+      // point: a project that never heard of cortex now has a PID and a log.
+      // Look the process up by its meta.json rather than by counting
+      // directories — init (PID 1) has one too, and a test that asserted a
+      // count would break the day init started persisting its own metadata.
+      const procsDir = join(home, 'processes');
+      const withMeta = existsSync(procsDir)
+        ? (readdirSync(procsDir) as string[]).filter((d) => existsSync(join(procsDir, d, 'meta.json')))
+        : [];
+      assert(withMeta.length === 1, `expected one persisted process, got ${withMeta.length}`);
+      const pid = Number(withMeta[0]) as never;
+      const meta = readMeta(home, pid);
+      assert(meta !== undefined, 'meta.json is readable back');
+      assert(meta.role === 'demo', `role recorded, got ${meta.role}`);
+      assert(meta.exitCode === 0, `exit code recorded, got ${String(meta.exitCode)}`);
+      assert(
+        meta.agent.module !== undefined && String(meta.agent.module).includes('wrap_agent'),
+        'meta records the wrapper module, so restore knows what to re-run',
+      );
+      // And the syscall log must exist, or `cortex trace` has nothing to show.
+      assert(existsSync(join(procsDir, String(pid), 'log.crec')), 'a .crec was written for the run');
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('wrap propagates a non-zero exit code to the caller', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      const code = await cmdWrap(['--role', 'failing', '--', process.execPath, '-e', 'process.exit(42)']);
+      // A supervisor that reported success for a failed run would be worse
+      // than useless in CI.
+      assert(code === 42, `expected 42, got ${code}`);
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('wrap reports 127 and says so when the command does not exist', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      const realErr = console.error;
+      const lines: string[] = [];
+      console.error = (...a: unknown[]) => void lines.push(a.map(String).join(' '));
+      let code = 0;
+      try {
+        code = await cmdWrap(['--role', 'missing', '--', 'cortex-no-such-binary-xyz']);
+      } finally {
+        console.error = realErr;
+      }
+      assert(code === 127, `expected 127, got ${code}`);
+      assert(
+        lines.join('\n').includes('command not found'),
+        `the user is told why, got: ${lines.join(' | ')}`,
+      );
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('wrap stops a long-running command at the timeout instead of leaking it', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      const marker = join(home, 'heartbeat.txt');
+      const realLog = console.log;
+      const realError = console.error;
+      console.log = () => undefined;
+      console.error = () => undefined;
+      let code = 0;
+      try {
+        code = await cmdWrap([
+          '--role',
+          'longrun',
+          '--timeout',
+          '900',
+          '--',
+          process.execPath,
+          '-e',
+          `const fs=require('fs');setInterval(()=>{try{fs.appendFileSync(${JSON.stringify(marker)},'x')}catch{}},50)`,
+        ]);
+      } finally {
+        console.log = realLog;
+        console.error = realError;
+      }
+      assert(code === 0, `a timed-out stop is not a failure, got ${code}`);
+      const sizeAtExit = existsSync(marker) ? (await readFile(marker, 'utf8')).length : 0;
+      assert(sizeAtExit > 0, 'the child actually ran, so this is a real test');
+      // The decisive check: an orphaned child would keep writing here after
+      // the CLI exited. A supervisor that leaks its child is not a supervisor.
+      await new Promise((r) => setTimeout(r, 700));
+      const sizeLater = existsSync(marker) ? (await readFile(marker, 'utf8')).length : 0;
+      assert(sizeLater === sizeAtExit, `child kept running after exit: ${sizeAtExit} -> ${sizeLater}`);
+      await rm(home, { recursive: true, force: true });
+    });
+  } finally {
+    if (realHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = realHome;
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+
+// =============================================================================
 // Dashboard server checks
 // =============================================================================
 
@@ -10991,6 +11148,7 @@ await runDeepseekChecks();
 await runOpenAiChecks();
 await runLangchainChecks();
 await runLLMTapChecks();
+await runWrapChecks();
 await runDashboardChecks();
 await runFsChecks();
 await runMcpChecks();

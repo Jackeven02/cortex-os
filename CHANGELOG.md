@@ -42,6 +42,61 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex wrap` — run any command as a supervised cortex process.** The two
+  integrations (`integrations/langchain`, `integrations/llm-tap`) make an
+  existing agent observable; neither makes it supervisable, because
+  supervision needs a kernel-owned process and a callback cannot conjure one.
+  `wrap` closes that gap the only honest way — it runs the command as a child
+  of a kernel process. The project is not modified, not reimplemented, and not
+  asked to speak cortex:
+
+  ```bash
+  cortex wrap --role research --restart on-failure -- python research.py
+  cortex wrap --role api --cwd ./service -- node dist/server.js
+  ```
+
+  Afterwards it is an ordinary cortex process: `cortex kill` reaches the child
+  (escalating `SIGTERM` → `SIGKILL` after `--kill-grace-ms`), `cortex trace`
+  shows its syscall log including the signal handlers it registered,
+  `--token-budget` applies, `--restart` re-runs it, and `cortex ps` / `top` /
+  the dashboard list it beside kernel-spawned agents.
+
+  **Exit codes are propagated** — `cortex wrap … -- pytest` returns pytest's
+  code, and a missing command returns `127` with `command not found` on
+  stderr. A supervisor that reported success for a failed run would be worse
+  than useless in CI.
+
+  **A timed-out run is stopped, not abandoned.** When `--timeout` expires
+  cortex escalates the signal and waits for the child to actually die. A smoke
+  check asserts the child stops writing to disk after the CLI exits, because a
+  supervisor that leaks its child is not a supervisor. On POSIX the whole
+  process group is signalled, so a shell that spawned grandchildren takes them
+  along; on Windows `taskkill /T /F` terminates the tree, which cannot be
+  caught — a wrapped Windows program is stopped reliably but cannot be asked
+  politely, and docs/INTEGRATIONS.md says so.
+
+  An unknown `--restart` value is rejected rather than silently treated as
+  `never`: a typo must not disable supervision, which is the one failure mode
+  where the command still looks like it worked.
+
+  **What checkpoint means here, stated plainly:** a snapshot captures the
+  *wrapper's* state, not the child's — the child is a separate OS process and
+  no snapshot can reach into it. `restore` on a wrapped run therefore re-runs
+  the command from the start rather than resuming it mid-flight. That is why
+  the natural checkpoint boundary for a wrapped project is "the run ended",
+  the one boundary that is actually true; the outcome is recorded in the
+  `episodic` region under `wrap:result` so a later restore knows what it is
+  replacing. Real mid-run checkpointing and `fork` still mean
+  `cortex spawn --module`.
+
+  `wrap` supervises a *run*; `cortex daemon install` supervises a long-lived
+  process that should return after a reboot. Same restart machinery, different
+  lifetime.
+
+  Seven new smoke checks: argument validation, the unknown-restart rejection,
+  a clean run, exit-code propagation, the 127 path, and two timeout cases
+  including the no-leaked-child assertion.
+
 - **`cortex-agent-os/integrations/llm-tap` — one line to see any LLM client.**
   The LangChain adapter only reaches LangChain, and only if the host wires a
   callback by hand. LlamaIndex, the raw OpenAI SDK, the Vercel AI SDK and a

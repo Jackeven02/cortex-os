@@ -48,6 +48,7 @@ import { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir 
 import { readAllMetas, readMeta, writeMeta, maxPidOnDisk, readExitRecord, type ProcessMeta } from './process_store.js';
 
 import { cmdSpawn } from './commands/spawn.js';
+import { cmdWrap } from './commands/wrap.js';
 import { cmdPs } from './commands/ps.js';
 import { cmdTop } from './commands/top.js';
 import { cmdKill } from './commands/kill.js';
@@ -84,6 +85,8 @@ export async function main(argv: string[]): Promise<number> {
     switch (command) {
       case 'spawn':
         return await cmdSpawn(rest);
+      case 'wrap':
+        return await cmdWrap(rest);
       case 'ps':
         return await cmdPs(rest);
       case 'top':

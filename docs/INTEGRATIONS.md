@@ -118,6 +118,67 @@ Stated plainly, because these are structural and not fixable with effort:
 
 The tap is a meter, not a proxy. It never rewrites a request, injects a prompt, or silently retries — anything that changes what the model sees belongs in a driver, where it is auditable.
 
+## `cortex wrap` — supervision without a rewrite
+
+The two integrations above make an existing agent **observable**. Neither makes it **supervisable**, because supervision needs a kernel-owned process and a callback cannot conjure one.
+
+`cortex wrap` closes that gap the only honest way: it runs somebody else's command as a child of a kernel process. The project is not modified, not reimplemented, and not asked to speak cortex. It gets a PID, a parent, a state, a budget, a signal disposition and a restart policy.
+
+```bash
+cortex wrap --role demo -- echo hello
+cortex wrap --role research --restart on-failure -- python research.py
+cortex wrap --role api --cwd ./service -- node dist/server.js
+cortex wrap --role agent --tap -- npx tsx my-agent.ts
+```
+
+Afterwards the run is an ordinary cortex process:
+
+```
+$ cortex ps
+PID     PPID    ROLE          STATE         TOKENS    AGE
+---------------------------------------------------------
+1       -       init          running       0         0ms
+2       1       demo          zombie        0         5s
+
+$ cortex trace 2
+time                  pid    syscall           phase   duration  reversibility
+-------------------------------------------------------------------------------------
+09:12:05.117  2      __state          exit    -         idempotent
+09:12:05.132  2      __state          exit    -         idempotent
+09:12:05.151  2      on_signal        exit    -         reversible
+09:12:05.314  2      memory_write     enter   -         reversible
+09:12:05.315  2      memory_write     exit    1ms       reversible
+09:12:05.315  2      exit             enter   -         irreversible
+```
+
+| What you get | How |
+|---|---|
+| Killable | `cortex kill <pid>` — the signal reaches the child, escalated to `SIGKILL` after `--kill-grace-ms` |
+| Auditable | `cortex trace <pid>` — the wrapper's syscall log, including the signal handlers it registered |
+| Budgeted | `--token-budget` (with `--tap`, the child's own LLM calls count against it) |
+| Restartable | `--restart on-failure \| always`, with `--max-restarts` and the kernel's restart-storm detection |
+| Visible | `cortex ps`, `cortex top`, the dashboard — same as a spawned agent |
+
+**Exit codes are propagated.** `cortex wrap … -- pytest` returns pytest's exit code, and a missing command returns `127` with `command not found` on stderr. A supervisor that reported success for a failed run would be worse than useless in CI.
+
+**Timed-out runs are stopped, not abandoned.** When `--timeout` expires, cortex escalates `SIGTERM` → `SIGKILL` and waits for the child to actually die. A test asserts the child stops writing after the CLI exits, because a supervisor that leaks its child is not a supervisor.
+
+### What checkpoint means here
+
+A snapshot captures the *wrapper's* state, not the child's. The child is a separate OS process with its own heap; no snapshot can reach into it. So **`restore` on a wrapped run re-runs the command from the start** rather than resuming it mid-flight.
+
+This is not a gap we papered over — it is *why* the natural checkpoint boundary for a wrapped project is "the run ended", the one boundary that is actually true. The run's outcome is written to the `episodic` region under `wrap:result` (command, exit code, whether it was cancelled), so a later restore knows what it is replacing.
+
+For real mid-run checkpointing and `fork`, the agent has to be spawned by the kernel: `cortex spawn --module`. More work, more power.
+
+### Relation to `cortex daemon`
+
+`wrap` supervises a **run**. `cortex daemon install` supervises a **long-lived process that should come back after a reboot** — same restart machinery, but with a persisted `DaemonSpec` and an OS service unit. Use `wrap` for a batch job or a one-off script; use `daemon` for a service.
+
+### Platform note
+
+On POSIX, cancelling a wrapped process signals the whole process group, so a shell that spawned grandchildren of its own takes them along. On Windows there is no graceful equivalent — `taskkill /T /F` terminates the tree without giving the child a `SIGTERM` handler a chance to run, so a Windows-wrapped program cannot flush on cancel. It is stopped, and it is stopped reliably; it just cannot be asked nicely.
+
 ## Embedded dashboard
 
 ```ts
