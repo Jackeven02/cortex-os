@@ -183,6 +183,7 @@ import {
 } from '../src/drivers/llm/openai.js';
 
 import { CortexLangChainCallbackHandler } from '../src/integrations/langchain.js';
+import { tapFetch, llmTapStats, isLLMUrl, __resetLLMTapForTests, type TapCallInfo } from '../src/integrations/llm_tap.js';
 import { startDashboard } from '../src/dashboard/server.js';
 import { writeMeta, type ProcessMeta } from '../src/cli/process_store.js';
 
@@ -8617,6 +8618,202 @@ async function runLangchainChecks(): Promise<void> {
 }
 
 // =============================================================================
+// fetch tap checks — the zero-code path for any OpenAI-compatible client
+// =============================================================================
+
+async function runLLMTapChecks(): Promise<void> {
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { readRecords } = await import('../src/kernel/recorder.js');
+  const { existingCrecPath } = await import('../src/index.js');
+  const { asProcessId } = await import('../src/kernel/types.js');
+
+  const readTap = async (dir: string, pid: number) => {
+    const out = [];
+    for await (const r of readRecords(existingCrecPath(dir, asProcessId(pid)))) out.push(r);
+    return out;
+  };
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-tap-'));
+  const realFetch = globalThis.fetch;
+  try {
+    await checkAsync('isLLMUrl recognises OpenAI-compatible endpoints and rejects others', () => {
+      assert(isLLMUrl('https://api.openai.com/v1/chat/completions'), 'openai chat');
+      assert(isLLMUrl('https://openrouter.ai/api/v1/chat/completions'), 'openrouter');
+      assert(isLLMUrl('http://localhost:11434/api/chat'), 'ollama');
+      assert(isLLMUrl('https://api.openai.com/v1/embeddings'), 'embeddings');
+      assert(!isLLMUrl('https://api.github.com/user'), 'a REST endpoint is not an LLM');
+      assert(!isLLMUrl('not a url'), 'garbage is not a url');
+    });
+
+    await checkAsync('tap counts tokens and writes an llm_call pair with no prompt text', async () => {
+      const seen: TapCallInfo[] = [];
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            model: 'gpt-4o-mini',
+            usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 8 } },
+            choices: [{ message: { content: 'SECRET COMPLETION TEXT' } }],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )) as unknown as typeof globalThis.fetch;
+
+      const uninstall = await tapFetch({ dir: tmp, pid: 7001, onCall: (i) => void seen.push(i) });
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        body: JSON.stringify({ model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'SECRET PROMPT' }] }),
+      });
+      // The host must still get its body back intact — the tap is a meter, not
+      // a proxy. If this fails, the tap broke the host it was meant to observe.
+      const echoed = (await (res as unknown as Response).json()) as Record<string, unknown>;
+      assert((echoed['choices'] as unknown[]).length === 1, 'caller still receives the untouched body');
+      await uninstall();
+
+      const frames = await readTap(tmp, 7001);
+      assert(frames.length === 2, `expected enter+exit, got ${frames.length}`);
+      assert(frames[0]!.phase === 'enter' && frames[1]!.phase === 'exit', 'phases pair up');
+      assert(frames[0]!.syscall === 'llm_call', 'recorded under the llm_call name');
+      const result = frames[1]!.result as Record<string, unknown>;
+      assert(result['inputTokens'] === 100 && result['outputTokens'] === 20, 'token usage extracted');
+      assert(result['cachedTokens'] === 8, 'cached prefix tokens found in prompt_tokens_details');
+      assert(typeof result['usd'] === 'number' && (result['usd'] as number) > 0, 'usd priced from the driver table');
+      const raw = JSON.stringify(frames);
+      assert(!raw.includes('SECRET PROMPT'), 'request body text never recorded');
+      assert(!raw.includes('SECRET COMPLETION'), 'response text never recorded');
+      assert(seen.length === 1 && seen[0]!.inputTokens === 100, 'onCall fired once with the usage');
+    });
+
+    await checkAsync('tap leaves non-LLM requests completely alone', async () => {
+      let passthrough = 0;
+      globalThis.fetch = (async () => {
+        passthrough += 1;
+        return new Response('{"ok":true}', { status: 200 });
+      }) as unknown as typeof globalThis.fetch;
+      const uninstall = await tapFetch({ dir: tmp, pid: 7002 });
+      await fetch('https://api.github.com/user');
+      await uninstall();
+      assert(passthrough === 1, 'request still went through');
+      const frames = await readTap(tmp, 7002);
+      assert(frames.length === 0, 'a non-LLM request records nothing');
+    });
+
+    await checkAsync('a non-2xx response becomes a trap frame carrying the status', async () => {
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ error: 'rate limited' }), {
+          status: 429,
+          headers: { 'content-type': 'application/json' },
+        })) as unknown as typeof globalThis.fetch;
+      const uninstall = await tapFetch({ dir: tmp, pid: 7003 });
+      const res = await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      await uninstall();
+      assert(res.status === 429, 'caller still sees the real status');
+      const frames = await readTap(tmp, 7003);
+      assert(frames.length === 2, 'enter plus trap');
+      assert(frames[1]!.phase === 'trap', 'a failed call is a trap, not an exit');
+      assert(frames[1]!.error !== undefined && frames[1]!.error.message.includes('429'), 'status is in the error');
+    });
+
+    await checkAsync('a network throw records a trap and rethrows to the caller', async () => {
+      globalThis.fetch = (async () => {
+        throw new TypeError('fetch failed');
+      }) as unknown as typeof globalThis.fetch;
+      const uninstall = await tapFetch({ dir: tmp, pid: 7004 });
+      let caught: unknown;
+      try {
+        await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      } catch (err) {
+        caught = err;
+      }
+      await uninstall();
+      assert(caught instanceof TypeError, 'the original error reaches the host untouched');
+      const frames = await readTap(tmp, 7004);
+      assert(frames.length === 2 && frames[1]!.phase === 'trap', 'enter plus trap');
+    });
+
+    await checkAsync('a token ceiling is recorded as an overrun, not silently ignored', async () => {
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ model: 'gpt-4o-mini', usage: { prompt_tokens: 100, completion_tokens: 50 } }), {
+          status: 200,
+        })) as unknown as typeof globalThis.fetch;
+      const seen: TapCallInfo[] = [];
+      // Budget below the first call's usage, so the very call crosses it.
+      const uninstall = await tapFetch({ dir: tmp, pid: 7005, tokenBudget: 100, onCall: (i) => void seen.push(i) });
+      await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      await uninstall();
+      const frames = await readTap(tmp, 7005);
+      const result = frames[1]!.result as Record<string, unknown>;
+      assert(result['budget'] === 'exceeded', 'the overrun is visible in the record');
+      assert(seen[0]!.budget === 'record', 'default action is record, not throw');
+      assert(llmTapStats().inputTokens === 100, 'running totals are readable without parsing the log');
+    });
+
+    await checkAsync("onBudget 'throw' aborts the call but keeps the record", async () => {
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ model: 'gpt-4o-mini', usage: { prompt_tokens: 100, completion_tokens: 50 } }), {
+          status: 200,
+        })) as unknown as typeof globalThis.fetch;
+      const uninstall = await tapFetch({ dir: tmp, pid: 7006, tokenBudget: 10, onBudget: 'throw' });
+      let caught: Error | undefined;
+      try {
+        await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      } catch (err) {
+        caught = err as Error;
+      }
+      await uninstall();
+      assert(caught !== undefined && caught.message.includes('budget exceeded'), 'the host is told why it stopped');
+      const frames = await readTap(tmp, 7006);
+      assert(frames.length === 2, 'the spend is still auditable after the abort');
+      assert((frames[1]!.result as Record<string, unknown>)['budget'] === 'exceeded', 'and still marked as an overrun');
+    });
+
+    await checkAsync('a custom match narrows the tap to one provider', async () => {
+      let other = 0;
+      globalThis.fetch = (async () => {
+        other += 1;
+        return new Response('{"ok":true}', { status: 200 });
+      }) as unknown as typeof globalThis.fetch;
+      const uninstall = await tapFetch({ dir: tmp, pid: 7007, match: (u) => u.includes('openai.com') });
+      await fetch('https://api.anthropic.com/v1/messages', { method: 'POST', body: '{}' });
+      await uninstall();
+      assert(other === 1, 'the unmatched request still went through');
+      assert((await readTap(tmp, 7007)).length === 0, 'and was not recorded');
+    });
+
+    await checkAsync('a second tap returns the first uninstaller instead of double-counting', async () => {
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ model: 'gpt-4o-mini', usage: { prompt_tokens: 7, completion_tokens: 3 } }), {
+          status: 200,
+        })) as unknown as typeof globalThis.fetch;
+      const first = await tapFetch({ dir: tmp, pid: 7008 });
+      // The second call must be a no-op returning the first uninstaller. Its
+      // own pid must be ignored entirely — otherwise every request would be
+      // counted twice, once per wrapper, and the budget would be nonsense.
+      const second = await tapFetch({ dir: tmp, pid: 7009 });
+      await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      await second();
+      const frames = await readTap(tmp, 7008);
+      assert(frames.length === 2, `exactly one pair recorded, got ${frames.length}`);
+      const result = frames[1]!.result as Record<string, unknown>;
+      assert(result['inputTokens'] === 7, 'counted once, not twice');
+      await first();
+    });
+
+    await checkAsync('uninstall restores the original fetch', async () => {
+      const before = globalThis.fetch;
+      const uninstall = await tapFetch({ dir: tmp, pid: 7010 });
+      assert(globalThis.fetch !== before, 'fetch is wrapped while installed');
+      await uninstall();
+      assert(globalThis.fetch === before, 'fetch is put back on uninstall');
+    });
+  } finally {
+    await __resetLLMTapForTests();
+    globalThis.fetch = realFetch;
+    await rm(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // Dashboard server checks
 // =============================================================================
 
@@ -10793,6 +10990,7 @@ await runMockLLMChecks();
 await runDeepseekChecks();
 await runOpenAiChecks();
 await runLangchainChecks();
+await runLLMTapChecks();
 await runDashboardChecks();
 await runFsChecks();
 await runMcpChecks();

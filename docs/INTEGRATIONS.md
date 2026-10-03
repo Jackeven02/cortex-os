@@ -51,6 +51,72 @@ Without `pid` the handler falls back to `jsonl`, because a `.crec` frame belongs
 
 This adapter adds **observability** to an existing execution. The chain still runs in the host application's event loop: callback instrumentation does not move it into a Cortex process, does not make its state checkpointable, and does not give it a PID of its own. It borrows one (`pid` above) so its records have somewhere to live. For checkpoint / fork / supervision, the agent has to be spawned by the kernel — see `cortex spawn --module`.
 
+## The fetch tap — any LLM client, zero code changes
+
+The callback handler above only reaches LangChain, and only if the host wires it up by hand. LlamaIndex, the raw OpenAI SDK, the Vercel AI SDK, a hand-rolled `fetch` — none of them are reachable that way, and writing one adapter per framework means always arriving months after the framework does.
+
+`tapFetch` goes one level lower. Every one of those clients ends up calling `fetch()`, so wrapping `globalThis.fetch` sees all of them at once and **the host project does not change at all**:
+
+```ts
+import { tapFetch, llmTapStats } from 'cortex-agent-os/integrations/llm-tap';
+
+const uninstall = tapFetch({ dir: '.cortex', pid: 42, tokenBudget: 500_000 });
+
+// ... the host's existing agent code runs completely unchanged ...
+
+console.info(llmTapStats()); // { calls, inputTokens, outputTokens, cachedTokens, usd }
+await uninstall();
+```
+
+That is one line, in any project, in any framework. It records an `llm_call` pair per request, so `cortex trace <pid>` shows the run and `cortex ps` shows its spend:
+
+```
+$ cortex trace 9100
+time                  pid    syscall           phase   duration  reversibility
+-------------------------------------------------------------------------------------
+04:38:49.313  9100   llm_call         enter   -         reversible
+04:38:49.313  9100   llm_call         exit    18ms      reversible
+04:38:49.332  9100   llm_call         enter   -         reversible
+04:38:49.332  9100   llm_call         exit    3ms       reversible
+# 4 record(s)
+```
+
+What lands in the log is the shape, never the text:
+
+```jsonc
+// enter frame args
+{ "via": "fetch-tap", "url": "https://api.openai.com/v1/chat/completions", "model": "gpt-4o-mini", "messages": 1 }
+// exit frame result
+{ "model": "gpt-4o-mini", "inputTokens": 250, "cachedTokens": 32, "outputTokens": 60, "usd": 0.0000711, "httpStatus": 200 }
+```
+
+Message *count*, not message *text*. Enough to debug a regression, impossible to leak a prompt.
+
+### Options
+
+| Option | Default | Effect |
+|---|---|---|
+| `pid` | *required* | Owning process for the records. Without it there is nothing to attribute calls to. |
+| `dir` | `.cortex` | Cortex state directory. |
+| `tokenBudget` | — | Token ceiling. Crossing it is visible in the record as `budget: "exceeded"`. |
+| `usdBudget` | — | Same, in dollars. First one crossed wins. |
+| `onBudget` | `'record'` | `'record'` logs the overrun; `'throw'` aborts the call *after* recording it, so the spend stays auditable. |
+| `match` | `isLLMUrl` | Narrow to one provider: `match: (url) => url.includes('openai.com')`. |
+| `onCall` | — | Called per request with the usage, for a host that wants its own meter. |
+
+`isLLMUrl` matches OpenAI-compatible `/v1/{chat/completions,completions,embeddings,responses}`, Ollama's `/api/chat`, and Anthropic's `/v1/messages`. It is deliberately narrow: a wider net would eventually count a metrics endpoint, and a wrong token count in `cortex ps` is worse than a missing one because it silently corrupts a budget the user set. A provider with an unrecognised shape is **not counted rather than counted wrongly**.
+
+Only one tap is installed at a time. A second `tapFetch` call returns the first one's uninstaller instead of stacking a second wrapper — two wrappers would double-count every request, which surfaces as "why is my budget wrong" and costs an afternoon.
+
+### What the tap cannot do
+
+Stated plainly, because these are structural and not fixable with effort:
+
+- **The tap is an observer, not a syscall.** The request never passes through the kernel's `llm_call` route, so it is not capability-checked, and the record is an observer entry attributed to `pid` rather than a frame in that process's own causal log at the point the call happened.
+- **No state capture.** `checkpoint` / `fork` / `restore` stay unavailable, because the agent's state lives in the host's JavaScript heap rather than a kernel-owned image. Same limit as the callback adapter, same reason.
+- **The host keeps running.** `cortex kill` on a tapped pid marks the entry a zombie; it cannot stop the host's event loop, because the host is not a kernel-spawned process. To get real supervision, spawn the agent with `cortex spawn --module`.
+
+The tap is a meter, not a proxy. It never rewrites a request, injects a prompt, or silently retries — anything that changes what the model sees belongs in a driver, where it is auditable.
 
 ## Embedded dashboard
 

@@ -34,6 +34,10 @@
       "types": "./dist/integrations/langchain.d.ts",
       "import": "./dist/integrations/langchain.js"
     },
+    "./integrations/llm-tap": {
+      "types": "./dist/integrations/llm_tap.d.ts",
+      "import": "./dist/integrations/llm_tap.js"
+    },
     "./dashboard": {
       "types": "./dist/dashboard/index.d.ts",
       "import": "./dist/dashboard/index.js"

@@ -42,6 +42,62 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex-agent-os/integrations/llm-tap` — one line to see any LLM client.**
+  The LangChain adapter only reaches LangChain, and only if the host wires a
+  callback by hand. LlamaIndex, the raw OpenAI SDK, the Vercel AI SDK and a
+  hand-rolled `fetch` were all invisible, and one adapter per framework always
+  arrives months after the framework does.
+
+  `tapFetch` wraps `globalThis.fetch` instead, so it sees every OpenAI-compatible
+  client at once and the host project changes not at all:
+
+  ```ts
+  const uninstall = tapFetch({ dir: '.cortex', pid: 42, tokenBudget: 500_000 });
+  ```
+
+  Each recognised request records an `llm_call` enter/exit pair in
+  `.cortex/processes/<pid>/log.crec`, so `cortex trace`, `cortex ps` and the
+  dashboard show a project cortex did not spawn. Token, cached-token and USD
+  totals come from the response `usage` block (OpenAI's three spellings plus the
+  Ollama and Anthropic shapes) and are priced with the openai driver's table
+  rather than a fourth copy of it.
+
+  **The tap is a meter, not a proxy.** It never rewrites a request, injects a
+  prompt, or silently retries. The host still receives the untouched response
+  body, and a test asserts that, because a tap that broke its host would be
+  worse than no tap. What is recorded is the *shape* of a call — message count,
+  model, token counts, USD, HTTP status — never prompt or completion text.
+
+  Budget ceilings (`tokenBudget` / `usdBudget`) mark the crossing record with
+  `budget: "exceeded"`; `onBudget: 'throw'` additionally aborts the call *after*
+  writing the record, so an abort stays auditable. `match` narrows the tap to
+  one provider. `llmTapStats()` exposes the running totals for a host that wants
+  its own meter.
+
+  `isLLMUrl` is deliberately narrow — OpenAI-compatible endpoints, Ollama's
+  `/api/chat`, Anthropic's `/v1/messages`. A wider net would eventually count a
+  metrics endpoint, and a wrong token count in `cortex ps` is worse than a
+  missing one: it silently corrupts a budget the user set. An unrecognised wire
+  format is not counted rather than counted wrongly. A second `tapFetch` call
+  returns the first uninstaller instead of stacking a wrapper that would
+  double-count every request.
+
+  Documented limits, in docs/INTEGRATIONS.md §"What the tap cannot do": the tap
+  is an observer and not a syscall route, so it is not capability-checked; no
+  state capture, so `checkpoint`/`fork`/`restore` stay unavailable; and
+  `cortex kill` marks a tapped pid without stopping the host's event loop,
+  because the host is not a kernel-spawned process. Real supervision still
+  means `cortex spawn --module`.
+
+  Ten new smoke checks cover URL recognition, token extraction including the
+  cached-prefix path, pass-through of non-LLM requests, the trap path for both
+  an HTTP error and a network throw, both budget actions, `match`, the
+  double-install guard and uninstall. Verified end to end against a real
+  localhost HTTP server: two calls produced exactly two frame pairs, the host
+  read its own responses back, a `/health` request on the same origin recorded
+  nothing, and neither `CONFIDENTIAL PROMPT` nor the completion text appears
+  anywhere in the decoded log.
+
 - **The LangChain adapter can now write a real `.crec`, so `cortex trace`
   reads an agent cortex did not spawn.** `CortexLangChainCallbackHandler` took
   a `pid` and wrote it into its own `events.jsonl` — a file nothing else in the
