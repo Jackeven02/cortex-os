@@ -2114,10 +2114,21 @@ async function runIpcChecks(): Promise<void> {
       const b = await spawnRunning(table, 'b');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
       const chan = asChannelId('recorded');
+      // `send` is still self-recorded (its record must sit inside its own
+      // atomicity window); `recv` records through the dispatcher, so it needs
+      // a dispatcher to go through.
+      const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const dispatcher = new SyscallDispatcher({
+        table,
+        signals,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        ipc: mgr,
+      });
 
       await mgr.send(a, chan, { recorded: true });
       // Walk b to RUNNING (it already is) and recv.
-      const msg = await mgr.recv(b, chan, { blocking: false });
+      const msg = await dispatcher.invoke(b, 'recv', chan, { blocking: false });
       assert((msg.body as { recorded: boolean }).recorded === true, 'body mismatch');
 
       const recA = table.recorderFor(a)!;
@@ -2137,9 +2148,11 @@ async function runIpcChecks(): Promise<void> {
       for await (const r of readRecords(recB.path)) {
         if (r.syscall === 'recv') recvRecords.push(r);
       }
-      assert(recvRecords.length === 1, `expected 1 recv record, got ${recvRecords.length}`);
-      assert(recvRecords[0]!.reversibility === 'irreversible', 'recv should be irreversible');
-      const result = recvRecords[0]!.result as { body: { recorded: boolean } };
+      assert(recvRecords.length === 2, `expected recv enter+exit, got ${recvRecords.length}`);
+      assert(recvRecords[0]!.phase === 'enter', 'recv enter frame first');
+      assert(recvRecords[1]!.phase === 'exit', 'recv exit frame last');
+      assert(recvRecords[1]!.reversibility === 'irreversible', 'recv should be irreversible');
+      const result = recvRecords[1]!.result as { body: { recorded: boolean } };
       assert(result.body.recorded === true, 'recv record should capture the message body');
     });
 
@@ -3379,7 +3392,7 @@ async function runCheckpointChecks(): Promise<void> {
 
   // --- recording ------------------------------------------------------------
 
-  await checkAsync('take records an idempotent checkpoint syscall', async () => {
+  await checkAsync('checkpoint records enter+exit through the dispatcher, still idempotent', async () => {
     const sub = join(tmp, 'ckpt-records');
     await mkdir(sub, { recursive: true });
     const table = new ProcessTable({
@@ -3390,25 +3403,36 @@ async function runCheckpointChecks(): Promise<void> {
     tables.push(table);
     const pid = await spawnRunning(table);
     const { ckpt } = makeCkpt(table);
-    const { chainId } = await ckpt.take(pid, { tag: 'pre-deploy' });
+    // The module no longer records; the dispatcher does, so drive it there.
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const dispatcher = new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      checkpoint: ckpt,
+    });
+    const returned = await dispatcher.invoke(pid, 'checkpoint', { tag: 'pre-deploy' });
     const rec = table.recorderFor(pid)!;
     await rec.flush();
     const records: SyscallRecord[] = [];
     for await (const r of readRecords(rec.path)) records.push(r);
     const ck = records.filter((r) => r.syscall === 'checkpoint');
-    assert(ck.length === 1, `expected 1 checkpoint record, got ${ck.length}`);
-    assert(ck[0]!.phase === 'exit', 'exit phase');
-    assert(ck[0]!.reversibility === 'idempotent', 'checkpoint is idempotent');
-    assert(
-      ck[0]!.stateBefore === 'checkpointing' && ck[0]!.stateAfter === 'running',
-      'state transition recorded',
-    );
-    const res = ck[0]!.result as { chainId: string; byteSize: number; syscallLogOffset: number };
-    assert(res.chainId === unbrand(chainId), 'result carries chainId');
+    assert(ck.length === 2, `expected checkpoint enter+exit, got ${ck.length}`);
+    assert(ck[0]!.phase === 'enter' && ck[1]!.phase === 'exit', 'enter then exit');
+    assert(ck[1]!.reversibility === 'idempotent', 'checkpoint is idempotent');
+    // Boundary semantics: the states either side of the syscall, the same
+    // vantage point every other syscall records.
+    assert(ck[0]!.stateBefore === 'running', `stateBefore ${String(ck[0]!.stateBefore)}`);
+    const res = ck[1]!.result as { chainId: string; byteSize: number; syscallLogOffset: number };
+    assert(res.chainId === unbrand(returned.chainId), 'result carries the returned chainId');
     assert(typeof res.byteSize === 'number' && res.byteSize > 0, 'result carries byteSize');
-    const args = ck[0]!.args as { tag?: string; detach: boolean };
+    assert(typeof res.syscallLogOffset === 'number', 'result carries the snapshot log offset');
+    // The ABI return stays narrow even though the record is wide.
+    assert(Object.keys(returned as object).length === 1, 'agent receives only { chainId }');
+    const args = ck[0]!.args as { tag?: string; detach?: boolean };
     assert(args.tag === 'pre-deploy', 'tag captured in args');
-    assert(args.detach === false, 'detach flag captured');
+    assert(args.detach !== true, 'detach flag captured');
   });
 
   await checkAsync('restoreAs records a reversible restore syscall in the new log', async () => {

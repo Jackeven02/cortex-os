@@ -850,13 +850,18 @@ The ABI is now frozen, which changes what "what comes next" means.
 
 **Recording ownership — resolved in stages, because none of it is an ABI change:** the modules `memory.ts`, `ipc.ts`, `fork.ts` and `checkpoint.ts` predate the dispatcher and used to write their own `.crec` frames (`memory_read`, `memory_write`, `send`, `recv`, `fork`, `checkpoint`, `restore`). The on-disk format is identical either way, so this is internal tidying rather than a contract change — which is exactly why it was not allowed to hold the freeze hostage.
 
-`memory_read` and `memory_write` now record through the dispatcher like every other syscall: they gain the missing `enter` frame, their `trap` frames come from the dispatcher's uniform path, and their redaction rules are unchanged because the dispatcher applies the same shaping the manager used to — a read records `{count, valuesHash}` instead of the returned values, and a write hashes any value above the manager's `largeValueBytes` threshold (or any value whose caller set `recordHashOnly`). `MemoryManager` no longer owns a recorder or a call-ID counter.
+`memory_read`, `memory_write`, `recv` and `checkpoint` now record through the dispatcher like every other syscall: each gains the `enter` frame it never had, their `trap` frames come from the dispatcher's uniform path, and the redaction rules the modules applied are unchanged because the dispatcher applies the same shaping — a read records `{count, valuesHash}` instead of the returned values, and a write hashes any value above the manager's `largeValueBytes` threshold (or any value whose caller set `recordHashOnly`). `MemoryManager` no longer owns a recorder or a call-ID counter.
 
-The remaining five stay self-recorded for concrete reasons, not for tidiness debt:
+Two of those needed a way to say "record this, return that":
+
+- `recv` records the delivered message as `{from, to, body, sentAt}`; the `callId` is left out because the `send` record already carries it, and the wait time is the frame's own `durationMs`.
+- `checkpoint` routes a wider object than it returns. `CheckpointManager.take()` hands back the snapshot's `byteSize` and `syscallLogOffset` alongside the `chainId`, the `exit` record keeps all three (the log offset is what makes a checkpoint replayable against `.crec`), and the agent still receives exactly `{ chain_id }` as the ABI promises. Its `stateBefore`/`stateAfter` are now the states either side of the syscall — the same vantage point every other syscall records — rather than the module's internal `checkpointing` → final transition.
+
+The remaining three stay self-recorded for concrete reasons, not for tidiness debt:
 
 - `fork` writes into **two** logs (the parent's and the child's), and only the module knows about the child.
 - `send` needs the record ordered inside its own atomicity window: a failed record must not leave a phantom, half-committed message, so the module must control exactly when it records.
-- `recv`, `checkpoint` and `restore` are recorded at points the generic path cannot express (the message consumption, the snapshot's own log offset, and the restored process's lineage respectively).
+- `restore` records into the **restored** process's log, not the caller's, because the record is about the new process's lineage.
 
 The ABI is the contract. The architecture is how we keep that contract. The kernel is the implementation. In that order.
 

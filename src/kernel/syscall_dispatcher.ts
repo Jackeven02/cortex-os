@@ -364,9 +364,7 @@ export function killReversibility(signal: Signal): Reversibility {
  */
 export const SELF_RECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName>([
   'send',
-  'recv',
   'fork',
-  'checkpoint',
   'restore',
 ]);
 
@@ -722,7 +720,7 @@ export class SyscallDispatcher {
           if (!resumed) throw new ProcessExitSignal(152, 'process terminated while stopped for budget exhaustion');
         }
       }
-      return result;
+      return projectReturn(syscall, result) as SyscallReturn[S];
     } catch (err) {
       // `exit` tears down and records itself, then throws the sentinel.
       if (isProcessExitSignal(err)) throw err;
@@ -1466,12 +1464,19 @@ export class SyscallDispatcher {
   async #checkpoint(
     pid: ProcessId,
     opts?: CheckpointOptions,
-  ): Promise<{ readonly chainId: ChainId }> {
+  ): Promise<{ readonly chainId: ChainId; readonly byteSize: number; readonly syscallLogOffset: number }> {
     if (this.#checkpointMgr === null) {
       trap('EDRIVER', 'checkpoint', { reason: 'checkpoint engine not configured' });
     }
     const ref = await this.#checkpointMgr.take(pid, opts);
-    return { chainId: ref.chainId };
+    // Routed wider than the ABI return on purpose: `byteSize` and
+    // `syscallLogOffset` are recorded, `chainId` is what the agent gets
+    // (see `projectReturn`).
+    return {
+      chainId: ref.chainId,
+      byteSize: ref.byteSize,
+      syscallLogOffset: unbrand(ref.syscallLogOffset),
+    };
   }
 
   async #restore(
@@ -2052,8 +2057,38 @@ function shapeResult(syscall: SyscallName, result: unknown): unknown {
       valuesHash: hashValue(result.map((e) => (e as MemoryEntry).value)),
     };
   }
+  if (syscall === 'recv' && isRecord(result)) {
+    // The message as the agent received it, minus the delivery bookkeeping
+    // (`callId`) that the `send` record already carries.
+    return { from: result['from'], to: result['to'], body: result['body'], sentAt: result['sentAt'] };
+  }
+  if (syscall === 'checkpoint' && isRecord(result)) {
+    // The snapshot's own facts, including the log offset it was taken at —
+    // that offset is what makes a checkpoint replayable against `.crec`.
+    return {
+      chainId: result['chainId'],
+      byteSize: result['byteSize'],
+      syscallLogOffset: result['syscallLogOffset'],
+    };
+  }
   return result;
 }
+
+/**
+ * Narrow a routed value to the ABI's declared return shape. `checkpoint`
+ * routes a richer object than it returns: the extra fields (`byteSize`,
+ * `syscallLogOffset`) exist for the `exit` record, not for the agent, and the
+ * ABI promises `checkpoint` resolves to `{ chain_id }`.
+ */
+function projectReturn(syscall: SyscallName, result: unknown): unknown {
+  if (syscall === 'checkpoint' && isRecord(result)) {
+    return { chainId: result['chainId'] };
+  }
+  return result;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
 
 /** Narrow an unknown result to LLMResponse for budget accounting. */
 function isLLMResponse(v: unknown): v is LLMResponse {

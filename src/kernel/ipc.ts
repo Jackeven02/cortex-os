@@ -623,7 +623,6 @@ export class IpcManager {
     const queued = channel.queue.shift();
     if (queued !== undefined) {
       channel.totalRecv++;
-      await this.#recordRecv(pid, channel, queued, /* waitDurationMs */ 0);
       return queued;
     }
 
@@ -755,12 +754,13 @@ export class IpcManager {
         channel: channel.id,
         registeredAt: startedAt,
         resolve: (msg) => {
-          // Wrap resolution so we can transition state and record before
-          // handing the message back to the agent.
+          // Wrap resolution so we can transition state before handing the
+          // message back to the agent. The `recv` record itself is the
+          // dispatcher's to write (ABI.md §9, recording ownership) — and it
+          // still lands before the agent resumes, because the agent is
+          // awaiting this syscall, not the bare promise.
           void (async () => {
             try {
-              const waitMs = durationMs(waiter.registeredAt, this.#now());
-              await this.#recordRecv(pid, channel, msg, waitMs);
               // BLOCKED → READY. The scheduler dispatches READY → RUNNING
               // later; the promise resolves now so the agent's `await`
               // unblocks the moment the message is in hand.
@@ -954,49 +954,6 @@ export class IpcManager {
       if (isCortexError(err)) throw err;
       throw new CortexError('ERECORD', 'send', {
         message: `failed to record send to ${unbrand(channel.id)}`,
-        cause: err,
-      });
-    }
-  }
-
-  async #recordRecv(
-    pid: ProcessId,
-    channel: Channel,
-    msg: IpcMessage,
-    waitDurationMs: number,
-  ): Promise<void> {
-    const recorder = this.#table.recorderFor(pid);
-    if (recorder === null) return;
-
-    const entry = this.#table.get(pid);
-    const state: ProcessState = entry?.state ?? 'running';
-
-    const record: SyscallRecordInput = {
-      timestamp: this.#now(),
-      pid,
-      syscall: 'recv',
-      callId: msg.callId ?? `recv-${unbrand(pid)}-${Date.now()}`,
-      phase: 'exit',
-      args: {
-        source: unbrand(channel.id),
-        sourceKind: 'channel',
-        waitDurationMs,
-      },
-      result: { from: msg.from, to: msg.to, body: msg.body, sentAt: msg.sentAt },
-      stateBefore: state,
-      stateAfter: state,
-      // The message is gone from the queue; consumption is irreversible.
-      reversibility: 'irreversible',
-      kernelAbiVersion: this.kernelAbiVersion,
-      ...(waitDurationMs > 0 ? { durationMs: waitDurationMs } : {}),
-    };
-
-    try {
-      await recorder.append(record);
-    } catch (err) {
-      if (isCortexError(err)) throw err;
-      throw new CortexError('ERECORD', 'recv', {
-        message: `failed to record recv from ${unbrand(channel.id)}`,
         cause: err,
       });
     }

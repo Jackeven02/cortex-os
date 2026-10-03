@@ -42,24 +42,35 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Changed
 
-- **`memory_read` / `memory_write` now record through the dispatcher's single
-  recording path** (instead of `MemoryManager` writing its own frames). Both
-  syscalls therefore gain the `enter` frame they never had, which makes
-  `cortex trace` and any replay read them like every other syscall, and their
-  `trap` frames now come from the dispatcher's uniform path too. The redaction
-  rules are unchanged by design — a read records `{count, valuesHash}` rather
-  than the values themselves, and a write hashes any value above the
-  manager's `largeValueBytes` threshold or with `recordHashOnly` set — the
-  dispatcher simply applies the shaping the manager used to apply.
-  `MemoryManager` no longer holds a recorder or a call-ID counter.
+- **`memory_read` / `memory_write` / `recv` / `checkpoint` now record through
+  the dispatcher's single recording path** (instead of `MemoryManager`,
+  `IpcManager` and `CheckpointManager` writing their own frames). All four
+  gain the `enter` frame they never had, which makes `cortex trace` and any
+  replay read them like every other syscall, and their `trap` frames now come
+  from the dispatcher's uniform path too. The redaction rules move with the
+  records, unchanged: a read records `{count, valuesHash}` rather than the
+  values themselves, and a write hashes any value above the manager's
+  `largeValueBytes` threshold or with `recordHashOnly` set.
+  `MemoryManager` no longer holds a recorder or a call-ID counter, and
+  `IpcManager` / `CheckpointManager` no longer record `recv` / `checkpoint`.
 
-  This closes part of the follow-up recorded under the `1.1` entry below: the
-  remaining five self-recorded syscalls (`send`, `recv`, `fork`, `checkpoint`,
-  `restore`) keep their own frames for concrete reasons — `fork` writes into
-  two logs, `send` must order its record inside its own atomicity window, and
-  the last three are recorded at points the generic path cannot express.
-  No syscall, `.crec`, or `.csnap` format change: `KERNEL_ABI_VERSION` stays
-  `1.0.0`.
+  Two of them needed the dispatcher to distinguish *what is recorded* from
+  *what is returned*: `recv` records the delivered message
+  (`{from, to, body, sentAt}` — the wait time is the frame's own
+  `durationMs`), and `checkpoint` records `{chainId, byteSize,
+  syscallLogOffset}` while the agent still receives exactly `{ chain_id }`.
+  `CheckpointManager.take()` therefore returns the snapshot's `byteSize` and
+  `syscallLogOffset`; the log offset is what makes a checkpoint replayable
+  against `.crec`. A checkpoint record's `stateBefore` / `stateAfter` are now
+  the states either side of the syscall, like every other syscall, rather than
+  the module's internal `checkpointing` → final transition.
+
+  This closes four of the seven self-recorded syscalls tracked in ABI.md. The
+  remaining three keep their own frames for concrete reasons now written into
+  that section: `fork` writes into two logs, `send` must order its record
+  inside its own atomicity window, and `restore` records into the *restored*
+  process's log. No syscall, `.crec`, or `.csnap` format change:
+  `KERNEL_ABI_VERSION` stays `1.0.0`.
 
 ## [1.2.0] — 2026-10-02
 

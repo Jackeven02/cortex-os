@@ -272,7 +272,14 @@ export class CheckpointManager {
   async take(
     pid: ProcessId,
     opts?: CheckpointOptions,
-  ): Promise<{ chainId: ChainId; path: string }> {
+  ): Promise<{
+    chainId: ChainId;
+    path: string;
+    /** Size of the written `.csnap`, for the dispatcher's `exit` record. */
+    byteSize: number;
+    /** Log offset the snapshot was taken at, for causal ordering in replay. */
+    syscallLogOffset: SyscallOffset;
+  }> {
     const entry = this.#table.mustGet(pid, 'checkpoint'); // traps ESRCH
 
     const detach = opts?.detach === true;
@@ -372,12 +379,12 @@ export class CheckpointManager {
       });
       this.#table.pushCheckpoint(pid, chainId);
 
-      await this.#recordCheckpoint(pid, chainId, opts, fileBytes.byteLength, syscallLogOffset, finalState);
-
       // CHECKPOINTING → RUNNING (or SUSPENDED with detach).
       await this.#table.setState(pid, finalState, { trigger: 'checkpoint' });
 
-      return { chainId, path };
+      // `byteSize` and `syscallLogOffset` travel back to the dispatcher, which
+      // owns the `checkpoint` record (ABI.md §9, recording ownership).
+      return { chainId, path, byteSize: fileBytes.byteLength, syscallLogOffset };
     } catch (err) {
       // Best-effort: never strand the process in CHECKPOINTING. Only recover
       // if we actually entered it — an ESTATE from the initial transition
@@ -659,38 +666,6 @@ export class CheckpointManager {
   // ---------------------------------------------------------------------------
   // §4.5 Recording
   // ---------------------------------------------------------------------------
-
-  async #recordCheckpoint(
-    pid: ProcessId,
-    chainId: ChainId,
-    opts: CheckpointOptions | undefined,
-    byteSize: number,
-    syscallLogOffset: SyscallOffset,
-    finalState: 'running' | 'suspended' | 'ready',
-  ): Promise<void> {
-    const recorder = this.#table.recorderFor(pid);
-    if (recorder === null) return;
-
-    const record: SyscallRecordInput = {
-      timestamp: this.#now(),
-      pid,
-      syscall: 'checkpoint',
-      callId: `ckpt-${unbrand(chainId)}`,
-      phase: 'exit',
-      args: {
-        ...(opts?.tag !== undefined ? { tag: opts.tag } : {}),
-        detach: opts?.detach === true,
-        includeDriverStates: opts?.includeDriverStates !== false,
-      },
-      result: { chainId: unbrand(chainId), byteSize, syscallLogOffset: unbrand(syscallLogOffset) },
-      stateBefore: 'checkpointing',
-      stateAfter: finalState,
-      // Multiple checkpoints are fine (ABI.md §4.2).
-      reversibility: 'idempotent',
-      kernelAbiVersion: this.kernelAbiVersion,
-    };
-    await this.#append(recorder, record, 'checkpoint');
-  }
 
   async #recordRestore(
     newPid: ProcessId,
