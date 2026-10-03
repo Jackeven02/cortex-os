@@ -49,8 +49,8 @@
 import { join } from 'node:path';
 import { KERNEL_ABI_VERSION } from '../index.js';
 import { OPENAI_PRICING, type FetchFn, type FetchResponseLike } from '../drivers/llm/openai.js';
-import { Recorder, type SyscallRecordInput } from '../kernel/recorder.js';
-import { asProcessId, type Timestamp } from '../kernel/types.js';
+import { Recorder, readRecords, existingCrecPath, type SyscallRecordInput } from '../kernel/recorder.js';
+import { asProcessId, type SyscallRecord, type Timestamp } from '../kernel/types.js';
 
 // =============================================================================
 // §1. Public options
@@ -518,6 +518,94 @@ export interface LLMTapStats {
 /** Where the tap writes, for a host that wants to pre-create the directory. */
 export function llmTapProcessDir(dir: string, pid: number): string {
   return join(dir, 'processes', String(pid));
+}
+
+/**
+ * Spend read back out of a `.crec`, as opposed to {@link llmTapStats} which
+ * reports the in-process counters of whoever installed the tap.
+ *
+ * These are two different questions, and the difference matters at exactly the
+ * wrong moment if you conflate them. `llmTapStats()` answers "how much has this
+ * process spent so far" and only works *inside* the tapped process. This
+ * function answers "how much did that process spend" and works from *outside*,
+ * after it exited — which is the only vantage point a supervisor, a dashboard,
+ * or `cortex ps` has.
+ *
+ * Without it the money is simply gone: the frames are in the log, but nothing
+ * ever reads them back, so a wrapped run that spent real tokens reports zero.
+ * That is worse than no accounting, because the number looks measured.
+ */
+export interface TapSpend {
+  /** Completed calls (an `exit` frame). A `trap` frame is not counted here. */
+  readonly calls: number;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cachedTokens: number;
+  readonly usd: number;
+  /**
+   * Calls that hit an error or blew the budget. Kept separate because they
+   * still cost money — a request the provider answered with a 500 was billed,
+   * and a request aborted after the write was also billed.
+   */
+  readonly failedCalls: number;
+}
+
+const ZERO_SPEND: TapSpend = { calls: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, usd: 0, failedCalls: 0 };
+
+/**
+ * Sum the `llm_call` frames in a process's log.
+ *
+ * Reads the same `.crec` every other tool reads, so the number here and the
+ * number in `cortex trace` cannot disagree. Only `phase === 'exit'` and
+ * `phase === 'trap'` frames carry a result; the `enter` frames are excluded or
+ * every call would be counted twice.
+ *
+ * A missing or truncated log yields zeros rather than throwing. The caller is a
+ * CLI printing a summary line, and a summary line that fails to print because
+ * a log is missing is a worse outcome than a summary that honestly says zero.
+ */
+export async function readTapSpend(dir: string, pid: number): Promise<TapSpend> {
+  let records: AsyncGenerator<SyscallRecord, void, undefined>;
+  try {
+    records = readRecords(existingCrecPath(dir, asProcessId(pid)));
+  } catch {
+    return ZERO_SPEND;
+  }
+
+  let calls = 0;
+  let failedCalls = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let cachedTokens = 0;
+  let usd = 0;
+
+  try {
+    for await (const r of records) {
+      if (r.syscall !== 'llm_call') continue;
+      if (r.phase === 'enter') continue;
+      // A trap from a network throw carries no result at all: the request
+      // never got an answer, so there is nothing to bill.
+      const result = r.result as Record<string, unknown> | undefined;
+      if (result === undefined || result === null) continue;
+
+      const read = (key: string): number => {
+        const n = Number(result[key]);
+        return Number.isFinite(n) ? n : 0;
+      };
+
+      if (r.phase === 'exit') calls += 1;
+      else failedCalls += 1;
+      inputTokens += read('inputTokens');
+      outputTokens += read('outputTokens');
+      cachedTokens += read('cachedTokens');
+      usd += read('usd');
+    }
+  } catch {
+    // A torn tail or a half-written frame stops the reader. Everything before
+    // it was still real spend, so return the partial sum rather than zeros.
+  }
+
+  return { calls, inputTokens, outputTokens, cachedTokens, usd, failedCalls };
 }
 
 /** Test seam: reset module state between cases. Not part of the public API. */

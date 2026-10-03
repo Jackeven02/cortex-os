@@ -25,6 +25,7 @@
 import { spawn } from 'node:child_process';
 import type { CortexContext } from '../kernel/index.js';
 import { unbrand } from '../kernel/types.js';
+import { readTapSpend } from '../integrations/llm_tap.js';
 
 /**
  * What the wrapper was asked to run. Passed through `ctx.args` by
@@ -55,6 +56,16 @@ export interface WrapArgs {
    * would be a guess that happens to be right until the first init reap.
    */
   readonly env?: Readonly<Record<string, string>>;
+  /**
+   * Cortex state directory, when the tap is in play.
+   *
+   * The wrapper needs it to read the child's spend back off its own `.crec`
+   * after the child is gone — it kept no counter of its own, because the child
+   * made the LLM calls, not the wrapper. Defaults to `.cortex`, which is right
+   * only when the CLI ran with no `--prefix`; `cortex wrap` always passes the
+   * resolved directory so this is a fallback rather than the normal path.
+   */
+  readonly tapDir?: string;
 }
 
 const DEFAULT_KILL_GRACE_MS = 5_000;
@@ -167,11 +178,36 @@ export default async function wrappedCommand(ctx: CortexContext, raw: unknown): 
   // The one boundary that is genuinely a boundary: the run ended. Recording
   // it means `cortex trace` shows what the wrapped project did, and it gives
   // `restore` something real to re-run.
+  //
+  // The spend is read back off this process's own `.crec` rather than taken
+  // from a counter the wrapper kept, because the wrapper did not make the LLM
+  // calls — the child did, and the tap appended them to the same log. Reading
+  // the log means the number here is the same number `cortex trace` shows, and
+  // it survives a cancelled run: the frames are already on disk by the time the
+  // child dies, whether it exited cleanly or was killed.
+  //
+  // A run that was cancelled still cost whatever it spent before it was
+  // stopped. Recording that is the difference between "we know this run cost
+  // $0.42" and "we have no idea what the killed run cost", which is the
+  // question you actually have when something hangs and you kill it.
+  const spend = await readTapSpend(args.tapDir ?? '.cortex', unbrand(ctx.pid));
   await ctx
     .memory_write('episodic', 'wrap:result', {
       command,
       exitCode: code,
       ...(cancelled ? { cancelled: true } : {}),
+      // Zero-valued fields are omitted rather than written as 0 so a run that
+      // was never tapped is not indistinguishable from one that spent nothing
+      // on purpose. The difference matters when reading a restore's history.
+      ...(spend.calls > 0 || spend.failedCalls > 0
+        ? {
+            llmCalls: spend.calls,
+            ...(spend.failedCalls > 0 ? { llmCallsFailed: spend.failedCalls } : {}),
+            tokensIn: spend.inputTokens,
+            tokensOut: spend.outputTokens,
+            usd: Number(spend.usd.toFixed(6)),
+          }
+        : {}),
     })
     .catch(() => undefined);
 
@@ -189,6 +225,7 @@ function parseArgs(raw: unknown): WrapArgs | undefined {
     ...(typeof obj['killGraceMs'] === 'number' ? { killGraceMs: obj['killGraceMs'] } : {}),
     ...(typeof obj['inheritStdio'] === 'boolean' ? { inheritStdio: obj['inheritStdio'] } : {}),
     ...(typeof obj['env'] === 'object' && obj['env'] !== null ? { env: obj['env'] as Record<string, string> } : {}),
+    ...(typeof obj['tapDir'] === 'string' ? { tapDir: obj['tapDir'] } : {}),
   };
 }
 

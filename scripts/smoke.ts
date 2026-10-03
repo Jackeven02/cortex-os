@@ -188,6 +188,7 @@ import {
   llmTapStats,
   isLLMUrl,
   installTapFromEnv,
+  readTapSpend,
   __resetLLMTapForTests,
   ENV_TAP_DIR,
   ENV_TAP_PID,
@@ -8925,6 +8926,55 @@ async function runLLMTapChecks(): Promise<void> {
       const uninstall = await installTapFromEnv({ [ENV_TAP_DIR]: tmp, [ENV_TAP_PID]: 'not-a-pid' });
       assert(uninstall === undefined, 'it declines quietly instead of throwing');
     });
+
+    // --- readTapSpend: the other direction ------------------------------------
+    //
+    // The tap writes; something has to read. Without a reader the frames sit in
+    // the log and every summary reports zero for a run that spent real money.
+
+    await checkAsync('readTapSpend sums the frames a tap wrote', async () => {
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            model: 'gpt-4o-mini',
+            usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 8 } },
+            choices: [{ message: { content: 'x' } }],
+          }),
+          { status: 200 },
+        )) as unknown as typeof globalThis.fetch;
+      const uninstall = await tapFetch({ dir: tmp, pid: 7020 });
+      await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      await uninstall();
+
+      const spend = await readTapSpend(tmp, 7020);
+      // Two calls, not four: the `enter` frames carry no usage and must not be
+      // counted, which is the mistake a naive "sum every llm_call frame" makes.
+      assert(spend.calls === 2, `two calls, got ${spend.calls}`);
+      assert(spend.inputTokens === 200, `200 in, got ${spend.inputTokens}`);
+      assert(spend.outputTokens === 40, `40 out, got ${spend.outputTokens}`);
+      assert(spend.cachedTokens === 16, `16 cached, got ${spend.cachedTokens}`);
+      assert(spend.usd > 0, 'and a non-zero price');
+    });
+
+    await checkAsync('readTapSpend counts a failed call separately and still bills it', async () => {
+      globalThis.fetch = (async () => new Response('nope', { status: 500 })) as unknown as typeof globalThis.fetch;
+      const uninstall = await tapFetch({ dir: tmp, pid: 7021 });
+      await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      await uninstall();
+      const spend = await readTapSpend(tmp, 7021);
+      // A 500 is not a success, but the provider charged for it. Reporting it
+      // as neither success nor cost would make the failure free.
+      assert(spend.calls === 0, `no completed calls, got ${spend.calls}`);
+      assert(spend.failedCalls === 1, `one failed call, got ${spend.failedCalls}`);
+    });
+
+    await checkAsync('readTapSpend returns zeros for a pid with no log', async () => {
+      // A summary line that throws because a log is missing is worse than one
+      // that honestly says zero.
+      const spend = await readTapSpend(tmp, 7099);
+      assert(spend.calls === 0 && spend.inputTokens === 0, 'zeros, not an exception');
+    });
   } finally {
     await __resetLLMTapForTests();
     globalThis.fetch = realFetch;
@@ -8944,6 +8994,7 @@ async function runWrapChecks(): Promise<void> {
   const { cmdWrap } = await import('../src/cli/commands/wrap.js');
   const { readMeta } = await import('../src/cli/process_store.js');
   const { defaultKernelDir } = await import('../src/index.js');
+  const { asProcessId: asPid } = await import('../src/kernel/types.js');
 
   // `cortex wrap` resolves the state directory the same way every other
   // command does, so the test drives it through the environment rather than
@@ -9078,6 +9129,161 @@ async function runWrapChecks(): Promise<void> {
       await rm(home, { recursive: true, force: true });
     });
 
+    await checkAsync('the tap spend is folded back into the recorded budgets', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      // The child's LLM calls never went through the dispatcher, so the
+      // kernel's own counters read zero for a run that spent real tokens. If
+      // they are not read back off the log, `meta.json` persists zeros and
+      // every read-only view — `cortex ps`, the dashboard, `cortex audit` —
+      // reports a spending run as free. A number that looks measured but is
+      // not is worse than no number at all.
+      const { createServer } = await import('node:http');
+      const server = createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          res.writeHead(200, { 'content-type': 'application/json' }).end(
+            JSON.stringify({
+              model: 'gpt-4o-mini',
+              usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 5 } },
+              choices: [{ message: { content: 'ok' } }],
+            }),
+          );
+        });
+      });
+      await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+      const port = (server.address() as { port: number }).port;
+
+      // The child installs the tap the way `cortex wrap --tap` tells it to, and
+      // makes two calls. Written as a real module import so the env channel is
+      // exercised end to end rather than stubbed.
+      const tapModule = new URL('../src/integrations/llm_tap.ts', import.meta.url).href;
+      const child = [
+        `const { installTapFromEnv } = await import(${JSON.stringify(tapModule)});`,
+        'const uninstall = await installTapFromEnv();',
+        'const call = () => fetch("http://127.0.0.1:' + port + '/v1/chat/completions", {',
+        '  method: "POST", headers: { "content-type": "application/json" },',
+        '  body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "q" }] }),',
+        '}).then((r) => r.json());',
+        'await call();',
+        'await call();',
+        'await uninstall();',
+      ].join('\n');
+
+      const code = await cmdWrap([
+        '--role',
+        'tapped',
+        '--tap',
+        '--',
+        process.execPath,
+        '--import',
+        'tsx',
+        '-e',
+        child,
+      ]);
+      server.close();
+      assert(code === 0, `the child should succeed, got ${code}`);
+
+      const pid = asPid(2);
+      const spend = await readTapSpend(home, pid);
+      assert(spend.calls === 2, `two completed calls, got ${spend.calls}`);
+      assert(spend.inputTokens === 200, `200 in, got ${spend.inputTokens}`);
+      assert(spend.outputTokens === 40, `40 out, got ${spend.outputTokens}`);
+      assert(spend.cachedTokens === 10, `10 cached, got ${spend.cachedTokens}`);
+      assert(spend.failedCalls === 0, 'no failures');
+
+      // And the same numbers must be what a read-only view reports, or the
+      // summary line and `cortex ps` would disagree with `cortex trace`.
+      const meta = readMeta(home, pid);
+      assert(meta !== undefined, 'meta.json was written');
+      assert(meta.budgetsSpent.tokensIn === 200, `meta tokensIn, got ${meta.budgetsSpent.tokensIn}`);
+      assert(meta.budgetsSpent.tokensOut === 40, `meta tokensOut, got ${meta.budgetsSpent.tokensOut}`);
+      assert(
+        meta.budgetsSpent.usdSpent > 0,
+        `meta usdSpent must be non-zero for a run that spent money, got ${meta.budgetsSpent.usdSpent}`,
+      );
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('a cancelled run still leaves its token spend on record', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      // The question you actually have when something hangs and you kill it is
+      // "what did that cost before it died". The frames are already on disk by
+      // the time the child is stopped, so the answer is available — but only if
+      // the summary is read back off the log rather than from a counter the
+      // wrapper kept (it kept none; the child made the calls).
+      const { createServer } = await import('node:http');
+      const server = createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => (body += c));
+        req.on('end', () => {
+          res.writeHead(200, { 'content-type': 'application/json' }).end(
+            JSON.stringify({
+              model: 'gpt-4o-mini',
+              usage: { prompt_tokens: 100, completion_tokens: 20 },
+              choices: [{ message: { content: 'ok' } }],
+            }),
+          );
+        });
+      });
+      await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+      const port = (server.address() as { port: number }).port;
+
+      const tapModule = new URL('../src/integrations/llm_tap.ts', import.meta.url).href;
+      const child = [
+        `const { installTapFromEnv } = await import(${JSON.stringify(tapModule)});`,
+        'const uninstall = await installTapFromEnv();',
+        'const call = () => fetch("http://127.0.0.1:' + port + '/v1/chat/completions", {',
+        '  method: "POST", headers: { "content-type": "application/json" },',
+        '  body: JSON.stringify({ model: "gpt-4o-mini", messages: [{ role: "user", content: "q" }] }),',
+        '}).then((r) => r.json());',
+        'await call();',
+        'await uninstall();',
+        // Stay alive so --timeout is what ends this run, rather than Node
+        // exiting on an unsettled await all by itself.
+        'setInterval(() => {}, 1000);',
+      ].join('\n');
+
+      const realLog = console.log;
+      const realError = console.error;
+      console.log = () => undefined;
+      console.error = () => undefined;
+      let code = 0;
+      try {
+        code = await cmdWrap([
+          '--role',
+          'cancelled',
+          '--tap',
+          '--timeout',
+          '900',
+          '--kill-grace-ms',
+          '200',
+          '--',
+          process.execPath,
+          '--import',
+          'tsx',
+          '-e',
+          child,
+        ]);
+      } finally {
+        console.log = realLog;
+        console.error = realError;
+        server.close();
+      }
+      assert(code === 137, `the run was killed, so 137 — got ${code}`);
+
+      const meta = readMeta(home, asPid(2));
+      assert(meta !== undefined, 'meta.json was written even for a killed run');
+      assert(String(meta.exitReason).includes('timed out'), `reason records the timeout, got ${meta.exitReason}`);
+      assert(
+        meta.budgetsSpent.tokensIn === 100 && meta.budgetsSpent.tokensOut === 20,
+        `the spend before the kill survives it: ${meta.budgetsSpent.tokensIn}/${meta.budgetsSpent.tokensOut}`,
+      );
+      await rm(home, { recursive: true, force: true });
+    });
+
     await checkAsync('wrap reports 127 and says so when the command does not exist', async () => {
       const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
       process.env['CORTEX_HOME'] = home;
@@ -9122,7 +9328,13 @@ async function runWrapChecks(): Promise<void> {
         console.log = realLog;
         console.error = realError;
       }
-      assert(code === 0, `a timed-out stop is not a failure, got ${code}`);
+      // A run cortex killed is not a run that succeeded. This line used to
+      // assert `code === 0` on the theory that stopping the child was "not a
+      // failure" — which made `cortex wrap --timeout 60 -- pytest` exit 0 on a
+      // hung suite. The heartbeat checks below are the point of this test; the
+      // exit code is asserted here because it is the same fact seen from the
+      // caller's side.
+      assert(code === 137, `a killed run must report 128+SIGKILL, got ${code}`);
       const sizeAtExit = existsSync(marker) ? (await readFile(marker, 'utf8')).length : 0;
       assert(sizeAtExit > 0, 'the child actually ran, so this is a real test');
       // The decisive check: an orphaned child would keep writing here after

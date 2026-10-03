@@ -239,6 +239,43 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   the production `readRecords`, and the `cortex trace` output above is real
   CLI output, not a fixture.
 
+### Fixed
+
+- **A tapped run no longer reports zero spend.** The tap wrote `llm_call`
+  frames into the `.crec`, and nothing ever read them back. A child's LLM calls
+  do not pass through the syscall dispatcher, so the kernel's `budgetsSpent`
+  stayed at zero for a run that spent real money — the summary line printed
+  `tokens: 0 (in 0, out 0)`, and `meta.json` persisted those zeros, so
+  `cortex ps`, the dashboard and `cortex audit` all showed a spending run as
+  free. A number that looks measured but is not is worse than no number.
+
+  `readTapSpend(dir, pid)` is the other half of the tap: it sums the `llm_call`
+  frames back out of the same log every other tool reads, so the summary and
+  `cortex trace` cannot disagree. `enter` frames are excluded (they carry no
+  usage — a naive sum counts every call twice), a `trap` is counted under
+  `failedCalls` and still billed, since a 500 was charged for, and a missing or
+  torn log yields the partial sum rather than throwing, because a summary line
+  that fails to print is worse than one that honestly says zero.
+
+  `cortex wrap` now folds the result into `budgetsSpent`, and the wrapper
+  records it in `wrap:result` so a later `restore` knows what the run it is
+  replacing cost. Verified end to end against a real localhost server: two calls
+  reported `tokens: 240 (in 200, out 40)` / `tap: 2 llm calls ($0.000053)` and
+  `meta.json` carried the same numbers, and a run that hung and was killed
+  still reported the 240/40 it had spent before it died.
+
+- **A timed-out `cortex wrap` no longer exits 0.** The timeout path left
+  `exitCode` null and `return exitCode ?? 0` turned "we killed it because it
+  overran" into success. In CI that is the worst available failure:
+  `cortex wrap --timeout 60 -- pytest` went green on a hung suite. It now
+  returns `137` — the shell's `128 + SIGKILL` convention, chosen because it is
+  non-zero *and* distinct from any code the child could return, so a log tells
+  "we killed it" from "it failed". A smoke check that had been asserting the old
+  `code === 0` was itself wrong about this and now asserts 137.
+
+  The timeout summary also states the code it is about to return, rather than
+  leaving the reader to infer it.
+
 ### Documentation
 
 - **The docs now match the code.** A line-by-line audit of every doc claim

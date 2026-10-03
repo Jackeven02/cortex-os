@@ -155,11 +155,13 @@ time                  pid    syscall           phase   duration  reversibility
 |---|---|
 | Killable | `cortex kill <pid>` — the signal reaches the child, escalated to `SIGKILL` after `--kill-grace-ms` |
 | Auditable | `cortex trace <pid>` — the wrapper's syscall log, including the signal handlers it registered |
-| Budgeted | `--token-budget` (with `--tap`, the child's own LLM calls count against it) |
+| Budgeted | `--token-budget` for kernel-routed calls; `--tap-token-budget` for the child's own LLM calls, metered by the tap and folded back into the reported spend |
 | Restartable | `--restart on-failure \| always`, with `--max-restarts` and the kernel's restart-storm detection |
 | Visible | `cortex ps`, `cortex top`, the dashboard — same as a spawned agent |
 
 **Exit codes are propagated.** `cortex wrap … -- pytest` returns pytest's exit code, and a missing command returns `127` with `command not found` on stderr. A supervisor that reported success for a failed run would be worse than useless in CI.
+
+**A run cortex kills exits non-zero.** When `--timeout` expires, `cortex wrap` stops the child and returns `137` — the shell's own `128 + SIGKILL` convention. It is deliberately distinct from any code the child could return on its own, so a log tells "we killed it" from "it failed". This was a bug: the timeout path had a null exit code and fell through to `0`, which made `cortex wrap --timeout 60 -- pytest` go green on a hung suite.
 
 **Timed-out runs are stopped, not abandoned.** When `--timeout` expires, cortex escalates `SIGTERM` → `SIGKILL` and waits for the child to actually die. A test asserts the child stops writing after the CLI exits, because a supervisor that leaks its child is not a supervisor.
 
@@ -193,6 +195,33 @@ cortex wrap --role agent --tap --tap-token-budget 500000 --tap-abort-on-budget -
 By default the tap **records** an overrun and lets the request finish — an audit trail beats a surprise crash. `--tap-abort-on-budget` makes the call throw instead, as if the driver returned `EDRIVER`. The spend is still written either way, so an aborted run is still auditable.
 
 `CORTEX_TAP_REQUIRED` changes the failure mode on the child's side. Without it, a malformed budget is ignored, because a typo in someone's `.env` should not take down a production run. With it — and `cortex wrap --tap` always sets it — a configuration the host cannot honour is an **error**, not a shrug. Returning a run that looks supervised and is not is the one outcome this project will not ship.
+
+### The money has to come back out of the log
+
+A tapped child's LLM calls never pass through the kernel's syscall dispatcher, so the kernel's own `budgetsSpent` counters read **zero** for a run that spent real tokens. The tap appends `llm_call` frames to the same `.crec`, and if nothing reads them back the numbers are simply gone: the summary line prints `tokens: 0` and `meta.json` persists zeros, so `cortex ps`, the dashboard and `cortex audit` all report a spending run as free.
+
+`readTapSpend(dir, pid)` is the other half of the tap — it sums those frames back out:
+
+```ts
+const spend = await readTapSpend('.cortex', 42);
+// { calls, inputTokens, outputTokens, cachedTokens, usd, failedCalls }
+```
+
+`cortex wrap` calls it after every run and folds the result into `budgetsSpent`, so the terminal summary, `meta.json` and `cortex trace` cannot disagree:
+
+```
+process exited (code 0: node exited 0)
+tokens: 240 (in 200, out 40)
+tap: 2 llm calls ($0.000053)
+```
+
+Three details worth knowing:
+
+- **`enter` frames are excluded.** They carry no usage, and a naive "sum every `llm_call` frame" counts every call twice.
+- **A failed call is counted separately, and still billed.** A request the provider answered with a 500 cost money. `failedCalls` keeps it visible without pretending it succeeded.
+- **A killed run keeps its spend.** The frames are on disk by the time the child is stopped, so a run that hung and was killed still reports what it cost before it died — which is the question you actually have at that moment.
+
+This is also why `llmTapStats()` and `readTapSpend()` are not redundant: the first answers "how much has this process spent" from *inside* the tapped process, the second answers "how much did that process spend" from *outside*, after it exited. Only the second vantage point exists for a supervisor, a dashboard or `cortex ps`.
 
 ### What checkpoint means here
 

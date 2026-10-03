@@ -56,9 +56,20 @@ import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.
 import type { AgentSpec, MemoryRegionPolicy, ProcessState, RestartPolicy } from '../../kernel/types.js';
 import { PID_INIT } from '../../kernel/process_table.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
+import { readTapSpend } from '../../integrations/llm_tap.js';
 
 /** Default time to let a wrapped run finish before the CLI gives up (ms). */
 const DEFAULT_TIMEOUT_MS = 120_000;
+
+/**
+ * What `cortex wrap` returns when it stopped the run itself.
+ *
+ * 128 + SIGKILL(9) = 137, the shell's own convention for "killed by a signal"
+ * (see `wrap_agent.ts`'s `signalNumber`, which reports 128 + N the same way).
+ * It is non-zero so CI fails, and distinct from a code the child could have
+ * returned on its own, so a log tells "we killed it" from "it failed".
+ */
+const TIMEOUT_EXIT_CODE = 137;
 
 export async function cmdWrap(args: string[]): Promise<number> {
   // Everything after `--` is the command to run. parseArgs would try to read
@@ -197,6 +208,10 @@ export async function cmdWrap(args: string[]): Promise<number> {
       // reading one env var — and `integrations/llm-tap` does that for it.
       ...(values.tap
         ? {
+            // The wrapper reads the child's spend back off this log after the
+            // child is gone, so it needs the directory too — it kept no counter
+            // of its own and must not guess where the log lives.
+            tapDir: dir,
             env: {
               CORTEX_TAP_DIR: dir,
               // The wrapper learns its own PID at runtime and substitutes the
@@ -318,10 +333,13 @@ export async function cmdWrap(args: string[]): Promise<number> {
     } else if (exitCode !== null) {
       console.log(`process exited (code ${exitCode}: ${exitReason})`);
     } else {
-      console.log(`process still ${state} after ${elapsed}ms`);
+      // Say the code we are about to return, rather than leaving the reader to
+      // infer it. `cortex wrap --timeout 60 -- pytest` in CI should be able to
+      // see "137" here and know the run was killed rather than finished.
+      console.log(`process still ${state} after ${elapsed}ms — returning ${TIMEOUT_EXIT_CODE}`);
     }
 
-    const spent = entry?.budgetsSpent ?? {
+    let spent = entry?.budgetsSpent ?? {
       tokensIn: 0,
       tokensOut: 0,
       tokensCached: 0,
@@ -329,8 +347,42 @@ export async function cmdWrap(args: string[]): Promise<number> {
       syscallCount: 0,
       wallTimeMs: elapsed,
     };
+
+    // The kernel's own counters only see syscalls that went through the
+    // dispatcher. A tapped child's LLM calls did not — they were metered by the
+    // tap and appended to the same `.crec` — so `budgetsSpent` reads zero for a
+    // run that spent real money. Read them back off the log and add them in.
+    //
+    // Two things this fixes that would otherwise be quietly wrong: the summary
+    // line printed `tokens: 0` for a run that spent 150, and `meta.json` stored
+    // those zeros, so `cortex ps`, the dashboard and `cortex audit` all reported
+    // a spending run as free. A number that looks measured but is not is worse
+    // than no number, so this is a correctness fix, not a feature.
+    let tapCalls = 0;
+    let tapFailedCalls = 0;
+    if (values.tap) {
+      const spend = await readTapSpend(dir, shownPid);
+      tapCalls = spend.calls + spend.failedCalls;
+      tapFailedCalls = spend.failedCalls;
+      spent = {
+        tokensIn: spent.tokensIn + spend.inputTokens,
+        tokensOut: spent.tokensOut + spend.outputTokens,
+        tokensCached: spent.tokensCached + spend.cachedTokens,
+        usdSpent: spent.usdSpent + spend.usd,
+        syscallCount: spent.syscallCount,
+        wallTimeMs: spent.wallTimeMs,
+      };
+    }
+
     const remaining = entry?.budgetsRemaining ?? { tokens: -1, usd: -1, wallTimeMs: -1 };
     console.log(`tokens: ${spent.tokensIn + spent.tokensOut} (in ${spent.tokensIn}, out ${spent.tokensOut})`);
+    // Only worth a line when the tap actually saw something. A wrapped command
+    // that made no LLM calls should not get a misleading "0 calls" summary.
+    if (tapCalls > 0) {
+      const plural = tapCalls === 1 ? '' : 's';
+      const failed = tapFailedCalls > 0 ? `, ${tapFailedCalls} failed` : '';
+      console.log(`tap: ${tapCalls} llm call${plural} ($${spent.usdSpent.toFixed(6)}${failed})`);
+    }
 
     // Persist so `cortex ps` / `trace` / the dashboard see this run after the
     // CLI exits. Same shape `cortex spawn` writes.
@@ -353,7 +405,17 @@ export async function cmdWrap(args: string[]): Promise<number> {
     };
     writeMeta(dir, meta);
 
-    return exitCode ?? 0;
+    // A timed-out run must not report success.
+    //
+    // `exitCode` is null on the timeout path, and `null ?? 0` turned "we killed
+    // it because it overran" into exit 0. In CI that is the worst possible
+    // failure: `cortex wrap --timeout 60 -- pytest` passes when the suite hung
+    // and was killed. A supervisor that reports success for a run it terminated
+    // is not a supervisor, so the timeout gets the shell's own convention for
+    // "killed by a signal" — 128 + SIGKILL — which is non-zero, and is
+    // distinguishable from the child's own failures in a log.
+    if (exitCode !== null) return exitCode;
+    return TIMEOUT_EXIT_CODE;
   } catch (err) {
     await kernel.shutdown();
     throw err;
