@@ -1057,6 +1057,35 @@ export class ProcessTable {
     }
   }
 
+  /**
+   * Flush and close every recorder still open.
+   *
+   * `reap()` closes the recorder of the process it removes, which covers every
+   * process that actually finishes. It does not cover the ones that never do:
+   * init is still RUNNING at shutdown by definition (it cannot exit without
+   * crashing the kernel), and a run stopped by `--timeout` may still be alive
+   * when the CLI tears down. Those recorders kept their file descriptors open
+   * until the host process exited, which Node reports as
+   * `Closing file descriptor 3 on garbage collection` — and, on a long-lived
+   * host, is an actual descriptor leak rather than a cosmetic warning.
+   *
+   * Best-effort per recorder, like `flushAll()`: one that is already closed
+   * (its process was reaped on the way here) must not stop the rest.
+   */
+  async closeAllRecorders(): Promise<void> {
+    for (const [pid, recorder] of this.#recorders) {
+      if (recorder === null) continue;
+      try {
+        await recorder.close();
+      } catch {
+        // Already closed, or the fd went away.
+      }
+      // Drop the reference either way — a recorder we failed to close must not
+      // be retried forever on the next shutdown.
+      this.#recorders.delete(pid);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // §6.9 Internal: recording
   // ---------------------------------------------------------------------------

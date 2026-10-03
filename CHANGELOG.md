@@ -241,6 +241,62 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **`cortex wrap --restart` now restarts anything.** The flag was parsed,
+  validated, stored on the process entry — and read by nobody. `kernel.spawn`
+  accepts a `restart` option and keeps it on `ProcessEntry`, but the entire
+  restart mechanism (exponential backoff, sliding-window storm detection, the
+  `maxRestarts` cap, the `restart` records) lives in `InitProcess` and is
+  reached only through `registerDaemon`. So `--restart on-failure` ran the
+  command exactly once and reported success or failure as if the policy did not
+  exist. A test that only checked "the flag is accepted" could never have
+  caught it.
+
+  `wrap` now registers as a daemon when a policy is set, which gets the real
+  machinery instead of a second copy of it. Two behaviours come with that, both
+  correct: init reaps its own daemons, and **each restart mints a fresh pid**, so
+  every attempt gets its own directory and its own `.crec`. Attempt 2's spend
+  cannot be confused with attempt 1's, and `cortex trace <pid>` shows one
+  attempt's calls.
+
+  That last point changed the reporting. The poll loop follows
+  `InitProcess.currentPidOf()` rather than the pid it was handed — polling the
+  original would see it reaped, conclude "finished", and report attempt 1's exit
+  code while attempts 2..N were still to come. It also waits while
+  `restartCount < maxRestarts` rather than waiting for a new pid to appear,
+  because init restarts on a *deferred* backoff timer (1s by default) and the
+  replacement does not exist yet at the moment the old one dies. The persisted
+  `meta.json` carries the last attempt's pid, so `cortex ps` describes how the
+  run actually ended, and the summary says which attempt the numbers belong to.
+
+  `--max-restarts N` turns out to be a cap on *runs*, not restarts: init gives
+  up once `restartCount >= N`, and `restartCount` advances when the restart is
+  decided, so N=2 runs the command twice. The field name says otherwise.
+  Renaming it or changing the arithmetic would break the frozen 1.0 ABI, so the
+  behaviour stands and is now written down in `docs/PROCESS.md` (on the field
+  itself) and `docs/INTEGRATIONS.md` (on the flag), and pinned by a smoke check
+  on both the daemon and the wrap side.
+
+  `InitProcess` gained `currentPidOf()` and `restartCountOf()`: `registerDaemon`
+  returns the *original* pid as the daemon's stable identity, so that value goes
+  stale on the first restart and a supervisor holding it polls a process that no
+  longer exists.
+
+  Verified end to end: a command that fails once then succeeds runs twice, ends
+  with the success code, and leaves two separate logs. A command that always
+  fails under `--max-restarts 2` runs twice and gives up with the command's own
+  exit code.
+
+- **Recorders are closed at shutdown, not just at reap.** `ProcessTable.reap()`
+  closes the recorder of the process it removes, which covers every process that
+  finishes. It did not cover the ones that never do: init is still RUNNING at
+  shutdown by definition, and a run stopped by `--timeout` may still be alive
+  when the CLI tears down. Those kept their file descriptors open until the host
+  process exited, which Node reports as
+  `Closing file descriptor 3 on garbage collection` on every `cortex wrap` — and
+  on a long-lived host is an actual descriptor leak rather than cosmetic noise.
+  `closeAllRecorders()` flushes and closes whatever is left, and
+  `Kernel.shutdown()` calls it.
+
 - **A tapped run no longer reports zero spend.** The tap wrote `llm_call`
   frames into the `.crec`, and nothing ever read them back. A child's LLM calls
   do not pass through the syscall dispatcher, so the kernel's `budgetsSpent`

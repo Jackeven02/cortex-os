@@ -1107,8 +1107,11 @@ export class Kernel {
    * that throws during close is logged via `onCloseError` but never blocks
    * shutdown). Idempotent: a second call returns the first call's report.
    *
-   * Init itself is left RUNNING (it cannot exit without crashing the kernel);
-   * the process table and its recorders are disposed by the host process exit.
+   * Recorders are flushed and closed here too, not just on reap. A process that
+   * never finishes — init, which cannot exit without crashing the kernel, or a
+   * run still alive when the CLI tears down — would otherwise keep its file
+   * descriptor open until the host process exits. That is what produced
+   * `Closing file descriptor 3 on garbage collection` on every `cortex wrap`.
    */
   async shutdown(): Promise<ShutdownReport> {
     if (this.#shutdownReport !== null) return this.#shutdownReport;
@@ -1123,6 +1126,10 @@ export class Kernel {
           finishedAt: this.#now(),
         };
     await this.registry.closeAll();
+    // Close, don't just flush: this is the last chance for any recorder whose
+    // process was never reaped, and a flush alone would leave the descriptor
+    // open for the host to trip over.
+    await this.table.closeAllRecorders();
     this.#shutdownReport = report;
     return report;
   }

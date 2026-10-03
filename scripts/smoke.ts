@@ -8987,7 +8987,7 @@ async function runLLMTapChecks(): Promise<void> {
 // =============================================================================
 
 async function runWrapChecks(): Promise<void> {
-  const { mkdtemp, rm, readFile } = await import('node:fs/promises');
+  const { mkdtemp, rm, readFile, writeFile } = await import('node:fs/promises');
   const { existsSync, readdirSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
@@ -9129,8 +9129,115 @@ async function runWrapChecks(): Promise<void> {
       await rm(home, { recursive: true, force: true });
     });
 
-    await checkAsync('the tap spend is folded back into the recorded budgets', async () => {
+    await checkAsync('--restart on-failure actually retries the command', async () => {
       const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      // This flag used to be accepted, stored on the process entry, and read by
+      // nobody: the whole restart mechanism lives in InitProcess behind
+      // `registerDaemon`, so `kernel.spawn({ restart })` configured nothing. The
+      // command ran exactly once. A test that only checked "the flag parses"
+      // would never have caught it, which is why the count is checked here.
+      const counter = join(home, 'attempts.txt');
+      const childFile = join(home, 'child.mjs');
+      // A file rather than `node -e`: `-e` refuses top-level await under ESM,
+      // and the tap install is exactly that.
+      await writeFile(
+        childFile,
+        [
+          "import fs from 'node:fs';",
+          `const p = ${JSON.stringify(counter)};`,
+          'let n = 0;',
+          "try { n = fs.readFileSync(p, 'utf8').length; } catch {}",
+          "fs.appendFileSync(p, 'x');",
+          'process.exit(n === 0 ? 1 : 0);',
+        ].join('\n'),
+        'utf8',
+      );
+
+      const realLog = console.log;
+      console.log = () => undefined;
+      let code = 0;
+      try {
+        code = await cmdWrap([
+          '--role',
+          'flaky',
+          '--restart',
+          'on-failure',
+          '--max-restarts',
+          '3',
+          '--timeout',
+          '15000',
+          '--',
+          process.execPath,
+          childFile,
+        ]);
+      } finally {
+        console.log = realLog;
+      }
+      assert(code === 0, `the second attempt succeeded, got ${code}`);
+
+      const attempts = existsSync(counter) ? (await readFile(counter, 'utf8')).length : 0;
+      assert(attempts === 2, `the command ran twice (fail then succeed), got ${attempts}`);
+
+      // Each attempt is a fresh process with its own directory, so the retries
+      // are individually auditable rather than one merged blob.
+      const procsDir = join(home, 'processes');
+      const logged = existsSync(procsDir)
+        ? (readdirSync(procsDir) as string[]).filter((d) => existsSync(join(procsDir, d, 'log.crec')))
+        : [];
+      assert(logged.length >= 2, `each attempt kept its own log, got ${logged.length}`);
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('--restart never leaves a failing command running forever', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      process.env['CORTEX_HOME'] = home;
+      const counter = join(home, 'attempts.txt');
+      const childFile = join(home, 'always-fails.mjs');
+      await writeFile(
+        childFile,
+        [
+          "import fs from 'node:fs';",
+          `const p = ${JSON.stringify(counter)};`,
+          "fs.appendFileSync(p, 'x');",
+          'process.exit(3);',
+        ].join('\n'),
+        'utf8',
+      );
+      const realLog = console.log;
+      console.log = () => undefined;
+      let code = 0;
+      try {
+        code = await cmdWrap([
+          '--role',
+          'doomed',
+          '--restart',
+          'on-failure',
+          '--max-restarts',
+          '2',
+          '--timeout',
+          '20000',
+          '--',
+          process.execPath,
+          childFile,
+        ]);
+      } finally {
+        console.log = realLog;
+      }
+      assert(code === 3, `the command's own failure code comes back, got ${code}`);
+      // The name says "restarts" but the implemented cap is on *runs*: init
+      // gives up when `restartCount >= maxRestarts`, and `restartCount` is
+      // incremented at the moment the restart is decided, so `maxRestarts: 2`
+      // yields two runs and one restart. Renaming the field or changing the
+      // arithmetic would break the frozen 1.0 ABI, so the behaviour stands and
+      // is documented instead. The daemon smoke check ("maxRestarts caps total
+      // restarts") pins the same rule from the other side.
+      const attempts = existsSync(counter) ? (await readFile(counter, 'utf8')).length : 0;
+      assert(attempts === 2, `the cap is two runs, got ${attempts}`);
+      await rm(home, { recursive: true, force: true });
+    });
+
+    await checkAsync('the tap spend is folded back into the recorded budgets', async () => {      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
       process.env['CORTEX_HOME'] = home;
       // The child's LLM calls never went through the dispatcher, so the
       // kernel's own counters read zero for a run that spent real tokens. If

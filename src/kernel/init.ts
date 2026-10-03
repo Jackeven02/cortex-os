@@ -304,6 +304,32 @@ export class InitProcess {
     return this.#daemons.size;
   }
 
+  /**
+   * The PID a daemon is running as *right now*.
+   *
+   * `registerDaemon` returns the original pid, which is the daemon's stable
+   * identity — but every restart mints a fresh one, so that value goes stale
+   * immediately. Anything supervising a restarting process has to ask this
+   * instead of holding on to the pid it was handed, or it will poll a process
+   * that no longer exists and conclude the run finished.
+   *
+   * Returns the original pid when the daemon is between attempts (waiting on a
+   * backoff timer, or reaped after giving up), so a caller polling in a loop
+   * sees a stable identity rather than `undefined` flickering.
+   */
+  currentPidOf(daemonId: ProcessId): ProcessId {
+    const rec = this.#daemons.get(unbrand(daemonId));
+    return rec === undefined ? daemonId : rec.currentPid;
+  }
+
+  /**
+   * How many times a daemon has been restarted. Zero means the first attempt is
+   * still the current one.
+   */
+  restartCountOf(daemonId: ProcessId): number {
+    return this.#daemons.get(unbrand(daemonId))?.restartCount ?? 0;
+  }
+
   // ---------------------------------------------------------------------------
   // §6.1 Lifecycle
   // ---------------------------------------------------------------------------

@@ -230,20 +230,45 @@ export async function cmdWrap(args: string[]): Promise<number> {
 
     const agentSpec: AgentSpec = { module: wrapperUrl, args: agentArgs };
 
-    const pid = await kernel.spawn({
-      role: values.role,
-      agent: agentSpec,
-      memory: regionPolicies,
-      ...(tokenBudget !== undefined ? { budgets: { tokens: tokenBudget } } : {}),
-      // A wrapped command is arbitrary user code that may run indefinitely,
-      // so a restart policy is opt-in rather than inherited. `never` is the
-      // honest default: re-running someone's script because it failed is a
-      // decision the operator should make, not a side effect of wrapping it.
-      ...(restart.kind !== 'never' ? { restart } : {}),
-    });
+    // A restart policy needs the *supervisor*, not just a policy field.
+    //
+    // `kernel.spawn` stores `restart` on the process entry and nothing reads it
+    // there — the whole restart mechanism (exponential backoff, sliding-window
+    // storm detection, the `maxRestarts` cap, `restart` records in init's log)
+    // lives in `InitProcess` and is reached only through `registerDaemon`. So
+    // passing `restart` to `spawn` looked like it configured supervision and
+    // silently did nothing: `--restart on-failure` ran the command exactly
+    // once, which a test that only checked the flag was accepted never saw.
+    //
+    // Registering as a daemon gets the real machinery instead of a second copy
+    // of it. Two behaviour changes come with that, both correct:
+    //   - init reaps its own daemons, so the poll loop below sees the exit
+    //     through init rather than holding a zombie.
+    //   - each restart mints a FRESH pid, so every attempt gets its own
+    //     directory and its own `.crec`. Attempt 2's spend cannot be confused
+    //     with attempt 1's, and `cortex trace <pid>` shows one attempt's calls.
+    const supervised = restart.kind !== 'never';
+    const pid = supervised
+      ? await kernel.registerDaemon({
+          role: values.role,
+          agent: agentSpec,
+          restart,
+          ...(tokenBudget !== undefined ? { budgets: { tokens: tokenBudget } } : {}),
+          ...(values.memory !== undefined ? { memory: regionPolicies } : {}),
+        })
+      : await kernel.spawn({
+          role: values.role,
+          agent: agentSpec,
+          memory: regionPolicies,
+          ...(tokenBudget !== undefined ? { budgets: { tokens: tokenBudget } } : {}),
+        });
 
     const shownPid = unbrand(pid);
     console.log(`[pid ${shownPid}] ${command.join(' ')}`);
+    if (supervised) {
+      const cap = restart.maxRestarts === undefined ? 'unlimited' : `${restart.maxRestarts} run${restart.maxRestarts === 1 ? '' : 's'}`;
+      console.log(`[pid ${shownPid}] restart policy: ${restart.kind} (cap: ${cap})`);
+    }
     if (values.tap) {
       console.log(`[pid ${shownPid}] tap enabled — the child must call installTapFromEnv() to activate it`);
       console.log('[pid] add this near the top of the child\'s entry point:');
@@ -253,23 +278,57 @@ export async function cmdWrap(args: string[]): Promise<number> {
 
     // Let the run finish. Same poll shape as `cortex spawn`: yield to the
     // event loop so the scheduler can make progress.
+    //
+    // Under a restart policy the pid moves: every attempt is a fresh process
+    // with its own directory and its own `.crec`. So the loop asks init which
+    // pid is current rather than watching the one it was handed. Polling the
+    // original would see it reaped, conclude "finished", and report the first
+    // attempt's exit code as the run's result — while attempts 2..N were still
+    // going to happen.
     const startTime = Date.now();
     let done = false;
+    let current = pid;
+    // The cap the user set, resolved once. Infinity when they set none.
+    const maxRestarts = restart.maxRestarts ?? Infinity;
     while (Date.now() - startTime < timeoutMs) {
-      const entry = kernel.table.get(pid);
+      if (supervised) {
+        const next = kernel.init.currentPidOf(pid);
+        if (unbrand(next) !== unbrand(current)) {
+          console.log(
+            `[pid ${unbrand(current)}] restarting as pid ${unbrand(next)} (attempt ${kernel.init.restartCountOf(pid) + 1})`,
+          );
+          current = next;
+        }
+      }
+      const entry = kernel.table.get(current);
       if (
         entry === undefined ||
         entry.state === 'zombie' ||
         entry.state === 'exiting' ||
         entry.state === 'suspended'
       ) {
+        // A finished attempt is not a finished run. Init restarts on a
+        // *deferred* backoff timer (1s by default), so at this instant the
+        // replacement may not exist yet and `currentPidOf` still names the dead
+        // pid. Treating that as "done" is how a supervisor declares victory one
+        // attempt before the retry — and, with a 1s backoff, it declared
+        // victory on *every* retry.
+        //
+        // The honest test is whether init has given up, not whether a new pid
+        // has appeared: it stops when `restartCount` reaches the cap. Until
+        // then this loop waits, which is also what gives the backoff timer room
+        // to fire. The timeout above remains the backstop for a wedged run.
+        if (supervised && kernel.init.restartCountOf(pid) < maxRestarts) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          continue;
+        }
         done = true;
         break;
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
 
-    const entry = kernel.table.get(pid);
+    const entry = kernel.table.get(current);
     const elapsed = Date.now() - startTime;
 
     let state: ProcessState;
@@ -279,7 +338,7 @@ export async function cmdWrap(args: string[]): Promise<number> {
     if (entry === undefined) {
       // Reaped: recover the REAL status from the .crec exit record rather than
       // assuming success, or a killed run would print "code 0: completed".
-      const exitRec = await readExitRecord(dir, pid);
+      const exitRec = await readExitRecord(dir, current);
       state = 'zombie';
       exitCode = exitRec?.code ?? 1;
       exitReason =
@@ -302,7 +361,7 @@ export async function cmdWrap(args: string[]): Promise<number> {
       state = entry.state;
       exitCode = null;
       exitReason = `timed out after ${elapsed}ms`;
-      console.error(`[pid ${shownPid}] still ${state} after ${elapsed}ms — stopping it`);
+      console.error(`[pid ${unbrand(current)}] still ${state} after ${elapsed}ms — stopping it`);
       console.error('[pid] raise --timeout, or use `cortex daemon install` for a long-lived run');
       // Same escalation init.ts uses for a daemon that overran: SIGTERM, then
       // SIGKILL after the grace period.
@@ -312,12 +371,12 @@ export async function cmdWrap(args: string[]): Promise<number> {
       // Sleeping on the event loop would deliver the signal to the kernel and
       // then shut down before the handler ever got a turn, leaving the child
       // process orphaned. settle() drives the ticks that run the handler.
-      await kernel.signals.send(pid, 'SIGTERM', PID_INIT).catch(() => undefined);
+      await kernel.signals.send(current, 'SIGTERM', PID_INIT).catch(() => undefined);
       await kernel.settle(2000, () => new Promise((resolve) => setTimeout(resolve, 10)));
-      const stillLive = kernel.table.get(pid);
+      const stillLive = kernel.table.get(current);
       if (stillLive !== undefined && stillLive.state !== 'zombie') {
-        console.error(`[pid ${shownPid}] ignored SIGTERM — sending SIGKILL`);
-        await kernel.signals.send(pid, 'SIGKILL', PID_INIT).catch(() => undefined);
+        console.error(`[pid ${unbrand(current)}] ignored SIGTERM — sending SIGKILL`);
+        await kernel.signals.send(current, 'SIGKILL', PID_INIT).catch(() => undefined);
         await kernel.settle(2000, () => new Promise((resolve) => setTimeout(resolve, 10)));
       }
     }
@@ -361,7 +420,7 @@ export async function cmdWrap(args: string[]): Promise<number> {
     let tapCalls = 0;
     let tapFailedCalls = 0;
     if (values.tap) {
-      const spend = await readTapSpend(dir, shownPid);
+      const spend = await readTapSpend(dir, unbrand(current));
       tapCalls = spend.calls + spend.failedCalls;
       tapFailedCalls = spend.failedCalls;
       spent = {
@@ -375,6 +434,18 @@ export async function cmdWrap(args: string[]): Promise<number> {
     }
 
     const remaining = entry?.budgetsRemaining ?? { tokens: -1, usd: -1, wallTimeMs: -1 };
+    if (supervised) {
+      // Say plainly which attempt the numbers below belong to. Under a restart
+      // policy each attempt is its own process with its own log, so "tokens: X"
+      // is the final attempt's spend, not the run's total — and a reader who
+      // assumes otherwise will think the retries were free.
+      const attempts = kernel.init.restartCountOf(pid) + 1;
+      console.log(
+        attempts > 1
+          ? `attempt ${attempts} of ${command.join(' ')} — earlier attempts ran as their own pids and are still on record`
+          : command.join(' '),
+      );
+    }
     console.log(`tokens: ${spent.tokensIn + spent.tokensOut} (in ${spent.tokensIn}, out ${spent.tokensOut})`);
     // Only worth a line when the tap actually saw something. A wrapped command
     // that made no LLM calls should not get a misleading "0 calls" summary.
@@ -386,10 +457,18 @@ export async function cmdWrap(args: string[]): Promise<number> {
 
     // Persist so `cortex ps` / `trace` / the dashboard see this run after the
     // CLI exits. Same shape `cortex spawn` writes.
+    //
+    // Under a restart policy the persisted pid is the LAST attempt, not the
+    // original. Those differ, and the difference decides what a reader sees:
+    // the final attempt's `budgetsSpent` and `log.crec` live under the pid that
+    // actually produced them, so persisting the original would point `cortex ps`
+    // at attempt 1's numbers and hide every retry. Each attempt's own directory
+    // and log stay on disk, so the earlier spends are still readable by pid.
+    const finalPid = unbrand(current);
     const meta: ProcessMeta = {
-      pid: shownPid,
+      pid: finalPid,
       ppid: 1,
-      pgid: shownPid,
+      pgid: finalPid,
       role: values.role,
       state,
       exitCode,
@@ -455,7 +534,10 @@ OPTIONS
   --role <name>          Label shown in \`cortex ps\` and the dashboard (required)
   --cwd <path>           Working directory for the child
   --restart <policy>     never (default) | on-failure | always
-  --max-restarts <n>     Cap restarts; the kernel also detects restart storms
+  --max-restarts <n>     Cap on RUNS (n=2 means the command runs twice, once
+                         initially and once retried), despite the name. Retries
+                         wait 1s, then 2s, 4s... The kernel also detects
+                         restart storms and gives up on its own.
   --kill-grace-ms <n>    SIGTERM to SIGKILL grace period (default 5000)
   --token-budget <n>     Token ceiling for this run
   --tap                  Tell the child it is being tapped, by setting

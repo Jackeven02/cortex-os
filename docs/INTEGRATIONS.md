@@ -159,6 +159,15 @@ time                  pid    syscall           phase   duration  reversibility
 | Restartable | `--restart on-failure \| always`, with `--max-restarts` and the kernel's restart-storm detection |
 | Visible | `cortex ps`, `cortex top`, the dashboard — same as a spawned agent |
 
+**`--restart` re-runs the command through init, not through a second code path.** The policy needs the supervisor, and the supervisor is `InitProcess` — exponential backoff, the sliding-window storm check and the `maxRestarts` cap all live there.
+
+`--max-restarts N` is a cap on **runs**, which is not what the name suggests: init gives up when `restartCount >= N`, and `restartCount` advances the moment a restart is decided. So `--max-restarts 2` runs the command twice — one initial run plus one retry. Renaming the field or changing the arithmetic would break the frozen 1.0 ABI, so the behaviour stands and is written down here instead. The first restart waits `backoffMs` (1s by default), doubling each time, so a policy with room for several retries takes correspondingly longer to exhaust.
+
+Each attempt is a **separate process with its own pid, directory and `.crec`**. Two consequences worth knowing:
+
+- The summary line reports the **final** attempt. A retry that spent money is not free — the earlier attempt's spend is still on record under its own pid, and `cortex trace <pid>` shows that attempt's calls.
+- `cortex ps` persists the last attempt's pid, so it points at the numbers that actually describe how the run ended.
+
 **Exit codes are propagated.** `cortex wrap … -- pytest` returns pytest's exit code, and a missing command returns `127` with `command not found` on stderr. A supervisor that reported success for a failed run would be worse than useless in CI.
 
 **A run cortex kills exits non-zero.** When `--timeout` expires, `cortex wrap` stops the child and returns `137` — the shell's own `128 + SIGKILL` convention. It is deliberately distinct from any code the child could return on its own, so a log tells "we killed it" from "it failed". This was a bug: the timeout path had a null exit code and fell through to `0`, which made `cortex wrap --timeout 60 -- pytest` go green on a hung suite.

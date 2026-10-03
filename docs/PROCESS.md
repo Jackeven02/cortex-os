@@ -501,7 +501,11 @@ export interface BudgetLimits {
 
 export interface RestartPolicy {
   readonly kind: 'always' | 'on-failure' | 'never';
-  readonly maxRestarts?: number;    // default Infinity
+  readonly maxRestarts?: number;    // default Infinity. Cap on RUNS, despite the
+                                    // name: init gives up once restartCount has
+                                    // reached it, and restartCount advances when
+                                    // the restart is decided. So 2 => two runs
+                                    // (one initial, one retry).
   readonly backoffMs?: number;      // default 1000, exponential
   readonly window?: number;         // sliding window for "too many restarts" alarm
 }
