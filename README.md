@@ -100,6 +100,13 @@ $ cortex watch --pid 1234
 19:50:09.077  1234    exit             enter   -         irreversible
 # pid 1234 exited with code 3 (probe finished on purpose)
 
+# Supervise a live agent: kill it if it stops making progress, and put
+# a fresh one in its place. "Stuck" is read off the syscall log, not off
+# silence — a sleep is a declared wait, not a stall.
+$ cortex supervise 1234 --kill-after 30000 --restart
+# pid 1234 has been inside recv for 1588ms — killing it
+# pid 1234 exited with code 137 (signal:SIGKILL)
+
 # Pause and resume across reboots
 # (a checkpoint captures a live process, so this needs a live kernel:
 #  `cortex daemon run` — and SIGUSR2 means "checkpoint now")
@@ -164,7 +171,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 631 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 641 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

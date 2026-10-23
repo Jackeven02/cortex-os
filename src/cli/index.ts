@@ -58,6 +58,7 @@ import { cmdLogs } from './commands/logs.js';
 import { cmdMemory } from './commands/memory.js';
 import { cmdWait } from './commands/wait.js';
 import { cmdWatch } from './commands/watch.js';
+import { cmdSupervise } from './commands/supervise.js';
 import { cmdAttach } from './commands/attach.js';
 import { cmdDaemon } from './commands/daemon.js';
 import { cmdCheckpoint } from './commands/checkpoint.js';
@@ -108,6 +109,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdWait(rest);
       case 'watch':
         return await cmdWatch(rest);
+      case 'supervise':
+        return await cmdSupervise(rest);
       case 'attach':
         return await cmdAttach(rest);
       case 'daemon':

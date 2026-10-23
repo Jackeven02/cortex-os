@@ -100,6 +100,13 @@ $ cortex watch --pid 1234
 19:50:09.077  1234    exit             enter   -         irreversible
 # pid 1234 exited with code 3 (probe finished on purpose)
 
+# 监督一个活着的 agent：卡住就杀掉，再换一个新的上来。
+# "卡住"是从 syscall 日志里读出来的，不是靠沉默判断 ——
+# sleep 是一次声明过的等待，不是停滞。
+$ cortex supervise 1234 --kill-after 30000 --restart
+# pid 1234 has been inside recv for 1588ms — killing it
+# pid 1234 exited with code 137 (signal:SIGKILL)
+
 # 跨重启暂停和恢复
 # （快照捕获的是**正在运行**的进程，所以这需要活内核：
 #   `cortex daemon run` —— SIGUSR2 的语义就是"立刻做快照"）
@@ -159,7 +166,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 631 项断言，0 失败
+npx tsx scripts/smoke.ts                # 641 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。

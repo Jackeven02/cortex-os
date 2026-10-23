@@ -246,6 +246,7 @@ import { cmdLogs } from '../src/cli/commands/logs.js';
 import { cmdMemory } from '../src/cli/commands/memory.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
+import { cmdSupervise } from '../src/cli/commands/supervise.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import {
   listDaemons,
@@ -283,6 +284,7 @@ import {
   readExitRecord,
   findCheckpointByTag,
   readSpec,
+  writeSpec,
   specPath,
   outputPath,
   readOutput,
@@ -12749,6 +12751,383 @@ async function runEventStreamChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Supervision checks (cortex supervise)
+// =============================================================================
+
+/**
+ * The shell supervising a live agent.
+ *
+ * The interesting property here is **how a stall is detected**. Not by
+ * silence — an agent parked in `recv()`, or one deep in a long LLM call, is
+ * quiet but not stuck. The syscall log knows the difference: every syscall is
+ * an `enter` frame and an `exit`/`trap` frame with the same `callId`, so a
+ * process that entered a syscall and never came out of it is *inside* that
+ * syscall, and has been for exactly as long as the gap.
+ *
+ * These checks pin the three things that have to be true for the supervisor
+ * to be worth having: it kills a process that is genuinely stuck, it leaves a
+ * process that is legitimately waiting alone, and it reports a normal ending
+ * with the process's own exit code.
+ */
+async function runSuperviseChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-supervise-'));
+  const kernels: Kernel[] = [];
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevLog = console.log;
+  const prevErr = console.error;
+
+  try {
+    const kernel = await bootKernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: tmp,
+      autoStart: true,
+      loadDrivers: (reg) => {
+        reg.registerMemory(inmemMemory());
+      },
+      agentLoader: async () => async (ctx, args) => {
+        const mode = typeof args['mode'] === 'string' ? args['mode'] : 'ok';
+        if (mode === 'stuck') {
+          // Blocks forever. The `enter` frame is written; the matching exit
+          // never is — which is exactly what a stall looks like in the log.
+          await ctx.recv();
+          return;
+        }
+        if (mode === 'sleeper') {
+          // A declared wait. Long, but not stuck.
+          await ctx.sleep(900);
+          ctx.exit(0, 'slept');
+          return;
+        }
+        if (mode === 'quiet') {
+          // One ordinary call, then a long stretch of pure JavaScript with
+          // no syscall at all. The call *closed*, so the process is not inside
+          // anything — a supervisor that could not pair the `enter` and the
+          // `trap` would still think it was stuck inside that call.
+          try {
+            await ctx.recv(undefined, { timeoutMs: 50 });
+          } catch (err) {
+            if ((err as { errno?: string }).errno !== 'ETIMEDOUT') throw err;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 1200));
+          ctx.exit(0, 'quiet but fine');
+          return;
+        }
+        if (mode === 'busy') {
+          // Busy, but making progress: a `recv` that times out every 100 ms.
+          // Each one opens a call and closes it again, so the process is
+          // never *inside* one syscall for long — and must never be killed.
+          for (let i = 0; i < 12; i += 1) {
+            try {
+              await ctx.recv(undefined, { timeoutMs: 100 });
+            } catch (err) {
+              if ((err as { errno?: string }).errno !== 'ETIMEDOUT') throw err;
+            }
+          }
+          ctx.exit(0, 'busy but fine');
+          return;
+        }
+        if (mode === 'fail') {
+          ctx.exit(1, 'failed on purpose');
+          return;
+        }
+        ctx.exit(0, 'all good');
+      },
+    });
+    kernels.push(kernel);
+
+    const server = await startKernelServer(kernel, { log: () => {} });
+    servers.push(server);
+    writeEndpoint(tmp, server.endpoint);
+    process.env['CORTEX_HOME'] = tmp;
+
+    const capture = async (
+      run: () => Promise<number>,
+    ): Promise<{ code: number; out: string; err: string }> => {
+      let out = '';
+      let err = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      console.error = (...parts: unknown[]): void => {
+        err += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      try {
+        const code = await run();
+        return { code, out, err };
+      } finally {
+        process.stdout.write = prevWrite;
+        console.error = prevErr;
+      }
+    };
+
+    await checkAsync('cortex supervise kills a process that is genuinely stuck', async () => {
+      const pid = await kernel.spawn({
+        role: 'stuck',
+        agent: { module: 'test:stuck', args: { mode: 'stuck' } },
+      });
+
+      const result = await capture(() =>
+        cmdSupervise([String(unbrand(pid)), '--kill-after', '300']),
+      );
+
+      assert(
+        result.out.includes('has been inside recv'),
+        `the stall was noticed, got: ${result.out}`,
+      );
+      assert(
+        result.out.includes(`pid ${unbrand(pid)} exited`),
+        `the ending was reported, got: ${result.out}`,
+      );
+      assert(
+        result.code === 124,
+        `the supervisor reports that it intervened (124), got ${result.code}`,
+      );
+
+      // And the process really is gone — the supervisor did not just report.
+      const stillThere = kernel.table.get(pid);
+      assert(
+        stillThere === undefined || stillThere.state === 'zombie',
+        `the stuck process is not running, got ${stillThere?.state ?? 'gone'}`,
+      );
+    });
+
+    await checkAsync('cortex supervise notices a process that was already stuck', async () => {
+      const pid = await kernel.spawn({
+        role: 'stuck-early',
+        agent: { module: 'test:stuck', args: { mode: 'stuck' } },
+      });
+
+      // Let it get properly stuck *before* the supervisor starts. The
+      // `recv`'s `enter` frame is now in the past — the stream cannot tell
+      // the supervisor about it, so the log has to.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const result = await capture(() =>
+        cmdSupervise([String(unbrand(pid)), '--kill-after', '300', '--timeout-ms', '15000']),
+      );
+
+      assert(
+        result.out.includes('is already inside recv'),
+        `the supervisor found the call the process was already in, got: ${result.out}`,
+      );
+      assert(
+        result.out.includes('has been inside recv'),
+        `the stall was noticed, got: ${result.out}`,
+      );
+      assert(
+        result.code === 124,
+        `the supervisor reports that it intervened (124), got ${result.code}`,
+      );
+    });
+
+    await checkAsync('cortex supervise leaves a process that is legitimately waiting alone', async () => {
+      const pid = await kernel.spawn({
+        role: 'sleeper',
+        agent: { module: 'test:sleeper', args: { mode: 'sleeper' } },
+      });
+
+      // The sleeper waits 900ms; the threshold is 300ms. A sleep is a
+      // declared wait, so the supervisor must not call it a stall.
+      const result = await capture(() =>
+        cmdSupervise([String(unbrand(pid)), '--kill-after', '300']),
+      );
+
+      assert(
+        !result.out.includes('has been inside sleep'),
+        `the sleep was not called a stall, got: ${result.out}`,
+      );
+      assert(
+        result.out.includes(`pid ${unbrand(pid)} exited with code 0`),
+        `the normal ending was reported, got: ${result.out}`,
+      );
+      assert(
+        result.code === 0,
+        `the supervisor returns the process's own exit code, got ${result.code}`,
+      );
+    });
+
+    await checkAsync('cortex supervise leaves a process that is making progress alone', async () => {
+      const pid = await kernel.spawn({
+        role: 'busy',
+        agent: { module: 'test:busy', args: { mode: 'busy' } },
+      });
+
+      // The agent does a `recv` that times out every 100 ms. Each call opens
+      // and closes, so it is never inside one syscall for long — a supervisor
+      // that could not pair the `enter` and `trap` frames would call this a
+      // stall and kill a process that was working fine.
+      const result = await capture(() =>
+        cmdSupervise([String(unbrand(pid)), '--kill-after', '300']),
+      );
+
+      assert(
+        !result.out.includes('has been inside'),
+        `the busy process was not called a stall, got: ${result.out}`,
+      );
+      assert(
+        result.out.includes(`pid ${unbrand(pid)} exited with code 0`),
+        `it was left to finish, got: ${result.out}`,
+      );
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+    });
+
+    await checkAsync('cortex supervise leaves a process that is making progress alone', async () => {
+      const pid = await kernel.spawn({
+        role: 'quiet',
+        agent: { module: 'test:quiet', args: { mode: 'quiet' } },
+      });
+
+      // The agent makes one call, then computes in pure JavaScript for well
+      // over the threshold. The call *closed*, so the process is not inside
+      // anything — a supervisor that kept the call open after its closing
+      // frame would kill a process that was working fine.
+      const result = await capture(() =>
+        cmdSupervise([String(unbrand(pid)), '--kill-after', '300']),
+      );
+
+      assert(
+        !result.out.includes('has been inside'),
+        `the quiet process was not called a stall, got: ${result.out}`,
+      );
+      assert(
+        result.out.includes(`pid ${unbrand(pid)} exited with code 0`),
+        `it was left to finish, got: ${result.out}`,
+      );
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+    });
+
+    await checkAsync('cortex supervise reports the exit code of a process that failed', async () => {
+      const pid = await kernel.spawn({
+        role: 'failing',
+        agent: { module: 'test:fail', args: { mode: 'fail' } },
+      });
+
+      const result = await capture(() =>
+        cmdSupervise([String(unbrand(pid)), '--kill-after', '5000']),
+      );
+
+      assert(
+        result.out.includes(`pid ${unbrand(pid)} exited with code 1`),
+        `the failure was reported, got: ${result.out}`,
+      );
+      assert(
+        result.code === 1,
+        `the supervisor returns the process's own exit code, got ${result.code}`,
+      );
+    });
+
+    await checkAsync('cortex supervise --restart puts a fresh process in place', async () => {
+      const pid = await kernel.spawn({
+        role: 'restartable',
+        agent: { module: 'test:fail', args: { mode: 'fail' } },
+      });
+
+      // The supervisor restarts from the spec that was persisted when the
+      // process was created (the CLI writes it; a host kernel does not).
+      writeSpec(tmp, {
+        pid: unbrand(pid),
+        ppid: 1,
+        role: 'restartable',
+        agent: { module: 'test:fail', args: { mode: 'fail' } },
+        memory: {},
+        startedAt: '2026-01-01T00:00:00.000Z',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+
+      const result = await capture(() =>
+        cmdSupervise([
+          String(unbrand(pid)),
+          '--restart',
+          '--max-restarts',
+          '1',
+          '--backoff-ms',
+          '10',
+          '--kill-after',
+          '5000',
+        ]),
+      );
+
+      assert(
+        result.out.includes('restarted as pid'),
+        `a fresh process was started, got: ${result.out}`,
+      );
+      const restarted = /restarted as pid (\d+)/.exec(result.out);
+      assert(restarted !== null, `the new pid is reported, got: ${result.out}`);
+      const newPid = Number(restarted![1]);
+      assert(newPid !== unbrand(pid), 'the new process has a new pid');
+      // The fresh process fails immediately, so it is already gone by now —
+      // init reaps it. What proves it *ran* is its own log on disk.
+      const newLog = join(tmp, 'processes', String(newPid), 'log.crec');
+      assert(
+        existsSync(newLog),
+        `the new process really ran (its log is at ${newLog})`,
+      );
+      assert(
+        result.code === 1,
+        `the supervisor returns the last exit code, got ${result.code}`,
+      );
+    });
+
+    await checkAsync('cortex supervise refuses a pid the kernel does not have', async () => {
+      const result = await capture(() => cmdSupervise(['999999', '--kill-after', '300']));
+      assert(result.code === 1, `exit 1, got ${result.code}`);
+      assert(
+        result.err.includes('no such process'),
+        `the reason is reported, got: ${result.err.trim()}`,
+      );
+    });
+
+    await checkAsync('cortex supervise says plainly that it needs a live kernel', async () => {
+      const empty = mkdtempSync(join(tmpdir(), 'cortex-supervisenokernel-'));
+      process.env['CORTEX_HOME'] = empty;
+      const result = await capture(() => cmdSupervise(['2', '--kill-after', '300']));
+      rmSync(empty, { recursive: true, force: true });
+      assert(result.code === 1, `exit 1, got ${result.code}`);
+      assert(
+        result.err.includes('no live kernel'),
+        `the reason is reported, got: ${result.err.trim()}`,
+      );
+    });
+
+    await checkAsync('cortex supervise refuses an option it cannot make sense of', async () => {
+      const result = await capture(() => cmdSupervise(['2', '--kill-after', 'soon']));
+      assert(result.code === 1, `exit 1, got ${result.code}`);
+      assert(
+        result.err.includes('invalid --kill-after'),
+        `the reason is reported, got: ${result.err.trim()}`,
+      );
+    });
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // CLI daemon checks (#039)
 // =============================================================================
 
@@ -13608,6 +13987,7 @@ await runOutputCaptureChecks();
 await runMemoryInspectChecks();
 await runHostWaitChecks();
 await runEventStreamChecks();
+await runSuperviseChecks();
 await runDaemonChecks();
 await runKernelHardeningChecks();
 await runTransportChecks();

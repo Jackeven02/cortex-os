@@ -985,15 +985,70 @@ The `record` lines are printed in the same layout as `cortex trace`, so the
 two can be read side by side — and they *are* the same frames, which is the
 point.
 
+**And it made the shell a supervisor.** A stream is only half a story. Until
+something *acts* on it, the operator is still the one who has to be there —
+and the project's strongest demo (a planner that notices a hung coder, kills
+it, and puts a fresh one in its place) only worked from *inside* an agent,
+written in agent code.
+
+`cortex supervise <pid>` is the shell-side version of that, and it is built
+entirely on the stream:
+
+```console
+$ cortex supervise 2 --kill-after 30000 --restart
+# supervising pid 2
+# kill it if it stays inside one syscall for more than 30000ms (sleep is exempt — it is a declared wait)
+# restart it when it ends (at most 5 time(s))
+# pid 2 is already inside recv (since 2026-10-23T20:15:39.975Z)
+# pid 2 has been inside recv for 1588ms — killing it
+# pid 2 was not running — its SIGTERM was queued, so it was killed outright
+# pid 2 exited with code 137 (signal:SIGKILL)
+```
+
+**How a stall is decided — not by silence.** Silence is not evidence of a
+stall: an agent parked in `recv()` waiting for a message, or one deep in a
+legitimate 60-second LLM call, produces no frames, and neither of them is
+stuck. The kernel's log knows the difference. Every syscall is written as an
+`enter` frame and an `exit`/`trap` frame **with the same `callId`**, so a
+process that entered `tool_call` at 10:00:00 and has produced no matching
+exit since is not "quiet" — it is *inside* `tool_call`, and has been for
+exactly as long as the gap between the two frames. That is a precise stall
+signal, and it is the one the supervisor uses. `sleep` is exempt: a sleep is
+a **declared wait**, not a stall.
+
+**The startup window is real, and the log closes it.** The stream only
+carries what happens *after* a subscriber connects — a supervisor that
+starts while the agent is already blocked would never see that `recv`'s
+`enter` frame, because it was written before the supervisor was listening.
+So the supervisor reads the process's log once at startup and works out which
+call is still open (and when it opened). The log is the record of what the
+process is doing; asking it is cheaper than guessing.
+
+**A queued signal is not a delivered signal.** `SIGTERM`'s default action is
+"terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
+a process that is *not running* sits in its pending queue until it wakes up
+— and a process stuck in a `recv` with no timeout may never wake. The kernel
+says what it did with the signal (the `__signal` record's `outcome` is
+`queued`), and the supervisor reads that off the stream: there is nothing to
+wait for, so it escalates to `SIGKILL` at once instead of burning the grace
+period. The alternative — waiting out a grace period for a signal that will
+never be seen — is how a supervisor ends up waiting on a corpse.
+
 **Known limits (v0).**
 
-- **Watching is still not reacting.** The transport carries a stream now, but
-  nothing in the kernel *acts* on what a subscriber sees: a watcher that wants
-  to kill a runaway agent still has to issue the `kill` itself. The frames
-  arrive; the policy stays with the host. That is deliberate — an operator
-  watching a kernel must not be able to change what the kernel does by
-  watching it — but it means the next thing to build is a supervisor that
-  consumes the stream, not a bigger stream.
+- **Watching is still not reacting — for a *host*.** The transport carries a
+  stream, and `cortex supervise` reacts to it. But the reaction lives in the
+  CLI, not in the kernel: nothing in the kernel *acts* on what a subscriber
+  sees, and a subscriber that wants to kill a runaway agent still has to
+  issue the `kill` itself. That is deliberate — an operator watching a
+  kernel must not be able to change what the kernel does by watching it —
+  but it means the supervisor is a program, not a kernel feature.
+- **The supervisor cannot see a hang that never made a syscall.** Its signal
+  is "this process is inside one syscall, and has been for too long". A
+  process that stops calling the kernel altogether — spinning in plain
+  JavaScript, or parked on a promise — is invisible to it, because there is
+  no frame to pair. The kernel is cooperative and does not preempt
+  (PROCESS.md §8.2); nothing short of real isolation would catch that.
 - `cortex attach` still follows the `.crec` file on disk (which the daemon
   writes to) and delivers the interactive half over the wire. `cortex logs
   --follow` has the same shape: it polls `output.log` every 250 ms. Both work

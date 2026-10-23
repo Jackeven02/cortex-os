@@ -376,6 +376,29 @@ also why the hook lives on the recorder rather than on the dispatcher: seven
 modules write records directly, and the recorder is the only place all of
 them pass through.
 
+**A host can supervise with this.** `cortex supervise` is the CLI's version,
+and it is worth reading as an example: it decides that a process is stuck by
+pairing the `enter` and `exit` frames of each call (same `callId`) and
+measuring the gap — *not* by treating silence as a stall, which would kill
+every agent waiting on a message or in the middle of a long LLM call. The
+same shape works in a host:
+
+```typescript
+const open = new Map<string, { syscall: string; since: number }>();
+kernel.subscribe((event) => {
+  if (event.kind !== 'record') return;
+  const r = event.record;
+  if (r.phase === 'enter') open.set(r.callId, { syscall: r.syscall, since: Date.now() });
+  else open.delete(r.callId);
+  // …decide what to do about an open call that is too old
+});
+```
+
+One trap worth naming: the stream only carries what happens **after** you
+subscribe. If the process is already stuck when you start watching, its
+`enter` frame is in the past — read the process's `.crec` once at startup
+to find out what it is already inside. (`cortex supervise` does.)
+
 ### 7.3 What a host cannot do
 
 - **Call syscalls as a process.** `dispatcher.invoke(pid, …)` runs the

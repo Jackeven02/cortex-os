@@ -380,6 +380,19 @@ This means an agent that is blocked waiting on an LLM response and receives SIGT
 
 `SIGUSR2` is no exception: a "checkpoint now" aimed at a parked agent waits for the agent to run again, and the snapshot is taken then. The snapshot is of the agent as it is *when it resumes*, not as it was when the signal arrived.
 
+**A queued signal waits for a wake-up that may never come.** The rule above
+is right for an agent that is waiting for something — an LLM response, a
+message — because it will wake up. But an agent parked in a `recv()` with no
+timeout, or one that never wakes at all, will never see the signal: it sits
+in the pending queue indefinitely. So `SIGTERM` alone cannot stop such an
+agent, and a graceful termination needs a fallback. `SIGKILL` is the
+fallback — it is applied immediately, whatever state the target is in — and
+`cortex supervise` uses exactly that: it reads the `outcome` of its own
+signal out of the target's `__signal` record (`queued` means "not running,
+not going to see it") and escalates at once instead of waiting out a grace
+period for a signal that will never be delivered. This is a known sharp edge
+of the queuing rule, tracked in BACKLOG.md.
+
 ### 7.3 Group signals
 
 `kill(-pgid, sig)` delivers the signal to every member of the group. This is the standard way to terminate a whole subtree.

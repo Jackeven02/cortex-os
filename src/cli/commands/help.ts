@@ -25,6 +25,7 @@ COMMANDS
   memory       What a running process knows (its memory regions)
   wait         Wait for a process to end, and report its exit code
   watch        Watch the kernel's event stream, live
+  supervise    Keep a process honest: kill it if it stalls, restart it if it ends
   checkpoint   Snapshot a process to disk
   restore      Restore a process from a checkpoint
   fork         Clone a running process at its current state

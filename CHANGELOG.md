@@ -42,6 +42,68 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex supervise <pid>` — the shell supervises a live agent.** A stream is
+  only half a story. Everything the shell could do with a live agent was
+  something a human had to do — the moment an agent got stuck, the operator
+  had to be *there*. That is not supervision, that is babysitting. And the
+  project's strongest demo (a planner that notices a hung coder, kills it,
+  and puts a fresh one in its place) only worked from *inside* an agent,
+  written in agent code.
+
+  `cortex supervise` is the shell-side version, built entirely on the event
+  stream.
+
+  ```console
+  $ cortex supervise 2 --kill-after 30000 --restart
+  # supervising pid 2
+  # kill it if it stays inside one syscall for more than 30000ms (sleep is exempt — it is a declared wait)
+  # restart it when it ends (at most 5 time(s))
+  # pid 2 is already inside recv (since 2026-10-23T20:15:39.975Z)
+  # pid 2 has been inside recv for 1588ms — killing it
+  # pid 2 was not running — its SIGTERM was queued, so it was killed outright
+  # pid 2 exited with code 137 (signal:SIGKILL)
+  ```
+
+  **A stall is decided by the log, not by silence.** Silence is not evidence
+  of a stall: an agent parked in `recv()` waiting for a message, or one deep
+  in a legitimate 60-second LLM call, produces no frames, and neither of them
+  is stuck. The kernel's log knows the difference — every syscall is an
+  `enter` frame and an `exit`/`trap` frame **with the same `callId`**, so a
+  process that entered `tool_call` and has produced no matching exit is not
+  "quiet" but *inside* `tool_call`, and has been for exactly as long as the
+  gap between the frames. `sleep` is exempt: a declared wait, not a stall.
+
+  **The startup window is real, and the log closes it.** The stream only
+  carries what happens *after* a subscriber connects, so a supervisor that
+  starts while the agent is already blocked would never see that `recv`'s
+  `enter` frame — it was written before the supervisor was listening. The
+  supervisor reads the process's log once at startup and works out which call
+  is still open, and when it opened. This was found by a real run, not by a
+  test: the first version of the command sat watching a process that was
+  demonstrably stuck and saw nothing at all.
+
+  **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
+  "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
+  a process that is not running waits in its pending queue until it wakes up
+  — and a process stuck in a `recv` with no timeout may never wake. The
+  kernel reports what it did with the signal (the `__signal` record's
+  `outcome` is `queued`), and the supervisor reads that off the stream: there
+  is nothing to wait for, so it escalates to `SIGKILL` at once instead of
+  burning a grace period on a signal that will never be seen.
+
+  Exit codes follow the established convention: the supervised process's own
+  code, **124** when the supervisor had to intervene (the convention
+  `timeout(1)` uses), **130** when the operator interrupted it.
+
+  Ten smoke checks, three of them reverse-verified: breaking the
+  `enter`/`exit` pairing makes the supervisor kill a process that was working
+  fine ("has been inside recv for 511ms — killing it"); dropping the `sleep`
+  exemption makes it kill a legitimately sleeping process; zeroing the
+  intervention exit code fails the contract.
+
+  (docs/ARCHITECTURE.md §12.1; docs/PROCESS.md §7.2; `src/cli/commands/
+  supervise.ts`; 10 smoke checks.)
+
 - **`cortex watch` — the kernel's event stream, live.** Everything the
   transport had done so far was *request/response*: a client asked, the kernel
   answered, the client went away. That is the right shape for a question, and
@@ -749,12 +811,12 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 - **The published assertion count was stale.** The READMEs' quickstart, the
   landing page's status panel and the HN launch draft all said "580 smoke
-  checks"; the suite is 631. The numbers were last refreshed when the landing
+  checks"; the suite is 641. The numbers were last refreshed when the landing
   page was first built and were never moved again, so a reader who ran the
-  suite saw fifty-one more assertions than the documents promised. All four
-  places now say 631, and the landing page's primitive grid grew a `logs`, a
-  `memory` and a `watch` tile — the grid listed twelve verbs and there are now
-  fifteen.
+  suite saw sixty-one more assertions than the documents promised. All four
+  places now say 641, and the landing page's primitive grid grew a `logs`, a
+  `memory`, a `watch` and a `supervise` tile — the grid listed twelve verbs
+  and there are now sixteen.
 
 - **Every `cortex ps` against a live kernel wrote a frame into the
   supervisor's log.** The transport's `ps` went through the dispatcher — init
