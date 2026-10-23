@@ -631,6 +631,15 @@ export class SyscallDispatcher {
   /** pid → records of synchronous syscalls awaiting their next flush. */
   #syncPending = new Map<number, SyscallRecordInput[]>();
   /**
+   * PIDs whose exit metadata has already been persisted.
+   *
+   * A process can reach ZOMBIE through two doors — the `exit` syscall and a
+   * signal — and the exit-metadata hook must fire exactly once per process.
+   * PIDs are never reused (the table's counter only ever climbs), so a
+   * per-PID set is a sound "already done" marker.
+   */
+  #persistedExitPids = new Set<number>();
+  /**
    * Capability state lives on the process-table entry (`entry.capabilities`
    * / `entry.grantable`), **not** here — it is process state, so it has to
    * survive `checkpoint` → `restore` and be visible to `ps` without going
@@ -1376,6 +1385,61 @@ export class SyscallDispatcher {
     if (this.#wakeGate === null) resume();
   }
 
+  /**
+   * Persist a process's exit metadata through the `onProcessExit` hook.
+   *
+   * Called at the ZOMBIE transition — by the `exit` syscall, and by the
+   * kernel's signal path for a process that died from a signal — so that
+   * *every* process that ends lands a `meta.json`. That is what makes
+   * agent-internal `ctx.spawn()` children visible to `ps` / `top` in a later
+   * CLI invocation (issue C2), and what makes a killed agent visible too.
+   *
+   * It used to fire only from the `exit` syscall. A signal-driven death
+   * walked the process to ZOMBIE inside `signals.ts` and handed it straight
+   * to `init` for reaping, and the entry was gone before anything could
+   * describe it — so a killed agent did not even show up as a zombie in
+   * `cortex ps`, it simply vanished. That was invisible while `cortex kill`
+   * could not actually signal anything; the moment the CLI could deliver a
+   * real signal (the loopback transport, docs/ARCHITECTURE.md §12.1), it
+   * became the difference between "the agent is dead and here is its exit
+   * code" and "the agent vanished".
+   *
+   * Best-effort: a failure to persist must not turn a clean death into a
+   * teardown crash. Idempotent — a PID is never reused, so the second call
+   * for the same PID is a no-op.
+   */
+  async persistExitMeta(pid: ProcessId): Promise<void> {
+    if (this.#onProcessExit === undefined) return;
+    const key = unbrand(pid);
+    if (this.#persistedExitPids.has(key)) return;
+
+    const entry = this.#table.get(pid);
+    if (entry === undefined) return;
+
+    this.#persistedExitPids.add(key);
+    const meta: PersistedProcessMeta = {
+      pid: key,
+      ppid: entry.ppid === null ? null : unbrand(entry.ppid),
+      pgid: unbrand(entry.pgid),
+      role: entry.role,
+      state: 'zombie',
+      exitCode: entry.exitCode,
+      exitReason: entry.exitReason,
+      startedAt: entry.startedAt,
+      lastTransitionAt: entry.lastTransitionAt,
+      budgetsSpent: { ...entry.budgetsSpent },
+      budgetsRemaining: { ...entry.budgetsRemaining },
+      agent: entry.agent,
+      kernelAbiVersion: this.kernelAbiVersion,
+    };
+    try {
+      await this.#onProcessExit(meta);
+    } catch {
+      // Meta persistence is best-effort: a failure here must not turn a
+      // clean exit into a teardown crash.
+    }
+  }
+
   async #exit(
     pid: ProcessId,
     code: number,
@@ -1420,32 +1484,7 @@ export class SyscallDispatcher {
     await this.#table.setState(pid, 'zombie', { trigger: 'exit', code });
 
     // Persist metadata NOW, before `init.handleZombie` may reap the entry.
-    // This is what makes agent-internal `ctx.spawn()` children visible to
-    // `ps` / `top` in a later CLI invocation (issue C2): every process lands a
-    // `meta.json` at exit, not just the single PID the CLI spawned directly.
-    if (this.#onProcessExit !== undefined) {
-      const meta: PersistedProcessMeta = {
-        pid: unbrand(pid),
-        ppid: entry.ppid === null ? null : unbrand(entry.ppid),
-        pgid: unbrand(entry.pgid),
-        role: entry.role,
-        state: 'zombie',
-        exitCode: entry.exitCode,
-        exitReason: entry.exitReason,
-        startedAt: entry.startedAt,
-        lastTransitionAt: entry.lastTransitionAt,
-        budgetsSpent: { ...entry.budgetsSpent },
-        budgetsRemaining: { ...entry.budgetsRemaining },
-        agent: entry.agent,
-        kernelAbiVersion: this.kernelAbiVersion,
-      };
-      try {
-        await this.#onProcessExit(meta);
-      } catch {
-        // Meta persistence is best-effort: a failure here must not turn a
-        // clean exit into a teardown crash.
-      }
-    }
+    await this.persistExitMeta(pid);
 
     // Hand off to the supervisor: reparent orphans, SIGCHLD, conditional reap,
     // daemon restart. Then wake any parent parked in wait().

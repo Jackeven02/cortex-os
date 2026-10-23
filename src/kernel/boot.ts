@@ -110,6 +110,7 @@
  */
 
 import { join } from 'node:path';
+import { mkdirSync } from 'node:fs';
 
 import {
   type AgentSpec,
@@ -476,6 +477,16 @@ export class Kernel {
       kernelAbiVersion: this.kernelAbiVersion,
       now: this.#now,
       recorderFactory,
+      // Claim a PID by creating its directory *exclusively*. The mkdir is the
+      // atomic step: exactly one kernel can win a given PID, so a daemon
+      // living in this directory and a short-lived CLI invocation working in
+      // it cannot end up appending to the same `log.crec`. Only installed for
+      // the default on-disk layout — a custom recorder factory may not use
+      // directories at all, and an in-memory kernel wants no filesystem in
+      // its PID path.
+      ...(opts.recorderFactory === undefined
+        ? { pidClaim: (pid: number) => claimPidDirectory(this.#processesDir, pid) }
+        : {}),
     });
 
     // --- signals ↔ init (deferred ref breaks the cycle, as in the smoke) -----
@@ -487,7 +498,14 @@ export class Kernel {
       kernelAbiVersion: this.kernelAbiVersion,
       now: this.#now,
       handlerInvoker,
-      onZombie: (pid, code, reason) => {
+      onZombie: async (pid, code, reason) => {
+        // A process that died from a signal never went through the `exit`
+        // syscall, so the dispatcher's exit-metadata hook has not fired for
+        // it. Persist it here — *before* init reaps the entry, because once
+        // it is reaped there is nothing left to describe. Without this, an
+        // agent killed by SIGTERM vanished from `cortex ps` instead of
+        // showing up as a zombie with its exit code.
+        await this.dispatcher?.persistExitMeta(pid);
         // Init is always constructed below, so by the time any signal is
         // delivered the ref is set. Guard anyway (defensive, cheap).
         return initRef === undefined ? undefined : initRef.handleZombie(pid, code, reason);
@@ -1144,6 +1162,39 @@ export class Kernel {
 // =============================================================================
 // §5. Helpers
 // =============================================================================
+
+/**
+ * Claim a PID by creating its process directory *exclusively*.
+ *
+ * The state directory can host more than one kernel: `cortex daemon run`
+ * keeps one alive there while other `cortex` invocations work in the same
+ * directory. Each kernel counts PIDs up from its own seed, and without a
+ * claim the two counters eventually walk into each other — at which point
+ * the loser opens the winner's `log.crec` in append mode and two unrelated
+ * processes share one syscall log. The `mkdir` is the fix: it is atomic,
+ * so exactly one caller can win a given PID.
+ *
+ * @returns `true` when this kernel claimed the PID, `false` when somebody
+ *          else already holds it.
+ */
+function claimPidDirectory(processesDir: string, pid: number): boolean {
+  const path = join(processesDir, String(pid));
+  try {
+    // The parent may not exist yet on a fresh state directory.
+    mkdirSync(processesDir, { recursive: true });
+  } catch {
+    return false;
+  }
+  try {
+    // `recursive: false` is the whole point: the mkdir fails when the
+    // directory already exists, and that failure is the "somebody else owns
+    // this PID" signal.
+    mkdirSync(path, { recursive: false });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;

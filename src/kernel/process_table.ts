@@ -331,6 +331,27 @@ export interface ProcessTableOptions {
    * `() => new Date().toISOString()`.
    */
   readonly now?: () => Timestamp;
+  /**
+   * Try to *claim* a PID before it is handed out.
+   *
+   * A PID is only meaningful inside one kernel, but the PID *space* belongs
+   * to the kernel's state directory — and a directory can host more than one
+   * kernel. `cortex daemon run` keeps a kernel alive in `.cortex/` while
+   * other `cortex` invocations work in the same directory, and each of them
+   * counts PIDs up from its own seed. Without a claim, the two counters walk
+   * into each other, and the loser opens the winner's `log.crec` in append
+   * mode: two unrelated processes sharing one syscall log, silently.
+   *
+   * The claim is the fix, and it has to be atomic — hence the filesystem
+   * rather than a counter. The production claimer creates
+   * `<dir>/processes/<pid>/` with an *exclusive* mkdir, which exactly one
+   * caller can win. A false return means "someone else holds this PID" and
+   * the table moves on to the next one.
+   *
+   * Optional: absent (the default) the table allocates purely in memory,
+   * which is what an in-memory kernel wants.
+   */
+  readonly pidClaim?: (pid: number) => boolean;
 }
 
 /**
@@ -362,11 +383,13 @@ export class ProcessTable {
   #nextPid = PID_FIRST_USER;
   #recorderFactory: RecorderFactory;
   #now: () => Timestamp;
+  #pidClaim: ((pid: number) => boolean) | null;
 
   constructor(opts: ProcessTableOptions) {
     this.kernelAbiVersion = opts.kernelAbiVersion;
     this.#recorderFactory = opts.recorderFactory ?? nullRecorderFactory;
     this.#now = opts.now ?? (() => new Date().toISOString());
+    this.#pidClaim = opts.pidClaim ?? null;
   }
 
   // ---------------------------------------------------------------------------
@@ -389,6 +412,31 @@ export class ProcessTable {
       this.#nextPid++;
     }
     return asProcessId(this.#nextPid++);
+  }
+
+  /**
+   * Allocate a PID that this kernel can prove is unclaimed.
+   *
+   * Without a claimer this is just `nextPid()`. With one, a candidate that
+   * somebody else already holds is skipped — the claim is what keeps two
+   * kernels sharing a state directory from writing the same `.crec` file
+   * (see `ProcessTableOptions.pidClaim`).
+   *
+   * The bound on the search is a backstop, not a policy: a directory with
+   * 4096 consecutive taken PIDs is not a thing that happens, and looping
+   * forever on a broken claimer would be worse than failing loudly.
+   */
+  #claimNextPid(): ProcessId {
+    const claim = this.#pidClaim;
+    if (claim === null) return this.nextPid();
+    for (let attempt = 0; attempt < 4096; attempt += 1) {
+      const candidate = this.nextPid();
+      if (claim(unbrand(candidate))) return candidate;
+    }
+    trap('EAGAIN', 'allocate', {
+      reason: 'could not find an unclaimed PID',
+      attempts: 4096,
+    });
   }
 
   /**
@@ -439,7 +487,7 @@ export class ProcessTable {
     }
 
     // Determine PID.
-    const pid = opts.pid ?? this.nextPid();
+    const pid = opts.pid ?? this.#claimNextPid();
     if (this.#entries.has(unbrand(pid))) {
       trap('EINVAL', 'allocate', {
         pid: unbrand(pid),

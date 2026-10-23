@@ -311,6 +311,36 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A process killed by a signal never got its exit metadata.** The
+  `onProcessExit` hook — the thing that writes a `meta.json` so `cortex ps`
+  and `cortex top` can show a process after it ends — fired only from the
+  `exit` syscall. A process that died from a signal never went through that
+  path: `signals.ts` walked it to ZOMBIE and handed it to `init` for
+  reaping, and the entry was gone before anything could describe it. The
+  consequence was that a signalled process did not show up as a *zombie*
+  with its exit code — it simply vanished from the process list.
+
+  That was invisible while `cortex kill` could not actually signal
+  anything, because it rewrote the metadata itself. The moment the CLI
+  could deliver a real signal (the loopback transport, above), it became
+  the difference between "the agent is dead, here is exit 137 (signal:
+  SIGKILL)" and "the agent is gone". The signal path now persists the exit
+  metadata before `init` reaps the entry, and the dispatcher exposes that
+  step as `persistExitMeta()` so both doors into ZOMBIE share it.
+
+- **Two kernels in one state directory could hand out the same PID.** A
+  state directory can host more than one kernel — `cortex daemon run` keeps
+  one alive there while other `cortex` invocations work in the same
+  directory — and each kernel counted PIDs up from its own seed. The two
+  counters were not coordinated, so they walked into each other, and the
+  loser opened the winner's `log.crec` in append mode: two unrelated
+  processes sharing one syscall log, silently, with no error anywhere.
+
+  The fix is a *claim*. A PID's directory is created with an exclusive
+  `mkdir`, which is atomic, so exactly one kernel can win a given PID; the
+  other skips to the next one. The PID space belongs to the directory, and
+  now the directory enforces it. (`docs/ARCHITECTURE.md` §7.)
+
 - **A failed `recv` or `checkpoint` was written to the log twice.** The
   recording-ownership work in ABI.md §11 moved `recv` and `checkpoint` onto
   the dispatcher's single path — but it moved only their *success* records.

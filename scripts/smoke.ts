@@ -11874,6 +11874,105 @@ async function runDaemonChecks(): Promise<void> {
     rmSync(tmp, { recursive: true, force: true });
   }
 }
+// =============================================================================
+// Kernel hardening checks — the two bugs the live-kernel transport exposed
+// =============================================================================
+
+/**
+ * Both of these were invisible while the CLI could not deliver a real signal
+ * or run two kernels in one directory. They are checked here, directly
+ * against the kernel API, so they do not depend on the transport.
+ */
+async function runKernelHardeningChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, readdirSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-hardening-'));
+
+  const kernels: Kernel[] = [];
+
+  async function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (fn()) return true;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return fn();
+  }
+
+  try {
+    await checkAsync('a process killed by a signal persists its exit metadata', async () => {
+      // The `exit` syscall persisted the meta; a signal death used to skip
+      // that path entirely, so a killed agent vanished from `ps` instead of
+      // showing up as a zombie with its exit code.
+      const exits: { pid: number; exitCode: number | null; exitReason: string | null }[] = [];
+      const k = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir: tmp,
+        autoStart: true,
+        loadDrivers: (reg) => reg.registerLLM(mockLLM()),
+        agentLoader: async () => async (ctx) => {
+          // Park on a long recv, so the kill lands on a BLOCKED process.
+          try {
+            await ctx.recv(undefined, { timeoutMs: 60_000 });
+          } catch {
+            /* the process is going away */
+          }
+        },
+        onProcessExit: (meta) => {
+          exits.push({ pid: meta.pid, exitCode: meta.exitCode, exitReason: meta.exitReason });
+        },
+      });
+      kernels.push(k);
+
+      const pid = await k.spawn({ role: 'victim', agent: { module: 'test:victim' } });
+      assert(await waitFor(() => k.table.get(pid)?.state === 'blocked'), 'the victim parked');
+
+      await k.signals.send(pid, 'SIGKILL');
+      assert(await waitFor(() => exits.length > 0), 'the exit hook fired for the signal death');
+
+      const meta = exits[0]!;
+      assert(meta.pid === unbrand(pid), `the meta names the right pid, got ${meta.pid}`);
+      assert(meta.exitReason === 'signal:SIGKILL', `exit reason, got ${meta.exitReason}`);
+      assert(meta.exitCode === 137, `exit code, got ${meta.exitCode}`);
+    });
+
+    await checkAsync('a second kernel in the same directory does not reuse a PID', async () => {
+      // A state directory can host more than one kernel — a daemon plus a
+      // short-lived CLI invocation. Each counts PIDs up from its own seed, so
+      // without a claim the two walk into each other and the loser appends
+      // to the winner's `log.crec`: two processes sharing one syscall log,
+      // silently.
+      const claimedBefore = new Set(
+        readdirSync(join(tmp, 'processes')).filter((d) => /^\d+$/.test(d)),
+      );
+      const second = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir: tmp,
+        autoStart: false,
+        loadDrivers: (reg) => reg.registerLLM(mockLLM()),
+        agentLoader: async () => async () => {},
+      });
+      kernels.push(second);
+      const pid = unbrand(await second.spawn({ role: 'other', agent: { module: 'test:other' } }));
+      assert(
+        !claimedBefore.has(String(pid)),
+        `the new pid ${pid} was already claimed by the first kernel`,
+      );
+      assert(claimedBefore.size >= 1, `the first kernel claimed a pid, got ${claimedBefore.size}`);
+    });
+  } finally {
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -11896,6 +11995,7 @@ await runSqliteChecks();
 runRegionsChecks();
 await runCliChecks();
 await runDaemonChecks();
+await runKernelHardeningChecks();
 await runBootChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
