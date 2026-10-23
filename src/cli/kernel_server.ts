@@ -26,8 +26,21 @@
  * being half-delivered. The transport adds reachability; it does not add a
  * side door around the kernel's guarantees.
  *
- * The two exceptions are `ping` and `shutdown`, which are transport-level
- * housekeeping and deliberately leave no trace in the syscall log.
+ * The exceptions are the three commands that are **not actions by an agent**,
+ * and they are exceptions for that reason alone.
+ *
+ * - `ping` and `shutdown` are transport-level housekeeping.
+ * - `ps` is the operator *looking* at the process table. The transport reads
+ *   the table directly instead of making init call the `ps` syscall on the
+ *   operator's behalf, because a monitoring loop that polls every second
+ *   would otherwise write a frame into init's log for every poll — and a
+ *   read is not something the kernel's causal history should record. (An
+ *   agent's own `ctx.ps()` is still a syscall and is still recorded, per
+ *   ABI.md §4.1. Only the transport's view of the table is not.)
+ *
+ * Everything that *acts* — `send`, `kill`, `checkpoint`, `restore`, `spawn` —
+ * goes through the dispatcher, and is recorded exactly like the local
+ * equivalent.
  *
  * ## The kernel stays transport-agnostic
  *
@@ -379,7 +392,14 @@ async function dispatch(
 
     case 'ps': {
       const filter = args['filter'] as ProcessFilter | undefined;
-      const processes = await kernel.dispatcher.invoke(asProcessId(1), 'ps', filter);
+      // A read, not an action: the transport asks the kernel what its process
+      // table looks like, and that question is not the kernel's business to
+      // record. Going through `dispatcher.invoke` here would make init call
+      // the `ps` syscall on the operator's behalf and write a frame into
+      // init's log for every poll — a monitoring loop would grow the log
+      // without doing anything. An agent's own `ctx.ps()` is unaffected: that
+      // is still a syscall, and still recorded (ABI.md §4.1).
+      const processes = kernel.table.list(filter);
       return { processes };
     }
 

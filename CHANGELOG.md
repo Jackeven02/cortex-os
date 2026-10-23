@@ -491,6 +491,29 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **Every `cortex ps` against a live kernel wrote a frame into the
+  supervisor's log.** The transport's `ps` went through the dispatcher — init
+  calling the `ps` syscall on the operator's behalf — so a monitoring loop
+  polling every second grew init's `.crec` without doing any work, and the
+  supervisor's causal history filled up with frames about looking.
+
+  The transport now reads the process table directly. The distinction is
+  deliberate: `ping` and `shutdown` are transport-level housekeeping, and
+  `ps` is the operator *looking* — none of the three is an action by an
+  agent, so none of them belongs in the kernel's record of what its agents
+  did. Everything that *acts* (`send`, `kill`, `checkpoint`, `restore`,
+  `spawn`) still goes through the dispatcher and is still recorded exactly
+  like the local equivalent.
+
+  An agent's own `ctx.ps()` is untouched: it is still a syscall, still
+  recorded, still shaped by ABI.md §4.1. Only the transport's view of the
+  table changed, and the wire format did not.
+
+  The check fails without the change — it was confirmed to fail, not merely
+  to pass.
+
+  (src/cli/kernel_server.ts; 1 smoke check.)
+
 - **A snapshot of a running agent could not be restored once its kernel was
   gone.** The `.csnap` body deliberately omits the agent spec (docs/STATE.md
   §4) — a restore has to be told what to rebuild. The only thing on disk that

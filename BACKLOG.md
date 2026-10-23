@@ -244,8 +244,6 @@ Things we want, but not yet:
   a `SIGUSR2` that had to wait for its target to run again is recorded
   without a `from`. Preserving the sender needs a `ProcessInfo` change —
   a `2.0` conversation, not a `1.1` one.
-- A read-only transport query that is *not* recorded (today `ps` goes through
-  the dispatcher, so every poll adds a frame to init's log).
 
 ---
 

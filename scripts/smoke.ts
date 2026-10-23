@@ -12335,6 +12335,28 @@ async function runTransportChecks(): Promise<void> {
         );
       });
 
+      await checkAsync('a remote ps leaves no trace in the kernel\'s log', async () => {
+        // The transport's `ps` is the operator *looking* at the process table,
+        // not an agent doing something — so it must not write a frame into
+        // init's log. It used to: every poll went through `dispatcher.invoke`,
+        // so a monitoring loop grew the supervisor's causal history without
+        // doing any work.
+        const countPsFrames = async (): Promise<number> => {
+          let n = 0;
+          for await (const r of readRecords(existingCrecPath(tmp, PID_INIT))) {
+            if (r.syscall === 'ps') n += 1;
+          }
+          return n;
+        };
+        const before = await countPsFrames();
+        for (let i = 0; i < 5; i += 1) {
+          const response = await client!.requestRaw('ps');
+          assert(response.ok === true, `ps ${i} succeeds, got ${JSON.stringify(response)}`);
+        }
+        const after = await countPsFrames();
+        assert(after === before, `no ps frames were written, got ${after - before}`);
+      });
+
       await checkAsync('a remote checkpoint snapshots a live agent', async () => {
         // The whole point of the transport: a process that is *running* can be
         // snapshotted from another process. Before the transport existed this

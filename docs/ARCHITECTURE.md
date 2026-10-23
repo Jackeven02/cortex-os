@@ -715,6 +715,18 @@ message had no inbox to land in and the kernel exited a millisecond later
 taking it away. `cortex kill` could not signal anything either — it
 rewrote the on-disk metadata. Both are real now, against a live kernel.
 
+**And it stopped polluting the log.** Every transport command that *acts* —
+`send`, `kill`, `checkpoint`, `restore`, `spawn` — is answered through the
+dispatcher, so it is recorded in the kernel's `.crec` exactly like the local
+equivalent. The read-only ones are not: `ping` and `shutdown` are
+transport-level housekeeping, and `ps` is the operator *looking* at the
+process table. The transport reads the table directly rather than making init
+call the `ps` syscall on the operator's behalf — because a monitoring loop
+that polls every second would otherwise write a frame into init's log for
+every poll, and a read is not something the kernel's causal history should
+record. (An agent's own `ctx.ps()` is unaffected: still a syscall, still
+recorded — ABI.md §4.1.)
+
 **And it made the snapshot reachable.** `cortex checkpoint <pid>` used to be
 a command that could not succeed: a checkpoint captures a *running* process,
 and the short-lived CLI kernel holds only init, so the PID it was asked about
