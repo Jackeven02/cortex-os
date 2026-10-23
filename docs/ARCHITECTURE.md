@@ -1030,6 +1030,40 @@ kernel does not park a process while its LLM call is in flight (PROCESS.md
 §3.7), so such a process is `running`, not `blocked`, and the process table
 says nothing is wrong. The log says it is four minutes into an `llm_call`.
 
+**And the dashboard stopped reading only the dead.** The dashboard is the
+operator's window, and it had the same blind spot as everything else that
+reads the disk: a process that has not exited has no `meta.json` yet, because
+the kernel writes it when the process ends. So its process list was a
+directory of corpses — the agents that had finished — and the agent that was
+actually working was missing from it. The activity feed was worse: it was
+built by scanning the logs of the processes that *had* a `meta.json`, so the
+200 KB of syscall frames a running agent had already produced were on disk
+and invisible.
+
+With a live kernel the dashboard reads that kernel's own process table, and
+takes the event stream by push: the frames arrive as the kernel writes them,
+and nothing is re-read. The disk is still the source for everything that has
+finished, and the log of a running process is still read from disk — a
+`meta.json` is a *process record*, not a *log file*, and the log is there
+from the very first syscall.
+
+The two paths produce the same events, because they go through the same
+conversion (`toDashboardEvent`): a frame pushed over the wire and the same
+frame read off disk are the same object. That is the rule the whole project
+follows — two views of the same fact must not be able to disagree.
+
+The process list, meanwhile, is the *same view* `cortex ps` shows: one
+module (`src/cli/process_view.ts`) answers for both, and it takes the
+connection it is given rather than opening its own — the dashboard holds one
+connection for its whole life and hands it over.
+
+**And the dashboard learned to stop.** An open event stream is a connection
+that never ends by itself, and `server.close()` waits for it. The dashboard's
+own UI holds one open from the moment it loads, so Ctrl+C would hang the
+dashboard instead of stopping it — the operator's way out was the one thing
+that did not work. The server now drops its connections when it closes, and
+closing twice is not an error.
+
 **The startup window is real, and the log closes it.** The stream only
 carries what happens *after* a subscriber connects — a supervisor that
 starts while the agent is already blocked would never see that `recv`'s
@@ -1132,6 +1166,11 @@ different endings, and the operator is told which one happened.
   exited and written its meta.
 - A crashed kernel leaves a stale `kernel.json` behind. Clients detect it
   (the port refuses the connection) and fall back to the disk view.
+- **The dashboard's pushed stream needs the kernel.** Without one, it falls
+  back to watching the directory and re-reading every log on every change —
+  the thing the live path replaced. And the *process list* is then the disk's:
+  a running process has no `meta.json` yet, so it has no row (its log is
+  still shown).
 - A **queued** signal loses its sender. The pending queue holds the signal
   (`pendingSignals` is part of `ProcessInfo`, and the ABI is frozen), so a
   `SIGUSR2` that had to wait for the target to run again is recorded without

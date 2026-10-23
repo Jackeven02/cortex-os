@@ -187,7 +187,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 651 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 655 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -300,7 +300,7 @@ $ cortex dashboard                  # read-only: watch only
 $ cortex dashboard --ops spawn,kill,restore   # allow those three from the UI
 ```
 
-Read-only by default. The dashboard has no resident kernel to talk to, so it does what any viewer of a filesystem can do: it reads `.cortex/processes/<pid>/meta.json`, decodes the `.crec` syscall logs, lists checkpoints, and renders the tree. `restore` is a pure disk write, which is why it works even in v0's no-daemon model.
+Read-only by default. With a live kernel in the directory (`cortex daemon run`), the dashboard **watches that kernel**: the processes that are *running* appear in the list — a running process has no `meta.json` yet, so a disk-only view would show a directory of corpses — and the event stream arrives by push, as the kernel writes it. Without one it does what any viewer of a filesystem can do: it reads `.cortex/processes/<pid>/meta.json`, decodes the `.crec` syscall logs (including the logs of processes that are still running), lists checkpoints, and renders the tree. `restore` is a pure disk write, which is why it works even in v0's no-daemon model.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

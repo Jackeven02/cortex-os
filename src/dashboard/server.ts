@@ -6,15 +6,42 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { format } from 'node:util';
 import { asProcessId } from '../kernel/types.js';
-import type { ProcessInfo } from '../kernel/types.js';
+import type { ProcessInfo, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
-import { readAllMetas } from '../cli/process_store.js';
+import { readAllMetas, listProcDirs } from '../cli/process_store.js';
+import { readProcessView } from '../cli/process_view.js';
+import type { KernelCommand } from '../cli/kernel_protocol.js';
+
+/**
+ * The live kernel the dashboard watches, if there is one.
+ *
+ * A `KernelClient` satisfies this. It is an interface rather than a concrete
+ * client so the dashboard can be driven by anything that can answer a
+ * command and push events — the CLI hands it the transport client, and a
+ * test hands it a fake.
+ */
+export interface DashboardKernel {
+  /** Ask the kernel a question (`ps`). */
+  request(cmd: KernelCommand, args?: Record<string, unknown>): Promise<unknown>;
+  /** Subscribe to the kernel's event stream. Returns an unsubscribe. */
+  subscribe(handler: (event: unknown) => void): Promise<() => void>;
+}
 
 export interface DashboardOptions {
   readonly dir?: string;
   readonly host?: string;
   readonly port?: number;
   readonly processes?: () => readonly ProcessInfo[];
+  /**
+   * The live kernel to watch.
+   *
+   * With one, the dashboard shows the processes that are **running** — a
+   * process that has not exited has no `meta.json` yet, so the disk alone
+   * shows a directory of corpses and omits the agent that is actually
+   * working — and the event stream arrives by push instead of by re-reading
+   * every log on every filesystem change.
+   */
+  readonly kernel?: DashboardKernel;
   /**
    * Opt-in write operations. Off by default.
    * `true` enables every op (`spawn`, `kill`, `restore`); an array enables
@@ -73,59 +100,97 @@ async function readEvents(dir: string, range: TimeRange): Promise<unknown[]> {
   return rows.reverse();
 }
 
+/**
+ * One event in the dashboard's activity panel.
+ *
+ * Derived from a syscall frame — the same frame the `.crec` log holds.
+ */
+interface DashboardEvent {
+  type: string;
+  at: string;
+  runId: string;
+  pid: number;
+  name: string;
+  durationMs?: number;
+  error?: string;
+  errorMessage?: string;
+  model?: string;
+  tokensIn?: number;
+  tokensOut?: number;
+  usd?: number;
+  audit?: Record<string, unknown>;
+}
+
+/**
+ * Turn a syscall frame into a dashboard event — or `undefined` when the
+ * frame is not one the dashboard shows.
+ *
+ * The disk path and the live path both go through here, so a frame that
+ * arrives by push looks exactly like the same frame read off disk. Two
+ * rules, and they are the same rules the log view uses: a call's `enter`
+ * frame is not an event (the `exit` frame is), and the kernel's own
+ * `__`-prefixed bookkeeping frames are not the agent's work.
+ */
+function toDashboardEvent(record: SyscallRecord, pid: number): DashboardEvent | undefined {
+  if (record.phase === 'enter' || record.syscall.startsWith('__')) return undefined;
+  const type =
+    record.syscall === 'llm_call'
+      ? 'llm.call'
+      : record.syscall === 'tool_call'
+        ? 'tool.call'
+        : `kernel.${record.syscall}`;
+  // Tools may attach a generic `audit` object to their structured
+  // output. It is passed through verbatim — the dashboard does not
+  // know (or care) what domains put inside it.
+  const toolResult = record.result as
+    | { output?: { structured?: { audit?: Record<string, unknown> } } }
+    | undefined;
+  const audit = record.syscall === 'tool_call' ? toolResult?.output?.structured?.audit : undefined;
+  const llmResult =
+    record.syscall === 'llm_call'
+      ? (record.result as
+          | { model?: string; usage?: { inputTokens?: number; outputTokens?: number; usd?: number } }
+          | undefined)
+      : undefined;
+  return {
+    type,
+    at: record.timestamp,
+    runId: record.callId,
+    pid,
+    name: record.syscall,
+    ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
+    ...(record.error !== undefined ? { error: record.error.errno } : {}),
+    ...(record.error !== undefined ? { errorMessage: safeErrorMessage(record.error.message) } : {}),
+    ...(llmResult?.model !== undefined ? { model: llmResult.model } : {}),
+    ...(llmResult?.usage?.inputTokens !== undefined ? { tokensIn: llmResult.usage.inputTokens } : {}),
+    ...(llmResult?.usage?.outputTokens !== undefined ? { tokensOut: llmResult.usage.outputTokens } : {}),
+    ...(llmResult?.usage?.usd !== undefined ? { usd: llmResult.usage.usd } : {}),
+    ...(audit !== undefined ? { audit } : {}),
+  };
+}
+
 async function readSyscallEvents(dir: string, range: TimeRange): Promise<unknown[]> {
-  const events: Array<{
-    type: string;
-    at: string;
-    runId: string;
-    pid: number;
-    name: string;
-    durationMs?: number;
-    error?: string;
-    errorMessage?: string;
-    model?: string;
-    tokensIn?: number;
-    tokensOut?: number;
-    usd?: number;
-    audit?: Record<string, unknown>;
-  }> = [];
+  const events: DashboardEvent[] = [];
   const filtering = range.from !== undefined || range.to !== undefined;
-  for (const meta of readAllMetas(dir)) {
-    const path = existingCrecPath(dir, asProcessId(meta.pid));
+  // Every process that has a log — running or finished.
+  //
+  // Scanning the metas alone would show a directory of corpses: a running
+  // process has no `meta.json` yet (the kernel writes it when the process
+  // exits), so its log — which is on disk all the same, and is being
+  // appended to right now — would never be read. The agent that is working
+  // is the one whose history the operator wants.
+  const pids = new Set<number>([
+    ...listProcDirs(dir).map((p) => p.pid),
+    ...readAllMetas(dir).map((m) => m.pid),
+  ]);
+  for (const pid of [...pids].sort((a, b) => a - b)) {
+    const path = existingCrecPath(dir, asProcessId(pid));
     if (!existsSync(path)) continue;
     try {
       for await (const record of readRecords(path)) {
-        if (record.phase === 'enter' || record.syscall.startsWith('__')) continue;
         if (filtering && !inRange(Date.parse(record.timestamp), range)) continue;
-        const type = record.syscall === 'llm_call'
-          ? 'llm.call'
-          : record.syscall === 'tool_call'
-            ? 'tool.call'
-            : `kernel.${record.syscall}`;
-        // Tools may attach a generic `audit` object to their structured
-        // output. It is passed through verbatim — the dashboard does not
-        // know (or care) what domains put inside it.
-        const toolResult = record.result as { output?: { structured?: { audit?: Record<string, unknown> } } } | undefined;
-        const audit = record.syscall === 'tool_call' ? toolResult?.output?.structured?.audit : undefined;
-        const llmResult = record.syscall === 'llm_call' ? record.result as {
-          model?: string;
-          usage?: { inputTokens?: number; outputTokens?: number; usd?: number };
-        } | undefined : undefined;
-        events.push({
-          type,
-          at: record.timestamp,
-          runId: record.callId,
-          pid: meta.pid,
-          name: record.syscall,
-          ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
-          ...(record.error !== undefined ? { error: record.error.errno } : {}),
-          ...(record.error !== undefined ? { errorMessage: safeErrorMessage(record.error.message) } : {}),
-          ...(llmResult?.model !== undefined ? { model: llmResult.model } : {}),
-          ...(llmResult?.usage?.inputTokens !== undefined ? { tokensIn: llmResult.usage.inputTokens } : {}),
-          ...(llmResult?.usage?.outputTokens !== undefined ? { tokensOut: llmResult.usage.outputTokens } : {}),
-          ...(llmResult?.usage?.usd !== undefined ? { usd: llmResult.usage.usd } : {}),
-          ...(audit !== undefined ? { audit } : {}),
-        });
+        const event = toDashboardEvent(record, pid);
+        if (event !== undefined) events.push(event);
       }
     } catch {
       continue;
@@ -138,6 +203,22 @@ async function readSyscallEvents(dir: string, range: TimeRange): Promise<unknown
 
 const byNewest = (a: unknown, b: unknown): number =>
   Date.parse(String((b as { at?: string }).at ?? '')) - Date.parse(String((a as { at?: string }).at ?? ''));
+
+/**
+ * The processes the dashboard shows.
+ *
+ * The same view `cortex ps` shows: a live kernel's own process table for
+ * the processes it still holds, the disk's records for the ones it has
+ * finished. Without a kernel it is the disk alone — which is a directory of
+ * *finished* processes, because a process that has not exited has no
+ * `meta.json` yet. That is why the dashboard needs a kernel to show the
+ * agent that is actually working.
+ */
+async function listProcesses(dir: string, options: DashboardOptions): Promise<unknown[]> {
+  if (options.processes !== undefined) return [...options.processes()];
+  const view = await readProcessView(dir, options.kernel);
+  return [...view.rows];
+}
 
 /** Every write operation the dashboard knows how to perform. */
 const DASHBOARD_OPS = ['spawn', 'kill', 'restore'] as const;
@@ -323,8 +404,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         return;
       }
       if (url.pathname === '/api/processes') {
-        const live = options.processes?.();
-        json(response, 200, live ?? readAllMetas(dir));
+        json(response, 200, await listProcesses(dir, options));
         return;
       }
       if (url.pathname === '/api/events') {
@@ -360,16 +440,91 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         let watcher: FSWatcher | undefined;
         let debounce: ReturnType<typeof setTimeout> | undefined;
         let heartbeat: ReturnType<typeof setInterval> | undefined;
+        let unsubscribe: (() => void) | undefined;
         const send = (event: string, data: unknown): void => {
           if (!closed) response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
         };
+
+        // --- the live path: the kernel pushes ------------------------------
+        // Nothing is re-read. The frames arrive as the kernel writes them,
+        // and the process list comes from the kernel's own table. This is
+        // the difference between watching a kernel and watching a
+        // directory: the disk path re-reads *every* log on *every* change.
+        if (options.kernel !== undefined) {
+          // Frames that arrive while the history is being read are held, so
+          // that nothing is lost and nothing is shown twice.
+          const held: unknown[] = [];
+          let ready = false;
+          let recent: unknown[] = [];
+          const seeded = new Set<string>();
+
+          const handle = (raw: unknown): void => {
+            const event = raw as { kind?: string; pid?: number; record?: unknown };
+            if (event.kind === 'record') {
+              const converted = toDashboardEvent(event.record as SyscallRecord, event.pid ?? 0);
+              if (converted === undefined) return;
+              // A frame that was already in the history is not new.
+              if (seeded.has(converted.runId)) return;
+              recent = [converted, ...recent].slice(0, limit);
+              send('events', recent);
+              return;
+            }
+            if (event.kind === 'process-start' || event.kind === 'process-exit') {
+              void listProcesses(dir, options).then((rows) => {
+                send('processes', rows);
+              });
+            }
+          };
+
+          try {
+            unsubscribe = await options.kernel.subscribe((raw) => {
+              if (!ready) {
+                held.push(raw);
+                return;
+              }
+              handle(raw);
+            });
+          } catch {
+            unsubscribe = undefined;
+          }
+
+          if (unsubscribe !== undefined) {
+            // Seed the panel from the disk, so it is not empty when the
+            // dashboard opens: the kernel only carries what happens from
+            // now on.
+            const [callbacks, syscalls] = await Promise.all([
+              readEvents(dir, {}),
+              readSyscallEvents(dir, {}),
+            ]);
+            recent = [...callbacks, ...syscalls].sort(byNewest).slice(0, limit);
+            for (const event of recent) {
+              const runId = (event as { runId?: string }).runId;
+              if (runId !== undefined) seeded.add(runId);
+            }
+            send('processes', await listProcesses(dir, options));
+            send('events', recent);
+            ready = true;
+            for (const raw of held) handle(raw);
+
+            heartbeat = setInterval(() => { if (!closed) response.write(': ping\n\n'); }, 15000);
+            request.on('close', () => {
+              closed = true;
+              if (heartbeat !== undefined) clearInterval(heartbeat);
+              unsubscribe?.();
+            });
+            return;
+          }
+          // No live stream after all: fall through to the disk path.
+        }
+
+        // --- the disk path: watch the directory and re-read ---------------
         const push = async (): Promise<void> => {
           try {
             const [callbacks, syscalls] = await Promise.all([
               readEvents(dir, {}),
               readSyscallEvents(dir, {}),
             ]);
-            send('processes', options.processes?.() ?? readAllMetas(dir));
+            send('processes', await listProcesses(dir, options));
             send('events', [...callbacks, ...syscalls].sort(byNewest).slice(0, limit));
           } catch {
             // Transient read failure: keep the stream alive.
@@ -446,9 +601,24 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
   });
   const address = server.address();
   const actualPort = address !== null && typeof address !== 'string' ? address.port : port;
+  // Closing twice is not an error: a dashboard that has already been closed
+  // is closed.
+  let closing: Promise<void> | undefined;
+  const close = (): Promise<void> => {
+    closing ??= new Promise<void>((resolve) => {
+      // An open event stream is a connection that never ends by itself, and
+      // `server.close` waits for it. The dashboard's own UI holds one open
+      // from the moment it loads, so without this Ctrl+C would hang the
+      // dashboard instead of stopping it. The stream belongs to the
+      // viewer, not to the server — drop it.
+      server.close(() => resolve());
+      server.closeAllConnections();
+    });
+    return closing;
+  };
   return {
     server,
     url: `http://${host}:${actualPort}`,
-    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+    close,
   };
 }

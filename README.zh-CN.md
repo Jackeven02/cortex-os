@@ -181,7 +181,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 651 项断言，0 失败
+npx tsx scripts/smoke.ts                # 655 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -291,7 +291,7 @@ $ cortex dashboard                  # 只读：仅观察
 $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 ```
 
-**默认只读。** 因为 v0 没有常驻内核可对话，大屏能做的就是任何"看文件系统的人"能做的事：读 `.cortex/processes/<pid>/meta.json`、解码 `.crec` syscall 日志、列出检查点、渲染进程树。`restore` 是纯写盘操作，所以它在 v0 的无守护进程模型下也能工作。
+**默认只读。** 状态目录里有活内核时（`cortex daemon run`），大屏**盯着那个内核**：**正在运行**的进程会出现在列表里——活进程还没有 `meta.json`，只看磁盘的话看到的是一堆尸体——事件流也由内核推送，边写边到。没有活内核时，大屏能做的就是任何"看文件系统的人"能做的事：读 `.cortex/processes/<pid>/meta.json`、解码 `.crec` syscall 日志（**包括还在跑的进程的日志**）、列出检查点、渲染进程树。`restore` 是纯写盘操作，所以它在 v0 的无守护进程模型下也能工作。
 
 三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
 

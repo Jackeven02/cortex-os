@@ -9805,7 +9805,10 @@ async function runDashboardChecks(): Promise<void> {
         const res = await fetch(`${dash.url}/api/processes`);
         assert(res.status === 200, `GET status ${res.status}`);
         const metas = (await res.json()) as Array<Record<string, unknown>>;
-        assert(metas.length === 1 && metas[0]!['role'] === 'hello', 'persisted meta served');
+        // The same view `cortex ps` shows: the recorded process, plus the
+        // synthetic init that gives the tree a root.
+        assert(metas.length === 2, `expected 2 rows, got ${metas.length}`);
+        assert(metas.some((m) => m['role'] === 'hello'), 'persisted meta served');
         const post = await fetch(`${dash.url}/api/processes`, { method: 'POST' });
         assert(post.status === 405, `POST status ${post.status}`);
       });
@@ -13368,6 +13371,208 @@ async function runTopChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Dashboard-with-a-live-kernel checks (#061)
+// =============================================================================
+
+/**
+ * The dashboard watching a live kernel.
+ *
+ * Without a kernel the dashboard can only show *finished* processes: a
+ * process that has not exited has no `meta.json` yet, so the disk is a
+ * directory of corpses and the agent that is actually working is missing.
+ * With one, the dashboard reads the kernel's own process table and takes
+ * the event stream by push.
+ */
+async function runDashboardLiveChecks(): Promise<void> {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-dashlive-'));
+  const kernels: Kernel[] = [];
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevLog = console.log;
+  const prevErr = console.error;
+
+  try {
+    const kernel = await bootKernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: tmp,
+      autoStart: true,
+      loadDrivers: (reg) => {
+        reg.registerMemory(inmemMemory());
+      },
+      agentLoader: async () => async (ctx, args) => {
+        const mode = typeof args['mode'] === 'string' ? args['mode'] : 'push';
+        if (mode === 'push') {
+          // One ordinary call, so the kernel has a frame to push — and then
+          // it stays alive, because a process that has exited is reaped and
+          // (in this harness) leaves no record behind.
+          await ctx.memory_write('semantic', 'live-key', 'live-value');
+          await ctx.recv();
+          return;
+        }
+        // Alive and doing nothing: the dashboard must still show it.
+        await ctx.recv();
+        return;
+      },
+    });
+    kernels.push(kernel);
+
+    const server = await startKernelServer(kernel, { log: () => {} });
+    servers.push(server);
+    writeEndpoint(tmp, server.endpoint);
+    process.env['CORTEX_HOME'] = tmp;
+
+    const probe = await probeKernel(tmp);
+    assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+    const client = probe.kind === 'live' ? probe.client : undefined;
+
+    const dash = await startDashboard({ dir: tmp, port: 0, kernel: client! });
+    try {
+      await checkAsync('the dashboard shows the processes that are running', async () => {
+        const pid = await kernel.spawn({
+          role: 'live-one',
+          agent: { module: 'test:live', args: { mode: 'alive' } },
+        });
+        // Let it be running (and not yet finished) when the dashboard reads.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        const res = await fetch(`${dash.url}/api/processes`);
+        assert(res.status === 200, `status ${res.status}`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+
+        const row = rows.find((r) => r['pid'] === unbrand(pid));
+        assert(row !== undefined, `the running process is in the list, got: ${JSON.stringify(rows.map((r) => r['pid']))}`);
+        assert(row!['role'] === 'live-one', `it is the process we spawned, got ${String(row!['role'])}`);
+        assert(row!['live'] === true, `it is marked live, got ${String(row!['live'])}`);
+      });
+
+      await checkAsync('the dashboard pushes live events instead of re-reading', async () => {
+        const res = await fetch(`${dash.url}/api/stream?limit=50`);
+        assert(res.status === 200, `status ${res.status}`);
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let text = '';
+        try {
+          // The stream opens with the history; the *push* is what we are
+          // testing, so the frame we look for is one that does not exist yet.
+          //
+          // The wait is bounded on its own: a read on an idle stream blocks
+          // until the next frame (the server pings every 15s), which would
+          // sail straight past the deadline.
+          const readUntil = async (needle: string, ms: number): Promise<boolean> => {
+            const deadline = Date.now() + ms;
+            for (;;) {
+              const left = deadline - Date.now();
+              if (left <= 0) return false;
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              const expiry = new Promise<null>((resolve) => {
+                timer = setTimeout(() => resolve(null), left);
+              });
+              const chunk = await Promise.race([reader.read(), expiry]);
+              if (timer !== undefined) clearTimeout(timer);
+              if (chunk === null) return false;
+              const { value, done } = chunk;
+              if (done) return false;
+              text += decoder.decode(value, { stream: true });
+              if (text.includes(needle)) return true;
+            }
+          };
+
+          const opened = await readUntil('event: events', 3000);
+          assert(opened, `the stream opened, got: ${text.slice(0, 300)}`);
+
+          const before = text.length;
+          // Now the kernel does something, and the frame must arrive by push.
+          const pid = await kernel.spawn({
+            role: 'pushed',
+            agent: { module: 'test:live', args: { mode: 'push' } },
+          });
+          assert(pid !== undefined, 'the process was spawned');
+
+          const pushed = await readUntil('kernel.memory_write', 5000);
+          assert(pushed, `the frame was pushed, got: ${text.slice(before, before + 400)}`);
+        } finally {
+          // Always drop the stream: an open one keeps the server's `close`
+          // waiting, and a failed assertion must not hang the smoke run.
+          await reader.cancel().catch(() => undefined);
+        }
+      });
+
+      await checkAsync('the dashboard shows the history of a process that is still running', async () => {
+        const pid = await kernel.spawn({
+          role: 'historian',
+          agent: { module: 'test:live', args: { mode: 'push' } },
+        });
+        assert(pid !== undefined, 'the process was spawned');
+
+        // The agent is still running, so it has no `meta.json` yet — the
+        // file the kernel writes when a process exits. Its log is on disk
+        // all the same, and the dashboard has to be able to read it: the
+        // agent that is working is the one whose history matters.
+        const deadline = Date.now() + 5000;
+        let seen = false;
+        while (Date.now() < deadline && !seen) {
+          const res = await fetch(`${dash.url}/api/events?limit=50`);
+          const rows = (await res.json()) as Array<Record<string, unknown>>;
+          seen = rows.some((r) => r['pid'] === unbrand(pid) && r['name'] === 'memory_write');
+          if (!seen) await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        assert(seen, "the running process's memory_write is in the event feed");
+      });
+
+      // Last, because it closes the dashboard: an open event stream is a
+      // connection that never ends by itself, and `server.close()` waits for
+      // it. The dashboard's own UI holds one open from the moment it loads,
+      // so without a fix this is where Ctrl+C would hang the dashboard
+      // instead of stopping it.
+      await checkAsync('the dashboard stops even with a stream still open', async () => {
+        const res = await fetch(`${dash.url}/api/stream?limit=5`);
+        assert(res.status === 200, `status ${res.status}`);
+        const reader = res.body!.getReader();
+        try {
+          const first = await reader.read();
+          assert(first.done !== true, 'the stream is open');
+
+          const outcome = await Promise.race([
+            dash.close().then(() => 'closed'),
+            new Promise((resolve) => setTimeout(() => resolve('still open'), 3000)),
+          ]);
+          assert(outcome === 'closed', `the dashboard did not close while a stream was attached (${outcome})`);
+        } finally {
+          await reader.cancel().catch(() => undefined);
+        }
+      });
+    } finally {
+      await dash.close();
+      client?.close();
+    }
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // Kernel-gone checks (#058)
 // =============================================================================
 /**
@@ -14468,6 +14673,7 @@ await runLangchainChecks();
 await runLLMTapChecks();
 await runWrapChecks();
 await runDashboardChecks();
+await runDashboardLiveChecks();
 await runFsChecks();
 await runMcpChecks();
 await runDiffChecks();

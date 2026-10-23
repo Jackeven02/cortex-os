@@ -29,6 +29,7 @@ import {
   type ProcessMeta,
 } from './process_store.js';
 import { probeKernel } from './kernel_client.js';
+import type { KernelCommand } from './kernel_protocol.js';
 import {
   unbrand,
   type BlockedReason,
@@ -36,6 +37,18 @@ import {
   type BudgetLimits,
   type ProcessState,
 } from '../kernel/types.js';
+
+/**
+ * The bit of a live kernel the read-only views need.
+ *
+ * A `KernelClient` satisfies this. It is a separate interface so that a
+ * caller that *already* holds a connection can hand it over instead of
+ * having the view open (and close) one of its own — the dashboard holds
+ * one connection for its whole life, and the view has to be able to use it.
+ */
+export interface ProcessSource {
+  request(cmd: KernelCommand, args?: Record<string, unknown>): Promise<unknown>;
+}
 
 /**
  * The subset of a process's facts that the read-only views need.
@@ -164,24 +177,39 @@ function rowFromLive(info: LiveProcessInfo): ProcessRow {
  * Never throws: a live kernel that cannot be reached (crashed, stopped) is
  * not an error for a read-only view — it just means the disk is all there
  * is, which is exactly what the view showed before the transport existed.
+ *
+ * @param source An already-open connection to a live kernel. When given,
+ *   the view uses it and **does not close it** — the caller owns it. When
+ *   omitted, the view finds a kernel itself and closes the connection again.
  */
-export async function readProcessView(dir: string): Promise<ProcessView> {
+export async function readProcessView(
+  dir: string,
+  source?: ProcessSource,
+): Promise<ProcessView> {
   const disk = readAllMetas(dir);
 
-  const probe = await probeKernel(dir);
-  if (probe.kind !== 'live') {
-    return {
-      rows: [syntheticInit(), ...disk.map(rowFromMeta)].sort((a, b) => a.pid - b.pid),
-      live: false,
-    };
+  let live: ProcessSource | undefined = source;
+  let owned = false;
+  if (live === undefined) {
+    const probe = await probeKernel(dir);
+    if (probe.kind !== 'live') {
+      return {
+        rows: [syntheticInit(), ...disk.map(rowFromMeta)].sort((a, b) => a.pid - b.pid),
+        live: false,
+      };
+    }
+    live = probe.client;
+    owned = true;
   }
 
   try {
-    const result = await probe.client.request<{ processes: readonly LiveProcessInfo[] }>('ps');
-    const live = result.processes.map(rowFromLive);
-    const livePids = new Set(live.map((r) => r.pid));
+    const result = (await live.request('ps')) as {
+      readonly processes: readonly LiveProcessInfo[];
+    };
+    const rows = result.processes.map(rowFromLive);
+    const livePids = new Set(rows.map((r) => r.pid));
     const merged = [
-      ...live,
+      ...rows,
       ...disk.filter((m) => !livePids.has(m.pid)).map(rowFromMeta),
     ].sort((a, b) => a.pid - b.pid);
     // The live kernel always has init in its table; if it somehow does not,
@@ -194,7 +222,7 @@ export async function readProcessView(dir: string): Promise<ProcessView> {
       live: false,
     };
   } finally {
-    probe.client.close();
+    if (owned) (live as { close?: () => void }).close?.();
   }
 }
 

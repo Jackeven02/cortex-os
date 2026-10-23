@@ -42,6 +42,67 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex dashboard` watches the live kernel, not just its leftovers.** The
+  dashboard was the operator's window, and it was showing a window onto a
+  graveyard. A process that has not exited has no `meta.json` yet — the kernel
+  writes it when the process ends — so the process list was a directory of
+  *finished* processes and the agent that was actually working was missing
+  from it. The activity feed was worse: it was built by scanning the logs of
+  the processes that *had* a `meta.json`, so the 200 KB of syscall frames a
+  running agent had already produced were sitting on disk, and invisible.
+
+  With a live kernel in the directory, the dashboard now reads that kernel's
+  own process table and takes the event stream **by push** — the frames arrive
+  as the kernel writes them, and nothing is re-read.
+
+  ```console
+  $ cortex dashboard
+  Cortex dashboard listening at http://127.0.0.1:4173
+  Watching a live kernel — running processes and a pushed event stream.
+  Press Ctrl+C to stop.
+  ```
+
+  **The disk was not the problem; the *scan* was.** A running process's log is
+  on disk from its very first syscall — a `meta.json` is a *process record*,
+  not a *log file*, and the dashboard had been using the record to decide
+  which logs to read. The scan now covers every process that has a log,
+  running or finished, so the history of a live agent is on the screen from
+  the moment the page opens.
+
+  **One conversion, two paths.** A frame pushed over the wire and the same
+  frame read off disk go through the same `toDashboardEvent()`, so the pushed
+  event and the disk event are the same object — two views of the same fact
+  cannot disagree. (The same rule the rest of the project follows: `cortex
+  top` and `cortex supervise` share one reading of "stuck" for exactly this
+  reason.)
+
+  **One process view for the whole project.** `cortex ps`, `cortex top` and the
+  dashboard now render the same rows, from one module
+  (`src/cli/process_view.ts`). The view takes the connection it is given
+  rather than opening its own, so the dashboard holds one connection for its
+  whole life — the process table comes from it and the event stream is pushed
+  on it.
+
+  **And the dashboard learned to stop.** An open event stream is a connection
+  that never ends by itself, and `server.close()` waits for it. The
+  dashboard's own UI holds one open from the moment it loads, so **Ctrl+C
+  hung the dashboard instead of stopping it** — the operator's way out was
+  the one thing that did not work. The server now drops its connections when
+  it closes, and closing twice is not an error.
+
+  **4 smoke checks** (651 → 655), all four reverse-verified: making the
+  process view unable to reach the kernel → the running process vanishes from
+  the list (only `init` is left); never subscribing to the kernel → the
+  stream falls back to the disk, and a running process's frames never arrive
+  (its log is invisible to a scan that only reads finished processes);
+  scanning the metas alone → the running process's history disappears from
+  the event feed; and dropping the connection cleanup → the dashboard cannot
+  close while a stream is attached.
+
+  No ABI change: `KERNEL_ABI_VERSION` stays 1.0.0, and the transport
+  protocol is unchanged — the dashboard is a client of the same `subscribe`
+  command `cortex watch` uses.
+
 - **`cortex top` can now tell a waiting process from a stuck one.** The
   process table says a process is BLOCKED, and that is all it says. A
   listener parked on a channel and an agent that will never be answered read
