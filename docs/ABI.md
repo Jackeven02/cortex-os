@@ -857,11 +857,14 @@ Two of those needed a way to say "record this, return that":
 - `recv` records the delivered message as `{from, to, body, sentAt}`; the `callId` is left out because the `send` record already carries it, and the wait time is the frame's own `durationMs`.
 - `checkpoint` routes a wider object than it returns. `CheckpointManager.take()` hands back the snapshot's `byteSize` and `syscallLogOffset` alongside the `chainId`, the `exit` record keeps all three (the log offset is what makes a checkpoint replayable against `.crec`), and the agent still receives exactly `{ chain_id }` as the ABI promises. Its `stateBefore`/`stateAfter` are now the states either side of the syscall — the same vantage point every other syscall records — rather than the module's internal `checkpointing` → final transition.
 
-The remaining three stay self-recorded for concrete reasons, not for tidiness debt:
+The remaining two stay self-recorded for concrete reasons, not for tidiness debt:
 
 - `fork` writes into **two** logs (the parent's and the child's), and only the module knows about the child.
-- `send` needs the record ordered inside its own atomicity window: a failed record must not leave a phantom, half-committed message, so the module must control exactly when it records.
 - `restore` records into the **restored** process's log, not the caller's, because the record is about the new process's lineage.
+
+`send` was the hard one, and it is now resolved too. It needs the record ordered inside its own atomicity window: a failed record must not leave a phantom, half-committed message, so the module must control exactly when it records. The seam that satisfies both halves is a transaction: `IpcManager.prepareSend()` hands back a prepared send with a `commit()` and a `rollback()`, the dispatcher writes the `enter`/`exit` frames, and only a landed frame lets the message become real. A frame that cannot be written rolls the send back — the enqueue is undone, a parked waiter is restored to the parked set, and the counters go back to where they were.
+
+That split has a cost worth stating: `send` now gets the `enter` frame it never had, and its delivery facts (`target`, `toPid`, `queueDepth`, `handedOff`) moved from the frame's `args` to the `exit` frame's `result`, where every other syscall keeps its result. The on-disk format is unchanged — same frame, same fields, same `.crec` encoding.
 
 The ABI is the contract. The architecture is how we keep that contract. The kernel is the implementation. In that order.
 

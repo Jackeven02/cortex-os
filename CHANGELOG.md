@@ -241,6 +241,32 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **`send` records through the dispatcher now, without losing its atomicity.**
+  `send` was the last syscall that wrote its own `.crec` frame, and the reason
+  was real: a failed record must not leave a phantom, half-committed message
+  (ABI.md §11), so the module had to control exactly when it recorded. Moving
+  the record to the dispatcher would have put the frame *after* the commit —
+  and a disk error would then have left a message in the queue that no log
+  mentioned.
+
+  The seam between the two is a transaction. `IpcManager.prepareSend()`
+  returns a prepared send with a `commit()` and a `rollback()`; the dispatcher
+  writes the `enter` and `exit` frames and then commits — or, if the frame
+  could not be written, rolls the send back. The enqueue is undone, a parked
+  waiter is restored to the parked set, the counters go back, and the failure
+  surfaces as `ERECORD` exactly as before.
+
+  What changed in the log: `send` gains the `enter` frame it never had, and
+  its delivery facts (`target`, `toPid`, `queueDepth`, `handedOff`) moved
+  from the frame's `args` to the `exit` frame's `result`, where every other
+  syscall keeps its result. The agent still receives nothing — `send`
+  resolves to `void`, as the ABI promises.
+
+  The two rollback checks now drive the dispatcher with a recorder that fails
+  only on the `exit` frame. That is the window that matters: the `enter`
+  frame has to land, or the send would never be prepared and the rollback
+  would prove nothing.
+
 - **A failed `recv` or `checkpoint` was written to the log twice.** The
   recording-ownership work in ABI.md §11 moved `recv` and `checkpoint` onto
   the dispatcher's single path — but it moved only their *success* records.

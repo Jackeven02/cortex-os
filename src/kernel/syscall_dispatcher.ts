@@ -23,28 +23,33 @@
  *   7. Write an `exit` or `trap` record.
  *   8. Return the result, or rethrow the `CortexError`.
  *
- * ## Recording ownership — a v0 deviation, stated honestly
+ * ## Recording ownership
  *
  * docs/ARCHITECTURE.md §4.10 says the dispatcher is "the only place syscalls
- * are ... recorded." In the kernel as actually built, four modules predate
- * this file and already write their own syscall records: `memory.ts`
- * (`memory_read` / `memory_write`), `ipc.ts` (`send` / `recv`), `fork.ts`
- * (`fork`), and `checkpoint.ts` (`checkpoint` / `restore`). Re-recording them
- * here would double every log line and break their smoke checks.
+ * are ... recorded." Four modules predate this file and used to write their
+ * own syscall records: `memory.ts` (`memory_read` / `memory_write`), `ipc.ts`
+ * (`send` / `recv`), `fork.ts` (`fork`), and `checkpoint.ts` (`checkpoint` /
+ * `restore`). All seven have now been collapsed onto the path below, in
+ * stages (docs/ABI.md §11).
  *
- * So v0 splits the duty:
+ * The duty now splits three ways:
  *
- *   - **Self-recorded syscalls** (`SELF_RECORDED` below) are routed and gated
- *     here, but the *record* is written by the owning module. The dispatcher
- *     still enforces state, reversibility, and budget for them.
  *   - **Dispatcher-recorded syscalls** (everything else) get the full
  *     `enter` + `exit`/`trap` pair written here.
+ *   - **Self-recorded syscalls** (`SELF_RECORDED_SYSCALLS` below) are routed
+ *     and gated here, but the *record* is written by the owning module —
+ *     because the frame belongs in a **different process's** log, not the
+ *     caller's. The dispatcher still enforces state, reversibility, and
+ *     budget for them.
  *   - **Unrecorded syscalls** (`budget`) are never logged, per docs/ABI.md
  *     §4.8 ("would bloat logs; derived from other syscalls' recordings").
  *
- * Collapsing the self-recorded modules onto the dispatcher is a documented
- * follow-up (it touches four modules and their tests); it is deliberately not
- * done in this commit. See docs/ARCHITECTURE.md §4.10 doc-fix note.
+ * One syscall needs both halves: `send` must not commit its message until
+ * its record has landed (docs/ABI.md §11 — a failed record must not leave a
+ * phantom, half-committed message), so the module *prepares* the send and
+ * hands back a transaction. The dispatcher writes the frame and then calls
+ * `commit()` — or `rollback()`, if the frame could not be written. See
+ * `DeferredCommit`.
  *
  * ## What v0 does NOT wire yet
  *
@@ -363,10 +368,45 @@ export function killReversibility(signal: Signal): Reversibility {
  * module header "Recording ownership".
  */
 export const SELF_RECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName>([
-  'send',
   'fork',
   'restore',
 ]);
+
+/**
+ * A routed syscall whose side effect is committed only *after* its record
+ * has landed.
+ *
+ * `send` is the one syscall that cannot simply do the thing and then record
+ * it: a failed record must not leave a phantom, half-committed message
+ * (docs/ABI.md §11), so the module has to control exactly when the message
+ * becomes real. But the *record* belongs to the dispatcher like every other
+ * syscall's.
+ *
+ * This is the seam between the two. The route returns one of these instead
+ * of a plain value; the dispatcher writes the frame, then calls `commit()`.
+ * If anything between the route and the frame fails, the dispatcher calls
+ * `rollback()` instead, and the message never existed as far as anyone can
+ * tell.
+ */
+interface DeferredCommit {
+  /** Distinguishes a deferred transaction from a plain routed value. */
+  readonly __deferred: true;
+  /** The value the syscall returns — and what the exit frame records. */
+  readonly value: unknown;
+  /** Make the side effect real. Called after the record landed. */
+  commit(): void;
+  /** Undo the side effect. Called when the record could not be written. */
+  rollback(): void;
+}
+
+/** Is this routed value a deferred transaction rather than a plain result? */
+function isDeferredCommit(value: unknown): value is DeferredCommit {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as { readonly __deferred?: unknown }).__deferred === true
+  );
+}
 
 /** Syscalls never recorded (docs/ABI.md §4.8). */
 export const UNRECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName>([
@@ -692,8 +732,15 @@ export class SyscallDispatcher {
       });
     }
 
+    // A `send` is prepared but not committed: the module hands back a
+    // transaction so the record lands *before* the message becomes real
+    // (docs/ABI.md §11 — a failed record must not leave a phantom message).
+    let deferred: DeferredCommit | null = null;
+
     try {
-      const result = (await this.#route(pid, syscall, args, callId)) as SyscallReturn[S];
+      const routed = await this.#route(pid, syscall, args, callId);
+      deferred = isDeferredCommit(routed) ? routed : null;
+      const result = (deferred !== null ? deferred.value : routed) as SyscallReturn[S];
 
       // §4.10 step 9 — budget accounting (skipped for `exit`, which throws).
       const budgetExhausted = await this.#account(pid, syscall, result);
@@ -708,6 +755,8 @@ export class SyscallDispatcher {
           durationMs: Date.now() - startedAt,
         });
       }
+      // The record landed, so the side effect may now become real.
+      deferred?.commit();
       if (budgetExhausted && this.#wakeGate !== null) {
         const current = this.#table.get(pid);
         // 152 = 128 + SIGXCPU(24): terminated as a consequence of budget
@@ -724,6 +773,9 @@ export class SyscallDispatcher {
     } catch (err) {
       // `exit` tears down and records itself, then throws the sentinel.
       if (isProcessExitSignal(err)) throw err;
+      // The side effect never became real: undo it before the failure is
+      // recorded, so the log and the world agree on what happened.
+      deferred?.rollback();
       if (recorded && isCortexError(err)) {
         const stateAfter = this.#table.get(pid)?.state ?? stateBefore;
         await this.#write(pid, syscall, callId, 'trap', {
@@ -1008,6 +1060,7 @@ export class SyscallDispatcher {
           args[0] as ProcessId | ChannelId,
           args[1],
           args[2] as SendOptions | undefined,
+          callId,
         );
       case 'recv':
         return await this.#recv(pid, args[0] as ChannelId | undefined, args[1] as RecvOptions | undefined);
@@ -1647,8 +1700,9 @@ export class SyscallDispatcher {
     pid: ProcessId,
     target: ProcessId | ChannelId,
     message: unknown,
-    opts?: SendOptions,
-  ): Promise<void> {
+    opts: SendOptions | undefined,
+    callId: string,
+  ): Promise<DeferredCommit> {
     if (this.#ipc === null) {
       trap('EDRIVER', 'send', { reason: 'ipc engine not configured' });
     }
@@ -1659,7 +1713,16 @@ export class SyscallDispatcher {
     if (typeof raw === 'number' && !this.#isKin(pid, asProcessId(raw))) {
       this.#requireCapability(pid, 'send', 'ipc:any');
     }
-    await this.#ipc.send(pid, target, message, opts ?? {});
+    // The module prepares the send but does not commit it: the frame is
+    // written here first, and only a landed frame makes the message real
+    // (docs/ABI.md §11 — the atomicity window).
+    const prepared = await this.#ipc.prepareSend(pid, target, message, opts ?? {}, callId);
+    return {
+      __deferred: true,
+      value: prepared.record,
+      commit: prepared.commit,
+      rollback: prepared.rollback,
+    };
   }
 
   /**
@@ -2083,6 +2146,11 @@ function shapeResult(syscall: SyscallName, result: unknown): unknown {
 function projectReturn(syscall: SyscallName, result: unknown): unknown {
   if (syscall === 'checkpoint' && isRecord(result)) {
     return { chainId: result['chainId'] };
+  }
+  if (syscall === 'send') {
+    // The ABI promises `send` resolves to nothing. The delivery facts it
+    // produced are recorded in the frame, not handed to the agent.
+    return undefined;
   }
   return result;
 }

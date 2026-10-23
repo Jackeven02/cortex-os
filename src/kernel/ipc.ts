@@ -75,19 +75,28 @@
  *
  * ## Recording
  *
- * Every `send` and `recv` writes a record to the *caller's* `.crec` log:
+ * This module does **not** write syscall records any more. Both `send` and
+ * `recv` are recorded by the syscall dispatcher, like every other syscall
+ * (docs/ABI.md §9, recording ownership):
  *
- *   - `send`: `syscall: 'send'`, args = `{ target, targetKind, body,
- *     queueDepth }`, reversibility = `'idempotent'` (until consumed).
- *   - `recv`: `syscall: 'recv'`, args = `{ source, sourceKind }`,
- *     result = the message, reversibility = `'irreversible'` (the message
- *     is gone from the queue).
+ *   - `send`: `syscall: 'send'`, reversibility = `'idempotent'` (until
+ *     consumed). The message body rides in the `enter` frame's arguments;
+ *     the delivery facts (`target`, `toPid`, `queueDepth`, `handedOff`) ride
+ *     in the `exit` frame's result.
+ *   - `recv`: `syscall: 'recv'`, result = the message, reversibility =
+ *     `'irreversible'` (the message is gone from the queue).
  *   - Errors: `phase: 'trap'` with the errno/message/details.
  *
  * The receiver does NOT write a record on `send` (only the sender does).
  * The receiver's record is the `recv` it eventually issues. This avoids
  * double-counting and matches the "syscall log = caller's log" invariant
  * from ARCHITECTURE.md §2.
+ *
+ * `send` is the one syscall that cannot simply do the thing and then record
+ * it: a failed record must not leave a phantom, half-committed message
+ * (docs/ABI.md §11). So this module *prepares* the send and hands back a
+ * transaction — the dispatcher writes the frame and then commits, or rolls
+ * back if the frame could not be written.
  *
  * See: docs/ABI.md §4.5, docs/ARCHITECTURE.md §4.4, docs/PROCESS.md §7
  *
@@ -269,6 +278,38 @@ export interface CloseChannelOptions {
   readonly drop?: boolean;
 }
 
+/**
+ * A send that has been *prepared* but not yet committed.
+ *
+ * `send` is the one syscall whose side effect cannot simply happen and then
+ * be recorded: a failed record must not leave a phantom, half-committed
+ * message (docs/ABI.md §11), so the module has to control exactly when the
+ * message becomes real. But the *record* belongs to the dispatcher like every
+ * other syscall's.
+ *
+ * This type is the seam between the two. The dispatcher writes the frame and
+ * then calls `commit()`; if the write fails it calls `rollback()` instead,
+ * and the message never existed as far as anyone can tell.
+ */
+export interface PreparedSend {
+  /**
+   * The facts the dispatcher records as the `send` frame's result. The
+   * message body itself rides in the `enter` frame's arguments, like every
+   * other syscall's arguments.
+   */
+  readonly record: {
+    readonly target: string;
+    readonly targetKind: 'channel';
+    readonly toPid: number | null;
+    readonly queueDepth: number;
+    readonly handedOff: boolean;
+  };
+  /** Finalise the send — hand a parked waiter its message. */
+  commit(): void;
+  /** Undo the send — the record failed, so the message must not exist. */
+  rollback(): void;
+}
+
 // =============================================================================
 // §5. IpcManager
 // =============================================================================
@@ -447,8 +488,11 @@ export class IpcManager {
   // ---------------------------------------------------------------------------
 
   /**
-   * Send a message. Non-blocking by default. Implicitly creates the
+   * Prepare a send. Non-blocking by default. Implicitly creates the
    * channel if absent (ABI.md §9.3).
+   *
+   * The caller (the syscall dispatcher) records the frame and then commits
+   * or rolls back — see `PreparedSend`.
    *
    * @param from    Sender (ProcessId for agent sends, ChannelId for
    *                system-originated messages).
@@ -457,28 +501,29 @@ export class IpcManager {
    * @param body    Arbitrary payload. Must be CBOR-serializable since it
    *                lands in the .crec log.
    * @param opts    `blocking` (v0: only false honored), `queueLimit`.
+   * @param callId  The dispatcher's call id for this syscall — the same one
+   *                the `send` record carries, so the message's delivery id
+   *                and the record's id are one thing.
    *
    * @throws CortexError EBADF if the channel is closed, EAGAIN if the
    *         queue is full and `blocking: false`, ESRCH if `to` is a
    *         ProcessId not in the table.
    */
-  async send(
+  async prepareSend(
     from: ProcessId | ChannelId,
     to: ProcessId | ChannelId,
     body: unknown,
-    opts: SendOptions = {},
-  ): Promise<void> {
-    const callId = this.#nextCallId();
+    opts: SendOptions,
+    callId: string,
+  ): Promise<PreparedSend> {
     const channel = this.#resolveForSend(from, to);
 
     // ESRCH for ProcessId targets that don't exist.
     if (isProcessTarget(to) && !this.#table.has(to)) {
-      const err = new CortexError('ESRCH', 'send', {
+      throw new CortexError('ESRCH', 'send', {
         message: `target process ${unbrand(to)} not in table`,
         details: { target: unbrand(to) },
       });
-      await this.#recordTrap(from, 'send', callId, err, { target: unbrand(to) });
-      throw err;
     }
 
     // Closed channel: EBADF + SIGPIPE on the sender.
@@ -486,10 +531,6 @@ export class IpcManager {
       const err = new CortexError('EBADF', 'send', {
         message: `channel ${unbrand(channel.id)} is closed`,
         details: { channel: unbrand(channel.id) },
-      });
-      await this.#recordTrap(from, 'send', callId, err, {
-        target: unbrand(channel.id),
-        closed: true,
       });
       if (this.#signals !== null && isProcessTarget(from) && this.#table.has(from)) {
         // Best-effort SIGPIPE; if delivery fails, the original EBADF still
@@ -509,15 +550,10 @@ export class IpcManager {
       // v0 does not implement blocking sends. Honor `blocking: true` as
       // EAGAIN with a clear message rather than parking the sender on a
       // waiters list we don't yet have.
-      const err = new CortexError('EAGAIN', 'send', {
+      throw new CortexError('EAGAIN', 'send', {
         message: `channel ${unbrand(channel.id)} queue full (limit ${limit})`,
         details: { channel: unbrand(channel.id), queueDepth: channel.queue.length, limit },
       });
-      await this.#recordTrap(from, 'send', callId, err, {
-        target: unbrand(channel.id),
-        queueDepth: channel.queue.length,
-      });
-      throw err;
     }
 
     const msg: IpcMessage = {
@@ -528,43 +564,61 @@ export class IpcManager {
       callId,
     };
 
+    const queueDepthBefore = channel.queue.length;
+    const toPid = isProcessTarget(to) ? unbrand(to) : null;
+
     // Direct handoff if a waiter is parked.
     const waiter = channel.waiters.shift();
     if (waiter !== undefined) {
-      const queueDepthBefore = channel.queue.length;
       channel.totalSent++;
       channel.totalRecv++;
       this.#trackMembership(from, channel.id);
       this.#trackMembership(waiter.pid, channel.id);
-      try {
-        await this.#recordSend(from, channel, msg, /* handedOff */ true, queueDepthBefore);
-      } catch (err) {
-        // Recording failed: the send did not take effect. Undo the handoff so
-        // the waiter stays parked (a later send or the next recv can still be
-        // served) and the counters reflect reality, then surface the error.
-        // Channel-membership bookkeeping is diagnostic and left in place.
-        channel.waiters.unshift(waiter);
-        channel.totalSent--;
-        channel.totalRecv--;
-        throw err;
-      }
-      this.#settleWaiterResolve(waiter, msg);
-      return;
+      return {
+        record: {
+          target: unbrand(channel.id),
+          targetKind: 'channel',
+          toPid,
+          queueDepth: queueDepthBefore,
+          handedOff: true,
+        },
+        // The waiter stays parked until the record lands: a send that was
+        // never recorded must not be delivered either.
+        commit: () => {
+          this.#settleWaiterResolve(waiter, msg);
+        },
+        rollback: () => {
+          // Undo the handoff so the waiter stays parked (a later send or the
+          // next recv can still be served) and the counters reflect reality.
+          // Channel-membership bookkeeping is diagnostic and left in place.
+          channel.waiters.unshift(waiter);
+          channel.totalSent--;
+          channel.totalRecv--;
+        },
+      };
     }
 
     // Otherwise enqueue.
-    const queueDepthBefore = channel.queue.length;
     channel.queue.push(msg);
     channel.totalSent++;
     this.#trackMembership(from, channel.id);
-    try {
-      await this.#recordSend(from, channel, msg, /* handedOff */ false, queueDepthBefore);
-    } catch (err) {
-      // Roll back the enqueue: a failed send must leave no committed message.
-      channel.queue.pop();
-      channel.totalSent--;
-      throw err;
-    }
+    return {
+      record: {
+        target: unbrand(channel.id),
+        targetKind: 'channel',
+        toPid,
+        queueDepth: queueDepthBefore,
+        handedOff: false,
+      },
+      commit: () => {
+        /* the message is already queued */
+      },
+      rollback: () => {
+        // Roll back the enqueue: a failed send must leave no committed message.
+        channel.queue.pop();
+        channel.totalSent--;
+      },
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -899,112 +953,6 @@ export class IpcManager {
     set.add(unbrand(channel));
   }
 
-  // ---------------------------------------------------------------------------
-  // §5.9 Internal: recording
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Append a `send` exit record to the sender's .crec log. Best-effort:
-   * a missing recorder (null factory) is a silent no-op so smoke tests
-   * can run without disk I/O.
-   */
-  async #recordSend(
-    from: ProcessId | ChannelId,
-    channel: Channel,
-    msg: IpcMessage,
-    handedOff: boolean,
-    queueDepthBefore: number,
-  ): Promise<void> {
-    if (!isProcessTarget(from)) return; // system-originated; no log to write to
-    const recorder = this.#table.recorderFor(from);
-    if (recorder === null) return;
-
-    const entry = this.#table.get(from);
-    const state: ProcessState = entry?.state ?? 'running';
-
-    const record: SyscallRecordInput = {
-      timestamp: msg.sentAt,
-      pid: from,
-      syscall: 'send',
-      callId: msg.callId ?? `send-${unbrand(from)}-${Date.now()}`,
-      phase: 'exit',
-      args: {
-        target: unbrand(channel.id),
-        targetKind: 'channel',
-        body: msg.body,
-        toPid: isProcessTarget(msg.to) ? unbrand(msg.to) : null,
-        queueDepth: queueDepthBefore,
-        handedOff,
-      },
-      stateBefore: state,
-      stateAfter: state,
-      // Idempotent until consumed; we record the ambiguity honestly per
-      // ABI.md §4.5. Once a recv pulls it, the recv record marks the
-      // irreversible consumption.
-      reversibility: 'idempotent',
-      kernelAbiVersion: this.kernelAbiVersion,
-    };
-
-    try {
-      await recorder.append(record);
-    } catch (err) {
-      if (isCortexError(err)) throw err;
-      throw new CortexError('ERECORD', 'send', {
-        message: `failed to record send to ${unbrand(channel.id)}`,
-        cause: err,
-      });
-    }
-  }
-
-  /**
-   * Append a `send` trap record to the sender's .crec log.
-   *
-   * `send` is one of the syscalls that still owns its own record — see the
-   * dispatcher's "Recording ownership" note. `recv`, by contrast, was
-   * collapsed onto the dispatcher's single path, so this method must never
-   * write a `recv` frame: the dispatcher already wrote the `enter` frame and
-   * writes the matching `trap` frame under the same callId.
-   */
-  async #recordTrap(
-    who: ProcessId | ChannelId,
-    syscall: 'send',
-    callId: string,
-    err: CortexError,
-    extraArgs: Record<string, unknown>,
-  ): Promise<void> {
-    if (!isProcessTarget(who)) return;
-    const recorder = this.#table.recorderFor(who);
-    if (recorder === null) return;
-
-    const entry = this.#table.get(who);
-    const state: ProcessState = entry?.state ?? 'running';
-
-    const record: SyscallRecordInput = {
-      timestamp: this.#now(),
-      pid: who,
-      syscall,
-      callId,
-      phase: 'trap',
-      args: extraArgs,
-      error: {
-        errno: err.errno,
-        message: err.message,
-        ...(err.details !== undefined ? { details: err.details } : {}),
-      },
-      stateBefore: state,
-      stateAfter: state,
-      reversibility: 'idempotent',
-      kernelAbiVersion: this.kernelAbiVersion,
-    };
-
-    try {
-      await recorder.append(record);
-    } catch (recordErr) {
-      // Recording failure during a trap path is doubly unfortunate, but
-      // the original error is more important to surface. Swallow.
-      void recordErr;
-    }
-  }
 }
 
 // =============================================================================

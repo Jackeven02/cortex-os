@@ -130,6 +130,8 @@ import {
   type SpawnOptions,
   type RandomOptions,
   type BudgetLimits,
+  type SendOptions,
+  type ChannelId,
   DriverRegistry,
   satisfiesAbi,
   parseSemver,
@@ -1614,6 +1616,26 @@ async function runIpcChecks(): Promise<void> {
   }
 
   /**
+   * `IpcManager.send` is now `prepareSend` + `commit`: the module prepares the
+   * send, the *dispatcher* writes the record, and the message only becomes
+   * real once that record has landed (docs/ABI.md §11 — the atomicity
+   * window). The checks below are about IPC semantics, so they drive the
+   * module directly and commit by hand; the recording path is exercised
+   * separately, through the dispatcher.
+   */
+  let sendSeq = 0;
+  async function doSend(
+    mgr: IpcManager,
+    from: ProcessIdAlias,
+    to: ProcessIdAlias | ChannelId,
+    body: unknown,
+    opts: SendOptions = {},
+  ): Promise<void> {
+    const prepared = await mgr.prepareSend(from, to, body, opts, `test-send-${++sendSeq}`);
+    prepared.commit();
+  }
+
+  /**
    * Controllable timer so the timeout test does not depend on wall-clock.
    * `fireTimers()` runs every scheduled callback synchronously.
    */
@@ -1688,7 +1710,7 @@ async function runIpcChecks(): Promise<void> {
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
       const chan = asChannelId('auto-created');
       assert(!mgr.hasChannel(chan), 'channel should not exist yet');
-      await mgr.send(a, chan, { hello: 'world' });
+      await doSend(mgr, a, chan, { hello: 'world' });
       assert(mgr.hasChannel(chan), 'channel should exist after send');
       const info = mgr.getChannel(chan);
       assert(info !== undefined, 'getChannel should return info');
@@ -1712,7 +1734,7 @@ async function runIpcChecks(): Promise<void> {
       const a = await spawnRunning(table, 'a');
       const b = await spawnRunning(table, 'b');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
-      await mgr.send(a, b, { ping: true });
+      await doSend(mgr, a, b, { ping: true });
       const inbox = pidInboxChannel(b);
       assert(mgr.hasChannel(inbox), 'inbox channel should exist');
       const msg = await mgr.recv(b, inbox, { blocking: false });
@@ -1726,7 +1748,7 @@ async function runIpcChecks(): Promise<void> {
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
       let caught: unknown;
       try {
-        await mgr.send(a, asProcessId(9999), 'nope');
+        await doSend(mgr, a, asProcessId(9999), 'nope');
       } catch (err) {
         caught = err;
       }
@@ -1739,7 +1761,7 @@ async function runIpcChecks(): Promise<void> {
       const a = await spawnRunning(table, 'a');
       const b = await spawnRunning(table, 'b');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
-      await mgr.send(a, b, { toInbox: 1 });
+      await doSend(mgr, a, b, { toInbox: 1 });
       // recv with no source argument should read b's inbox.
       const msg = await mgr.recv(b, undefined, { blocking: false });
       assert((msg.body as { toInbox: number }).toInbox === 1, 'should read from inbox');
@@ -1762,7 +1784,7 @@ async function runIpcChecks(): Promise<void> {
       assert(blockedOn !== null && blockedOn.kind === 'recv', 'blockedOn should be recv');
 
       // Now send — this should hand off directly and wake b.
-      await mgr.send(a, chan, { woke: true });
+      await doSend(mgr, a, chan, { woke: true });
       const msg = await recvPromise;
       assert((msg.body as { woke: boolean }).woke === true, 'message mismatch');
       assert(table.snapshot(b).state === 'ready', `b should be ready after wake, got ${table.snapshot(b).state}`);
@@ -1834,9 +1856,9 @@ async function runIpcChecks(): Promise<void> {
       const b = await spawnRunning(table, 'b');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
       const chan = asChannelId('fifo');
-      await mgr.send(a, chan, 1);
-      await mgr.send(a, chan, 2);
-      await mgr.send(a, chan, 3);
+      await doSend(mgr, a, chan, 1);
+      await doSend(mgr, a, chan, 2);
+      await doSend(mgr, a, chan, 3);
       // Walk b to RUNNING for each recv (recv requires RUNNING).
       const got: unknown[] = [];
       for (let i = 0; i < 3; i++) {
@@ -1858,7 +1880,7 @@ async function runIpcChecks(): Promise<void> {
 
       const recvPromise = mgr.recv(b, chan);
       await waitFor(() => mgr.getChannel(chan)?.waiterCount === 1, 'waiter registered');
-      await mgr.send(a, chan, { direct: true });
+      await doSend(mgr, a, chan, { direct: true });
       await recvPromise;
 
       const info = mgr.getChannel(chan)!;
@@ -1866,14 +1888,17 @@ async function runIpcChecks(): Promise<void> {
       assert(info.totalSent === 1 && info.totalRecv === 1, 'counters should both be 1');
     });
 
-    await checkAsync('send rolls back the enqueue when recording fails (ERECORD)', async () => {
-      // A throwaway recorder whose append fails on demand. `fail` stays false
-      // during spawn (the __state records must land); we flip it only around
-      // the send we want to fail.
-      let fail = false;
+    await checkAsync('send rolls back the enqueue when the record fails (ERECORD)', async () => {
+      // The record is the dispatcher's now, but the message must not become
+      // real until that record has landed (docs/ABI.md §11). So the *exit*
+      // frame's write is the commit point: if it fails, the send is undone.
+      // The enter frame is written before the route, so it must still land —
+      // otherwise the send would never even be prepared and the rollback
+      // would prove nothing.
+      let failExit = false;
       const fake = {
-        append: async () => {
-          if (fail) throw new Error('disk on fire');
+        append: async (rec: { phase?: string }) => {
+          if (failExit && rec.phase === 'exit') throw new Error('disk on fire');
         },
         flush: async () => {},
         close: async () => {},
@@ -1887,12 +1912,20 @@ async function runIpcChecks(): Promise<void> {
       tables.push(table);
       const a = await spawnRunning(table, 'a');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const dispatcher = new SyscallDispatcher({
+        table,
+        signals,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        ipc: mgr,
+      });
       const chan = asChannelId('rollback-enqueue');
 
-      fail = true;
+      failExit = true;
       let caught: unknown;
       try {
-        await mgr.send(a, chan, 'nope');
+        await dispatcher.invoke(a, 'send', chan, 'nope');
       } catch (err) {
         caught = err;
       }
@@ -1904,17 +1937,17 @@ async function runIpcChecks(): Promise<void> {
       assert(info.totalSent === 0, `totalSent should roll back to 0, got ${info.totalSent}`);
 
       // A later send with a healthy recorder commits normally.
-      fail = false;
-      await mgr.send(a, chan, 'ok');
+      failExit = false;
+      await dispatcher.invoke(a, 'send', chan, 'ok');
       assert(mgr.getChannel(chan)!.queueDepth === 1, 'healthy send should enqueue');
       assert(mgr.getChannel(chan)!.totalSent === 1, 'totalSent should be 1 after healthy send');
     });
 
     await checkAsync('send rolls back a failed direct handoff, leaving the waiter parked', async () => {
-      let fail = false;
+      let failExit = false;
       const fake = {
-        append: async () => {
-          if (fail) throw new Error('disk on fire');
+        append: async (rec: { phase?: string }) => {
+          if (failExit && rec.phase === 'exit') throw new Error('disk on fire');
         },
         flush: async () => {},
         close: async () => {},
@@ -1929,15 +1962,23 @@ async function runIpcChecks(): Promise<void> {
       const a = await spawnRunning(table, 'a');
       const b = await spawnRunning(table, 'b');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const dispatcher = new SyscallDispatcher({
+        table,
+        signals,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        ipc: mgr,
+      });
       const chan = asChannelId('rollback-handoff');
 
       const recvPromise = mgr.recv(b, chan);
       await waitFor(() => mgr.getChannel(chan)?.waiterCount === 1, 'waiter registered');
 
-      fail = true;
+      failExit = true;
       let caught: unknown;
       try {
-        await mgr.send(a, chan, 'lost');
+        await dispatcher.invoke(a, 'send', chan, 'lost');
       } catch (err) {
         caught = err;
       }
@@ -1952,8 +1993,8 @@ async function runIpcChecks(): Promise<void> {
       assert(table.snapshot(b).state === 'blocked', 'receiver should still be blocked');
 
       // With a healthy recorder, that very same parked waiter is served next.
-      fail = false;
-      await mgr.send(a, chan, 'served');
+      failExit = false;
+      await dispatcher.invoke(a, 'send', chan, 'served');
       const got = await recvPromise;
       assert(got.body === 'served', `parked waiter should get the second message, got ${JSON.stringify(got.body)}`);
       assert(mgr.getChannel(chan)!.waiterCount === 0, 'waiter consumed after successful handoff');
@@ -1990,8 +2031,8 @@ async function runIpcChecks(): Promise<void> {
       const a = await spawnRunning(table, 'a');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
       const chan = asChannelId('drop-me');
-      await mgr.send(a, chan, 'msg1');
-      await mgr.send(a, chan, 'msg2');
+      await doSend(mgr, a, chan, 'msg1');
+      await doSend(mgr, a, chan, 'msg2');
       assert(mgr.getChannel(chan)!.queueDepth === 2, 'precondition: 2 queued');
       mgr.closeChannel(chan);
       assert(mgr.getChannel(chan)!.queueDepth === 0, 'queue should be dropped on close');
@@ -2026,7 +2067,7 @@ async function runIpcChecks(): Promise<void> {
 
       let caught: unknown;
       try {
-        await mgr.send(a, chan, 'too late');
+        await doSend(mgr, a, chan, 'too late');
       } catch (err) {
         caught = err;
       }
@@ -2088,11 +2129,11 @@ async function runIpcChecks(): Promise<void> {
         defaultQueueLimit: 2,
       });
       const chan = asChannelId('limited');
-      await mgr.send(a, chan, 'one');
-      await mgr.send(a, chan, 'two');
+      await doSend(mgr, a, chan, 'one');
+      await doSend(mgr, a, chan, 'two');
       let caught: unknown;
       try {
-        await mgr.send(a, chan, 'three');
+        await doSend(mgr, a, chan, 'three');
       } catch (err) {
         caught = err;
       }
@@ -2107,7 +2148,7 @@ async function runIpcChecks(): Promise<void> {
       const b = await spawnRunning(table, 'b');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
       const chan = asChannelId('membership');
-      await mgr.send(a, chan, 'hi');
+      await doSend(mgr, a, chan, 'hi');
       await mgr.recv(b, chan, { blocking: false });
       assert(mgr.channelsOf(a).some((c) => unbrand(c) === 'membership'), 'sender should be a member');
       assert(mgr.channelsOf(b).some((c) => unbrand(c) === 'membership'), 'receiver should be a member');
@@ -2127,9 +2168,8 @@ async function runIpcChecks(): Promise<void> {
       const b = await spawnRunning(table, 'b');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
       const chan = asChannelId('recorded');
-      // `send` is still self-recorded (its record must sit inside its own
-      // atomicity window); `recv` records through the dispatcher, so it needs
-      // a dispatcher to go through.
+      // Both `send` and `recv` record through the dispatcher now, so both go
+      // through it.
       const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
       const dispatcher = new SyscallDispatcher({
         table,
@@ -2139,7 +2179,7 @@ async function runIpcChecks(): Promise<void> {
         ipc: mgr,
       });
 
-      await mgr.send(a, chan, { recorded: true });
+      await dispatcher.invoke(a, 'send', chan, { recorded: true });
       // Walk b to RUNNING (it already is) and recv.
       const msg = await dispatcher.invoke(b, 'recv', chan, { blocking: false });
       assert((msg.body as { recorded: boolean }).recorded === true, 'body mismatch');
@@ -2153,9 +2193,26 @@ async function runIpcChecks(): Promise<void> {
       for await (const r of readRecords(recA.path)) {
         if (r.syscall === 'send') sendRecords.push(r);
       }
-      assert(sendRecords.length === 1, `expected 1 send record, got ${sendRecords.length}`);
+      assert(sendRecords.length === 2, `expected send enter+exit, got ${sendRecords.length}`);
+      assert(sendRecords[0]!.phase === 'enter', 'send enter frame first');
+      assert(sendRecords[1]!.phase === 'exit', 'send exit frame last');
       assert(sendRecords[0]!.reversibility === 'idempotent', 'send should be idempotent');
-      assert(sendRecords[0]!.phase === 'exit', 'send record should be exit phase');
+      assert(sendRecords[1]!.reversibility === 'idempotent', 'send should be idempotent');
+      assert(
+        sendRecords[0]!.callId === sendRecords[1]!.callId,
+        'send enter and exit must share one callId',
+      );
+      // The delivery facts ride in the exit frame; the body rides in the
+      // enter frame's arguments, like every other syscall's arguments.
+      const sendResult = sendRecords[1]!.result as {
+        target: string;
+        toPid: number | null;
+        queueDepth: number;
+        handedOff: boolean;
+      };
+      assert(sendResult.target === 'recorded', `send target should be the channel, got ${sendResult.target}`);
+      assert(sendResult.handedOff === false, 'an empty channel means no handoff');
+      assert(sendResult.queueDepth === 0, 'queue depth before the send was 0');
 
       const recvRecords: SyscallRecord[] = [];
       for await (const r of readRecords(recB.path)) {
