@@ -65,6 +65,7 @@ import {
   deleteDaemon,
 } from '../daemon_store.js';
 import { startKernelServer } from '../kernel_server.js';
+import { KernelCommandError, probeKernel } from '../kernel_client.js';
 import { clearEndpoint, endpointPath, writeEndpoint } from '../kernel_endpoint.js';
 
 // =============================================================================
@@ -85,6 +86,8 @@ export async function cmdDaemon(args: string[]): Promise<number> {
     case 'run':
     case 'start':
       return await cmdDaemonRun(rest);
+    case 'stop':
+      return await cmdDaemonStop(rest);
     case undefined:
     case '--help':
     case '-h':
@@ -422,6 +425,47 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
 }
 
 // =============================================================================
+// stop
+// =============================================================================
+
+/**
+ * Ask the running daemon to stop.
+ *
+ * The kernel serves a `shutdown` command; this is the CLI entry point for
+ * it. The daemon answers the request first and stops afterwards, so the
+ * reply is not lost to a closing socket.
+ */
+export async function cmdDaemonStop(_args: string[]): Promise<number> {
+  const dir = defaultKernelDir();
+  const probe = await probeKernel(dir);
+  if (probe.kind === 'live') {
+    const client = probe.client;
+    try {
+      await client.request('shutdown');
+      console.log('daemon stop requested');
+      return 0;
+    } catch (err) {
+      if (err instanceof KernelCommandError) {
+        console.error(`cortex daemon stop: ${err.errno}: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    } finally {
+      client.close();
+    }
+  }
+
+  if (probe.kind === 'stale') {
+    console.error(
+      `cortex daemon stop: the kernel that published ${probe.endpoint.host}:${probe.endpoint.port} ` +
+      `is not reachable (${probe.reason})`,
+    );
+  }
+  console.error('cortex daemon stop: no daemon is running in this directory.');
+  return 1;
+}
+
+// =============================================================================
 // OS service-unit generation
 // =============================================================================
 
@@ -607,17 +651,19 @@ USAGE
   cortex daemon list
   cortex daemon uninstall <name>
   cortex daemon run [name]
+  cortex daemon stop
 
 SUBCOMMANDS
   install     Persist a daemon spec and generate an OS service unit
   list        Show registered daemons and their restart policy
   uninstall   Remove a daemon spec (and best-effort its unit file)
   run         Boot a kernel, register the daemon(s), stay alive until SIGTERM
+  stop        Ask the running kernel to shut down
 
 The kernel supervises each daemon per its RestartPolicy (always / on-failure /
 never) with exponential backoff and restart-storm detection — see
-docs/PROCESS.md §9-§10. 'run' keeps the process alive; stopping it (Ctrl-C, or
---max-runtime-ms for tests) shuts the kernel down.
+docs/PROCESS.md §9-§10. 'run' keeps the process alive; stopping it (Ctrl-C, 'stop',
+or --max-runtime-ms for tests) shuts the kernel down.
 
 Run 'cortex daemon <subcommand> --help' for details.
 `);

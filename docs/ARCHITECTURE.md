@@ -720,16 +720,34 @@ and the file. The other route is the signal: `SIGUSR2` means "checkpoint now"
 (docs/PROCESS.md §7.4), so `cortex kill <pid> --signal SIGUSR2` asks a live
 agent to save itself.
 
+**And it gave the shell a lifecycle.** `cortex spawn` boots a kernel of its
+own, runs the agent to completion, and exits — the agent's life is bounded by
+the command, and every later `cortex` invocation finds only the files it left
+behind. `cortex spawn --live` asks the kernel that is already running
+instead: the agent is spawned into it, keeps running after the command exits,
+and is reachable by every other transport command (`send`, `checkpoint`,
+`kill`, `attach --interactive`). `cortex daemon stop` closes the loop by
+asking the running kernel to shut down.
+
+The default is unchanged on purpose. `cortex spawn` without `--live` still
+runs the agent to completion and prints its result — the quiet mode of a
+short-lived process is what most invocations want — and the opt-in is what
+makes the different behaviour visible instead of silent. Two things travel
+with a live-spawned agent and are worth knowing: its output goes to the
+daemon's stdout (it is the daemon's child now), and its LLM drivers come from
+the daemon's environment — the API key the daemon was started with, not the
+one in the shell that typed the command.
+
 **Known limits (v0).**
 
 - The transport carries commands, not streams: there is no live trace
   subscription yet. `cortex attach` still follows the `.crec` file on disk
   (which the daemon writes to) and delivers the interactive half over the
   wire.
-- `cortex spawn` still boots its own short-lived kernel rather than
-  spawning into the live one. That is why the PID claim exists (§7): the
-  two kernels share one directory, and the claim keeps them off each
-  other's PIDs.
+- `cortex spawn` still boots its own short-lived kernel by default, and
+  `cortex spawn --live` opts into the live one. Either way the two kernels
+  can share a directory, which is why the PID claim exists (§7): the claim
+  keeps them off each other's PIDs and off each other's logs.
 - A crashed kernel leaves a stale `kernel.json` behind. Clients detect it
   (the port refuses the connection) and fall back to the disk view.
 - A **queued** signal loses its sender. The pending queue holds the signal

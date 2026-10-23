@@ -11803,6 +11803,19 @@ async function runDaemonChecks(): Promise<void> {
       assert(out.includes('on-failure'), 'restart policy listed');
     });
 
+    await checkAsync('cortex daemon stop says plainly that there is nothing to stop', async () => {
+      // No kernel is serving this directory, so there is nothing to stop.
+      // The command must say that rather than pretend it stopped something.
+      let err = '';
+      console.log = () => {};
+      console.error = (...parts: unknown[]): void => { err += parts.map((p) => String(p)).join(' ') + '\n'; };
+      const code = await cmdDaemon(['stop']);
+      console.log = prevLog;
+      console.error = prevErr;
+      assert(code === 1, `exit 1, got ${code}`);
+      assert(err.includes('no daemon is running'), `the reason is reported, got: ${err.trim()}`);
+    });
+
     await checkAsync('cortex daemon uninstall removes the spec (and the unit file)', async () => {
       console.log = prevLog; console.error = prevErr;
       // Create the unit at the path uninstall will look for (platform-dependent;
@@ -12126,7 +12139,18 @@ async function runTransportChecks(): Promise<void> {
     });
     kernels.push(kernel);
 
-    const server = await startKernelServer(kernel, { log: () => {} });
+    // The received array collects every agent's inbox, so a check that needs
+    // "did this agent hear anything" compares its length before and after.
+    let shutdownRequested = false;
+    const server = await startKernelServer(kernel, {
+      log: () => {},
+      // The hook deliberately does NOT stop the kernel: the check below
+      // asserts that the request reached it, and the rest of the suite still
+      // needs a live kernel.
+      onShutdown: () => {
+        shutdownRequested = true;
+      },
+    });
     writeEndpoint(tmp, server.endpoint);
 
     try {
@@ -12283,6 +12307,51 @@ async function runTransportChecks(): Promise<void> {
           await waitFor(() => received.length > before),
           'the agent still receives messages after the checkpoint',
         );
+      });
+
+      await checkAsync('a remote spawn starts an agent in the live kernel', async () => {
+        // `cortex spawn` boots a kernel of its own, runs the agent to
+        // completion and exits — the agent's life is bounded by the command.
+        // Asking a live kernel instead gives an agent that keeps running, and
+        // that every other transport command (send, checkpoint, kill) can
+        // then reach.
+        const response = await client!.requestRaw('spawn', {
+          role: 'spawned',
+          agent: { module: 'test:listener' },
+        });
+        assert(response.ok === true, `the spawn is accepted, got ${JSON.stringify(response)}`);
+        if (!response.ok) return;
+        const result = response.result as { pid: number };
+        assert(Number.isInteger(result.pid), `a pid came back, got ${String(result.pid)}`);
+
+        const entry = kernel.table.get(asProcessId(result.pid));
+        assert(entry !== undefined, 'the agent is in the live kernel');
+        assert(entry!.role === 'spawned', `the role is spawned, got ${entry!.role}`);
+        assert(entry!.ppid === 1, `init is its parent, got ${String(entry!.ppid)}`);
+
+        // It keeps running — that is the whole point of the live kernel.
+        assert(
+          await waitFor(() => kernel.table.get(asProcessId(result.pid))?.state !== undefined),
+          'the agent is still there a moment later',
+        );
+        assert(
+          await waitFor(() => kernel.table.get(asProcessId(result.pid))?.state === 'blocked'),
+          'the spawned agent parked on recv',
+        );
+
+        // And it is reachable like any other live agent.
+        const before = received.length;
+        await client!.request('send', { pid: result.pid, message: 'hello, spawned agent' });
+        assert(
+          await waitFor(() => received.length > before),
+          'the spawned agent receives messages',
+        );
+      });
+
+      await checkAsync('a remote shutdown asks the kernel to stop', async () => {
+        const response = await client!.requestRaw('shutdown');
+        assert(response.ok === true, `the shutdown is accepted, got ${JSON.stringify(response)}`);
+        assert(await waitFor(() => shutdownRequested), 'the kernel was asked to stop');
       });
 
       await checkAsync('a remote SIGUSR2 checkpoints the target', async () => {

@@ -42,7 +42,19 @@
 import { createServer, type Server, type Socket } from 'node:net';
 import { randomBytes } from 'node:crypto';
 
-import { asChannelId, asProcessId, type ProcessFilter, type ProcessId, type Signal } from '../kernel/types.js';
+import {
+  asChannelId,
+  asProcessId,
+  unbrand,
+  type AgentSpec,
+  type BudgetLimits,
+  type Capability,
+  type MemoryRegionPolicy,
+  type ProcessFilter,
+  type ProcessId,
+  type Signal,
+  type SpawnOptions,
+} from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
 import { ALL_SIGNALS } from '../kernel/signals.js';
 import type { Kernel } from '../kernel/boot.js';
@@ -485,6 +497,40 @@ async function dispatch(
         detach,
         state: after?.state ?? null,
       };
+    }
+
+    case 'spawn': {
+      const role = args['role'];
+      if (typeof role !== 'string' || role.length === 0) {
+        throw new WireError('EINVAL', 'spawn requires a role');
+      }
+      const agent = args['agent'];
+      if (typeof agent !== 'object' || agent === null || Array.isArray(agent)) {
+        throw new WireError('EINVAL', 'spawn requires an agent spec');
+      }
+      const opts: SpawnOptions = {
+        role,
+        agent: agent as AgentSpec,
+        ...(args['budgets'] !== undefined
+          ? { budgets: args['budgets'] as Partial<BudgetLimits> }
+          : {}),
+        ...(args['memory'] !== undefined
+          ? { memory: args['memory'] as Record<string, MemoryRegionPolicy> }
+          : {}),
+        ...(args['capabilities'] !== undefined
+          ? { capabilities: args['capabilities'] as Capability[] }
+          : {}),
+        ...(args['grantable'] !== undefined
+          ? { grantable: args['grantable'] as Capability[] }
+          : {}),
+      };
+      // Through the kernel's own spawn entry point, which runs the real
+      // `spawn` syscall with init as the caller: the process is allocated,
+      // recorded on init's log, readied and enqueued exactly as an in-agent
+      // `ctx.spawn` would be. The agent keeps running after this request
+      // answers — that is the whole point of asking a live kernel.
+      const pid = await kernel.spawn(opts);
+      return { pid: unbrand(pid), role };
     }
 
     case 'shutdown': {

@@ -26,6 +26,7 @@ import {
 } from '../index.js';
 import type { ProcessMeta } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
+import { KernelCommandError, probeKernel } from '../kernel_client.js';
 import type { AgentSpec, Capability, ProcessState, MemoryRegionPolicy } from '../../kernel/types.js';
 import { parseCapabilities } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
@@ -51,6 +52,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       grantable: { type: 'string' },
       args: { type: 'string' },
       timeout: { type: 'string', short: 't' },
+      live: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: false,
@@ -126,37 +128,31 @@ export async function cmdSpawn(args: string[]): Promise<number> {
     }
   }
 
-  const dir = defaultKernelDir();
-  ensureKernelDirs(dir);
-  const kernel = await bootCliKernel(
-    dir,
-    maxRegionEntries !== undefined ? { maxRegionEntries } : {},
-  );
-
-  try {
-    // Wire the LLM flags into the agent spec (they used to be parsed but
-    // ignored). --driver/--model/--max-tokens flow to the prompt agent's
-    // llm_call; --token-budget becomes a real spawn budget.
-    const model = values.model;
-    const driver = values.driver;
-    let maxTokens: number | undefined;
-    if (values['max-tokens'] !== undefined) {
-      maxTokens = parseInt(values['max-tokens'], 10);
-      if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
-        console.error(`cortex spawn: invalid --max-tokens: '${values['max-tokens']}'`);
-        await kernel.shutdown();
-        return 1;
-      }
+  // Wire the LLM flags into the agent spec (they used to be parsed but
+  // ignored). --driver/--model/--max-tokens flow to the prompt agent's
+  // llm_call; --token-budget becomes a real spawn budget.
+  //
+  // This is computed *before* the kernel boots: the live path (`--live`)
+  // needs the spec and no kernel of its own, because the agent is spawned
+  // into the kernel that is already running.
+  const model = values.model;
+  const driver = values.driver;
+  let maxTokens: number | undefined;
+  if (values['max-tokens'] !== undefined) {
+    maxTokens = parseInt(values['max-tokens'], 10);
+    if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+      console.error(`cortex spawn: invalid --max-tokens: '${values['max-tokens']}'`);
+      return 1;
     }
-    let tokenBudget: number | undefined;
-    if (values['token-budget'] !== undefined) {
-      tokenBudget = parseInt(values['token-budget'], 10);
-      if (!Number.isFinite(tokenBudget) || tokenBudget <= 0) {
-        console.error(`cortex spawn: invalid --token-budget: '${values['token-budget']}'`);
-        await kernel.shutdown();
-        return 1;
-      }
+  }
+  let tokenBudget: number | undefined;
+  if (values['token-budget'] !== undefined) {
+    tokenBudget = parseInt(values['token-budget'], 10);
+    if (!Number.isFinite(tokenBudget) || tokenBudget <= 0) {
+      console.error(`cortex spawn: invalid --token-budget: '${values['token-budget']}'`);
+      return 1;
     }
+  }
 
   // --args hands a JSON object to the agent as `AgentSpec.args`, so one agent
   // module can be reused for different work without editing it. It is the only
@@ -191,12 +187,33 @@ export async function cmdSpawn(args: string[]): Promise<number> {
           ...(agentArgs !== undefined ? { args: agentArgs } : {}),
         }
       : {
-            system,
-            ...(driver !== undefined ? { driver } : {}),
-            ...(model !== undefined ? { model } : {}),
-            ...(maxTokens !== undefined ? { maxTokens } : {}),
-          };
+          system,
+          ...(driver !== undefined ? { driver } : {}),
+          ...(model !== undefined ? { model } : {}),
+          ...(maxTokens !== undefined ? { maxTokens } : {}),
+        };
 
+  const dir = defaultKernelDir();
+  ensureKernelDirs(dir);
+
+  if (values.live) {
+    return await spawnLive({
+      dir,
+      role: values.role,
+      agent: agentSpec,
+      memory: regionPolicies,
+      ...(tokenBudget !== undefined ? { tokenBudget } : {}),
+      ...(capabilities !== undefined ? { capabilities } : {}),
+      ...(grantable !== undefined ? { grantable } : {}),
+    });
+  }
+
+  const kernel = await bootCliKernel(
+    dir,
+    maxRegionEntries !== undefined ? { maxRegionEntries } : {},
+  );
+
+  try {
     const pid = await kernel.spawn({
       role: values.role,
       agent: agentSpec,
@@ -320,6 +337,70 @@ export async function cmdSpawn(args: string[]): Promise<number> {
   }
 }
 
+/**
+ * Spawn into the kernel that is already running.
+ *
+ * `cortex spawn` normally boots a kernel of its own, runs the agent to
+ * completion, and exits — the agent's life is bounded by the command, and
+ * every other `cortex` invocation finds only the files it left behind. With
+ * `--live` the agent is spawned into the live kernel instead, so it keeps
+ * running after this command returns, and everything the transport can do
+ * (`cortex send`, `cortex checkpoint`, `cortex kill`, `cortex attach
+ * --interactive`) applies to it.
+ *
+ * Two things move with the agent, and the operator should know about both:
+ * its output goes to the daemon's stdout (it is the daemon's child now, not
+ * this shell's), and its LLM drivers come from the daemon's environment —
+ * the API key the daemon was started with, not the one in this shell.
+ */
+async function spawnLive(opts: {
+  readonly dir: string;
+  readonly role: string;
+  readonly agent: AgentSpec;
+  readonly memory: Record<string, MemoryRegionPolicy>;
+  readonly tokenBudget?: number;
+  readonly capabilities?: readonly Capability[];
+  readonly grantable?: readonly Capability[];
+}): Promise<number> {
+  const probe = await probeKernel(opts.dir);
+  if (probe.kind !== 'live') {
+    if (probe.kind === 'stale') {
+      console.error(
+        `cortex spawn --live: the kernel that published ${probe.endpoint.host}:${probe.endpoint.port} ` +
+        `is not reachable (${probe.reason})`,
+      );
+    }
+    console.error('cortex spawn --live: no live kernel is reachable in this directory.');
+    console.error("  (start one with 'cortex daemon run', or drop --live to run the");
+    console.error('   agent in a kernel of its own)');
+    return 1;
+  }
+
+  const client = probe.client;
+  try {
+    const result = await client.request<{ pid: number; role: string }>('spawn', {
+      role: opts.role,
+      agent: opts.agent,
+      memory: opts.memory,
+      ...(opts.tokenBudget !== undefined ? { budgets: { tokens: opts.tokenBudget } } : {}),
+      ...(opts.capabilities !== undefined ? { capabilities: opts.capabilities } : {}),
+      ...(opts.grantable !== undefined ? { grantable: opts.grantable } : {}),
+    });
+    console.log(`[pid ${result.pid}]`);
+    console.log('  spawned into the live kernel — it keeps running after this command');
+    console.log(`  (its output goes to the daemon's stdout; 'cortex trace ${result.pid}' follows its syscalls)`);
+    return 0;
+  } catch (err) {
+    if (err instanceof KernelCommandError) {
+      console.error(`cortex spawn --live: ${err.errno}: ${err.message}`);
+      return 1;
+    }
+    throw err;
+  } finally {
+    client.close();
+  }
+}
+
 function printSpawnHelp(): void {
   console.log(`cortex spawn — start an agent as a background process
 
@@ -362,6 +443,12 @@ OPTIONS
   --args <json>         A JSON object handed to the agent as its "args", so one
                         module can be reused for different work. Only applies
                         with --module. e.g. --args '{"topic":"mcp","depth":2}'
+  --live                Spawn into the live kernel (one started by
+                        'cortex daemon run') instead of a kernel of this
+                        command's own, so the agent keeps running after this
+                        command exits. Its output goes to the daemon's stdout
+                        and its LLM drivers come from the daemon's
+                        environment.
   -t, --timeout <ms>    Max wall time (default 30000)
   -h, --help            Show this help
 
@@ -384,5 +471,9 @@ EXAMPLES
   # Demo B — pause an agent at a checkpoint, resume it in a later invocation:
   cortex spawn --role demo --module ./examples/checkpoint-agent.ts
   cortex restore --tag demo-pause
+
+  # Start a long-lived agent in the running daemon and keep talking to it:
+  cortex spawn --live --role worker --module ./examples/listener-agent.ts
+  cortex send 3 "what is the weather?"
 `);
 }

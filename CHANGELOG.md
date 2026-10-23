@@ -42,6 +42,57 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The shell can now start an agent inside a running kernel, and stop that
+  kernel.** `cortex spawn` had two lifetimes and honoured only one of them. It
+  booted a private kernel, ran the agent to completion, printed the result and
+  exited — the right behaviour for `spawn` as a *runner*, and the wrong
+  behaviour for everything the daemon had just made reachable. A
+  `cortex send` could deliver into a live agent, but there was no way to put a
+  *new* agent into that kernel from the shell; and no way to end a running
+  daemon at all. `cortex daemon` offered `run`, `install`, `list` and
+  `uninstall`, so the only way to stop a live kernel was to kill its OS
+  process from outside — which is not a lifecycle, it is a Ctrl-C with extra
+  steps.
+
+  **`cortex spawn --live`** sends the spawn request to the running kernel
+  instead of starting a new one. The agent is created by that kernel, through
+  the ordinary `spawn` syscall on the dispatcher, so the state gate, the
+  capability gate and the recording path apply exactly as they do locally: a
+  remote spawn shows up in the live process table with a real PID, a real
+  parent and a real `.crec`, and the command that started it can exit while
+  the agent keeps running.
+
+  The default `cortex spawn` is unchanged — one kernel per invocation, result
+  printed, exit. `--live` is opt-in precisely because silently changing the
+  lifetime of the most-used command is the kind of quiet semantic change this
+  project does not make.
+
+  Two things a live spawn does *not* carry with it, both stated in the
+  command's output so nobody has to guess:
+
+  - **Output belongs to the daemon.** A live agent's stdout is the daemon's
+    stdout; the shell that spawned it gets no stream to read.
+  - **The LLM driver comes from the daemon's environment.** API keys and
+    driver configuration are read where the process runs, not where the
+    command was typed. Typing the key into the spawning shell does not give
+    the key to the daemon.
+
+  **`cortex daemon stop`** is the other half: it asks a running daemon to shut
+  down through the same transport the other shell commands use, so the kernel
+  gets to stop cleanly — logs flushed, endpoint file removed — instead of
+  being cut off. With no daemon running it says plainly that there is
+  nothing to stop and exits non-zero, rather than reporting a success that did
+  not happen.
+
+  Three smoke checks: a remote spawn produces an agent that is in the live
+  process table and can receive a message; a remote shutdown asks the kernel
+  to stop; and `cortex daemon stop` says there is nothing to stop when there
+  is not.
+
+  (docs/ARCHITECTURE.md §12.1; `src/cli/kernel_protocol.ts`,
+  `kernel_server.ts`, `commands/spawn.ts`, `commands/daemon.ts`; 3 smoke
+  checks.)
+
 - **`SIGUSR2` means "checkpoint now" — and now it does.** The signal has said
   *"Checkpoint now. Kernel writes snapshot"* since docs/PROCESS.md §7 was
   written, the transition table has carried a `running -> checkpointing` edge

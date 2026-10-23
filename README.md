@@ -78,9 +78,17 @@ $ cortex daemon install inbox-watcher --role inbox-watcher \
 [daemon inbox-watcher] installed (role=inbox-watcher, restart=on-failure)
 $ cortex daemon run inbox-watcher
 [daemon inbox-watcher pid 2] running (restart=on-failure)
+
+# start another agent *inside* that running kernel, from the shell
+$ cortex spawn --live --role extra --module ./examples/listener-agent.ts
+[pid 3] spawned into the live kernel — it keeps running after this command
+
+# ...and stop the kernel again, from the shell
+$ cortex daemon stop
+daemon stop requested
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a disk-based follow-mode syscall trace, and with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent and `cortex kill` delivers a real signal. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a disk-based follow-mode syscall trace, and with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, and `cortex daemon stop` shuts it down again. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 

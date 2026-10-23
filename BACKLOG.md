@@ -86,7 +86,7 @@ Pluggable backends. Each driver is independently testable.
 
 The user-facing surface. Should feel like a real OS shell.
 
-- [x] **#029** `cortex spawn` — start an agent, print PID → implemented (`--role`, `--task`, `--system`, `--module`; env-driven driver selection). Hardened this pass: `--module` spawns a user agent module; the previously-dead `--driver`/`--model`/`--max-tokens` now flow through `AgentSpec` into the prompt agent's `llm_call` and `--token-budget` becomes a real spawn budget; every spawned agent gets the three default memory regions (episodic/semantic/procedural) so `memory_write` does not trap ENOENT; and a reaped process's exit status is recovered from the `.crec` exit record instead of being hardcoded to `code 0: completed` (a failed run is no longer reported as success).
+- [x] **#029** `cortex spawn` — start an agent, print PID → implemented (`--role`, `--task`, `--system`, `--module`; env-driven driver selection). Hardened this pass: `--module` spawns a user agent module; the previously-dead `--driver`/`--model`/`--max-tokens` now flow through `AgentSpec` into the prompt agent's `llm_call` and `--token-budget` becomes a real spawn budget; every spawned agent gets the three default memory regions (episodic/semantic/procedural) so `memory_write` does not trap ENOENT; and a reaped process's exit status is recovered from the `.crec` exit record instead of being hardcoded to `code 0: completed` (a failed run is no longer reported as success). **`cortex spawn --live` spawns into the running kernel** instead of booting a throwaway one: the agent is created by the daemon's kernel through the ordinary `spawn` syscall on the dispatcher (so the state gate, the capability gate and the recording path apply exactly as they do locally), it gets a real PID in the live process table, and the command that started it can exit while the agent keeps running. It is opt-in because the default `spawn` is a *runner* — one kernel per invocation, result printed, exit — and silently changing the lifetime of the most-used command is the kind of quiet semantic change this project does not make. Two things a live spawn does not carry, both printed in the command's own output: the agent's stdout belongs to the daemon, and the LLM driver (API key included) is read from the *daemon's* environment, not the shell's.
 - [x] **#030** `cortex ps` — list processes with state, tokens, age → implemented (table format with PID/PPID/ROLE/STATE/TOKENS/AGE; `--state`/`--role` filters)
 - [x] **#031** `cortex attach` / `detach` — interactive session with a running agent
   - **v0 (this pass):** `attach <pid>` is a **read-only, disk-based follow-mode syscall trace** — `tail -f` on the process's `.crec`. It dumps every syscall the agent has made so far and, in follow mode (the default), polls the log every 250ms and prints new frames as another `cortex` invocation appends them; SIGINT / SIGTERM detach cleanly. It reuses the same `formatRecordLine` as `cortex trace`, so both commands print identical rows for the same file. Resolves a PID (via `CORTEX_HOME`) or a direct `.crec` path; `--once` for a one-shot dump; `--timeout-ms N` for headless / test use. 4 smoke checks cover `--once`-vs-`trace` row parity, follow-mode mid-window frame pickup, the missing-PID error, and the no-argument help path.
@@ -102,6 +102,7 @@ The user-facing surface. Should feel like a real OS shell.
   - **v0 (this pass):** `cortex daemon install <name> --role ... [--module|--system] [--restart always|on-failure|never] [--max-restarts n] [--backoff-ms n]` persists a `DaemonSpec` to `.cortex/daemons.json` (the registry ARCHITECTURE §7 already specified) and generates an OS service unit under `<CORTEX_HOME>/units/`: a systemd `.service` on linux, a launchd `.plist` on darwin. Windows gets an `schtasks` command printed instead of a file. `install` deliberately does **not** enable the unit itself — that needs the operator's session / root and is OS-specific — but it prints the exact `systemctl --user enable --now` / `launchctl load` / `schtasks` command. `cortex daemon list` renders the registry; `cortex daemon uninstall <name>` removes the spec and best-effort deletes the unit.
   - **`cortex daemon run [name]` is a real long-lived supervisor**, not the short-lived CLI model: it boots a kernel, registers the daemon(s) through the **existing** `Kernel.registerDaemon` → init supervision machinery (`RestartPolicy` always / on-failure / never, exponential backoff, `maxRestarts` cap, sliding-window restart-storm detection — docs/PROCESS.md §9–§10), and stays alive until SIGTERM/SIGINT (or `--max-runtime-ms n`, for headless / test use). **No kernel code changed** — init already had the supervisor; this command is the thin CLI shell over it. This is also the piece that makes `attach`'s deferred interactive send-half possible.
   - **It is now the kernel's transport endpoint.** While `daemon run` is alive, the kernel serves a loopback control port and publishes its endpoint in `<CORTEX_HOME>/kernel.json` (host, port, OS pid, a per-kernel token, ABI version). That is what discharges the deferral above: `cortex send`, `cortex kill` and `cortex attach --interactive` in the same directory now reach the *running* kernel instead of the files it left behind. Every remote action is answered by an existing kernel API through the dispatcher, so it is recorded in the kernel's `.crec` exactly like a local one — the transport adds reachability, not a side door (docs/ARCHITECTURE.md §12.1). `--port` pins the port instead of taking an ephemeral one.
+  - **`cortex daemon stop` is now a command.** The server already answered `shutdown`; what was missing was a way to *ask* for it from the shell, so the only way to end a live daemon was to kill its OS process from outside. It now asks the daemon to stop through the same transport the other commands use, so the kernel shuts down cleanly (logs flushed, endpoint file removed) instead of being cut off. With no daemon running it says plainly that there is nothing to stop and exits non-zero.
   - **8 smoke checks:** install persists a spec (with memory regions) and rejects a bad name / bad restart kind; list renders the registry; uninstall removes the spec (and the platform unit when one exists); the pure `generateServiceUnit` renders linux + darwin units correctly (win32 has no unit path); `enableCommand` is correct per platform; `daemon run --max-runtime-ms` actually restarts a crashing agent (asserts ≥ 2 `.crec` files, i.e. the restart fired); `run` on an unknown name fails.
 - [x] **#040** `cortex audit` — surface tools that are untagged for reversibility (STATE.md §8.7) → implemented, and **sharpened by #025**: it now prints each tool's tag *and* distinguishes a declared tag from an inferred one. Before MCP, "untagged" meant "the driver author forgot"; with MCP it means "the protocol has no field for it", so every MCP tool would have looked identically untagged. The driver exposes `declaredReversibility` (per exposed tool name) and audit flags the defaulted ones with `<- NOT declared; defaulted`, then summarizes how many are silently locked out of `forkable()` regions and how to fix it.
 
@@ -198,11 +199,14 @@ running agent (it could never succeed before — a checkpoint captures a live
 process, and the short-lived CLI kernel holds only init), and `SIGUSR2`
 means "checkpoint now" for real, which is the only way to ask *another*
 process to snapshot itself (`checkpoint` is a self-syscall; the ABI gives it
-no target argument). What remains for `1.1` comes out of the Icebox below —
-plus the two things the transport still does not do: `cortex spawn` does not
-yet spawn into the live kernel (it boots its own, and the PID claim keeps
-the two off each other's logs), and the transport carries commands rather
-than streams (there is no live trace subscription yet).
+no target argument). The transport now also owns the *lifecycle*: `cortex spawn
+--live` creates an agent **inside** the running kernel (the default `spawn`
+still boots its own — one kernel per invocation — so the PID claim keeps the
+two off each other's logs), and `cortex daemon stop` asks a running daemon to
+shut down cleanly instead of having its OS process killed from outside. What
+remains for `1.1` comes out of the Icebox below — plus the one thing the
+transport still does not do: it carries commands rather than streams (there is
+no live trace subscription yet).
 
 ---
 
@@ -230,12 +234,6 @@ Things we want, but not yet:
 - Optional Temporal-backed persistence driver (prove our "you can build cortex on Temporal" claim)
 
 **From the live-kernel transport:**
-- `cortex spawn --live` — spawn into the running kernel instead of a
-  short-lived one. The agent's stdout then belongs to the daemon, which is a
-  visible change in behaviour, so it must be opt-in rather than a silent
-  change to the most-used command.
-- `cortex daemon stop` as a CLI entry point (the server already answers
-  `shutdown`).
 - A **queued** signal loses its sender: the pending queue holds the signal
   only (`pendingSignals` is part of `ProcessInfo`, and the ABI is frozen), so
   a `SIGUSR2` that had to wait for its target to run again is recorded

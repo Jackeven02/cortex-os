@@ -78,9 +78,17 @@ $ cortex daemon install inbox-watcher --role inbox-watcher \
 [daemon inbox-watcher] installed (role=inbox-watcher, restart=on-failure)
 $ cortex daemon run inbox-watcher
 [daemon inbox-watcher pid 2] running (restart=on-failure)
+
+# 从 shell 往那个正在运行的内核里再起一个 agent
+$ cortex spawn --live --role extra --module ./examples/listener-agent.ts
+[pid 3] spawned into the live kernel — it keeps running after this command
+
+# ...再从 shell 把内核停掉
+$ cortex daemon stop
+daemon stop requested
 ```
 
-上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 是基于磁盘的 follow-mode syscall 追踪；如果有活内核在跑，它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
+上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 是基于磁盘的 follow-mode syscall 追踪；如果有活内核在跑，它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex daemon stop` 还能再把它停下来。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
 
 ---
 
