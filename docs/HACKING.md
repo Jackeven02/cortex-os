@@ -346,11 +346,35 @@ transition.
 | snapshot a running process | `kernel.dispatcher.invoke(pid, 'checkpoint', { tag })` |
 | be told when a process is created | `KernelOptions.onProcessStart` |
 | be told when a process ends | `KernelOptions.onProcessExit` |
+| **watch everything, as it happens** | **`kernel.subscribe(listener)`** |
 
 `KernelOptions.onProcessExit` is still worth wiring — it is how you persist
 your own metadata, and it fires at the same instant as `awaitExit` resolves.
 But it is a *notification*, not a *join*: it tells you a process ended, it
 does not wait for one.
+
+`kernel.subscribe(listener)` is the other shape again: it reports what the
+kernel does as it does it — a process being born, a process ending with its
+real exit code, and every syscall frame as it lands in the process's `.crec`
+log. The listener is called synchronously, so the event arrives at the moment
+it happens; keep it quick and hand slow work to a queue of your own. It
+returns an unsubscribe function, and a listener that throws is ignored — a
+broken watcher cannot take the kernel down.
+
+```typescript
+const stop = kernel.subscribe((event) => {
+  if (event.kind === 'process-exit') {
+    console.log(`pid ${event.pid} ended with ${String(event.exitCode)}`);
+  }
+});
+```
+
+One thing to know about the `record` events: they are the frames **as they
+are on disk**, with the same `byteOffset` — so a live watcher and
+`cortex trace` can never tell different stories about the same log. That is
+also why the hook lives on the recorder rather than on the dispatcher: seven
+modules write records directly, and the recorder is the only place all of
+them pass through.
 
 ### 7.3 What a host cannot do
 

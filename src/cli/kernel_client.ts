@@ -29,9 +29,9 @@ import { connect, type Socket } from 'node:net';
 
 import { readEndpoint, type KernelEndpoint } from './kernel_endpoint.js';
 import {
-  decodeResponse,
   encodeFrame,
   LineDecoder,
+  parseFrame,
   KERNEL_PROTOCOL_VERSION,
   type KernelCommand,
   type KernelResponseErr,
@@ -51,6 +51,8 @@ export class KernelClient {
   #decoder = new LineDecoder();
   #nextId = 0;
   #pending = new Map<string, { resolve: (value: unknown) => void; reject: (err: Error) => void }>();
+  /** Subscribe request id → the handler that wants its events. */
+  #events = new Map<string, (event: unknown) => void>();
   #closed = false;
 
   constructor(endpoint: KernelEndpoint, socket: Socket) {
@@ -88,8 +90,56 @@ export class KernelClient {
    */
   async requestRaw(cmd: KernelCommand, args?: Record<string, unknown>): Promise<KernelCommandResult> {
     if (this.#closed) throw new Error('connection to the kernel is closed');
-
     const id = String(++this.#nextId);
+    return await this.#send(id, cmd, args);
+  }
+
+  /**
+   * Subscribe to the kernel's event stream.
+   *
+   * The kernel acknowledges the request like any other command, and then
+   * *pushes* events on this same connection. The handler is registered
+   **before** the request goes out, so an event the kernel emits while it is
+   * still handling the request is not dropped on the floor — the ordering on
+   * the wire can put an event ahead of the acknowledgement.
+   *
+   * @param handler Called for every event the kernel pushes.
+   * @param args    Optional filter: `{ pid?: number, kinds?: string[] }`.
+   * @returns A function that cancels the subscription.
+   * @throws KernelCommandError when the kernel refuses the subscription.
+   */
+  async subscribe(
+    handler: (event: unknown) => void,
+    args?: Record<string, unknown>,
+  ): Promise<() => void> {
+    if (this.#closed) throw new Error('connection to the kernel is closed');
+    const id = String(++this.#nextId);
+    this.#events.set(id, handler);
+    try {
+      const response = await this.#send(id, 'subscribe', args);
+      if (!response.ok) {
+        this.#events.delete(id);
+        throw new KernelCommandError(
+          response.error.errno,
+          response.error.message,
+          response.error.details,
+        );
+      }
+    } catch (err) {
+      this.#events.delete(id);
+      throw err;
+    }
+    return () => {
+      this.#events.delete(id);
+    };
+  }
+
+  /** Write one request frame and wait for the response with the same id. */
+  async #send(
+    id: string,
+    cmd: KernelCommand,
+    args?: Record<string, unknown>,
+  ): Promise<KernelCommandResult> {
     const frame: Record<string, unknown> = {
       v: KERNEL_PROTOCOL_VERSION,
       id,
@@ -115,13 +165,31 @@ export class KernelClient {
   }
 
   #resolveLine(line: string): void {
-    let response;
+    let frame;
     try {
-      response = decodeResponse(line);
+      frame = parseFrame(line);
     } catch (err) {
-      this.#failAll(new Error(`malformed response from the kernel: ${(err as Error).message}`));
+      this.#failAll(new Error(`malformed frame from the kernel: ${(err as Error).message}`));
       return;
     }
+
+    // A pushed event is not a response: it carries the id of the subscribe
+    // request that opened the stream, and it must not be mistaken for a
+    // malformed response (which would fail every pending request on this
+    // connection).
+    if (frame.kind === 'event') {
+      const handler = this.#events.get(frame.id);
+      if (handler === undefined) return; // the subscription was cancelled
+      try {
+        handler(frame.event);
+      } catch {
+        // The handler is the caller's code. It must not be able to take the
+        // connection — or the kernel — down with it.
+      }
+      return;
+    }
+
+    const response = frame.response;
     const waiter = this.#pending.get(response.id);
     if (waiter === undefined) return;
     this.#pending.delete(response.id);

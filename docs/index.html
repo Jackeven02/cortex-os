@@ -298,6 +298,7 @@
         <div class="prim"><div class="k">logs</div><div class="v">Every line a process printed, kept per process, with its stream and timestamp.</div></div>
         <div class="prim"><div class="k">memory</div><div class="v">What a running process knows — its memory regions, and who else can see them.</div></div>
         <div class="prim"><div class="k">attach</div><div class="v">Follow a running process's syscall stream, like <code>tail -f</code>.</div></div>
+        <div class="prim"><div class="k">watch</div><div class="v">The kernel's event stream, live — every frame, pushed the moment it lands.</div></div>
         <div class="prim"><div class="k">limit</div><div class="v">Token, USD, and wall-time budgets per process.</div></div>
         <div class="prim"><div class="k">daemon</div><div class="v">Register a long-lived agent to start on boot and restart on failure.</div></div>
       </div>
@@ -384,7 +385,7 @@ npx tsx src/cli/index.ts diff 2 3</pre>
         <div class="stat"><div class="n">12</div><div class="l">kernel modules</div></div>
         <div class="stat"><div class="n">24</div><div class="l">syscalls</div></div>
         <div class="stat"><div class="n">7</div><div class="l">drivers (LLM · MCP · FS · memory)</div></div>
-        <div class="stat"><div class="n">624</div><div class="l">smoke checks, all green</div></div>
+        <div class="stat"><div class="n">631</div><div class="l">smoke checks, all green</div></div>
       </div>
       <p class="sub">
         Phases 0–5 are complete: the kernel boots, all drivers ship, the whole CLI
@@ -404,8 +405,9 @@ npx tsx src/cli/index.ts diff 2 3</pre>
         <b>Honest about what 1.0 is not.</b> A checkpoint captures the process
         <i>image</i> — state, memory, budgets, lineage — not the live JS call stack,
         so a restored agent re-runs from the top and skips completed work via a
-        memory marker. <code>attach</code> follows the on-disk syscall log; the
-        interactive send-half lands with a first-class daemon. Capability defaults are
+        memory marker. <code>attach</code> follows the on-disk syscall log;
+        <code>watch</code> is the live one — the kernel pushes the frames as they
+        land. The interactive send-half lands with a first-class daemon. Capability defaults are
         <i>full privilege</i>, not least privilege — narrowing is opt-in, because
         defaulting to least privilege would have broken every agent written before 1.0.
       </div>

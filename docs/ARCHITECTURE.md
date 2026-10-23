@@ -924,13 +924,81 @@ it resolves with the exit code, it still answers for a process that has already
 been reaped, and it refuses a pid the kernel has never known with `ESRCH`.
 docs/HACKING.md §7 is the whole story.
 
+**And it made the kernel a stream.** Everything above was still the transport
+carrying **commands**: a client asked, the kernel answered, the client went
+away. That is the right shape for a question, and the wrong shape for a
+question like *"tell me the moment this agent exits"* — and it is the one gap
+this section had named for a while. Asking is fine; *watching* is different,
+and watching by polling is a latency tax and a race.
+
+So the kernel now reports facts as they happen, and the transport carries
+them. `Kernel.subscribe(listener)` is the whole kernel-side API: one method,
+one callback, one unsubscribe function.
+
+```typescript
+const stop = kernel.subscribe((event) => {
+  if (event.kind === 'process-exit') console.log(`pid ${event.pid} → ${event.exitCode}`);
+});
+```
+
+Three kinds of event, all of them facts:
+
+- **`process-start`** — a process was born (pid, parent, role).
+- **`process-exit`** — a process ended, with its **real** exit code — the same
+  facts `awaitExit` resolves with, and the same ones `onProcessExit` reports.
+  One truth, three ways to reach it.
+- **`record`** — a syscall frame was appended to a process's `.crec` log. This
+  is the live equivalent of `cortex trace`: the same `SyscallRecord`, with the
+  same `byteOffset`, the instant it lands on disk.
+
+That last one has a subtlety worth naming, because it decided where the hook
+lives. **Seven** modules write records directly, through `recorder.append()`:
+the dispatcher, the scheduler, the signal manager, the process table, `fork`,
+`init` and `checkpoint` — four of them predate the dispatcher and own a record
+of their own. A hook on the dispatcher would therefore have reported a
+*subset* of the log, and a live watcher would have disagreed with
+`cortex trace` about what happened. The hook belongs on the **recorder**,
+which is the one place every frame passes through, so a subscriber's view of
+the log and the log itself cannot disagree. (The smoke suite asserts exactly
+that: the pushed frames and the frames on disk must be the same frames, at
+the same offsets.)
+
+Over the wire, the transport carries the stream on the same socket: a client
+sends `subscribe`, gets an ordinary acknowledgement, and then the kernel
+*pushes* `{event: …}` frames on that connection. `cortex watch` is the shell's
+view of it.
+
+```console
+$ cortex watch --pid 1234
+# watching the kernel event stream (Ctrl-C to stop)
+time                  pid    syscall           phase   duration  reversibility
+-------------------------------------------------------------------------------------
+19:50:09.072  1234    __sched          exit    -         idempotent
+19:50:09.072  1234    sleep            exit    2523ms    idempotent
+19:50:09.073  1234    memory_write     enter   -         reversible
+19:50:09.074  1234    memory_read      exit    0ms       idempotent
+19:50:09.077  1234    exit             enter   -         irreversible
+# pid 1234 exited with code 3 (probe finished on purpose)
+```
+
+The `record` lines are printed in the same layout as `cortex trace`, so the
+two can be read side by side — and they *are* the same frames, which is the
+point.
+
 **Known limits (v0).**
 
-- The transport carries commands, not streams: there is no live trace
-  subscription yet. `cortex attach` still follows the `.crec` file on disk
-  (which the daemon writes to) and delivers the interactive half over the
-  wire. `cortex logs --follow` has the same shape: it polls
-  `output.log` every 250 ms rather than subscribing to anything.
+- **Watching is still not reacting.** The transport carries a stream now, but
+  nothing in the kernel *acts* on what a subscriber sees: a watcher that wants
+  to kill a runaway agent still has to issue the `kill` itself. The frames
+  arrive; the policy stays with the host. That is deliberate — an operator
+  watching a kernel must not be able to change what the kernel does by
+  watching it — but it means the next thing to build is a supervisor that
+  consumes the stream, not a bigger stream.
+- `cortex attach` still follows the `.crec` file on disk (which the daemon
+  writes to) and delivers the interactive half over the wire. `cortex logs
+  --follow` has the same shape: it polls `output.log` every 250 ms. Both work
+  without a live kernel, which is why they keep that shape; `cortex watch` is
+  the live one.
 - **Memory inspection needs the live kernel.** `cortex memory <pid>` reads a
   process's memory regions through the transport, because a region's contents
   live in the memory driver — with the default `inmem` backing, in the kernel

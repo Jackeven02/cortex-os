@@ -300,6 +300,13 @@ A process dies in one of three ways:
 
 **Crash.** An unhandled exception in agent code, a corrupted snapshot, a kernel-level fault. State goes to EXITING with `exit_reason: 'crash'`. The supervisor's restart policy applies.
 
+**And it is reported, not only stored.** The exit facts — the real code, the
+reason — are also *pushed* to whoever is watching the kernel:
+`Kernel.subscribe` reports a `process-exit` event carrying the same code and
+the same reason (docs/ARCHITECTURE.md §12.1). A host that wants to react to a
+death does not have to poll the process table to notice it, and it cannot
+miss the window between the death and the reap.
+
 ### 6.4 Reaping
 
 The parent eventually calls `wait(pid)` or `wait_any()`. The kernel:

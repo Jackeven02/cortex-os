@@ -141,6 +141,7 @@ import {
   type SignalDisposition,
   type SignalHandler,
   type SpawnOptions,
+  type SyscallRecord,
   type Timestamp,
   type ToolCallOptions,
   type WaitOptions,
@@ -260,6 +261,65 @@ interface ExitWaiter {
   readonly resolve: (exit: ProcessExit | undefined) => void;
   timer: ReturnType<typeof setTimeout> | undefined;
 }
+
+/**
+ * Something the kernel reports to whoever is watching.
+ *
+ * ## Why this exists
+ *
+ * Until now a host could only *ask* the kernel things: `ps`, `memory`, `wait`,
+ * `kill`. Asking is fine for a question, but it is the wrong shape for a
+ * question like *"tell me the moment this agent exits"* — the host has to
+ * poll, and a polling loop is a latency tax and a race. The transport had the
+ * same gap: it carried commands, not streams.
+ *
+ * So the kernel reports facts as they happen, and a host may watch them.
+ * `Kernel.subscribe` is the whole API: one method, one callback, one
+ * unsubscribe function.
+ *
+ * ## What the events are
+ *
+ * - `process-start` — a process was born (pid, parent, role).
+ * - `process-exit` — a process ended, with its **real** exit code (the same
+ *   facts `awaitExit` resolves with, and the same ones `onProcessExit`
+ *   reports — one truth, three ways to reach it).
+ * - `record` — a syscall frame was appended to a process's `.crec` log. This
+ *   is the live equivalent of `cortex trace`: the same `SyscallRecord`, with
+ *   the same `byteOffset`, the instant it lands on disk.
+ *
+ * ## What they are not
+ *
+ * These are **facts, not commands**. An event carries no request and changes
+ * nothing; the kernel does not wait for a listener to finish, and a listener
+ * that throws cannot break the kernel (its error is swallowed — a broken
+ * watcher must not take the kernel down with it).
+ *
+ * Events are also not part of the syscall ABI. Nothing is added to
+ * `CortexContext`, no errno contract changes, and `KERNEL_ABI_VERSION` stays
+ * where it is. A host that never subscribes sees exactly the kernel it saw
+ * before.
+ */
+export type KernelEvent =
+  | {
+      readonly kind: 'process-start';
+      readonly pid: number;
+      readonly ppid: number | null;
+      readonly role: string;
+    }
+  | {
+      readonly kind: 'process-exit';
+      readonly pid: number;
+      readonly exitCode: number | null;
+      readonly exitReason: string | null;
+    }
+  | {
+      readonly kind: 'record';
+      readonly pid: number;
+      readonly record: SyscallRecord;
+    };
+
+/** A host watching the kernel's events. */
+export type KernelEventListener = (event: KernelEvent) => void;
 
 export interface KernelOptions {
   /** Written into every `.crec` / `.csnap` record. Required (no silent default). */
@@ -520,6 +580,8 @@ export class Kernel {
   #exits = new Map<number, ProcessExit>();
   /** pid → the hosts waiting for it to end. */
   #exitWaiters = new Map<number, ExitWaiter[]>();
+  /** The hosts watching the kernel's event stream. */
+  #listeners = new Set<KernelEventListener>();
 
   #booted = false;
   #shutdownReport: ShutdownReport | null = null;
@@ -543,13 +605,31 @@ export class Kernel {
     this.#loadAgent = opts.agentLoader ?? ((spec) => this.#defaultLoadAgent(spec));
 
     // --- recorder factory (§8 step 3b: initialise recorder) -----------------
-    const recorderFactory: RecorderFactory =
+    const openRecorder: RecorderFactory =
       opts.recorderFactory ??
       // One directory per process (docs/ARCHITECTURE.md §7): the log lives at
       // `<dir>/processes/<pid>/log.crec`, so a process's whole footprint is one
       // subtree. `Recorder.open` creates the directory on first write.
       (async (pid: ProcessId) =>
         Recorder.open({ pid, dir: join(this.#processesDir, String(unbrand(pid))) }));
+
+    // Every frame that lands in a process's log is reported to the event
+    // stream — through the **recorder**, not the dispatcher, because seven
+    // modules write records directly (the dispatcher, the scheduler, the
+    // signal manager, the process table, `fork`, `init`, `checkpoint`). The
+    // recorder is the one place every frame passes through, so a subscriber's
+    // view of the log cannot disagree with the log itself.
+    //
+    // The factory is wrapped rather than replaced, so a host that supplies its
+    // own recorder still gets a working event stream.
+    const recorderFactory: RecorderFactory = async (pid: ProcessId) => {
+      const recorder = await openRecorder(pid);
+      if (recorder === null) return null;
+      recorder.setOnRecord((record) => {
+        this.#emit({ kind: 'record', pid: unbrand(record.pid), record });
+      });
+      return recorder;
+    };
 
     // --- process_table ------------------------------------------------------
     const onProcessStart = opts.onProcessStart;
@@ -569,20 +649,20 @@ export class Kernel {
         : {}),
       // Every process is born through `table.allocate()` — the dispatcher's
       // `spawn`, init's daemon registration, and `restore` all land here — so
-      // this is the one place that sees every birth.
-      ...(onProcessStart !== undefined
-        ? {
-            onCreate: (entry) =>
-              onProcessStart({
-                pid: unbrand(entry.pid),
-                ppid: entry.ppid === null ? null : unbrand(entry.ppid),
-                role: entry.role,
-                agent: entry.agent,
-                memory: Object.fromEntries(entry.memoryRegions),
-                startedAt: entry.startedAt,
-              }),
-          }
-        : {}),
+      // this is the one place that sees every birth. The `process-start`
+      // event is emitted here for the same reason: one hook, every birth.
+      onCreate: (entry) => {
+        const birth: ProcessBirth = {
+          pid: unbrand(entry.pid),
+          ppid: entry.ppid === null ? null : unbrand(entry.ppid),
+          role: entry.role,
+          agent: entry.agent,
+          memory: Object.fromEntries(entry.memoryRegions),
+          startedAt: entry.startedAt,
+        };
+        this.#emit({ kind: 'process-start', pid: birth.pid, ppid: birth.ppid, role: birth.role });
+        return onProcessStart?.(birth);
+      },
     });
 
     // --- signals ↔ init (deferred ref breaks the cycle, as in the smoke) -----
@@ -966,12 +1046,78 @@ export class Kernel {
       exitReason: meta.exitReason,
     };
     this.#exits.set(key, exit);
+
+    // Tell the watchers before releasing the waiters: a subscriber that sees
+    // "pid 4 exited" and then asks `awaitExit(4)` must get the same answer
+    // the waiter is about to get.
+    this.#emit({
+      kind: 'process-exit',
+      pid: exit.pid,
+      // The code exactly as the kernel knows it — never a defaulted zero. A
+      // subscriber that sees "exited 0" for a process that failed has been
+      // told a lie it will act on.
+      exitCode: exit.exitCode,
+      exitReason: exit.exitReason,
+    });
+
     const waiters = this.#exitWaiters.get(key);
     if (waiters === undefined) return;
     this.#exitWaiters.delete(key);
     for (const waiter of waiters) {
       if (waiter.timer !== undefined) clearTimeout(waiter.timer);
       waiter.resolve(exit);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // §4.2c The event stream (facts, pushed to whoever is watching)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Watch the kernel's event stream.
+   *
+   * The kernel reports what happens as it happens; a host decides what to do
+   * about it. The returned function unsubscribes.
+   *
+   * The listener is called **synchronously**, inside the kernel's own turn —
+   * so an event is delivered at the moment it happens, not a tick later. It
+   * must therefore not block: do the work in the callback, and hand anything
+   * slow to a queue of your own.
+   *
+   * A listener that throws is ignored. A broken watcher must not be able to
+   * take the kernel down, and it certainly must not be able to change what
+   * the kernel does — events are facts, not commands.
+   *
+   * ```ts
+   * const stop = kernel.subscribe((event) => {
+   *   if (event.kind === 'process-exit') console.log(`pid ${event.pid} → ${event.exitCode}`);
+   * });
+   * // ... later
+   * stop();
+   * ```
+   */
+  subscribe(listener: KernelEventListener): () => void {
+    this.#listeners.add(listener);
+    return () => {
+      this.#listeners.delete(listener);
+    };
+  }
+
+  /**
+   * Report a fact to every watcher.
+   *
+   * Best-effort by design: a listener that throws is skipped, and the others
+   * still get the event. The kernel does not wait for listeners, and no
+   * listener can slow the kernel down with anything but its own CPU time.
+   */
+  #emit(event: KernelEvent): void {
+    if (this.#listeners.size === 0) return;
+    for (const listener of [...this.#listeners]) {
+      try {
+        listener(event);
+      } catch {
+        /* a broken watcher must not break the kernel */
+      }
     }
   }
 

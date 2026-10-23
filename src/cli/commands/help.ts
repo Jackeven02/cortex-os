@@ -24,6 +24,7 @@ COMMANDS
   logs         What a process printed (per-process stdout capture)
   memory       What a running process knows (its memory regions)
   wait         Wait for a process to end, and report its exit code
+  watch        Watch the kernel's event stream, live
   checkpoint   Snapshot a process to disk
   restore      Restore a process from a checkpoint
   fork         Clone a running process at its current state
@@ -51,6 +52,7 @@ EXAMPLES
   cortex logs 1234
   cortex memory 1234
   cortex wait 1234
+  cortex watch
   cortex checkpoint 1234 --tag "before risky edit"
   cortex restore --tag "before risky edit"
   cortex fork 1234

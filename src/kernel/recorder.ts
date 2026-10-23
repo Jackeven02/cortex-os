@@ -179,12 +179,36 @@ export class Recorder {
   #offset: number;
   #closed = false;
   #writeChain: Promise<void> = Promise.resolve();
+  #onRecord: ((record: SyscallRecord) => void) | undefined;
 
   private constructor(pid: ProcessId, path: string, handle: FileHandle, offset: number) {
     this.pid = pid;
     this.path = path;
     this.#handle = handle;
     this.#offset = offset;
+  }
+
+  /**
+   * Attach a listener that is told about every frame as it is written.
+   *
+   * The listener receives the **complete** record — including the
+   * `byteOffset` this recorder assigned — so a watcher sees exactly the
+   * frame that is now on disk, at the offset `cortex trace` would report for
+   * it. It fires after the write, in file order.
+   *
+   * Why the recorder and not the dispatcher: **seven** modules write records
+   * directly through `append()` — the dispatcher, the scheduler, the signal
+   * manager, the process table, `fork`, `init` and `checkpoint` — because
+   * they predate the dispatcher or own a record of their own. The recorder
+   * is the one place every frame passes through, so it is the only place
+   * where a live watcher can be told the truth: a subscriber's view of the
+   * log and the log itself cannot disagree.
+   *
+   * The listener is best-effort: one that throws is ignored. A watcher is a
+   * guest; it cannot be allowed to change what gets recorded.
+   */
+  setOnRecord(listener: ((record: SyscallRecord) => void) | undefined): void {
+    this.#onRecord = listener;
   }
 
   /**
@@ -363,6 +387,16 @@ export class Recorder {
     }
 
     this.#offset = position + CREC_FRAME_PREFIX_SIZE + payload.byteLength;
+
+    // Tell the watcher, now that the frame is on disk. The listener is a
+    // guest: it must not be able to change what was recorded.
+    if (this.#onRecord !== undefined) {
+      try {
+        this.#onRecord(record);
+      } catch {
+        /* a broken watcher must not break the writer */
+      }
+    }
     return byteOffset;
   }
 

@@ -98,6 +98,14 @@ Things that look like syscalls but aren't:
   (`Kernel.awaitExit(pid, { timeoutMs })`), not a syscall. Nothing is added to
   the ABI for it: the frozen syscall set is unchanged, and an agent's own
   `ctx.wait(pid)` keeps its exact meaning.
+- **Watching the kernel is not a syscall either.** A host can subscribe to the
+  kernel's event stream (`Kernel.subscribe`), and the transport can push those
+  events to a client — but there is no `ctx.watch()`, and nothing is added to
+  the frozen syscall set. An event is a **view** of the causal history, not a
+  new entry in it: the frames a subscriber sees are the frames that are
+  already in the `.crec`, at the offsets they occupy there, and the process
+  lifecycle facts are the same ones the log and the process table already
+  hold. Subscribing records nothing.
 
 This last point is important. Cortex cannot record what it does not see. If your agent does `fetch(...)` directly, the recording has a hole in it and replay will diverge.
 

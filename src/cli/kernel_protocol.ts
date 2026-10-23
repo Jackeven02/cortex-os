@@ -44,6 +44,24 @@
  * guessing. `errno` is one of the kernel's errnos (docs/ABI.md §3.2) when the
  * failure came from the kernel, and `EFAULT` when it came from the transport.
  *
+ * ## Events (the transport carries streams too)
+ *
+ * A client that asks to `subscribe` gets an ordinary acknowledgement, and
+ * then the kernel *pushes* frames on the same socket:
+ *
+ * ```json
+ * {"v":1,"id":"9","event":{"kind":"record","pid":2,"record":{…}}}
+ * ```
+ *
+ * The `id` is the id of the `subscribe` request, so a client multiplexing
+ * several subscriptions on one connection can tell them apart. An event frame
+ * is the only frame without an `ok` field — that is what distinguishes it
+ * from a response, and `parseFrame` is what tells them apart safely.
+ *
+ * The event payload is whatever the kernel reports (see `KernelEvent` in
+ * `kernel/boot.ts`). The transport does not interpret it and does not get to
+ * decide what a subscriber may see: the kernel filters, the transport carries.
+ *
  * @module cli/kernel_protocol
  */
 
@@ -57,8 +75,16 @@ export const KERNEL_PROTOCOL_VERSION = 1;
  * deliberately not recorded in the `.crec` log. `ps` and `memory` are the
  * operator *looking* at the kernel's state rather than acting through it, so
  * they are not recorded either — a monitoring loop that polls every second
- * would otherwise grow the log without doing any work. Everything else is
- * answered by the ordinary dispatcher path and therefore is recorded.
+ * would otherwise grow the log without doing any work. `wait` is the same
+ * shape: an operator waiting for a process to end is not something the
+ * process did.
+ *
+ * `subscribe` is the odd one: it is the only command that makes the kernel
+ * *push* rather than answer. It opens a stream on the same socket and is not
+ * recorded either — watching is not doing.
+ *
+ * Everything else is answered by the ordinary dispatcher path and therefore
+ * is recorded.
  */
 export type KernelCommand =
   | 'ping'
@@ -67,6 +93,7 @@ export type KernelCommand =
   | 'send'
   | 'kill'
   | 'wait'
+  | 'subscribe'
   | 'checkpoint'
   | 'restore'
   | 'spawn'
@@ -104,6 +131,24 @@ export interface KernelResponseErr {
 
 /** Either response frame. */
 export type KernelResponse = KernelResponseOk | KernelResponseErr;
+
+/**
+ * A pushed event frame.
+ *
+ * The kernel tells a subscriber that something happened. The `id` is the id of
+ * the `subscribe` request that opened the stream, so one connection can carry
+ * several subscriptions.
+ */
+export interface KernelEventFrame {
+  readonly v: number;
+  readonly id: string;
+  readonly event: unknown;
+}
+
+/** Either kind of frame a client can receive. */
+export type KernelFrame =
+  | { readonly kind: 'response'; readonly response: KernelResponse }
+  | { readonly kind: 'event'; readonly id: string; readonly event: unknown };
 
 /** Encode one frame as a wire line (including its terminator). */
 export function encodeFrame(value: unknown): string {
@@ -145,6 +190,31 @@ export function decodeResponse(line: string): KernelResponse {
     };
   }
   return { v: KERNEL_PROTOCOL_VERSION, id: r.id, ok: true, result: r.result };
+}
+
+/**
+ * Parse one wire line into a frame — a response, or a pushed event.
+ *
+ * The two are told apart by the `event` field: a response always has an `ok`
+ * flag, an event never does. Deciding this *before* trying to decode a
+ * response is what keeps a pushed event from being reported as a malformed
+ * response (and from failing every pending request on the connection).
+ *
+ * @throws Error when the line is not a well-formed frame. Callers turn this
+ *         into `EFAULT` rather than letting a malformed frame look like a
+ *         kernel failure.
+ */
+export function parseFrame(line: string): KernelFrame {
+  const parsed: unknown = JSON.parse(line);
+  if (typeof parsed !== 'object' || parsed === null) {
+    throw new Error('frame is not an object');
+  }
+  const id = (parsed as { id?: unknown }).id;
+  if (typeof id !== 'string') throw new Error('frame has no id');
+  if ('event' in (parsed as Record<string, unknown>)) {
+    return { kind: 'event', id, event: (parsed as { event: unknown }).event };
+  }
+  return { kind: 'response', response: decodeResponse(line) };
 }
 
 /**

@@ -144,6 +144,7 @@ import {
   PROMPT_AGENT_MAX_TURNS,
   type AgentFn,
   type KernelOptions,
+  type KernelEvent,
 } from '../src/index.js';
 
 import {
@@ -244,6 +245,7 @@ import { cmdTrace } from '../src/cli/commands/trace.js';
 import { cmdLogs } from '../src/cli/commands/logs.js';
 import { cmdMemory } from '../src/cli/commands/memory.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
+import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import {
   listDaemons,
@@ -12455,6 +12457,298 @@ async function runHostWaitChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Event-stream checks (the transport carries streams)
+// =============================================================================
+
+/**
+ * The kernel reports facts as they happen, and a host may watch them.
+ *
+ * These checks pin the properties that make the stream trustworthy:
+ *
+ *   - a `record` event is the frame that is **on disk**, at the same
+ *     `byteOffset` — a subscriber must not see a different history than
+ *     `cortex trace` would read back;
+ *   - a `process-exit` event carries the **real** exit code, not a default;
+ *   - unsubscribing stops delivery, and a listener that throws cannot break
+ *     the kernel (a watcher is a guest);
+ *   - the transport pushes those events to a client that asked for them.
+ */
+async function runEventStreamChecks(): Promise<void> {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-events-'));
+  const kernels: Kernel[] = [];
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+
+  try {
+    await checkAsync('a subscriber sees a process being born and ending', async () => {
+      const kernel = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir: tmp,
+        autoStart: true,
+        loadDrivers: (reg) => {
+          reg.registerMemory(inmemMemory());
+        },
+        agentLoader: async () => async (ctx, args) => {
+          ctx.exit(typeof args['code'] === 'number' ? args['code'] : 0, 'probe finished');
+        },
+      });
+      kernels.push(kernel);
+
+      const events: KernelEvent[] = [];
+      kernel.subscribe((event) => {
+        events.push(event);
+      });
+
+      const pid = await kernel.spawn({
+        role: 'watched',
+        agent: { module: 'test:probe', args: { code: 6 } },
+      });
+      await kernel.awaitExit(pid);
+
+      const start = events.find((e) => e.kind === 'process-start' && e.pid === unbrand(pid));
+      assert(start !== undefined, 'the birth was reported');
+      assert(
+        start!.kind === 'process-start' && start!.role === 'watched',
+        `the role came with it, got ${JSON.stringify(start)}`,
+      );
+      assert(
+        start!.kind === 'process-start' && start!.ppid === 1,
+        `the parent came with it, got ${JSON.stringify(start)}`,
+      );
+
+      const exit = events.find((e) => e.kind === 'process-exit' && e.pid === unbrand(pid));
+      assert(exit !== undefined, 'the exit was reported');
+      assert(
+        exit!.kind === 'process-exit' && exit!.exitCode === 6,
+        `the REAL exit code came with it, got ${JSON.stringify(exit)}`,
+      );
+      assert(
+        exit!.kind === 'process-exit' && exit!.exitReason === 'probe finished',
+        `the reason came with it, got ${JSON.stringify(exit)}`,
+      );
+
+      // The event and `awaitExit` are two views of one fact. They must not
+      // disagree — and neither of them may invent a zero for an exit code it
+      // does not have.
+      const awaited = await kernel.awaitExit(pid);
+      assert(awaited !== undefined, 'awaitExit answered');
+      assert(
+        exit!.kind === 'process-exit' && exit!.exitCode === awaited!.exitCode,
+        `the event and awaitExit agree on the exit code: ${JSON.stringify(exit)} vs ${JSON.stringify(awaited)}`,
+      );
+    });
+
+    await checkAsync('a record event is the frame that is on disk, at the same offset', async () => {
+      const kernel = kernels[0]!;
+      const events: KernelEvent[] = [];
+      kernel.subscribe((event) => {
+        events.push(event);
+      });
+
+      const pid = await kernel.spawn({
+        role: 'recorded',
+        agent: { module: 'test:probe', args: { code: 0 } },
+      });
+      await kernel.awaitExit(pid);
+
+      const records = events.filter((e): e is Extract<KernelEvent, { kind: 'record' }> =>
+        e.kind === 'record' && e.pid === unbrand(pid),
+      );
+      assert(records.length > 0, `the syscall frames were reported, got ${records.length}`);
+
+      // The log on disk must contain exactly the frames the subscriber saw,
+      // with the same offsets. If these two ever disagree, a live watcher and
+      // `cortex trace` are telling different stories.
+      const onDisk = await readRecords(join(tmp, 'processes', String(unbrand(pid)), 'log.crec'));
+      const fromDisk: SyscallRecord[] = [];
+      for await (const rec of onDisk) fromDisk.push(rec);
+
+      assert(
+        fromDisk.length === records.length,
+        `the same number of frames: ${records.length} pushed, ${fromDisk.length} on disk`,
+      );
+      const first = records[0]!;
+      const diskFirst = fromDisk[0]!;
+      assert(
+        first.record.byteOffset === diskFirst.byteOffset,
+        `the same byte offset: pushed ${first.record.byteOffset}, on disk ${diskFirst.byteOffset}`,
+      );
+      assert(
+        first.record.syscall === diskFirst.syscall && first.record.phase === diskFirst.phase,
+        'the same frame',
+      );
+    });
+
+    await checkAsync('unsubscribing stops delivery', async () => {
+      const kernel = kernels[0]!;
+      const seen: KernelEvent[] = [];
+      const stop = kernel.subscribe((event) => {
+        seen.push(event);
+      });
+      const before = seen.length;
+      stop();
+      await kernel.spawn({
+        role: 'after-unsubscribe',
+        agent: { module: 'test:probe', args: { code: 0 } },
+      });
+      assert(seen.length === before, `no further events arrived, got ${seen.length - before}`);
+    });
+
+    await checkAsync('a listener that throws cannot break the kernel', async () => {
+      const kernel = kernels[0]!;
+      const seen: KernelEvent[] = [];
+      kernel.subscribe(() => {
+        throw new Error('this watcher is broken');
+      });
+      kernel.subscribe((event) => {
+        seen.push(event);
+      });
+
+      const pid = await kernel.spawn({
+        role: 'resilient',
+        agent: { module: 'test:probe', args: { code: 0 } },
+      });
+      const exit = await kernel.awaitExit(pid);
+      assert(exit !== undefined, 'the process still ran to completion');
+      assert(
+        seen.some((e) => e.kind === 'process-exit' && e.pid === unbrand(pid)),
+        'the other subscriber still got its events',
+      );
+    });
+
+    await checkAsync('the transport pushes events to a subscribed client', async () => {
+      const kernel = kernels[0]!;
+      const server = await startKernelServer(kernel, { log: () => {} });
+      servers.push(server);
+      writeEndpoint(tmp, server.endpoint);
+
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+
+      const received: unknown[] = [];
+      await client!.subscribe((event) => {
+        received.push(event);
+      });
+
+      const pid = await kernel.spawn({
+        role: 'streamed',
+        agent: { module: 'test:probe', args: { code: 2 } },
+      });
+      await kernel.awaitExit(pid);
+      // Give the pushed frames a moment to land on the socket.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      assert(received.length > 0, `events arrived over the wire, got ${received.length}`);
+      const kinds = received.map((e) => (e as { kind?: string }).kind);
+      assert(
+        kinds.includes('process-exit'),
+        `the exit was pushed, got ${JSON.stringify(kinds)}`,
+      );
+      assert(
+        kinds.includes('record'),
+        `the syscall frames were pushed, got ${JSON.stringify(kinds)}`,
+      );
+
+      const exitEvent = received.find(
+        (e) => (e as { kind?: string }).kind === 'process-exit',
+      ) as { pid?: number; exitCode?: number | null } | undefined;
+      assert(
+        exitEvent !== undefined && exitEvent.exitCode === 2,
+        `the real exit code crossed the wire, got ${JSON.stringify(exitEvent)}`,
+      );
+
+      // A subscriber that asks for a kind that does not exist is refused
+      // rather than left waiting for something that can never arrive.
+      const bad = await client!.requestRaw('subscribe', { kinds: ['not-a-kind'] });
+      assert(!bad.ok, 'an unknown event kind is refused');
+      assert(
+        bad.ok === false && bad.error.errno === 'EINVAL',
+        `the refusal is EINVAL, got ${bad.ok === false ? bad.error.errno : 'ok'}`,
+      );
+
+      client!.close();
+    });
+
+    await checkAsync('cortex watch prints the events it is given', async () => {
+      process.env['CORTEX_HOME'] = tmp;
+      const kernel = kernels[0]!;
+
+      let out = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+
+      // Subscribe first, so the spawn below lands inside the watch window.
+      const probe = await probeKernel(tmp);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+      const received: string[] = [];
+      await client!.subscribe((event) => {
+        received.push((event as { kind?: string }).kind ?? '?');
+      });
+
+      const pid = await kernel.spawn({
+        role: 'watched-cli',
+        agent: { module: 'test:probe', args: { code: 0 } },
+      });
+      await kernel.awaitExit(pid);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      client!.close();
+
+      // Now the command itself, with a bounded window.
+      const code = await cmdWatch(['--timeout-ms', '150']);
+      process.stdout.write = prevWrite;
+
+      assert(code === 0, `watch exited cleanly, got ${code}`);
+      assert(out.includes('watching the kernel event stream'), `it announced itself, got: ${out}`);
+    });
+
+    await checkAsync('cortex watch says plainly that it needs a live kernel', async () => {
+      const empty = mkdtempSync(join(tmpdir(), 'cortex-watchnokernel-'));
+      process.env['CORTEX_HOME'] = empty;
+      let err = '';
+      const prevErr = console.error;
+      console.error = (...parts: unknown[]): void => {
+        err += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      let code: number;
+      try {
+        code = await cmdWatch([]);
+      } finally {
+        console.error = prevErr;
+        rmSync(empty, { recursive: true, force: true });
+      }
+      assert(code === 1, `exit 1, got ${code}`);
+      assert(err.includes('no live kernel'), `the reason is reported, got: ${err.trim()}`);
+    });
+  } finally {
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // CLI daemon checks (#039)
 // =============================================================================
 
@@ -13313,6 +13607,7 @@ await runCliChecks();
 await runOutputCaptureChecks();
 await runMemoryInspectChecks();
 await runHostWaitChecks();
+await runEventStreamChecks();
 await runDaemonChecks();
 await runKernelHardeningChecks();
 await runTransportChecks();

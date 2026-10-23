@@ -42,6 +42,67 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex watch` — the kernel's event stream, live.** Everything the
+  transport had done so far was *request/response*: a client asked, the kernel
+  answered, the client went away. That is the right shape for a question, and
+  the wrong shape for a question like *"tell me the moment this agent exits"*
+  — watching by polling is a latency tax and a race.
+
+  The kernel now reports facts as they happen, and the transport carries them.
+
+  ```console
+  $ cortex watch --pid 1234
+  # watching the kernel event stream (Ctrl-C to stop)
+  time                  pid    syscall           phase   duration  reversibility
+  -------------------------------------------------------------------------------------
+  19:50:09.072  1234    sleep            exit    2523ms    idempotent
+  19:50:09.073  1234    memory_write     enter   -         reversible
+  19:50:09.074  1234    memory_read      exit    0ms       idempotent
+  19:50:09.077  1234    exit             enter   -         irreversible
+  # pid 1234 exited with code 3 (probe finished on purpose)
+  ```
+
+  Three kinds of event, all of them facts: a process being **born**, a process
+  **ending** with its real exit code, and every syscall **frame** as it lands
+  in the process's `.crec` log. The `record` lines are printed in the same
+  layout as `cortex trace` — and they are the *same frames*, at the same
+  `byteOffset`, because the hook lives on the recorder rather than on the
+  dispatcher.
+
+  That last point was the interesting decision. The obvious place for the
+  hook is the dispatcher, and that would have been **wrong**: seven modules
+  write records directly through `recorder.append()` — the dispatcher, the
+  scheduler, the signal manager, the process table, `fork`, `init` and
+  `checkpoint` — because four of them predate the dispatcher and own a record
+  of their own. A dispatcher-level hook would have reported a *subset* of the
+  log, and a live watcher would have disagreed with `cortex trace` about what
+  happened. The recorder is the one place every frame passes through, so a
+  subscriber's view of the log and the log itself cannot disagree. The smoke
+  suite asserts exactly that.
+
+  Under the hood: `Kernel.subscribe(listener)` is the whole kernel-side API
+  (one method, one callback, one unsubscribe function), and the transport
+  carries the events on the same socket — a client sends `subscribe`, gets an
+  ordinary acknowledgement, and then receives `{event: …}` frames. A listener
+  that throws is ignored: a broken watcher cannot take the kernel down, and
+  watching never changes what the kernel does.
+
+  ABI unchanged: no syscall was added, `KERNEL_ABI_VERSION` stays 1.0.0, and
+  `Kernel.subscribe` is a host API like `awaitExit`. The transport protocol
+  gains a command and a frame type, both additive, so
+  `KERNEL_PROTOCOL_VERSION` does not bump.
+
+  Seven smoke checks: a subscriber sees a process being born and ending, the
+  pushed frames are the frames on disk at the same offsets, unsubscribing stops
+  delivery, a throwing listener cannot break the kernel, the transport pushes
+  the events (and refuses an unknown event kind with `EINVAL`), `cortex watch`
+  prints what it is given, and it says plainly when there is no live kernel.
+
+  (docs/ARCHITECTURE.md §12.1; docs/PROCESS.md §6.3; docs/ABI.md §2.4;
+  docs/HACKING.md §7.2; `src/kernel/boot.ts`, `src/kernel/recorder.ts`,
+  `src/cli/kernel_protocol.ts`, `kernel_server.ts`, `kernel_client.ts`,
+  `commands/watch.ts`; 7 smoke checks.)
+
 - **`cortex wait <pid>` — a process's ending, addressed to that process.** The
   transport could show a process's state (`ps`), its output (`logs`) and its
   knowledge (`memory`), but nothing could **block**: there was no verb for
@@ -688,11 +749,12 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 - **The published assertion count was stale.** The READMEs' quickstart, the
   landing page's status panel and the HN launch draft all said "580 smoke
-  checks"; the suite is 624. The numbers were last refreshed when the landing
+  checks"; the suite is 631. The numbers were last refreshed when the landing
   page was first built and were never moved again, so a reader who ran the
-  suite saw forty-four more assertions than the documents promised. All four
-  places now say 624, and the landing page's primitive grid grew a `logs` and
-  a `memory` tile — the grid listed twelve verbs and there are now fourteen.
+  suite saw fifty-one more assertions than the documents promised. All four
+  places now say 631, and the landing page's primitive grid grew a `logs`, a
+  `memory` and a `watch` tile — the grid listed twelve verbs and there are now
+  fifteen.
 
 - **Every `cortex ps` against a live kernel wrote a frame into the
   supervisor's log.** The transport's `ps` went through the dispatcher — init

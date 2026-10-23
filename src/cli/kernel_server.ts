@@ -293,7 +293,7 @@ async function handleLine(
   }
 
   try {
-    const result = await dispatch(kernel, request, opts, log, signal);
+    const result = await dispatch(kernel, request, opts, log, signal, socket);
     writeFrame(socket, { v: KERNEL_PROTOCOL_VERSION, id, ok: true, result });
   } catch (err) {
     writeFrame(socket, { v: KERNEL_PROTOCOL_VERSION, id, ok: false, error: toWireError(err) });
@@ -320,6 +320,42 @@ function tokensMatch(a: unknown, b: string): boolean {
 function writeFrame(socket: Socket, value: unknown): void {
   if (socket.destroyed) return;
   socket.write(encodeFrame(value));
+}
+
+/** The event kinds a subscriber may ask for. */
+const KNOWN_EVENT_KINDS: ReadonlySet<string> = new Set([
+  'process-start',
+  'process-exit',
+  'record',
+]);
+
+/**
+ * Parse the `kinds` filter of a `subscribe` request.
+ *
+ * Absent (or empty) means "everything". An unknown kind is **refused** rather
+ * than ignored: a subscriber that asked for a kind that does not exist would
+ * otherwise sit there waiting for something that can never arrive, and would
+ * never find out why.
+ */
+function parseEventKinds(raw: unknown): Set<string> | null {
+  if (raw === undefined || raw === null) return null;
+  if (!Array.isArray(raw)) {
+    throw new WireError('EINVAL', 'kinds must be an array of event kinds');
+  }
+  const kinds = new Set<string>();
+  for (const item of raw) {
+    if (typeof item !== 'string') {
+      throw new WireError('EINVAL', 'kinds must be an array of event kinds');
+    }
+    if (!KNOWN_EVENT_KINDS.has(item)) {
+      throw new WireError(
+        'EINVAL',
+        `unknown event kind: ${item} (known: ${[...KNOWN_EVENT_KINDS].join(', ')})`,
+      );
+    }
+    kinds.add(item);
+  }
+  return kinds.size === 0 ? null : kinds;
 }
 
 /** Map a thrown error onto the wire's error shape. */
@@ -399,6 +435,7 @@ async function dispatch(
   opts: KernelServerOptions,
   log: (message: string) => void,
   signal: AbortSignal,
+  socket: Socket,
 ): Promise<unknown> {
   const cmd: KernelCommand = request.cmd;
   const args = request.args ?? {};
@@ -596,6 +633,46 @@ async function dispatch(
         pid,
         exitCode: exit.exitCode,
         exitReason: exit.exitReason,
+      };
+    }
+
+    case 'subscribe': {
+      // Open a stream on this connection.
+      //
+      // This is the one command that makes the kernel *push* instead of
+      // answer: the acknowledgement comes back like any other response, and
+      // then every event the kernel reports arrives on this same socket as an
+      // `{event: …}` frame carrying the subscribe request's id.
+      //
+      // It is a read, like `ps` and `memory`: watching a kernel is not
+      // something the kernel did, so nothing is recorded. (A subscriber that
+      // wanted to *act* on what it sees acts through the ordinary commands —
+      // `kill`, `send`, `checkpoint` — and those are recorded as usual.)
+      const pidRaw = args['pid'];
+      let pid: number | null = null;
+      if (pidRaw !== undefined && pidRaw !== null) {
+        const parsed = Number(pidRaw);
+        if (!Number.isInteger(parsed)) {
+          throw new WireError('EINVAL', `invalid pid: ${String(pidRaw)}`);
+        }
+        pid = parsed;
+      }
+      const kinds = parseEventKinds(args['kinds']);
+
+      const unsubscribe = kernel.subscribe((event) => {
+        if (pid !== null && event.pid !== pid) return;
+        if (kinds !== null && !kinds.has(event.kind)) return;
+        writeFrame(socket, { v: KERNEL_PROTOCOL_VERSION, id: request.id, event });
+      });
+      // The subscription dies with the connection. A client that goes away
+      // must not leave the kernel pushing frames into a closed socket — and
+      // the connection's abort signal is exactly that moment.
+      signal.addEventListener('abort', unsubscribe, { once: true });
+
+      return {
+        subscribed: true,
+        pid,
+        kinds: kinds === null ? 'all' : [...kinds].join(','),
       };
     }
 
