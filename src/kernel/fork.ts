@@ -127,6 +127,31 @@ function isExhausted(limits: BudgetLimits): boolean {
 }
 
 // =============================================================================
+// §3. Call context
+// =============================================================================
+
+/**
+ * What the syscall dispatcher knows about the fork it is routing.
+ *
+ * The fork's *caller's* record is the dispatcher's (docs/ABI.md §9), so the
+ * dispatcher writes the `enter` frame before the fork runs. That frame's
+ * position in the parent's log is the fork's dividing line: the shared
+ * causal past is everything before it. The module cannot see that offset
+ * from the inside — by the time it runs, the frame has already landed — so
+ * the dispatcher hands it over.
+ */
+export interface ForkContext {
+  /**
+   * Byte offset in the parent's `.crec` where this fork's `enter` frame
+   * landed — the start of the fork call, and therefore the end of the
+   * shared causal past.
+   */
+  readonly sharedCausalPastOffset?: SyscallOffset;
+  /** The call id the dispatcher records the fork under. */
+  readonly callId?: string;
+}
+
+// =============================================================================
 // §4. ForkManager
 // =============================================================================
 
@@ -173,8 +198,19 @@ export class ForkManager {
    * Traps `ESRCH` (no such parent), `ESTATE` (parent not in a forkable state),
    * `EINVAL` (unknown fork kind), `EBUDGET` (child would be born exhausted),
    * or `EDRIVER` (a driver refused to close, or memory duplication failed).
+   *
+   * @param ctx  Supplied by the syscall dispatcher: where this fork's
+   *              `enter` frame landed in the parent's log, and the call id
+   *              the dispatcher will record the fork under. Without it the
+   *              module falls back to the parent's current log offset — which
+   *              is *after* the `enter` frame, and would make the fork itself
+   *              count as shared history.
    */
-  async fork(parentPid: ProcessId, opts?: ForkOptions): Promise<ForkResult> {
+  async fork(
+    parentPid: ProcessId,
+    opts?: ForkOptions,
+    ctx?: ForkContext,
+  ): Promise<ForkResult> {
     const kind = opts?.kind ?? DEFAULT_FORK_KIND;
     if (kind !== 'cognitive') {
       // Sandbox fork (§3.2) and shadow process (§3.4) are post-v0.
@@ -288,8 +324,13 @@ export class ForkManager {
 
       // --- steps 7 & 8: shared causal past + irreversible history -----------
       const recorder = this.#table.recorderFor(parentPid);
+      // The shared causal past is everything in the parent's log *before* the
+      // fork call. The dispatcher knows where the fork's `enter` frame
+      // landed; without it we would have to guess from the current offset,
+      // which is already past that frame.
       const sharedCausalPast: SyscallOffset =
-        recorder !== null ? recorder.currentOffset : asSyscallOffset(0);
+        ctx?.sharedCausalPastOffset ??
+        (recorder !== null ? recorder.currentOffset : asSyscallOffset(0));
       const irreversibleInPast =
         recorder !== null ? await this.#scanIrreversible(recorder.path) : [];
 
@@ -300,12 +341,10 @@ export class ForkManager {
       await this.#table.setState(childPid, 'ready', { trigger: 'fork' });
 
       // --- step 10: record the fork in BOTH logs ---------------------------
-      const callId = this.#nextCallId();
-      await this.#recordFork(parentPid, childPid, childChainId, callId, opts, budgetPolicy, {
-        sharedCausalPast,
-        irreversibleInPast,
-        stateBefore: parent.state,
-      });
+      // The *caller's* frame is the dispatcher's (docs/ABI.md §9). This module
+      // writes only the child's birth record — a frame about the child, in the
+      // child's log, that no other process can write.
+      const callId = ctx?.callId ?? this.#nextCallId();
       await this.#recordForkChild(childPid, parentPid, childChainId, callId, budgetPolicy);
 
       return {
@@ -326,9 +365,8 @@ export class ForkManager {
             details: { phase: 'fork' },
             cause: err,
           });
-      await this.#recordTrap(parentPid, cortexErr, {
-        ...(opts?.tag !== undefined ? { tag: opts.tag } : {}),
-      });
+      // No trap record here: the dispatcher owns the `fork` record and writes
+      // the matching trap frame under the same callId (docs/ABI.md §9).
       throw cortexErr;
     }
   }
@@ -376,54 +414,16 @@ export class ForkManager {
   // §4.4 Recording
   // ---------------------------------------------------------------------------
 
-  async #recordFork(
-    parentPid: ProcessId,
-    childPid: ProcessId,
-    childChainId: ChainId,
-    callId: string,
-    opts: ForkOptions | undefined,
-    budgetPolicy: string,
-    extra: {
-      sharedCausalPast: SyscallOffset;
-      irreversibleInPast: readonly string[];
-      stateBefore: string;
-    },
-  ): Promise<void> {
-    const recorder = this.#table.recorderFor(parentPid);
-    if (recorder === null) return;
-    const state = extra.stateBefore as SyscallRecordInput['stateBefore'];
-
-    const record: SyscallRecordInput = {
-      timestamp: this.#now(),
-      pid: parentPid,
-      syscall: 'fork',
-      callId,
-      phase: 'exit',
-      args: {
-        kind: opts?.kind ?? DEFAULT_FORK_KIND,
-        budgets: budgetPolicy,
-        ...(opts?.tag !== undefined ? { tag: opts.tag } : {}),
-        ...(opts?.memoryOverrides !== undefined
-          ? { memoryOverrides: Object.keys(opts.memoryOverrides) }
-          : {}),
-        closeDriverState: opts?.closeDriverState !== false,
-      },
-      result: {
-        childPid: unbrand(childPid),
-        childChainId: unbrand(childChainId),
-        sharedCausalPast: unbrand(extra.sharedCausalPast),
-        irreversibleInPast: [...extra.irreversibleInPast],
-      },
-      // The parent does not change state on fork (ABI.md §4.2).
-      stateBefore: state,
-      stateAfter: state,
-      // A fork can be undone by killing the child (ABI.md §4.2).
-      reversibility: 'reversible',
-      kernelAbiVersion: this.kernelAbiVersion,
-    };
-    await this.#append(recorder, record, 'fork');
-  }
-
+  /**
+   * Write the child's **birth record** into the child's own log: "I was
+   * born from a fork of pid N", plus the branch's chain id and the budget
+   * policy it inherited.
+   *
+   * This is the one frame the fork module still writes, and it is not a
+   * syscall record — the *caller's* `fork` frames are the dispatcher's
+   * (docs/ABI.md §9). This one describes the child, so it belongs in the
+   * child's log, and no other process can write it.
+   */
   async #recordForkChild(
     childPid: ProcessId,
     parentPid: ProcessId,
@@ -445,35 +445,6 @@ export class ForkManager {
       stateBefore: 'new',
       stateAfter: 'ready',
       reversibility: 'reversible',
-      kernelAbiVersion: this.kernelAbiVersion,
-    };
-    await this.#append(recorder, record, 'fork');
-  }
-
-  async #recordTrap(
-    pid: ProcessId,
-    err: CortexError,
-    extraArgs: Record<string, unknown>,
-  ): Promise<void> {
-    const recorder = this.#table.recorderFor(pid);
-    if (recorder === null) return;
-    const state = this.#table.get(pid)?.state ?? 'running';
-
-    const record: SyscallRecordInput = {
-      timestamp: this.#now(),
-      pid,
-      syscall: 'fork',
-      callId: `fork-trap-${unbrand(pid)}`,
-      phase: 'trap',
-      args: extraArgs,
-      error: {
-        errno: err.errno,
-        message: err.message,
-        ...(err.details !== undefined ? { details: err.details } : {}),
-      },
-      stateBefore: state,
-      stateAfter: state,
-      reversibility: 'idempotent',
       kernelAbiVersion: this.kernelAbiVersion,
     };
     await this.#append(recorder, record, 'fork');

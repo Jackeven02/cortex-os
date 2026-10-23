@@ -360,7 +360,15 @@ interface SyscallDispatcher {
 9. Update budget counters if syscall consumed tokens/USD.
 10. Return result or throw `CortexError`.
 
-This module is the only place syscalls are validated and recorded. No other module talks to the recorder directly except for internal events (state transitions, signal delivery).
+This module is the only place syscalls are validated and recorded. No other module talks to the recorder directly except for internal events (state transitions, signal delivery) and for the **birth record of a forked or restored child** — a frame about the new process, written into the new process's own log, which no other process could write.
+
+That exception is narrow on purpose. Four modules used to write their own syscall frames (`memory.ts`, `ipc.ts`, `fork.ts`, `checkpoint.ts` — seven syscalls between them), which meant two recording paths and therefore two places for the log and the code to drift apart. All seven now record through the dispatcher (ABI.md §11). What is left in the modules are the birth records, and those are events *about* a process rather than calls *by* one.
+
+Two syscalls needed more than a moved frame:
+
+- **`send`** cannot simply do the thing and then record it: a failed record must not leave a phantom, half-committed message (ABI.md §11), so the module has to control exactly when the message becomes real. `IpcManager.prepareSend()` hands back a prepared send with a `commit()` and a `rollback()`; the dispatcher writes the frames and then commits, or rolls back if the frame could not be written.
+- **`fork`** needs to know where its own `enter` frame landed, because the shared causal past is everything *before* the fork call (STATE.md §4). The dispatcher captures that offset and passes it down; without it the module could only read the parent's current offset, which is already past the frame.
+
 
 ### 4.11 `driver_registry.ts`
 

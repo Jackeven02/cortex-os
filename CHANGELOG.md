@@ -239,33 +239,51 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   the production `readRecords`, and the `cortex trace` output above is real
   CLI output, not a fixture.
 
-### Fixed
+### Changed
 
-- **`send` records through the dispatcher now, without losing its atomicity.**
-  `send` was the last syscall that wrote its own `.crec` frame, and the reason
-  was real: a failed record must not leave a phantom, half-committed message
-  (ABI.md §11), so the module had to control exactly when it recorded. Moving
-  the record to the dispatcher would have put the frame *after* the commit —
-  and a disk error would then have left a message in the queue that no log
-  mentioned.
+- **The syscall dispatcher is now the only place a syscall is recorded.** The
+  recording-ownership work that ABI.md §11 described in stages is finished:
+  all seven syscalls that used to write their own `.crec` frames
+  (`memory_read`, `memory_write`, `send`, `recv`, `fork`, `checkpoint`,
+  `restore`) now record through the dispatcher, and `SELF_RECORDED_SYSCALLS`
+  is empty. ARCHITECTURE.md §4.10 has said all along that the dispatcher is
+  "the only place syscalls are validated and recorded"; that is now true of
+  the code as well as the document.
 
-  The seam between the two is a transaction. `IpcManager.prepareSend()`
-  returns a prepared send with a `commit()` and a `rollback()`; the dispatcher
-  writes the `enter` and `exit` frames and then commits — or, if the frame
-  could not be written, rolls the send back. The enqueue is undone, a parked
-  waiter is restored to the parked set, the counters go back, and the failure
-  surfaces as `ERECORD` exactly as before.
+  Two of them could not simply move their frame, and both needed a seam:
 
-  What changed in the log: `send` gains the `enter` frame it never had, and
-  its delivery facts (`target`, `toPid`, `queueDepth`, `handedOff`) moved
+  - **`send`** may not do the thing and then record it — a failed record must
+    not leave a phantom, half-committed message. `IpcManager.prepareSend()`
+    now hands back a prepared send with a `commit()` and a `rollback()`; the
+    dispatcher writes the frames and then commits, or rolls the send back if
+    the frame could not be written.
+  - **`fork`** has to know where its own `enter` frame landed, because the
+    shared causal past is everything *before* the fork call and `cortex diff`
+    cuts the parent's log there. The dispatcher captures that offset and
+    passes it down.
+
+  `fork` and `restore` each also write a frame into a log that is not the
+  caller's: the child's birth record and the restored process's birth
+  record. Those stay with their modules — they describe a process, they are
+  not calls by one, and no other process could write them.
+
+  What changed in the log: `send`, `recv`, `fork`, `restore` and `checkpoint`
+  gained the `enter` frame they never had, and `send`'s delivery facts moved
   from the frame's `args` to the `exit` frame's `result`, where every other
-  syscall keeps its result. The agent still receives nothing — `send`
-  resolves to `void`, as the ABI promises.
+  syscall keeps its result. A failed `restore` is now recorded at all — it
+  never was, because the module wrote no trap frame for it and the
+  dispatcher was not recording that syscall.
 
-  The two rollback checks now drive the dispatcher with a recorder that fails
-  only on the `exit` frame. That is the window that matters: the `enter`
-  frame has to land, or the send would never be prepared and the rollback
-  would prove nothing.
+  No syscall was added, removed, renamed, or had its meaning changed. The
+  on-disk `.crec` format is unchanged: same frame, same fields, same
+  encoding.
+
+  The two `send` rollback checks now drive the dispatcher with a recorder
+  that fails only on the `exit` frame. That is the window that matters: the
+  `enter` frame has to land, or the send would never be prepared and the
+  rollback would prove nothing.
+
+### Fixed
 
 - **A failed `recv` or `checkpoint` was written to the log twice.** The
   recording-ownership work in ABI.md §11 moved `recv` and `checkpoint` onto

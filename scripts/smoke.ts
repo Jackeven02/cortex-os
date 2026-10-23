@@ -3612,6 +3612,44 @@ async function runCheckpointChecks(): Promise<void> {
     assert(args.sourcePid === unbrand(pid), 'restore args carry the source pid');
   });
 
+  await checkAsync("the caller's log records the restore it asked for", async () => {
+    const sub = join(tmp, 'restore-caller');
+    await mkdir(sub, { recursive: true });
+    const table = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
+    });
+    tables.push(table);
+    const pid = await spawnRunning(table);
+    const { ckpt } = makeCkpt(table);
+    const { chainId } = await ckpt.take(pid);
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const dispatcher = new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      checkpoint: ckpt,
+    });
+
+    const returned = (await dispatcher.invoke(pid, 'restore', chainId)) as { pid: ProcessIdAlias };
+    const rec = table.recorderFor(pid)!;
+    await rec.flush();
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) records.push(r);
+    const rs = records.filter((r) => r.syscall === 'restore');
+    assert(rs.length === 2, `expected restore enter+exit, got ${rs.length}`);
+    assert(rs[0]!.phase === 'enter', 'enter frame first');
+    assert(rs[1]!.phase === 'exit', 'exit frame last');
+    assert(rs[0]!.callId === rs[1]!.callId, 'enter and exit share one callId');
+    assert(rs[1]!.reversibility === 'reversible', 'restore is reversible');
+    const res = rs[1]!.result as { pid: number };
+    assert(res.pid === unbrand(returned.pid), 'the exit frame carries the new pid');
+    // The ABI return stays narrow even though the record is wide.
+    assert(Object.keys(returned as object).length === 1, 'agent receives only { pid }');
+  });
+
   // --- cleanup --------------------------------------------------------------
   for (const t of tables) {
     for (const pid of t.pids()) {
@@ -4100,21 +4138,48 @@ async function runForkChecks(): Promise<void> {
     const table = await makeTable(sub);
     const pid = await spawnRunning(table);
     const { fork } = makeFork(table);
-    const res = await fork.fork(pid, { tag: 'explore-alt' });
+    // The caller's frames are the dispatcher's now; the fork module writes
+    // only the child's birth record.
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const dispatcher = new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      fork,
+    });
+    const res = (await dispatcher.invoke(pid, 'fork', { tag: 'explore-alt' })) as ForkResult;
 
     const parentRec = table.recorderFor(pid)!;
     await parentRec.flush();
     const parentRecords: SyscallRecord[] = [];
     for await (const r of readRecords(parentRec.path)) parentRecords.push(r);
     const pf = parentRecords.filter((r) => r.syscall === 'fork');
-    assert(pf.length === 1, `parent log has 1 fork record, got ${pf.length}`);
+    assert(pf.length === 2, `parent log has fork enter+exit, got ${pf.length}`);
+    assert(pf[0]!.phase === 'enter', 'enter frame first');
+    assert(pf[1]!.phase === 'exit', 'exit frame last');
     assert(pf[0]!.reversibility === 'reversible', 'fork is reversible');
-    assert(pf[0]!.phase === 'exit', 'exit phase');
-    const pRes = pf[0]!.result as { childPid: number; childChainId: string };
+    assert(pf[1]!.reversibility === 'reversible', 'fork is reversible');
+    assert(pf[0]!.callId === pf[1]!.callId, 'enter and exit share one callId');
+    const pArgs = pf[0]!.args as { tag?: string };
+    assert(pArgs.tag === 'explore-alt', 'tag captured in the enter frame');
+    const pRes = pf[1]!.result as {
+      childPid: number;
+      childChainId: string;
+      sharedCausalPast: number;
+      irreversibleInPast: string[];
+    };
     assert(pRes.childPid === unbrand(res.childPid), 'parent record carries child pid');
-    const pArgs = pf[0]!.args as { tag?: string; budgets: string };
-    assert(pArgs.tag === 'explore-alt', 'tag captured');
-    assert(pArgs.budgets === 'reset', 'budget policy captured');
+    assert(pRes.childChainId === unbrand(res.childChainId), 'parent record carries the child chain id');
+    assert(Array.isArray(pRes.irreversibleInPast), 'parent record carries the irreversible history');
+    // The shared causal past must point at the fork *itself* — the byte
+    // offset where the enter frame landed — so `cortex diff` cuts the
+    // parent's log there and the fork call counts as the divergence rather
+    // than as shared history.
+    assert(
+      pRes.sharedCausalPast === unbrand(pf[0]!.byteOffset),
+      `shared causal past (${pRes.sharedCausalPast}) should be the enter frame's offset (${unbrand(pf[0]!.byteOffset)})`,
+    );
 
     const childRec = table.recorderFor(res.childPid)!;
     await childRec.flush();
@@ -5429,12 +5494,14 @@ async function runDispatcherChecks(): Promise<void> {
       assert(!SELF_RECORDED_SYSCALLS.has(s), `${s} both self-recorded and unrecorded`);
     }
     assert(UNRECORDED_SYSCALLS.has('budget'), 'budget is unrecorded');
-    // memory_read / memory_write collapsed onto the dispatcher's single
-    // recording path in 1.2.x; the rest still own their frames for reasons
-    // ABI.md § records (fork writes to two logs; send needs the record
-    // ordered inside its own atomicity window).
-    assert(!SELF_RECORDED_SYSCALLS.has('memory_read'), 'memory_read records through the dispatcher');
-    assert(!SELF_RECORDED_SYSCALLS.has('memory_write'), 'memory_write records through the dispatcher');
+    // Every syscall the dispatcher routes is now recorded by the dispatcher:
+    // the seven that used to write their own frames (memory_read,
+    // memory_write, send, recv, fork, checkpoint, restore) have all been
+    // collapsed onto its single path (ABI.md section 11).
+    assert(SELF_RECORDED_SYSCALLS.size === 0, `no syscall is self-recorded any more, got ${[...SELF_RECORDED_SYSCALLS].join(', ')}`);
+    for (const s of ['memory_read', 'memory_write', 'send', 'recv', 'fork', 'checkpoint', 'restore'] as const) {
+      assert(!SELF_RECORDED_SYSCALLS.has(s), `${s} records through the dispatcher`);
+    }
   });
 
   check('killReversibility maps signals correctly', () => {

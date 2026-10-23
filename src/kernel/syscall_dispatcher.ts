@@ -96,6 +96,7 @@ import {
   type ProcessInfo,
   type ProcessState,
   type RandomOptions,
+  type SyscallOffset,
   type RecvOptions,
   type RestoreOptions,
   type Reversibility,
@@ -112,6 +113,7 @@ import {
   type WaitOptions,
   type WaitResult,
   asProcessId,
+  asSyscallOffset,
   unbrand,
   CAPABILITIES,
   DEFAULT_CAPABILITIES,
@@ -366,11 +368,12 @@ export function killReversibility(signal: Signal): Reversibility {
  * Syscalls whose owning module already writes the `.crec` record. The
  * dispatcher gates and routes these but does not record them again — see the
  * module header "Recording ownership".
+ *
+ * Empty since the last of the seven self-recorded syscalls was collapsed
+ * onto the dispatcher's path (docs/ABI.md §11). Every syscall the dispatcher
+ * routes is now recorded by the dispatcher.
  */
-export const SELF_RECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName>([
-  'fork',
-  'restore',
-]);
+export const SELF_RECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName>([]);
 
 /**
  * A routed syscall whose side effect is committed only *after* its record
@@ -723,6 +726,11 @@ export class SyscallDispatcher {
     // frame, so the log still reads in the order it happened.
     await this.flushSyncCalls(pid);
 
+    // Where this call begins in the caller's log. `fork` needs it: the shared
+    // causal past is everything *before* the fork call, and the `enter` frame
+    // written below is the fork call's first byte.
+    const entryOffset = this.#table.recorderFor(pid)?.currentOffset ?? asSyscallOffset(0);
+
     if (recorded) {
       await this.#write(pid, syscall, callId, 'enter', {
         stateBefore,
@@ -738,7 +746,7 @@ export class SyscallDispatcher {
     let deferred: DeferredCommit | null = null;
 
     try {
-      const routed = await this.#route(pid, syscall, args, callId);
+      const routed = await this.#route(pid, syscall, args, callId, entryOffset);
       deferred = isDeferredCommit(routed) ? routed : null;
       const result = (deferred !== null ? deferred.value : routed) as SyscallReturn[S];
 
@@ -1011,6 +1019,7 @@ export class SyscallDispatcher {
     syscall: SyscallName,
     args: readonly unknown[],
     callId: string,
+    entryOffset: SyscallOffset,
   ): Promise<unknown> {
     switch (syscall) {
       case 'spawn':
@@ -1029,7 +1038,7 @@ export class SyscallDispatcher {
       case 'ps':
         return this.#ps(pid, args[0] as ProcessFilter | undefined);
       case 'fork':
-        return await this.#forkSyscall(pid, args[0] as ForkOptions | undefined);
+        return await this.#forkSyscall(pid, args[0] as ForkOptions | undefined, entryOffset, callId);
       case 'checkpoint':
         return await this.#checkpoint(pid, args[0] as CheckpointOptions | undefined);
       case 'restore':
@@ -1507,11 +1516,22 @@ export class SyscallDispatcher {
   // §7.5 State management
   // ---------------------------------------------------------------------------
 
-  async #forkSyscall(pid: ProcessId, opts?: ForkOptions): Promise<ForkResult> {
+  async #forkSyscall(
+    pid: ProcessId,
+    opts: ForkOptions | undefined,
+    entryOffset: SyscallOffset,
+    callId: string,
+  ): Promise<ForkResult> {
     if (this.#fork === null) {
       trap('EDRIVER', 'fork', { reason: 'fork engine not configured' });
     }
-    return await this.#fork.fork(pid, opts);
+    // The module needs to know where this fork's `enter` frame landed: the
+    // shared causal past ends there, and by the time the module runs the
+    // frame is already in the log.
+    return await this.#fork.fork(pid, opts, {
+      sharedCausalPastOffset: entryOffset,
+      callId,
+    });
   }
 
   async #checkpoint(
@@ -2133,6 +2153,24 @@ function shapeResult(syscall: SyscallName, result: unknown): unknown {
       byteSize: result['byteSize'],
       syscallLogOffset: result['syscallLogOffset'],
     };
+  }
+  if (syscall === 'fork' && isRecord(result)) {
+    // The fork's outcome: the child's identity, and the shared past both
+    // branches inherited. `cortex diff` reads `sharedCausalPast` back out of
+    // this frame to find the split point (docs/STATE.md §4).
+    return {
+      childPid: unbrand(result['childPid'] as ProcessId),
+      childChainId: unbrand(result['childChainId'] as ChainId),
+      sharedCausalPast: unbrand(result['sharedCausalPast'] as SyscallOffset),
+      irreversibleInPast: [...(result['irreversibleInPast'] as readonly string[])],
+    };
+  }
+  if (syscall === 'restore' && isRecord(result)) {
+    // The caller's half of a restore: the PID that was materialised. The
+    // *new* process's own birth record — which carries its lineage back to
+    // the checkpoint's source — is written by the checkpoint module, into
+    // that process's log.
+    return { pid: unbrand(result['pid'] as ProcessId) };
   }
   return result;
 }

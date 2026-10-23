@@ -668,6 +668,16 @@ export class CheckpointManager {
   // §4.5 Recording
   // ---------------------------------------------------------------------------
 
+  /**
+   * Write the restored process's **birth record** into its own log: which
+   * checkpoint it came from, which process took that checkpoint, and the PID
+   * it was given.
+   *
+   * This is the one frame the checkpoint module still writes, and it is not a
+   * syscall record — the *caller's* `restore` frames are the dispatcher's
+   * (docs/ABI.md §9). This one describes the new process's lineage, so it
+   * belongs in the new process's log.
+   */
   async #recordRestore(
     newPid: ProcessId,
     cp: Checkpoint,

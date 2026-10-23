@@ -857,14 +857,18 @@ Two of those needed a way to say "record this, return that":
 - `recv` records the delivered message as `{from, to, body, sentAt}`; the `callId` is left out because the `send` record already carries it, and the wait time is the frame's own `durationMs`.
 - `checkpoint` routes a wider object than it returns. `CheckpointManager.take()` hands back the snapshot's `byteSize` and `syscallLogOffset` alongside the `chainId`, the `exit` record keeps all three (the log offset is what makes a checkpoint replayable against `.crec`), and the agent still receives exactly `{ chain_id }` as the ABI promises. Its `stateBefore`/`stateAfter` are now the states either side of the syscall — the same vantage point every other syscall records — rather than the module's internal `checkpointing` → final transition.
 
-The remaining two stay self-recorded for concrete reasons, not for tidiness debt:
+**The last three are now resolved too, so the list is closed.**
 
-- `fork` writes into **two** logs (the parent's and the child's), and only the module knows about the child.
-- `restore` records into the **restored** process's log, not the caller's, because the record is about the new process's lineage.
+`send` was the hard one. It needs the record ordered inside its own atomicity window: a failed record must not leave a phantom, half-committed message, so the module must control exactly when it records. The seam that satisfies both halves is a transaction: `IpcManager.prepareSend()` hands back a prepared send with a `commit()` and a `rollback()`, the dispatcher writes the `enter`/`exit` frames, and only a landed frame lets the message become real. A frame that cannot be written rolls the send back — the enqueue is undone, a parked waiter is restored to the parked set, and the counters go back to where they were.
 
-`send` was the hard one, and it is now resolved too. It needs the record ordered inside its own atomicity window: a failed record must not leave a phantom, half-committed message, so the module must control exactly when it records. The seam that satisfies both halves is a transaction: `IpcManager.prepareSend()` hands back a prepared send with a `commit()` and a `rollback()`, the dispatcher writes the `enter`/`exit` frames, and only a landed frame lets the message become real. A frame that cannot be written rolls the send back — the enqueue is undone, a parked waiter is restored to the parked set, and the counters go back to where they were.
+`fork` and `restore` both write into a log that is not the caller's: the fork's child record goes into the child's log, and the restore's record goes into the restored process's log, because that record is about the new process's lineage. So the split is by *whose* story the frame belongs to:
 
-That split has a cost worth stating: `send` now gets the `enter` frame it never had, and its delivery facts (`target`, `toPid`, `queueDepth`, `handedOff`) moved from the frame's `args` to the `exit` frame's `result`, where every other syscall keeps its result. The on-disk format is unchanged — same frame, same fields, same `.crec` encoding.
+- The **caller's** frames are the dispatcher's. `fork` now records the parent's `enter`/`exit` pair, with the lineage (`childPid`, `childChainId`, `sharedCausalPast`, `irreversibleInPast`) in the `exit` frame's result — which is where `cortex diff` reads it from. `restore` records the caller's `enter`/`exit` pair, with the new PID in the result.
+- The **child's** birth record stays where it was: the fork module writes it into the child's log, and the checkpoint module writes the restored process's own birth record into that process's log. Those are events *about* a process, not calls *by* one.
+
+One consequence worth naming: `fork` needs to know where its own `enter` frame landed, because the shared causal past is everything *before* the fork call (STATE.md §4). The dispatcher captures that offset and passes it down; the module reading the parent's current offset would have pointed past the frame and made the fork itself count as shared history.
+
+What changed in the log, for the record: `send`, `recv`, `fork`, `restore` and `checkpoint` gained the `enter` frame they never had, and `send`'s delivery facts moved from the frame's `args` to the `exit` frame's `result`, where every other syscall keeps its result. The on-disk format is unchanged — same frame, same fields, same `.crec` encoding — and so is the ABI: no syscall was added, removed, renamed, or had its meaning changed.
 
 The ABI is the contract. The architecture is how we keep that contract. The kernel is the implementation. In that order.
 
