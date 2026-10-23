@@ -598,23 +598,25 @@ export class IpcManager {
 
     const entry = this.#table.mustGet(pid, 'recv');
     if (entry.state !== 'running') {
-      const err = new CortexError('ESTATE', 'recv', {
+      // The dispatcher owns the `recv` record (docs/ABI.md §9, recording
+      // ownership): it writes the `enter` frame and, on failure, the matching
+      // `trap` frame — under one callId, so replay can pair them. Writing a
+      // second trap here would double the failure in the log *and* give it a
+      // callId that matches nothing.
+      throw new CortexError('ESTATE', 'recv', {
         message: `recv requires RUNNING state, got ${entry.state}`,
         details: { pid: unbrand(pid), state: entry.state },
       });
-      await this.#recordTrap(pid, 'recv', callId, err, { source: unbrand(channelId) });
-      throw err;
     }
 
     const channel = this.#ensureChannelInternal(channelId, pid);
 
     if (channel.closed) {
-      const err = new CortexError('EBADF', 'recv', {
+      // Dispatcher-owned trap record — see the ESTATE branch above.
+      throw new CortexError('EBADF', 'recv', {
         message: `channel ${unbrand(channelId)} is closed`,
         details: { channel: unbrand(channelId) },
       });
-      await this.#recordTrap(pid, 'recv', callId, err, { source: unbrand(channelId) });
-      throw err;
     }
 
     this.#trackMembership(pid, channel.id);
@@ -628,15 +630,11 @@ export class IpcManager {
 
     // Empty queue + non-blocking → EAGAIN.
     if (!blocking) {
-      const err = new CortexError('EAGAIN', 'recv', {
+      // Dispatcher-owned trap record — see the ESTATE branch above.
+      throw new CortexError('EAGAIN', 'recv', {
         message: `channel ${unbrand(channelId)} is empty`,
         details: { channel: unbrand(channelId) },
       });
-      await this.#recordTrap(pid, 'recv', callId, err, {
-        source: unbrand(channelId),
-        nonBlocking: true,
-      });
-      throw err;
     }
 
     // Blocking path: park as a waiter, transition to BLOCKED.
@@ -798,11 +796,10 @@ export class IpcManager {
                   callId,
                 });
               }
-              if (isCortexError(err)) {
-                await this.#recordTrap(pid, 'recv', callId, err, {
-                  source: unbrand(channel.id),
-                });
-              }
+              // No trap record here: the dispatcher owns the `recv` record
+              // (docs/ABI.md §9). This rejection surfaces through the
+              // dispatcher's own `await`, so it writes the trap frame with
+              // the same callId as the `enter` frame.
             } finally {
               // Same reasoning as the resolve path: hand the rejection to the
               // agent on its next dispatch, not mid-wake.
@@ -959,9 +956,18 @@ export class IpcManager {
     }
   }
 
+  /**
+   * Append a `send` trap record to the sender's .crec log.
+   *
+   * `send` is one of the syscalls that still owns its own record — see the
+   * dispatcher's "Recording ownership" note. `recv`, by contrast, was
+   * collapsed onto the dispatcher's single path, so this method must never
+   * write a `recv` frame: the dispatcher already wrote the `enter` frame and
+   * writes the matching `trap` frame under the same callId.
+   */
   async #recordTrap(
     who: ProcessId | ChannelId,
-    syscall: 'send' | 'recv',
+    syscall: 'send',
     callId: string,
     err: CortexError,
     extraArgs: Record<string, unknown>,

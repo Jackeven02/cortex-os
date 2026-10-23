@@ -2169,7 +2169,7 @@ async function runIpcChecks(): Promise<void> {
       assert(result.body.recorded === true, 'recv record should capture the message body');
     });
 
-    await checkAsync('trap records land in .crec on EAGAIN', async () => {
+    await checkAsync('a failed recv writes exactly one enter+trap pair under one callId', async () => {
       const sub = join(tmp, 'ipc-traps');
       await mkdir(sub, { recursive: true });
       const table = new ProcessTable({
@@ -2180,19 +2180,46 @@ async function runIpcChecks(): Promise<void> {
       tables.push(table);
       const b = await spawnRunning(table, 'b');
       const mgr = new IpcManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+      const dispatcher = new SyscallDispatcher({
+        table,
+        signals,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        now: clock,
+        ipc: mgr,
+      });
+
+      // The dispatcher owns the `recv` record (docs/ABI.md §9). While ipc.ts
+      // still wrote a trap frame of its own, one failed recv produced *two*
+      // trap frames — and the module's one carried a callId that paired with
+      // no `enter` frame, so replay could not line them up.
       try {
-        await mgr.recv(b, asChannelId('trap-chan'), { blocking: false });
+        await dispatcher.invoke(b, 'recv', asChannelId('trap-chan'), { blocking: false });
       } catch {
-        /* expected */
+        /* expected: EAGAIN */
       }
+
       const recB = table.recorderFor(b)!;
       await recB.flush();
-      const traps: SyscallRecord[] = [];
+      const recvRecords: SyscallRecord[] = [];
       for await (const r of readRecords(recB.path)) {
-        if (r.syscall === 'recv' && r.phase === 'trap') traps.push(r);
+        if (r.syscall === 'recv') recvRecords.push(r);
       }
-      assert(traps.length === 1, `expected 1 trap record, got ${traps.length}`);
-      assert(traps[0]!.error?.errno === 'EAGAIN', `trap errno should be EAGAIN, got ${traps[0]!.error?.errno}`);
+      assert(recvRecords.length === 2, `expected enter+trap only, got ${recvRecords.length} frames`);
+      assert(recvRecords[0]!.phase === 'enter', 'first recv frame should be enter');
+      assert(recvRecords[1]!.phase === 'trap', 'second recv frame should be trap');
+      assert(
+        recvRecords[1]!.error?.errno === 'EAGAIN',
+        `trap errno should be EAGAIN, got ${recvRecords[1]!.error?.errno}`,
+      );
+      assert(
+        recvRecords[0]!.callId === recvRecords[1]!.callId,
+        'enter and trap must share one callId so replay can pair them',
+      );
+      assert(
+        recvRecords[1]!.reversibility === 'irreversible',
+        'recv trap must keep the irreversible tag, not a guessed one',
+      );
     });
   } finally {
     for (const t of tables) {
@@ -3446,6 +3473,57 @@ async function runCheckpointChecks(): Promise<void> {
     const args = ck[0]!.args as { tag?: string; detach?: boolean };
     assert(args.tag === 'pre-deploy', 'tag captured in args');
     assert(args.detach !== true, 'detach flag captured');
+  });
+
+  await checkAsync('a checkpoint that fails inside the module writes one trap frame', async () => {
+    const sub = join(tmp, 'ckpt-trap');
+    await mkdir(sub, { recursive: true });
+    const table = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      recorderFactory: async (pid) => Recorder.open({ pid, dir: join(sub, String(unbrand(pid))) }),
+    });
+    tables.push(table);
+    const pid = await spawnRunning(table);
+    // A cognitive source that throws is the in-module failure path: the
+    // state gate has already passed, so the module reaches its own catch —
+    // the branch that used to write a second, mismatched trap frame.
+    const { ckpt } = makeCkpt(table, {
+      cognitiveSource: () => {
+        throw new Error('cognitive snapshot unavailable');
+      },
+    });
+    const signals = new SignalManager({ table, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    const dispatcher = new SyscallDispatcher({
+      table,
+      signals,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      checkpoint: ckpt,
+    });
+
+    let caught: unknown = null;
+    try {
+      await dispatcher.invoke(pid, 'checkpoint', { tag: 'doomed' });
+    } catch (err) {
+      caught = err;
+    }
+    assert(isCortexError(caught), 'checkpoint should trap a CortexError');
+    assert((caught as CortexError).errno === 'EDRIVER', `expected EDRIVER, got ${(caught as CortexError).errno}`);
+
+    const rec = table.recorderFor(pid)!;
+    await rec.flush();
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) records.push(r);
+    const ck = records.filter((r) => r.syscall === 'checkpoint');
+    assert(ck.length === 2, `expected checkpoint enter+trap, got ${ck.length}`);
+    assert(ck[0]!.phase === 'enter', 'first checkpoint frame should be enter');
+    assert(ck[1]!.phase === 'trap', 'second checkpoint frame should be trap');
+    assert(
+      ck[0]!.callId === ck[1]!.callId,
+      'enter and trap must share one callId so replay can pair them',
+    );
+    assert(ck[1]!.reversibility === 'idempotent', 'checkpoint keeps its idempotent tag');
   });
 
   await checkAsync('restoreAs records a reversible restore syscall in the new log', async () => {

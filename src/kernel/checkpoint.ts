@@ -406,9 +406,10 @@ export class CheckpointManager {
             details: { phase: 'snapshot' },
             cause: err,
           });
-      await this.#recordTrap(pid, 'checkpoint', cortexErr, {
-        ...(opts?.tag !== undefined ? { tag: opts.tag } : {}),
-      });
+      // No trap record here: the dispatcher owns the `checkpoint` record
+      // (docs/ABI.md §9). It writes the `enter` frame and the matching
+      // `trap` frame under one callId; a second frame here would double the
+      // failure and pair it with a callId that matches nothing.
       throw cortexErr;
     }
   }
@@ -694,36 +695,6 @@ export class CheckpointManager {
       kernelAbiVersion: this.kernelAbiVersion,
     };
     await this.#append(recorder, record, 'restore');
-  }
-
-  async #recordTrap(
-    pid: ProcessId,
-    syscall: 'checkpoint' | 'restore',
-    err: CortexError,
-    extraArgs: Record<string, unknown>,
-  ): Promise<void> {
-    const recorder = this.#table.recorderFor(pid);
-    if (recorder === null) return;
-    const state = this.#table.get(pid)?.state ?? 'running';
-
-    const record: SyscallRecordInput = {
-      timestamp: this.#now(),
-      pid,
-      syscall,
-      callId: `${syscall}-trap-${unbrand(pid)}`,
-      phase: 'trap',
-      args: extraArgs,
-      error: {
-        errno: err.errno,
-        message: err.message,
-        ...(err.details !== undefined ? { details: err.details } : {}),
-      },
-      stateBefore: state,
-      stateAfter: state,
-      reversibility: 'idempotent',
-      kernelAbiVersion: this.kernelAbiVersion,
-    };
-    await this.#append(recorder, record, syscall);
   }
 
   async #append(

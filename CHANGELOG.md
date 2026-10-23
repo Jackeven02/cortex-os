@@ -241,6 +241,38 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A failed `recv` or `checkpoint` was written to the log twice.** The
+  recording-ownership work in ABI.md §11 moved `recv` and `checkpoint` onto
+  the dispatcher's single path — but it moved only their *success* records.
+  Their *trap* records stayed behind in `ipc.ts` and `checkpoint.ts`, and the
+  dispatcher writes a trap frame of its own whenever a syscall fails. So one
+  failed `recv` produced two `trap` frames:
+
+  ```
+  recv  enter   -          irreversible
+  recv  trap    -          idempotent      ← ipc.ts's own frame
+  recv  trap    2ms        irreversible    ← the dispatcher's frame
+  ```
+
+  Three things were wrong with that, and only the first is visible in the
+  frame count. The module's frame carried a `callId` the dispatcher never
+  issued, so it paired with no `enter` frame and a replay engine had no way to
+  line the failure up with the call that caused it. It carried a
+  `reversibility` tag the module had hardcoded — `idempotent`, while `recv` is
+  `irreversible` — so the log misreported how dangerous the failed operation
+  was. And it carried no `durationMs`.
+
+  The modules no longer write trap frames. `ipc.ts` and `checkpoint.ts` now
+  throw and let the dispatcher record, which is what ABI.md §11 already
+  promised ("their `trap` frames come from the dispatcher's uniform path") and
+  what ARCHITECTURE.md §4.10 has always said ("This module is the only place
+  syscalls are validated and recorded"). The `send` trap path still writes its
+  own frame — `send` is still self-recorded, for the reason in ABI.md §11.
+
+  Two smoke checks: a failed `recv` writes exactly one `enter`+`trap` pair
+  under one `callId`, and a `checkpoint` that fails inside the module (a
+  cognitive source that throws) writes one trap frame instead of two.
+
 - **`cortex wrap --restart` now restarts anything.** The flag was parsed,
   validated, stored on the process entry — and read by nobody. `kernel.spawn`
   accepts a `restart` option and keeps it on `ProcessEntry`, but the entire
