@@ -410,6 +410,37 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Documentation
 
+- **The kernel-size claim was off by more than half.** MANIFESTO §II.3
+  promised "the Cortex kernel fits in 3,000 lines of TypeScript". The kernel
+  is ~6,800 lines of code — 13,200 counting the comments — across sixteen
+  modules, and the dispatcher alone is 1,400. The number was a Phase-1
+  estimate that never got revisited, and the architecture document still
+  carried it as a promise.
+
+  The claim that was *behind* the number still holds, and holds better than
+  it did: the kernel is under half the codebase, with the CLI, the drivers,
+  the dashboard and the integrations together now slightly larger than it.
+  Both MANIFESTOs (EN + zh-CN) now state the measured numbers, and
+  ARCHITECTURE's Phase-1 estimate carries a note saying what it was and
+  what happened to it.
+
+- **The Demo C transcript in the README was from an older kernel.** The
+  captured run said `diverged after 4 shared syscall(s)`; the current kernel
+  says 7, because the syscalls that record through the dispatcher gained the
+  `enter` frame they never had, and each one counts in the shared history.
+  The capture log (`examples/demo-c.capture.log`) has been re-recorded from a
+  real run, `docs/demo-c.html` regenerated from it, and both READMEs and
+  BACKLOG.md updated to match. The old capture also carried a note that one
+  branch had no `meta.json`; that stopped being true when every process
+  started persisting its own metadata, and the note is gone with it.
+
+- **The landing page's status panel was a version behind.** It said eleven
+  kernel modules and 525 smoke checks. Twelve and 580 now — the module count
+  matching ARCHITECTURE §3's own number, which the panel should have agreed
+  with months ago. The launch drafts in `docs/launch/` carried the same
+  stale module count, and the counts in the *release notes* were left alone
+  on purpose: those describe what was true at the time of that release.
+
 - **The docs now match the code.** A line-by-line audit of every doc claim
   against the implementation turned up no missing features — every syscall,
   environment variable, CLI command, driver and bundled example promised in

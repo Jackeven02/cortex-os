@@ -105,7 +105,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 525 项断言，0 失败
+npx tsx scripts/smoke.ts                # 580 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -189,14 +189,15 @@ $ cortex example fork-compare-agent      # 或：cortex example demo-c
 process exited (code 0: branch A complete)
 
 $ cortex diff 2 3
-  diverged after 4 shared syscall(s) — fork recorded in pid 2 at byte offset 1712
-  syscall diff   (4 shared, - 6 A-only, + 8 B-only)
-  - 15:21:58.345  fork         out {"childChainId":"9c7acbf9-...","c...
-  - 15:21:58.346  llm_call     in  {"messages":[{"content":"Design dedup with a counting Blo...
-  + 15:21:58.352  llm_call     in  {"messages":[{"content":"Design dedup with an LRU-bounded...
-  + 15:21:58.353  exit         out {"code":0,"reason":"branch B complete"}
+  diverged after 7 shared syscall(s) — fork recorded in pid 2 at byte offset 2307
+  syscall diff   (7 shared, - 7 A-only, + 9 B-only)
+  - 16:08:15.616  fork         in  {"tag":"dedup-strategy"}
+  - 16:08:15.619  fork         out {"childChainId":"8a644ebd-...","c...
+  - 16:08:15.620  llm_call     in  {"messages":[{"content":"Design dedup with a counting Blo...
+  + 16:08:15.628  llm_call     in  {"messages":[{"content":"Design dedup with an LRU-bounded...
+  + 16:08:15.630  exit         out {"code":0,"reason":"branch B complete"}
   summary
-    records   14            12      syscalls  10        8
+    records   19            14      syscalls  15        10
     exit      0 branch A    0 branch B
   last llm_call output
     A: mock reply to: Design dedup with a counting Bloom filter.

@@ -38,7 +38,9 @@ We reject the AI-magic school of framework design where *"the agent decided to..
 
 ### 3. Small kernel, big userland.
 
-The Cortex kernel fits in **3,000 lines of TypeScript**. Everything else is a user-space program.
+The Cortex kernel is **~6,800 lines of TypeScript** (13,200 counting the comments and the doc blocks), across sixteen modules. Everything else is a user-space program — the CLI, the drivers, the dashboard, the integrations — and together they are now already slightly *larger* than the kernel. The kernel is under half the codebase.
+
+That ratio is the promise. It is not supposed to grow. A kernel that does too much is a kernel that does everything badly.
 
 - LLM providers are drivers.
 - Tool protocols (MCP, OpenAPI, custom) are drivers.

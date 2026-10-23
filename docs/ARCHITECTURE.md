@@ -657,6 +657,14 @@ src/
 
 **Estimated total at end of Phase 1:** ~3000 lines of TypeScript (matching MANIFESTO §II.3 promise).
 
+> **That estimate did not survive contact with the implementation, and the
+> promise behind it did.** The kernel is now ~6,800 lines of code (13,200
+> with the comments) across sixteen modules — the dispatcher alone is 1,400.
+> What the promise *was* about still holds: the kernel is under half the
+> codebase, with the CLI, the drivers, the dashboard and the integrations
+> together now slightly larger than it. MANIFESTO §II.3 states the current
+> numbers rather than the original estimate.
+
 ---
 
 ## 12. Open questions
