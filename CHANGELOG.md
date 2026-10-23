@@ -42,6 +42,32 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`--module` resolves a bundled example inside the package, not the cwd.**
+  Every demo in the README, the cookbook and the example files themselves is
+  spelled `--module ./examples/<name>.ts` — but `--module` was resolved
+  against the **current working directory**, and an installed package drops
+  no `examples/` folder there. So the command the documentation opens with
+  was the one command a real `npm i -g cortex-agent-os` user could not run.
+  (`cortex example` was built to work around exactly this, but only for the
+  examples it knows by name, and it never covered `daemon install`.)
+
+  Now a spec that names a bundled example resolves inside the package: the
+  compiled `dist/examples/<name>.js` that ships, or the `examples/<name>.ts`
+  sources in a clone. A path that exists in the cwd still wins, so a user's
+  own module is never shadowed by one of ours, and an unresolvable path
+  still fails the way it always did.
+
+  `cortex daemon install` also **refuses a module that does not exist**. A
+  daemon spec persists the module's path, and the daemon runs it later —
+  possibly after a reboot, possibly by a different account. A path that does
+  not exist now will not exist then either, so it is better refused at
+  install time than registered as a daemon that can only fail.
+
+  Three checks: a bundled example resolves inside the package when the cwd
+  has no `examples/` folder, a path that exists in the cwd wins over the
+  package, and an unresolvable path falls back to the cwd-relative
+  resolution.
+
 - **`cortex wrap` — run any command as a supervised cortex process.** The two
   integrations (`integrations/langchain`, `integrations/llm-tap`) make an
   existing agent observable; neither makes it supervisable, because

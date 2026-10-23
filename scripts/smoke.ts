@@ -287,6 +287,7 @@ import {
   MemoryArgError,
 } from '../src/cli/regions.js';
 import { cmdSpawn } from '../src/cli/commands/spawn.js';
+import { resolveModulePath } from '../src/cli/module_path.js';
 import { DEFAULT_MEMORY_REGIONS } from '../src/cli/index.js';
 
 let passed = 0;
@@ -11408,6 +11409,52 @@ async function runCliChecks(): Promise<void> {
   const { tmpdir } = await import('node:os');
   const tmp = mkdtempSync(join(tmpdir(), 'cortex-cli-'));
   try {
+    // --- --module resolution ------------------------------------------------
+    // The documented form is `--module ./examples/<name>.ts`, and an installed
+    // package has no `examples/` folder in the user's cwd. So the resolution
+    // has to reach into the package — which is only observable from a cwd
+    // that does *not* contain it.
+    await checkAsync('a bundled example resolves inside the package, not the cwd', async () => {
+      const here = process.cwd();
+      const elsewhere = mkdtempSync(join(tmpdir(), 'cortex-elsewhere-'));
+      try {
+        process.chdir(elsewhere);
+        const resolved = resolveModulePath('./examples/checkpoint-agent.ts');
+        assert(
+          existsSync(resolved),
+          `the bundled example should resolve to a real file, got ${resolved}`,
+        );
+        assert(
+          !resolved.startsWith(elsewhere),
+          `it should not resolve inside the cwd, got ${resolved}`,
+        );
+        assert(
+          resolved.includes('checkpoint-agent'),
+          `it should be the checkpoint agent, got ${resolved}`,
+        );
+      } finally {
+        process.chdir(here);
+        rmSync(elsewhere, { recursive: true, force: true });
+      }
+    });
+
+    check('a path that exists in the cwd wins over the package', () => {
+      const resolved = resolveModulePath('./examples/checkpoint-agent.ts');
+      assert(
+        resolved.endsWith('checkpoint-agent.ts'),
+        `expected the .ts source from the cwd, got ${resolved}`,
+      );
+    });
+
+    check('an unresolvable path falls back to the cwd-relative resolution', () => {
+      const resolved = resolveModulePath('./definitely-not-here.ts');
+      assert(
+        resolved.endsWith('definitely-not-here.ts'),
+        `expected the cwd-relative path, got ${resolved}`,
+      );
+      assert(!existsSync(resolved), 'and it should not exist');
+    });
+
     // Create processes dir.
     mkdirSync(join(tmp, 'processes'), { recursive: true });
 

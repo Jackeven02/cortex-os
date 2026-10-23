@@ -33,6 +33,8 @@ import { join, resolve } from 'node:path';
 import { platform as osPlatform } from 'node:os';
 import { pathToFileURL } from 'node:url';
 
+import { resolveModulePath } from '../module_path.js';
+
 import {
   bootCliKernel,
   defaultKernelDir,
@@ -147,9 +149,27 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
   }
 
   const system = values.system ?? `You are a ${values.role}. Your task: ${values.task ?? '(no task specified)'}`;
+
+  // A daemon spec persists the module's path, and the daemon runs it later —
+  // possibly after a reboot, possibly by a different user account. A path
+  // that does not exist now will not exist then either, so refuse it here
+  // rather than registering a daemon that can only ever fail.
+  let modulePath: string | undefined;
+  if (values.module !== undefined) {
+    modulePath = resolveModulePath(values.module);
+    if (!existsSync(modulePath)) {
+      console.error(`cortex daemon install: --module '${values.module}' does not exist`);
+      console.error(`(looked for ${modulePath})`);
+      console.error(
+        `if you meant one of the bundled examples, use its name -- e.g. ./examples/checkpoint-agent.ts`,
+      );
+      return 1;
+    }
+  }
+
   const agentSpec: AgentSpec =
-    values.module !== undefined
-      ? { module: pathToFileURL(resolve(values.module)).href }
+    modulePath !== undefined
+      ? { module: pathToFileURL(modulePath).href }
       : {
           system,
           ...(values.driver !== undefined ? { driver: values.driver } : {}),
@@ -544,7 +564,9 @@ OPTIONS
   --role <string>       Agent role (required)
   --task <string>       Task (becomes the system prompt)
   --system <string>     Full system prompt (overrides --task)
-  --module <path>       Run a user agent module instead of the prompt agent
+  --module <path>       Run a user agent module instead of the prompt agent.
+                        A bundled example may be named as ./examples/<name>.ts
+                        and resolves inside the package, not the cwd.
   --driver/--model/--max-tokens   Prompt-agent LLM options
   --token-budget <n>    Total token budget
   --restart <kind>      always | on-failure | never (default: never)
