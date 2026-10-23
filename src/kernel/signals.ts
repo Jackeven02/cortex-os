@@ -46,7 +46,7 @@
  *   SIGSTOP   stop         (pause, uncatchable)
  *   SIGCONT   continue     (resume from STOPPED)
  *   SIGUSR1   ignore       (reflect — agent-specific)
- *   SIGUSR2   ignore       (checkpoint — kernel-mediated, see checkpoint.ts)
+ *   SIGUSR2   checkpoint   (kernel-mediated snapshot — see checkpoint.ts)
  *   SIGCHLD   ignore       (parent notification)
  *   SIGXCPU   stop         (budget exceeded; supervisor decides next)
  *   SIGXFSZ   terminate    (memory region overflow)
@@ -61,12 +61,27 @@
  * `phase: 'exit'` and an `args` payload of `{ signal, from, disposition,
  * action, queued }` so replay engines can reconstruct the delivery order.
  *
+ * ## The `checkpoint` action
+ *
+ * `SIGUSR2` is the kernel's "checkpoint now" channel (docs/PROCESS.md §7:
+ * *"Checkpoint now. Kernel writes snapshot."*). Its default action is not a
+ * state change of its own: the kernel takes a **snapshot of the target**,
+ * which drives the target through CHECKPOINTING and back (docs/PROCESS.md
+ * §5). The snapshot belongs to `checkpoint.ts` and its recording to the
+ * dispatcher; the signal engine's own job is to decide *that* it should
+ * happen and to say so in the log.
+ *
+ * The mediation is injected (`checkpointMediator`) rather than imported:
+ * `checkpoint.ts` and the dispatcher both sit downstream of this module, and
+ * the kernel wires them together in `boot.ts`.
+ *
  * See: docs/PROCESS.md §7, docs/ARCHITECTURE.md §4.5
  *
  * @module kernel/signals
  */
 
 import {
+  type ChainId,
   type ProcessId,
   type ProcessState,
   type Signal,
@@ -129,8 +144,15 @@ export const UNCATCHABLE_SIGNALS: ReadonlySet<Signal> = new Set<Signal>([
  *   - `kill`      — like terminate but skips cleanup (SIGKILL only).
  *   - `stop`      — RUNNING → STOPPED.
  *   - `continue`  — STOPPED → READY.
+ *   - `checkpoint`— the kernel snapshots the target (SIGUSR2 only).
  */
-export type DefaultAction = 'ignore' | 'terminate' | 'kill' | 'stop' | 'continue';
+export type DefaultAction =
+  | 'ignore'
+  | 'terminate'
+  | 'kill'
+  | 'stop'
+  | 'continue'
+  | 'checkpoint';
 
 /**
  * Default action for each signal. Source: docs/PROCESS.md §7 table.
@@ -143,7 +165,7 @@ export const DEFAULT_ACTIONS: Readonly<Record<Signal, DefaultAction>> = Object.f
   SIGSTOP: 'stop',
   SIGCONT: 'continue',
   SIGUSR1: 'ignore',
-  SIGUSR2: 'ignore',
+  SIGUSR2: 'checkpoint',
   SIGCHLD: 'ignore',
   SIGXCPU: 'stop',
   SIGXFSZ: 'terminate',
@@ -187,6 +209,26 @@ export type HandlerInvoker = (
 ) => Promise<void>;
 
 /**
+ * The snapshotter the `checkpoint` default action calls.
+ *
+ * `SIGUSR2` means "checkpoint now" (docs/PROCESS.md §7): the kernel takes a
+ * snapshot **of the target**, which drives the target through CHECKPOINTING
+ * and back. The snapshot itself is `checkpoint.ts`'s job and its recording is
+ * the dispatcher's, so this is an injected seam rather than an import — the
+ * same shape as `handlerInvoker` and `onZombie`. `boot.ts` wires it to the
+ * dispatcher's `checkpoint` syscall, which means a signal-triggered snapshot
+ * is recorded exactly like an agent-initiated one.
+ *
+ * The returned `chainId` identifies the snapshot that was written; it is
+ * recorded in the `__signal` entry so the log says *which* snapshot the
+ * signal produced.
+ */
+export type CheckpointMediator = (
+  pid: ProcessId,
+  opts: { readonly detach?: boolean },
+) => Promise<{ readonly chainId: ChainId }>;
+
+/**
  * Optional hook fired *after* a process transitions to ZOMBIE. The
  * supervisor / init reaper uses this to send `SIGCHLD` to the parent and
  * to apply restart policies. Kept as a callback to avoid a circular
@@ -209,6 +251,13 @@ export interface SignalManagerOptions {
   readonly now?: () => Timestamp;
   /** Required to support `handler` dispositions. */
   readonly handlerInvoker?: HandlerInvoker;
+  /**
+   * Required to support the `checkpoint` default action (`SIGUSR2`). Without
+   * it, a `SIGUSR2` traps `EINVAL` — a kernel that promises "checkpoint now"
+   * but cannot snapshot is misconfigured, and saying so loudly beats
+   * silently dropping the signal.
+   */
+  readonly checkpointMediator?: CheckpointMediator;
   /** Fired after a SIGKILL/SIGTERM/SIGINT-driven ZOMBIE transition. */
   readonly onZombie?: OnZombieHook;
 }
@@ -237,6 +286,7 @@ export class SignalManager {
   #table: ProcessTable;
   #now: () => Timestamp;
   #handlerInvoker: HandlerInvoker | null;
+  #checkpointMediator: CheckpointMediator | null;
   #onZombie: OnZombieHook | null;
 
   constructor(opts: SignalManagerOptions) {
@@ -244,6 +294,7 @@ export class SignalManager {
     this.kernelAbiVersion = opts.kernelAbiVersion;
     this.#now = opts.now ?? (() => new Date().toISOString());
     this.#handlerInvoker = opts.handlerInvoker ?? null;
+    this.#checkpointMediator = opts.checkpointMediator ?? null;
     this.#onZombie = opts.onZombie ?? null;
   }
 
@@ -487,6 +538,9 @@ export class SignalManager {
 
       case 'kill':
         return await this.#applyKill(pid, signal, from);
+
+      case 'checkpoint':
+        return await this.#applyCheckpoint(pid, signal, from);
     }
   }
 
@@ -559,6 +613,63 @@ export class SignalManager {
       stateAfter: 'ready',
     });
     return 'delivered';
+  }
+
+  /**
+   * Take a snapshot of the target — the `SIGUSR2` default action
+   * (docs/PROCESS.md §7: *"Checkpoint now. Kernel writes snapshot."*).
+   *
+   * The signal engine does not snapshot anything itself: the mediator is the
+   * checkpoint manager behind the dispatcher, so the `checkpoint` frames land
+   * in the target's own log exactly like an agent-initiated checkpoint. What
+   * this method adds is the *cause* — a `__signal` record saying SIGUSR2
+   * arrived, from whom, and which snapshot it produced. Without it a
+   * signal-triggered snapshot would be indistinguishable from a self-checkpoint
+   * in the log.
+   *
+   * The target goes through CHECKPOINTING on the way (docs/PROCESS.md §5), so
+   * the mediation is not a no-op even though the visible state ends where it
+   * started.
+   *
+   * A failure is recorded, not thrown: a signal that cannot be delivered must
+   * not take the sender down with it. The outcome is `failed`, and the error
+   * travels in the `__signal` record.
+   */
+  async #applyCheckpoint(
+    pid: ProcessId,
+    signal: Signal,
+    from?: ProcessId,
+  ): Promise<DeliveryOutcome> {
+    if (this.#checkpointMediator === null) {
+      trap('EINVAL', 'kill', {
+        pid: unbrand(pid),
+        signal,
+        reason: 'the checkpoint action requires a checkpointMediator; kernel is misconfigured',
+      });
+    }
+
+    const before = this.#table.get(pid)?.state ?? 'zombie';
+    try {
+      const result = await this.#checkpointMediator(pid, { detach: false });
+      const after = this.#table.get(pid)?.state ?? before;
+      await this.#record(pid, signal, from, 'delivered', {
+        disposition: { kind: 'default' },
+        action: 'checkpoint',
+        stateBefore: before,
+        stateAfter: after,
+        chainId: unbrand(result.chainId),
+      });
+      return 'delivered';
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.#record(pid, signal, from, 'failed', {
+        disposition: { kind: 'default' },
+        action: 'checkpoint',
+        stateBefore: before,
+        error: { message },
+      });
+      return 'failed';
+    }
   }
 
   /**

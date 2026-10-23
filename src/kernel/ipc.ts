@@ -903,8 +903,21 @@ export class IpcManager {
 
   /**
    * Settle a parked `recv()`: either run `fn` now (no gate configured — the
-   * host's continuations run to completion and never race the state machine) or
-   * defer it to the receiver's next dispatch. See `wake_gate.ts`.
+   * host's continuations run to completion and never race the state machine)
+   * or defer it to the receiver's next dispatch. See `wake_gate.ts`.
+   *
+   * The wake is *always* deferred, because the body may only resume when the
+   * process is RUNNING again — resuming it while the process is still BLOCKED
+   * (or, worse, READY or CHECKPOINTING after an operator's checkpoint) is
+   * exactly the race the gate exists to remove.
+   *
+   * The gate releases a deferred wake on the receiver's next *dispatch*, and
+   * the scheduler only dispatches READY processes. So a receiver parked in
+   * RUNNING would never be dispatched again and its wake would be stranded
+   * forever. That state is reachable: a checkpoint takes a BLOCKED process
+   * out of BLOCKED while its waiter is still pending. Making it READY again
+   * is the same move the normal path makes out of BLOCKED — it gives the
+   * wake the dispatch it is waiting for.
    */
   #settleWake(pid: ProcessId, fn: () => void): void {
     if (this.#wakeGate === null) {
@@ -912,6 +925,16 @@ export class IpcManager {
       return;
     }
     this.#wakeGate.defer(pid, fn);
+    const state = this.#table.get(pid)?.state;
+    if (state !== 'running') return;
+    void this.#table
+      .setState(pid, 'ready', { trigger: 'recv-wake' })
+      .catch(() => {
+        // The state write failed: never leave the wake stranded behind a
+        // dispatch that cannot happen.
+        this.#wakeGate?.clear(pid);
+        fn();
+      });
   }
 
   // ---------------------------------------------------------------------------

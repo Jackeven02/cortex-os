@@ -94,7 +94,7 @@ The user-facing surface. Should feel like a real OS shell.
 - [x] **#032** `cortex kill` — send signals → implemented (`--signal`; all 13 cortex signals). **Now it signals for real.** With a live kernel (`cortex daemon run`), the signal is delivered through the kernel's own signal engine: the target's disposition is honoured, the signal is queued when the target is not running yet, the outcome is reported (`delivered` / `queued` / `dropped`), and the delivery is recorded in the kernel's `.crec`. Without one, there is no process to signal, so the command marks the process terminated in the on-disk metadata and says that is what it did.
 - [x] **#033** `cortex trace` — strace-style syscall log, live or from `.crec` file → implemented (reads `.crec` by PID or file path)
 - [x] **#034** `cortex fork` — clone a running process at its current state → implemented (`--tag`, `--budgets`)
-- [x] **#035** `cortex checkpoint` / `cortex restore` → implemented (`--tag`, `--detach`; restore by `--chain` or `--tag`). Cross-invocation restore now works: `bootCliKernel` injects a disk-backed `restoreContext` (rebuilds the agent spec from `<pid>.meta.json`, since the `.csnap` body deliberately omits it), seeds the PID counter from `maxPidOnDisk` so restore never reuses the suspended original's PID, and `--tag` resolves to a chain ID by scanning `.crec` checkpoint records (the tag is not in the `.csnap`). `spawn` now reports a self-checkpointed SUSPENDED process cleanly (with a `restore` hint) instead of as a timeout.
+- [x] **#035** `cortex checkpoint` / `cortex restore` → implemented (`--tag`, `--detach`; restore by `--chain` or `--tag`). Cross-invocation restore now works: `bootCliKernel` injects a disk-backed `restoreContext` (rebuilds the agent spec from `<pid>.meta.json`, since the `.csnap` body deliberately omits it), seeds the PID counter from `maxPidOnDisk` so restore never reuses the suspended original's PID, and `--tag` resolves to a chain ID by scanning `.crec` checkpoint records (the tag is not in the `.csnap`). `spawn` now reports a self-checkpointed SUSPENDED process cleanly (with a `restore` hint) instead of as a timeout. **And the snapshot of a *running* process now works.** `cortex checkpoint <pid>` used to be a command that could not succeed: a checkpoint captures a live process, and the short-lived CLI kernel holds exactly one entry (init), so the PID it was asked about was never there — the answer was always "no such process". With a live kernel it takes the snapshot through the dispatcher (so the state gate and the capability gate apply exactly as they do locally) and reports the chain id and the file; `--tag` is recorded in the checkpoint frame and `--detach` suspends the process, so "save and stop" is now something the shell can do to a running agent. The other route is `SIGUSR2`, whose default action is now `checkpoint` (docs/PROCESS.md §7.4) — the only way to ask *another* process to snapshot itself, because `checkpoint` is a self-syscall and the ABI gives it no target argument.
 - [x] **#036** `cortex send` — IPC from the shell → implemented (`--channel` or PID target). **Now it delivers.** The short-lived CLI model could not deliver anything: the fresh kernel's process table holds exactly one entry (init), so a message addressed to a real agent had no inbox to land in, and the kernel exited a millisecond later taking it with it — the syscall was recorded, nothing was delivered. With a live kernel, `cortex send <pid> <msg>` hands the message to a process that is actually running, through the same prepare/commit transaction the kernel uses internally. Without one, the command says so plainly instead of claiming a delivery it did not make.
 - [x] **#037** `cortex limit` — set token / cost / time budgets per process → implemented (`--tokens`, `--usd`, `--wall-time`; show mode when no limits given)
 - [x] **#038** `cortex diff` — compare two forked branches' syscall logs and outputs → implemented (`src/cli/diff_core.ts` for the pure logic + `src/cli/commands/diff.ts` for I/O). **The non-obvious part:** you cannot just diff two `.crec` files. A forked child inherits the parent's *state*, not its *log* — the shared causal past exists only in the parent's file. A naive head-to-head align therefore reports the entire shared history as "A only". So diff reads `sharedCausalPast` out of the parent's `fork` record, cuts the parent's log at that byte offset, and only then aligns the two tails with an LCS. LCS rather than a positional compare because branches can *re-converge* (both exit the same way) and a positional compare would call that a difference; LCS also reports one insertion as one insertion instead of a cascade. Signature comparison deliberately excludes `timestamp`/`durationMs`/`callId`/`byteOffset` — otherwise every line differs and the diff is useless. Falls back to a prefix compare (flagged as degenerate, out loud) above `MAX_LCS_CELLS`. Also surfaces `irreversibleInPast` (STATE.md §5.4: those actions happened once, in reality, and both branches inherit them — whoever wins, they already happened). 19 smoke checks, plus `examples/fork-compare-agent.ts` for the live demo.
@@ -192,12 +192,17 @@ cleanup (see the `1.0.0` entry above) is **done**: all seven syscalls now
 record through the dispatcher, and `SELF_RECORDED_SYSCALLS` is empty. The
 live-kernel transport (ARCHITECTURE §12.1) has landed too, which makes
 `cortex send` / `cortex kill` / `cortex attach --interactive` act on a
-*running* kernel instead of on the files it left behind. What remains for
-`1.1` comes out of the Icebox below — plus the two things the transport
-still does not do: `cortex spawn` does not yet spawn into the live kernel
-(it boots its own, and the PID claim keeps the two off each other's logs),
-and the transport carries commands rather than streams (there is no live
-trace subscription yet).
+*running* kernel instead of on the files it left behind. The transport now
+also reaches the snapshot: `cortex checkpoint <pid>` takes a snapshot of a
+running agent (it could never succeed before — a checkpoint captures a live
+process, and the short-lived CLI kernel holds only init), and `SIGUSR2`
+means "checkpoint now" for real, which is the only way to ask *another*
+process to snapshot itself (`checkpoint` is a self-syscall; the ABI gives it
+no target argument). What remains for `1.1` comes out of the Icebox below —
+plus the two things the transport still does not do: `cortex spawn` does not
+yet spawn into the live kernel (it boots its own, and the PID claim keeps
+the two off each other's logs), and the transport carries commands rather
+than streams (there is no live trace subscription yet).
 
 ---
 
@@ -223,6 +228,21 @@ Things we want, but not yet:
 - Plan 9-style "everything is a file" — expose every syscall as a file in a virtual filesystem (`/proc/<pid>/llm_call` you can `echo` into)
 - Formal model of the syscall ABI in TLA+ or Alloy
 - Optional Temporal-backed persistence driver (prove our "you can build cortex on Temporal" claim)
+
+**From the live-kernel transport:**
+- `cortex spawn --live` — spawn into the running kernel instead of a
+  short-lived one. The agent's stdout then belongs to the daemon, which is a
+  visible change in behaviour, so it must be opt-in rather than a silent
+  change to the most-used command.
+- `cortex daemon stop` as a CLI entry point (the server already answers
+  `shutdown`).
+- A **queued** signal loses its sender: the pending queue holds the signal
+  only (`pendingSignals` is part of `ProcessInfo`, and the ABI is frozen), so
+  a `SIGUSR2` that had to wait for its target to run again is recorded
+  without a `from`. Preserving the sender needs a `ProcessInfo` change —
+  a `2.0` conversation, not a `1.1` one.
+- A read-only transport query that is *not* recorded (today `ps` goes through
+  the dispatcher, so every poll adds a frame to init's log).
 
 ---
 

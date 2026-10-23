@@ -57,7 +57,7 @@ export const KERNEL_PROTOCOL_VERSION = 1;
  * deliberately not recorded in the `.crec` log. Everything else is answered
  * by the ordinary dispatcher path and therefore is recorded.
  */
-export type KernelCommand = 'ping' | 'ps' | 'send' | 'kill' | 'shutdown';
+export type KernelCommand = 'ping' | 'ps' | 'send' | 'kill' | 'checkpoint' | 'shutdown';
 
 /** A request frame. */
 export interface KernelRequest {

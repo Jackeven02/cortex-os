@@ -700,10 +700,24 @@ export class SyscallDispatcher {
     syscall: S,
     ...args: SyscallArgs[S]
   ): Promise<SyscallReturn[S]> {
-    const entry = this.#table.get(pid);
+    let entry = this.#table.get(pid);
     if (entry === undefined) {
       trap('ESRCH', syscall, { pid: unbrand(pid) });
     }
+
+    // A snapshot in progress makes the process transiently unable to take
+    // syscalls (docs/PROCESS.md §5). A body that resumes inside that window
+    // waits for the snapshot to land instead of trapping `ESTATE` — otherwise
+    // checkpointing a live agent could kill the very agent it was saving. The
+    // wait is bounded by the snapshot itself, which is milliseconds.
+    if (entry.state === 'checkpointing' && this.#checkpointMgr !== null) {
+      await this.#checkpointMgr.whenSettled(pid);
+      entry = this.#table.get(pid);
+      if (entry === undefined) {
+        trap('ESRCH', syscall, { pid: unbrand(pid) });
+      }
+    }
+
     const stateBefore = entry.state;
 
     // §4.10 step 2 — the uniform state gate.

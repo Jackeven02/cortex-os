@@ -64,6 +64,8 @@ $ cortex trace 1234
 14:23:06 llm_call(...) -> "Found it, editing now"
 
 # 跨重启暂停和恢复
+# （快照捕获的是**正在运行**的进程，所以这需要活内核：
+#   `cortex daemon run` —— SIGUSR2 的语义就是"立刻做快照"）
 $ cortex checkpoint 1234 --tag "before risky edit"
 $ cortex kill 1234
 # ... 第二天 ...

@@ -711,6 +711,15 @@ message had no inbox to land in and the kernel exited a millisecond later
 taking it away. `cortex kill` could not signal anything either — it
 rewrote the on-disk metadata. Both are real now, against a live kernel.
 
+**And it made the snapshot reachable.** `cortex checkpoint <pid>` used to be
+a command that could not succeed: a checkpoint captures a *running* process,
+and the short-lived CLI kernel holds only init, so the PID it was asked about
+was never there. It now asks the kernel that does have the process, takes the
+snapshot through the ordinary `checkpoint` syscall, and reports the chain id
+and the file. The other route is the signal: `SIGUSR2` means "checkpoint now"
+(docs/PROCESS.md §7.4), so `cortex kill <pid> --signal SIGUSR2` asks a live
+agent to save itself.
+
 **Known limits (v0).**
 
 - The transport carries commands, not streams: there is no live trace
@@ -723,6 +732,15 @@ rewrote the on-disk metadata. Both are real now, against a live kernel.
   other's PIDs.
 - A crashed kernel leaves a stale `kernel.json` behind. Clients detect it
   (the port refuses the connection) and fall back to the disk view.
+- A **queued** signal loses its sender. The pending queue holds the signal
+  (`pendingSignals` is part of `ProcessInfo`, and the ABI is frozen), so a
+  `SIGUSR2` that had to wait for the target to run again is recorded without
+  a `from`. The snapshot it produced is still identified by its chain id.
+- `checkpoint` is legal from RUNNING / BLOCKED / STOPPED, so a process that
+  is momentarily READY (scheduled, not yet dispatched) cannot be snapshotted
+  yet. The transport waits for that window rather than refusing; a process
+  that is STOPPED cannot be snapshotted at all, because the transition table
+  has no `stopped -> checkpointing` edge (BACKLOG #011).
 
 ### 12.2 Multiple kernels on one machine
 

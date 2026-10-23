@@ -64,6 +64,8 @@ $ cortex trace 1234
 14:23:06 llm_call(...) -> "Found it, editing now"
 
 # Pause and resume across reboots
+# (a checkpoint captures a live process, so this needs a live kernel:
+#  `cortex daemon run` — and SIGUSR2 means "checkpoint now")
 $ cortex checkpoint 1234 --tag "before risky edit"
 $ cortex kill 1234
 # ... next day ...

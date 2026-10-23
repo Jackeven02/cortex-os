@@ -240,6 +240,18 @@ export class CheckpointManager {
   /** chainId → ref, for O(1) load within a session. */
   #index = new Map<string, CheckpointRef>();
 
+  /**
+   * Snapshots currently in flight, per PID.
+   *
+   * A snapshot drives its process through CHECKPOINTING, and a process in
+   * CHECKPOINTING cannot take syscalls. A body that resumed inside that
+   * window used to trap `ESTATE` — which meant checkpointing a live agent
+   * could kill the very agent it was trying to save. The dispatcher waits on
+   * {@link CheckpointManager.whenSettled} instead of trapping, so the window
+   * has to be observable from outside this module.
+   */
+  #inflight = new Map<number, Promise<void>>();
+
   constructor(opts: CheckpointManagerOptions) {
     this.#table = opts.table;
     this.kernelAbiVersion = opts.kernelAbiVersion;
@@ -268,6 +280,9 @@ export class CheckpointManager {
    * Traps `ESRCH` (no such process), `EINVAL` (illegal source state, from
    * `setState`), `ERECORD` (disk failure), or `EDRIVER` (memory/driver
    * serialization).
+   *
+   * The snapshot is registered as in flight for the duration, so a body that
+   * resumes mid-snapshot can wait for it to land instead of trapping.
    */
   async take(
     pid: ProcessId,
@@ -278,6 +293,71 @@ export class CheckpointManager {
     /** Size of the written `.csnap`, for the dispatcher's `exit` record. */
     byteSize: number;
     /** Log offset the snapshot was taken at, for causal ordering in replay. */
+    syscallLogOffset: SyscallOffset;
+  }> {
+    const release = this.#beginSnapshot(pid);
+    try {
+      return await this.#snapshot(pid, opts);
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Resolve once no snapshot of `pid` is in flight.
+   *
+   * A no-op for a process nobody is snapshotting, so a caller can await it
+   * unconditionally.
+   */
+  async whenSettled(pid: ProcessId): Promise<void> {
+    const pending = this.#inflight.get(unbrand(pid));
+    if (pending === undefined) return;
+    await pending;
+  }
+
+  /**
+   * The on-disk path of a snapshot this kernel took.
+   *
+   * Returns `undefined` for a chainId this kernel never produced — the index
+   * is per-session, so a chainId restored from another kernel's `.csnap` is
+   * not in it.
+   */
+  pathOf(chainId: ChainId): string | undefined {
+    return this.#index.get(unbrand(chainId))?.path;
+  }
+
+  /**
+   * Register a snapshot as in flight and return the function that ends it.
+   *
+   * The returned function is idempotent, so the caller can end the snapshot
+   * from a `finally` without worrying about how it exited.
+   */
+  #beginSnapshot(pid: ProcessId): () => void {
+    const key = unbrand(pid);
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#inflight.set(key, done);
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      if (this.#inflight.get(key) === done) this.#inflight.delete(key);
+      release();
+    };
+  }
+
+  /**
+   * The snapshot itself. See {@link CheckpointManager.take} for the contract.
+   */
+  async #snapshot(
+    pid: ProcessId,
+    opts?: CheckpointOptions,
+  ): Promise<{
+    chainId: ChainId;
+    path: string;
+    byteSize: number;
     syscallLogOffset: SyscallOffset;
   }> {
     const entry = this.#table.mustGet(pid, 'checkpoint'); // traps ESRCH

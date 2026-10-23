@@ -124,7 +124,7 @@ CHECKPOINTING is observable (you can see it in `cortex ps`) but not controllable
 
 On completion, the process moves to one of:
 - **READY** (if the checkpoint was an "in-flight" snapshot, e.g. for backup or forking)
-- **SUSPENDED** (if the checkpoint was a "shutdown" snapshot, e.g. SIGUSR2 with `--detach`)
+- **SUSPENDED** (if the checkpoint was a "shutdown" snapshot, e.g. `checkpoint --detach`)
 
 ### 3.6 `SUSPENDED`
 
@@ -241,7 +241,7 @@ Every legal transition is listed here. Anything not in this table is illegal and
 | RUNNING | STOPPED | SIGSTOP, SIGXCPU, or budget exhaustion | paused in memory |
 | STOPPED | READY | SIGCONT | re-enqueued |
 | RUNNING | CHECKPOINTING | SIGUSR2 or `checkpoint()` syscall | snapshot begins |
-| BLOCKED | CHECKPOINTING | SIGUSR2 (delivered when blocked) | snapshot begins |
+| BLOCKED | CHECKPOINTING | `checkpoint()` syscall, or SIGUSR2 once it is delivered | snapshot begins |
 | CHECKPOINTING | READY | snapshot done, no `--detach` | re-enqueued |
 | CHECKPOINTING | SUSPENDED | snapshot done with `--detach` | removed from scheduler |
 | SUSPENDED | (gone) | `restore <chain_id>` | new PID created in NEW; old entry reaped |
@@ -332,7 +332,7 @@ Cortex signals are Unix-shaped but with agent-specific semantics.
 | `SIGSTOP` | 17 | **stop, uncatchable** | "Pause." Move to STOPPED. State remains in memory. |
 | `SIGCONT` | 18 | continue | "Resume from pause." STOPPED → READY. |
 | `SIGUSR1` | 10 | ignore | **"Reflect."** Write a self-summary to memory. Agent-specific. |
-| `SIGUSR2` | 30 | ignore | **"Checkpoint now."** Kernel writes snapshot. Agent-specific. |
+| `SIGUSR2` | 30 | checkpoint | **"Checkpoint now."** Kernel writes snapshot. Agent-specific. |
 | `SIGCHLD` | 19 | ignore | Sent to parent when child changes state (RUNNING → ZOMBIE, etc). |
 | `SIGXCPU` | 24 | stop | **Budget exceeded** (tokens or USD). Default: STOPPED until supervisor decides. |
 | `SIGXFSZ` | 25 | terminate | Memory region exceeded its size limit. |
@@ -354,9 +354,26 @@ If a signal arrives while the process is BLOCKED or STOPPED, it is queued. When 
 
 This means an agent that is blocked waiting on an LLM response and receives SIGTERM will not interrupt the LLM call mid-flight (which would waste tokens) — it will be delivered the moment the call returns.
 
+`SIGUSR2` is no exception: a "checkpoint now" aimed at a parked agent waits for the agent to run again, and the snapshot is taken then. The snapshot is of the agent as it is *when it resumes*, not as it was when the signal arrived.
+
 ### 7.3 Group signals
 
 `kill(-pgid, sig)` delivers the signal to every member of the group. This is the standard way to terminate a whole subtree.
+
+### 7.4 SIGUSR2: checkpoint now
+
+`SIGUSR2`'s default action is `checkpoint`: the kernel writes a snapshot of the target (§3.5) and the target keeps running. It is the channel an operator uses to ask a live agent to save itself — `cortex kill <pid> --signal SIGUSR2`, or a cron job that signals a long-running agent on a schedule (see §11.6).
+
+The signal is the *only* way to ask another process to snapshot itself, because `checkpoint` is a self-syscall: the ABI gives it no target argument, so the subject of a snapshot is always its caller. A signal is the one request that crosses the boundary.
+
+Two things are recorded, and they say different things:
+
+- the `checkpoint` syscall frames, in the **target's** log, say "this process was snapshotted" — the subject;
+- the `__signal` record, also in the target's log, says "SIGUSR2 arrived, from whom, and here is the snapshot it produced" — the cause.
+
+An agent that checkpoints *itself* has the first pair and no second one. That is how a replay tells the two apart.
+
+A signal-triggered snapshot does not detach: the agent keeps running afterwards. The "save and stop" variant is `checkpoint --detach`, which moves the process to SUSPENDED.
 
 ---
 

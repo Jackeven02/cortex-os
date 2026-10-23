@@ -42,6 +42,43 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`SIGUSR2` means "checkpoint now" — and now it does.** The signal has said
+  *"Checkpoint now. Kernel writes snapshot"* since docs/PROCESS.md §7 was
+  written, the transition table has carried a `running -> checkpointing` edge
+  attributed to it, and three places in the source named it. Nothing
+  implemented it: `SIGUSR2`'s default action was `ignore`, so the signal was
+  delivered, recorded, and dropped on the floor.
+
+  It now takes a snapshot of the target, through the ordinary `checkpoint`
+  syscall — so the `checkpoint` frames land in the target's log exactly like
+  an agent-initiated checkpoint, and the `__signal` frame beside them records
+  the *cause*: SIGUSR2 arrived, from whom, and here is the chain id it
+  produced. An agent that checkpoints itself has the frames and no signal;
+  that is how a replay tells the two apart.
+
+  This is the only way to ask *another* process to snapshot itself, because
+  `checkpoint` is a self-syscall — the ABI gives it no target argument, so
+  the subject of a snapshot is always its caller. A signal is the one request
+  that crosses the boundary, which is exactly why the ABI reserved one.
+
+  (docs/PROCESS.md §7.4; `src/kernel/signals.ts`, `boot.ts`; 1 smoke check.)
+
+- **`cortex checkpoint <pid>` snapshots a running process.** The command used
+  to be one that could not succeed: a checkpoint captures a *running*
+  process, and the short-lived CLI kernel holds exactly one process (init),
+  so the PID it was asked about was never there — `cortex checkpoint 2`
+  always answered "no such process".
+
+  With a live kernel it now takes the snapshot, through the dispatcher, so
+  the state gate and the capability gate apply exactly as they do locally,
+  and it reports the chain id and the file. `--tag` is recorded in the
+  checkpoint frame (which is how `cortex restore --tag` finds it) and
+  `--detach` suspends the process, so "save and stop" is now something the
+  shell can do to a running agent.
+
+  Without a live kernel the command says plainly that there is nothing to
+  snapshot, instead of pretending.
+
 - **A live kernel is now reachable from another `cortex` invocation.** Until
   now the CLI was a short-lived process model: every command booted its own
   kernel, did its work, wrote files, and exited. That made two commands
@@ -365,6 +402,26 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **A checkpoint no longer kills the agent it was saving.** Taking a snapshot
+  of a *blocked* process moves it out of BLOCKED — the snapshot is taken
+  while it is CHECKPOINTING, and it comes back READY — but its pending `recv`
+  waiter is still there, and the wake that settles that waiter was waiting
+  for a dispatch that never came. The agent hung forever: no further syscall
+  frames, no messages, no error. Worse, a wake that arrived *during* the
+  snapshot resumed the body while the process was still READY, and the body's
+  next syscall tripped the state gate with `ESTATE` — which killed it.
+
+  Both are the same bug. The wake gate releases a deferred wake on the next
+  *dispatch*, and the scheduler only dispatches READY processes, so a process
+  that had been moved out of BLOCKED had no dispatch left to wait for. The
+  IPC half of the wake protocol now makes the receiver READY again in that
+  case — the same move the normal path makes out of BLOCKED — and the
+  dispatcher's state gate waits for an in-flight snapshot to land instead of
+  trapping, so a body that resumes mid-snapshot waits rather than dies.
+
+  (src/kernel/ipc.ts, `syscall_dispatcher.ts`, `checkpoint.ts`; 1 smoke check,
+  which fails without the fix.)
 
 - **A process killed by a signal never got its exit metadata.** The
   `onProcessExit` hook — the thing that writes a `meta.json` so `cortex ps`

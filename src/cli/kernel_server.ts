@@ -42,7 +42,7 @@
 import { createServer, type Server, type Socket } from 'node:net';
 import { randomBytes } from 'node:crypto';
 
-import { asChannelId, asProcessId, type ProcessFilter, type Signal } from '../kernel/types.js';
+import { asChannelId, asProcessId, type ProcessFilter, type ProcessId, type Signal } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
 import { ALL_SIGNALS } from '../kernel/signals.js';
 import type { Kernel } from '../kernel/boot.js';
@@ -304,6 +304,47 @@ function toWireError(err: unknown): { errno: string; message: string; details?: 
 // Command dispatch
 // =============================================================================
 
+/**
+ * States a snapshot may be taken from right now.
+ *
+ * `checkpoint` is legal from RUNNING and BLOCKED (docs/ABI.md §4.2) — the
+ * states in which a process can take a syscall at all.
+ */
+const CHECKPOINTABLE: ReadonlySet<string> = new Set(['running', 'blocked']);
+
+/**
+ * States that are worth waiting through.
+ *
+ * A process that has just been created or scheduled (`NEW` / `READY`) reaches
+ * a checkpointable state within a tick, and one that is mid-snapshot
+ * (`CHECKPOINTING`) leaves it as soon as the snapshot lands. Everything else
+ * — stopped, suspended, exiting, zombie — is a state the operator has to
+ * resolve first.
+ */
+const WORTH_WAITING: ReadonlySet<string> = new Set(['new', 'ready', 'checkpointing']);
+
+/**
+ * Wait until `pid` can be snapshotted.
+ *
+ * Returns false when the process is gone, or when it is in a state no
+ * snapshot can be taken from and is not about to leave it.
+ */
+async function awaitCheckpointable(
+  kernel: Kernel,
+  pid: ProcessId,
+  timeoutMs = 2000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const entry = kernel.table.get(pid);
+    if (entry === undefined) return false;
+    if (CHECKPOINTABLE.has(entry.state)) return true;
+    if (!WORTH_WAITING.has(entry.state)) return false;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 async function dispatch(
   kernel: Kernel,
   request: KernelRequest,
@@ -368,6 +409,11 @@ async function dispatch(
       }
       const target = asProcessId(pid);
       const before = kernel.table.get(target)?.state;
+      // The checkpoint chain grows when a snapshot is taken. SIGUSR2 is the
+      // signal whose effect is a snapshot, and a snapshot leaves the process
+      // in the state it started in — so the chain is the only observable
+      // evidence that the signal did anything.
+      const beforeChain = kernel.table.get(target)?.checkpointChain.length ?? 0;
 
       // Through the dispatcher, so the kill is recorded like any other
       // syscall — and so the capability gate applies to remote kills exactly
@@ -382,6 +428,7 @@ async function dispatch(
       // process that is *gone* after the call died of the signal and was
       // reaped by init — the strongest evidence of delivery there is.
       const after = kernel.table.get(target);
+      const afterChain = after?.checkpointChain.length ?? 0;
       const outcome =
         after === undefined
           ? 'delivered'
@@ -389,8 +436,55 @@ async function dispatch(
             ? 'queued'
             : after.state !== before
               ? 'delivered'
-              : 'dropped';
+              : afterChain > beforeChain
+                ? 'delivered'
+                : 'dropped';
       return { outcome, pid, signal, state: after?.state ?? null };
+    }
+
+    case 'checkpoint': {
+      const pid = Number(args['pid']);
+      if (!Number.isInteger(pid)) {
+        throw new WireError('EINVAL', `invalid pid: ${String(args['pid'])}`);
+      }
+      const target = asProcessId(pid);
+      if (kernel.table.get(target) === undefined) {
+        throw new WireError('ESRCH', `no such process: ${pid}`);
+      }
+      // A snapshot may only be taken from a process that can take a syscall —
+      // RUNNING or BLOCKED (docs/ABI.md §4.2). A process that is momentarily
+      // READY (scheduled, not yet dispatched) is not one, and the operator did
+      // nothing wrong: the scheduler dispatches it within a tick. So wait for
+      // the window rather than refusing.
+      if (!(await awaitCheckpointable(kernel, target))) {
+        const state = kernel.table.get(target)?.state ?? 'gone';
+        throw new WireError(
+          'ESTATE',
+          `pid ${pid} is ${state}; a checkpoint needs it running or blocked`,
+        );
+      }
+      const detach = args['detach'] === true;
+      const tag = typeof args['tag'] === 'string' ? args['tag'] : undefined;
+
+      // Through the dispatcher, so the `checkpoint` frames land in the
+      // target's own log exactly like an agent-initiated checkpoint — and so
+      // the state gate applies to a remote checkpoint exactly as it does to a
+      // local one. `checkpoint` is a *self* syscall (the ABI gives it no
+      // target argument), so the target is both the caller and the subject
+      // here; the snapshot lands in the target's own log, and the operator's
+      // request is answered by this command's reply.
+      const result = await kernel.dispatcher.invoke(target, 'checkpoint', {
+        ...(tag !== undefined ? { tag } : {}),
+        detach,
+      });
+      const after = kernel.table.get(target);
+      return {
+        chainId: result.chainId,
+        path: kernel.checkpoint.pathOf(result.chainId) ?? null,
+        pid,
+        detach,
+        state: after?.state ?? null,
+      };
     }
 
     case 'shutdown': {

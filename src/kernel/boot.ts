@@ -498,6 +498,16 @@ export class Kernel {
       kernelAbiVersion: this.kernelAbiVersion,
       now: this.#now,
       handlerInvoker,
+      // `SIGUSR2` means "checkpoint now" (docs/PROCESS.md §7). The snapshot
+      // goes through the dispatcher, so the `checkpoint` frames land in the
+      // target's own log exactly like an agent-initiated one — and the
+      // `__signal` frame beside them records that the signal is what
+      // triggered it. The dispatcher is built further down this constructor,
+      // so the reference is resolved when a signal actually arrives.
+      checkpointMediator: async (pid: ProcessId) => {
+        const result = await this.dispatcher.invoke(pid, 'checkpoint');
+        return { chainId: result.chainId };
+      },
       onZombie: async (pid, code, reason) => {
         // A process that died from a signal never went through the `exit`
         // syscall, so the dispatcher's exit-metadata hook has not fired for

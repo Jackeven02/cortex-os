@@ -1186,7 +1186,7 @@ async function runSignalsChecks(): Promise<void> {
         const action = DEFAULT_ACTIONS[sig];
         assert(
           action === 'ignore' || action === 'terminate' || action === 'kill' ||
-          action === 'stop' || action === 'continue',
+          action === 'stop' || action === 'continue' || action === 'checkpoint',
           `${sig} has invalid default action: ${action}`,
         );
       }
@@ -11891,7 +11891,7 @@ async function runDaemonChecks(): Promise<void> {
  * against the kernel API, so they do not depend on the transport.
  */
 async function runKernelHardeningChecks(): Promise<void> {
-  const { mkdtempSync, rmSync, readdirSync } = await import('node:fs');
+  const { mkdtempSync, rmSync, readdirSync, mkdirSync, existsSync } = await import('node:fs');
   const { join } = await import('node:path');
   const { tmpdir } = await import('node:os');
   const tmp = mkdtempSync(join(tmpdir(), 'cortex-hardening-'));
@@ -11967,6 +11967,54 @@ async function runKernelHardeningChecks(): Promise<void> {
         `the new pid ${pid} was already claimed by the first kernel`,
       );
       assert(claimedBefore.size >= 1, `the first kernel claimed a pid, got ${claimedBefore.size}`);
+    });
+
+    await checkAsync('SIGUSR2 takes a snapshot of the target', async () => {
+      // `SIGUSR2` means "checkpoint now" (docs/PROCESS.md §7). The action was
+      // documented, wired into the transition table, and named in three places
+      // in the source — but nothing implemented it: the signal was delivered,
+      // recorded, and dropped on the floor as "default action is ignore".
+      const dir = join(tmp, 'sigusr2');
+      mkdirSync(dir, { recursive: true });
+      const k = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir,
+        autoStart: true,
+        loadDrivers: (reg) => reg.registerLLM(mockLLM()),
+        agentLoader: async () => async () => {},
+      });
+      kernels.push(k);
+
+      // Init lives in RUNNING, so the signal is delivered rather than queued.
+      const outcome = await k.signals.send(asProcessId(1), 'SIGUSR2', asProcessId(1));
+      assert(outcome === 'delivered', `the signal was delivered, got ${outcome}`);
+
+      const snaps = existsSync(join(dir, 'processes', '1', 'checkpoints'))
+        ? readdirSync(join(dir, 'processes', '1', 'checkpoints')).filter((f) => f.endsWith('.csnap'))
+        : [];
+      assert(snaps.length === 1, `exactly one snapshot was written, got ${snaps.length}`);
+
+      // The cause is in the log: the `__signal` frame says SIGUSR2 arrived and
+      // which snapshot it produced, right next to the `checkpoint` frames.
+      const records: SyscallRecord[] = [];
+      for await (const r of readRecords(existingCrecPath(dir, PID_INIT))) records.push(r);
+      const sig = records.find((r) => r.syscall === '__signal');
+      assert(sig !== undefined, 'the signal was recorded');
+      const args = (sig!.args ?? {}) as { signal?: string; action?: string; chainId?: string };
+      assert(args.signal === 'SIGUSR2', `the signal is SIGUSR2, got ${String(args.signal)}`);
+      assert(args.action === 'checkpoint', `the action is checkpoint, got ${String(args.action)}`);
+      assert(typeof args.chainId === 'string', 'the signal record names the snapshot');
+      assert(
+        snaps[0]!.includes(args.chainId!),
+        `the snapshot file matches the recorded chain id (${snaps[0]} vs ${args.chainId})`,
+      );
+
+      const frames = records.filter((r) => r.syscall === 'checkpoint');
+      assert(frames.length >= 2, `the checkpoint syscall was recorded, got ${frames.length} frames`);
+      assert(
+        frames.some((r) => r.phase === 'enter') && frames.some((r) => r.phase === 'exit'),
+        'the checkpoint has an enter/exit pair',
+      );
     });
   } finally {
     for (const k of kernels) {
@@ -12052,14 +12100,15 @@ async function runTransportChecks(): Promise<void> {
       dir: tmp,
       autoStart: true,
       loadDrivers: (reg) => reg.registerLLM(mockLLM()),
-      agentLoader: async () => async (ctx) => {
+      agentLoader: async () => async (ctx, args) => {
         // A listener: park on recv until something is delivered. Only a
         // timeout is the idle case — anything else means the process is
         // going away, and swallowing that would spin the body forever.
         agentStarted = true;
+        const timeoutMs = typeof args['timeoutMs'] === 'number' ? args['timeoutMs'] : 50;
         for (;;) {
           try {
-            const msg = await ctx.recv(undefined, { timeoutMs: 50 });
+            const msg = await ctx.recv(undefined, { timeoutMs });
             received.push(String(msg.body));
           } catch (err) {
             const errno = (err as { errno?: string }).errno;
@@ -12170,6 +12219,121 @@ async function runTransportChecks(): Promise<void> {
           processes.some((p) => p.pid === 1),
           'the live table contains init',
         );
+      });
+
+      await checkAsync('a remote checkpoint snapshots a live agent', async () => {
+        // The whole point of the transport: a process that is *running* can be
+        // snapshotted from another process. Before the transport existed this
+        // was impossible — the CLI booted a fresh kernel whose process table
+        // held only init, so the PID it was asked about was never there.
+        const pid = await kernel.spawn({
+          role: 'snapshot-me',
+          agent: { module: 'test:listener', args: { timeoutMs: 5000 } },
+        });
+        assert(await waitFor(() => kernel.table.get(pid)?.state !== undefined), 'the agent exists');
+        // Park it first: a checkpoint of a BLOCKED agent is the interesting
+        // case, because the process is taken out of BLOCKED while its `recv`
+        // waiter is still pending. A long recv timeout keeps that waiter
+        // pending for the whole check — with a short one the timeout may fire
+        // while the process is still READY, and the wake would then be
+        // released by the next dispatch, hiding the bug.
+        assert(
+          await waitFor(() => kernel.table.get(pid)?.state === 'blocked'),
+          'the agent parked on recv',
+        );
+
+        const response = await client!.requestRaw('checkpoint', {
+          pid: unbrand(pid),
+          tag: 'mid-flight',
+        });
+        assert(response.ok === true, `the checkpoint is accepted, got ${JSON.stringify(response)}`);
+        if (!response.ok) return;
+        const result = response.result as { chainId: string; path: string | null; state: string | null };
+        assert(typeof result.chainId === 'string' && result.chainId.length > 0, 'a chain id came back');
+        assert(result.path !== null, 'the snapshot path came back');
+        assert(existsSync(result.path!), `the snapshot exists at ${String(result.path)}`);
+        assert(result.path!.endsWith('.csnap'), 'the snapshot is a .csnap');
+
+        // The snapshot is recorded in the *target's* log, like any checkpoint,
+        // and it carries the tag — which is how `cortex restore --tag` finds it.
+        const frames: SyscallRecord[] = [];
+        for await (const r of readRecords(existingCrecPath(tmp, pid))) frames.push(r);
+        const cps = frames.filter((r) => r.syscall === 'checkpoint');
+        assert(cps.length >= 2, `the checkpoint frames landed, got ${cps.length}`);
+        const enter = cps.find((r) => r.phase === 'enter');
+        const enterArgs = (enter?.args ?? {}) as { tag?: string };
+        assert(enterArgs.tag === 'mid-flight', `the tag is recorded, got ${String(enterArgs.tag)}`);
+
+        // A checkpoint is not a kill.
+        assert(kernel.table.get(pid) !== undefined, 'the agent survived the checkpoint');
+
+        // And it is not a hang either. A checkpoint of a BLOCKED agent takes
+        // it out of BLOCKED while its `recv` waiter is still pending, so the
+        // wake that settles that waiter has no dispatch to wait for — the
+        // agent used to hang there forever, with no further syscall frames.
+        // Wait until the scheduler has really dispatched it (RUNNING), so the
+        // wake really has nowhere to go.
+        assert(
+          await waitFor(() => kernel.table.get(pid)?.state === 'running'),
+          'the scheduler dispatched the checkpointed agent',
+        );
+        const before = received.length;
+        await client!.request('send', { pid: unbrand(pid), message: 'still there?' });
+        assert(
+          await waitFor(() => received.length > before),
+          'the agent still receives messages after the checkpoint',
+        );
+      });
+
+      await checkAsync('a remote SIGUSR2 checkpoints the target', async () => {
+        // The other route to the same snapshot: `SIGUSR2` means "checkpoint
+        // now" (docs/PROCESS.md §7), and the kernel mediates it.
+        const pid = await kernel.spawn({ role: 'signalled', agent: { module: 'test:listener' } });
+        assert(await waitFor(() => kernel.table.get(pid)?.state !== undefined), 'the agent exists');
+
+        const response = await client!.requestRaw('kill', { pid: unbrand(pid), signal: 'SIGUSR2' });
+        assert(response.ok === true, `the signal is accepted, got ${JSON.stringify(response)}`);
+        if (!response.ok) return;
+        const result = response.result as { outcome: string };
+        assert(
+          result.outcome === 'delivered' || result.outcome === 'queued',
+          `the signal was delivered or queued, got ${result.outcome}`,
+        );
+
+        // A signal to a parked process is queued, not delivered
+        // (docs/PROCESS.md §7.2), so the snapshot lands on the agent's next
+        // turn — the wait is the point.
+        const dir = join(tmp, 'processes', String(unbrand(pid)), 'checkpoints');
+        const written = await waitFor(
+          () => existsSync(dir) && readdirSync(dir).some((f) => f.endsWith('.csnap')),
+          5000,
+        );
+        assert(written, 'the signal produced a snapshot');
+
+        // The cause is recorded: a `__signal` frame saying SIGUSR2 arrived and
+        // which snapshot it produced. The signal is queued first and delivered
+        // later, so the frame that carries the snapshot is the delivered one —
+        // and it lands just after the snapshot file does, so wait for it.
+        const isDelivered = (r: SyscallRecord): boolean => {
+          if (r.syscall !== '__signal') return false;
+          const a = (r.args ?? {}) as { signal?: string; outcome?: string };
+          return a.signal === 'SIGUSR2' && a.outcome === 'delivered';
+        };
+        let sig: SyscallRecord | undefined;
+        const deadline = Date.now() + 5000;
+        while (Date.now() < deadline && sig === undefined) {
+          for await (const r of readRecords(existingCrecPath(tmp, pid))) {
+            if (isDelivered(r)) {
+              sig = r;
+              break;
+            }
+          }
+          if (sig === undefined) await new Promise((r) => setTimeout(r, 20));
+        }
+        assert(sig !== undefined, 'the delivery was recorded');
+        const args = (sig!.args ?? {}) as { action?: string; chainId?: string };
+        assert(args.action === 'checkpoint', `the action is checkpoint, got ${String(args.action)}`);
+        assert(typeof args.chainId === 'string', 'the signal record names the snapshot');
       });
     } finally {
       await server.close();
