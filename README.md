@@ -46,7 +46,8 @@ $ cortex attach 1234
 14:23:01 1234  __state     exit  idempotent
 14:23:01 1234  memory_read  exit  idempotent
 14:23:04 1234  llm_call     exit  reversible
-# (interactive send / live prompt lands with cortex daemon install, #039)
+# (with a live kernel running: cortex attach 1234 --interactive
+#  delivers each line of stdin to the running agent)
 
 # Fork state to try an alternative path
 $ cortex fork 1234
@@ -77,7 +78,7 @@ $ cortex daemon run inbox-watcher
 [daemon inbox-watcher pid 2] running (restart=on-failure)
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a read-only, disk-based follow-mode syscall trace in v0 (it tails the on-disk `.crec`, not a live in-memory process — see its honest caveat in [BACKLOG.md](./BACKLOG.md) #031); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039). All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a disk-based follow-mode syscall trace, and with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent and `cortex kill` delivers a real signal. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 
@@ -137,7 +138,7 @@ That is 24 syscalls, up from 19. **From here:** breaking changes need a major bu
 
 **Phases 1–3 — largely complete.** The kernel boots; all twelve kernel modules plus the driver registry are in; all seven drivers ship (mock / deepseek / openai LLM, MCP and filesystem tools, inmem and sqlite memory); most of the CLI works. `cortex spawn → llm_call → exit → reap` runs, and checkpoint/restore survives across separate CLI invocations. Known v0 gaps are recorded honestly in [BACKLOG.md](./BACKLOG.md), not hidden.
 
-**Phase 4 — Killer demos.** All three are polished and captured as replays. Demo A (supervision tree): coders each generate one section of a README for a fictional library (see `examples/supervision-tree.ts`, [`docs/demo-a.html`](./docs/demo-a.html)). Demo B (pause across reboots): an inbox-watcher classifies tickets, checkpoints mid-run, and resumes after a reboot (see `examples/checkpoint-agent.ts`, [`docs/demo-b.html`](./docs/demo-b.html)). Demo C (fork and compare): a coder forks to explore two dedup strategies in parallel, then `cortex diff` lines up the branches so you keep the winner (see `examples/fork-compare-agent.ts`, [`docs/demo-c.html`](./docs/demo-c.html)). `cortex attach` ships as a follow-mode syscall trace (BACKLOG #031), and `cortex daemon install/run` registers and supervises long-lived agents, the piece that makes `attach`'s interactive send-half possible (BACKLOG #039). **Phase 3 is now complete** — every command in the demo above works.
+**Phase 4 — Killer demos.** All three are polished and captured as replays. Demo A (supervision tree): coders each generate one section of a README for a fictional library (see `examples/supervision-tree.ts`, [`docs/demo-a.html`](./docs/demo-a.html)). Demo B (pause across reboots): an inbox-watcher classifies tickets, checkpoints mid-run, and resumes after a reboot (see `examples/checkpoint-agent.ts`, [`docs/demo-b.html`](./docs/demo-b.html)). Demo C (fork and compare): a coder forks to explore two dedup strategies in parallel, then `cortex diff` lines up the branches so you keep the winner (see `examples/fork-compare-agent.ts`, [`docs/demo-c.html`](./docs/demo-c.html)). `cortex attach` ships as a follow-mode syscall trace (BACKLOG #031) and, with a live kernel, as an interactive session too; `cortex daemon install/run` registers and supervises long-lived agents and publishes the kernel's endpoint, which is what makes the running agent reachable (BACKLOG #039). **Phase 3 is now complete** — every command in the demo above works.
 
 Demo A is worth calling out because it changed the kernel: agents used to run to completion inside the quantum that dispatched them, so a parent parked in `wait()` held its own tick and its children could never run — `wait()` deadlocked by construction, and a supervision tree could not be written at all. The continuation is now cooperative (see PROCESS.md §8.2), so this works with no orchestrator:
 
@@ -228,7 +229,7 @@ Read-only by default. The dashboard has no resident kernel to talk to, so it doe
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 
 - `spawn` — runs a new agent to completion (or until it self-suspends, or `--timeout`). Default cap: 30s, so the HTTP request never hangs.
-- `kill` — v0's `cortex kill` is a pure disk operation: it marks the entry a zombie. No kernel, no signal delivery.
+- `kill` — sends the signal to the process. With no live kernel in the state directory it marks the entry a zombie on disk; with one, the signal is delivered for real through the kernel's signal engine.
 - `restore` — writes the snapshot back and re-materialises the process as a new PID.
 
 Ops are fine-grained: `--ops spawn` gives you a spawn button and nothing else. `GET /api/ops` reports what the current server was granted, and each `POST /api/ops/<op>` returns `403` for anything not granted. The server binds to `127.0.0.1` unless `--host` says otherwise, and serves a static, CSP-locked HTML file — no CDN, no build step, zero dependencies. You can also embed it in your own Node app via `cortex-agent-os/dashboard`. Full endpoint reference: [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md#embedded-dashboard).

@@ -3,13 +3,17 @@
  *
  * BACKLOG #030: *"list processes with state, tokens, age."*
  *
- * Reads `.meta.json` files from disk. Does NOT boot a kernel.
+ * Reads `.meta.json` files from disk, and — when a live kernel has published
+ * its endpoint — merges in that kernel's own process table, so a process
+ * that is running *right now* is visible instead of missing (it has no
+ * `meta.json` until it exits). Does NOT boot a kernel.
  *
  * @module cli/commands/ps
  */
 
 import { parseArgs } from 'node:util';
-import { defaultKernelDir, readAllMetas, type ProcessMeta } from '../index.js';
+import { defaultKernelDir } from '../index.js';
+import { readProcessView } from '../process_view.js';
 
 export async function cmdPs(args: string[]): Promise<number> {
   const { values } = parseArgs({
@@ -37,30 +41,10 @@ OPTIONS
   }
 
   const dir = defaultKernelDir();
-  const metas = readAllMetas(dir);
-
-  // Always show init (PID 1) at the top, even if no user processes exist.
-  const allMetas: ProcessMeta[] = [
-    {
-      pid: 1,
-      ppid: null,
-      pgid: 1,
-      role: 'init',
-      state: 'running',
-      exitCode: null,
-      exitReason: null,
-      startedAt: '—',
-      lastTransitionAt: '—',
-      budgetsSpent: { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 0, syscallCount: 0 },
-      budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
-      agent: { system: 'init' },
-      kernelAbiVersion: '1.0.0',
-    },
-    ...metas,
-  ];
+  const view = await readProcessView(dir);
 
   // Apply filters.
-  const filtered = allMetas.filter((p) => {
+  const filtered = view.rows.filter((p) => {
     if (values.state !== undefined && p.state !== values.state) return false;
     if (values.role !== undefined && p.role !== values.role) return false;
     return true;

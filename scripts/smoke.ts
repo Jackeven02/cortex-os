@@ -289,6 +289,13 @@ import {
 import { cmdSpawn } from '../src/cli/commands/spawn.js';
 import { resolveModulePath } from '../src/cli/module_path.js';
 import { DEFAULT_MEMORY_REGIONS } from '../src/cli/index.js';
+import {
+  writeEndpoint,
+  readEndpoint,
+  clearEndpoint,
+} from '../src/cli/kernel_endpoint.js';
+import { startKernelServer } from '../src/cli/kernel_server.js';
+import { probeKernel, KernelClient } from '../src/cli/kernel_client.js';
 
 let passed = 0;
 let failed = 0;
@@ -11973,6 +11980,213 @@ async function runKernelHardeningChecks(): Promise<void> {
   }
 }
 
+// =============================================================================
+// CLI ↔ live-kernel transport checks
+// =============================================================================
+
+/**
+ * The transport is the piece that makes a *running* kernel reachable from
+ * another process, so these checks exercise the whole path: a real kernel on
+ * a real directory, a real TCP server on loopback, a real client, and the
+ * real syscall log afterwards.
+ */
+async function runTransportChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, existsSync, writeFileSync, readdirSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-transport-'));
+
+  const kernels: Kernel[] = [];
+
+  /** Poll until `fn()` is true, or give up. */
+  async function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (fn()) return true;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return fn();
+  }
+
+  try {
+    // --- the endpoint descriptor -------------------------------------------
+    await checkAsync('the endpoint descriptor round-trips through kernel.json', async () => {
+      const endpoint = {
+        host: '127.0.0.1',
+        port: 4242,
+        pid: 1234,
+        token: 'secret-token',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        abiVersion: KERNEL_ABI_VERSION,
+        dir: tmp,
+      };
+      writeEndpoint(tmp, endpoint);
+      assert(existsSync(join(tmp, 'kernel.json')), 'kernel.json written');
+      const read = readEndpoint(tmp);
+      assert(read !== undefined, 'descriptor reads back');
+      assert(read!.port === 4242, `port round-trips, got ${read!.port}`);
+      assert(read!.token === 'secret-token', 'token round-trips');
+      assert(read!.abiVersion === KERNEL_ABI_VERSION, 'abi version round-trips');
+
+      // Clearing is conditional on the descriptor still naming this kernel.
+      assert(clearEndpoint(tmp, { ...endpoint, port: 9999 }) === false, 'a foreign descriptor is not cleared');
+      assert(existsSync(join(tmp, 'kernel.json')), 'descriptor survives a mismatched clear');
+      assert(clearEndpoint(tmp, endpoint) === true, 'the matching descriptor is cleared');
+      assert(!existsSync(join(tmp, 'kernel.json')), 'kernel.json removed');
+    });
+
+    await checkAsync('a corrupt endpoint descriptor reads as "no endpoint"', async () => {
+      writeFileSync(join(tmp, 'kernel.json'), '{not json', 'utf8');
+      assert(readEndpoint(tmp) === undefined, 'corrupt descriptor is ignored');
+      writeFileSync(join(tmp, 'kernel.json'), '{"host":"127.0.0.1"}', 'utf8');
+      assert(readEndpoint(tmp) === undefined, 'incomplete descriptor is ignored');
+    });
+
+    // --- a live kernel, reached over the wire ------------------------------
+    const received: string[] = [];
+    const exits: { pid: number; exitCode: number | null; exitReason: string | null }[] = [];
+    let agentStarted = false;
+
+    const kernel = await bootKernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: tmp,
+      autoStart: true,
+      loadDrivers: (reg) => reg.registerLLM(mockLLM()),
+      agentLoader: async () => async (ctx) => {
+        // A listener: park on recv until something is delivered. Only a
+        // timeout is the idle case — anything else means the process is
+        // going away, and swallowing that would spin the body forever.
+        agentStarted = true;
+        for (;;) {
+          try {
+            const msg = await ctx.recv(undefined, { timeoutMs: 50 });
+            received.push(String(msg.body));
+          } catch (err) {
+            const errno = (err as { errno?: string }).errno;
+            if (errno !== 'ETIMEDOUT') throw err;
+          }
+        }
+      },
+      onProcessExit: (meta) => {
+        exits.push({
+          pid: meta.pid,
+          exitCode: meta.exitCode,
+          exitReason: meta.exitReason,
+        });
+      },
+    });
+    kernels.push(kernel);
+
+    const server = await startKernelServer(kernel, { log: () => {} });
+    writeEndpoint(tmp, server.endpoint);
+
+    try {
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `probe finds the live kernel, got ${probe.kind}`);
+
+      const client = probe.kind === 'live' ? probe.client : undefined;
+      assert(client !== undefined, 'client exists');
+
+      await checkAsync('a remote send delivers into a live agent\'s inbox', async () => {
+        const pid = await kernel.spawn({ role: 'listener', agent: { module: 'test:listener' } });
+        assert(await waitFor(() => agentStarted), 'the agent started');
+        assert(
+          await waitFor(() => kernel.table.get(pid)?.state === 'blocked'),
+          'the agent parked on recv',
+        );
+
+        await client!.request('send', { pid: unbrand(pid), message: 'hello over the wire' });
+        assert(await waitFor(() => received.length > 0), 'the agent received the message');
+        assert(received[0] === 'hello over the wire', `message body, got ${received[0]}`);
+      });
+
+      await checkAsync('a remote send is recorded as a send syscall in the caller\'s log', async () => {
+        const sends: SyscallRecord[] = [];
+        for await (const r of readRecords(existingCrecPath(tmp, PID_INIT))) {
+          if (r.syscall === 'send') sends.push(r);
+        }
+        assert(sends.length > 0, 'init logged the remote send');
+        const phases = sends.map((r) => r.phase).sort();
+        assert(
+          phases.includes('enter') && phases.includes('exit'),
+          `the send has an enter/exit pair, got ${phases.join(',')}`,
+        );
+      });
+
+      await checkAsync('a remote send to an unknown pid is refused with ESRCH', async () => {
+        const response = await client!.requestRaw('send', { pid: 9999, message: 'nobody home' });
+        assert(response.ok === false, 'the send is refused');
+        if (!response.ok) {
+          assert(response.error.errno === 'ESRCH', `errno ESRCH, got ${response.error.errno}`);
+        }
+      });
+
+      await checkAsync('a request with the wrong token is refused', async () => {
+        const { connect } = await import('node:net');
+        const socket = connect({
+          host: server.endpoint.host,
+          port: server.endpoint.port,
+        });
+        const rogue = new KernelClient({ ...server.endpoint, token: 'not-the-token' }, socket);
+        const response = await rogue.requestRaw('ps');
+        rogue.close();
+        assert(response.ok === false, 'the rogue request is refused');
+        if (!response.ok) {
+          assert(response.error.errno === 'EPERM', `errno EPERM, got ${response.error.errno}`);
+        }
+      });
+
+      await checkAsync('a remote kill delivers a real signal to the live agent', async () => {
+        const pid = await kernel.spawn({ role: 'victim', agent: { module: 'test:listener' } });
+        assert(await waitFor(() => kernel.table.get(pid)?.state !== undefined), 'the victim exists');
+
+        const response = await client!.requestRaw('kill', { pid: unbrand(pid), signal: 'SIGKILL' });
+        assert(response.ok === true, `the kill is accepted, got ${JSON.stringify(response)}`);
+        // Init reaps its own children, so the entry is gone by the time we
+        // look — the exit metadata is the durable evidence.
+        assert(
+          await waitFor(() => exits.some((m) => m.pid === unbrand(pid))),
+          'the agent died of the signal',
+        );
+        const meta = exits.find((m) => m.pid === unbrand(pid));
+        assert(meta?.exitReason === 'signal:SIGKILL', `exit reason, got ${meta?.exitReason}`);
+        assert(meta?.exitCode === 137, `exit code, got ${meta?.exitCode}`);
+      });
+
+      await checkAsync('a process killed by a signal still gets its exit metadata', async () => {
+        // The `exit` syscall persisted the meta; a signal death used to skip
+        // that path entirely, so a killed agent vanished from `ps` instead of
+        // showing up as a zombie with its exit code.
+        assert(exits.length > 0, 'the exit hook fired for the signal death');
+      });
+
+      await checkAsync('the live kernel reports its process table over the wire', async () => {
+        const response = await client!.requestRaw('ps');
+        assert(response.ok === true, `ps succeeds, got ${JSON.stringify(response)}`);
+        if (!response.ok) return;
+        const processes = (response.result as { processes: readonly { pid: number }[] }).processes;
+        assert(Array.isArray(processes), 'ps returns a list');
+        assert(
+          processes.some((p) => p.pid === 1),
+          'the live table contains init',
+        );
+      });
+    } finally {
+      await server.close();
+      clearEndpoint(tmp, server.endpoint);
+    }
+  } finally {
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -11996,6 +12210,7 @@ runRegionsChecks();
 await runCliChecks();
 await runDaemonChecks();
 await runKernelHardeningChecks();
+await runTransportChecks();
 await runBootChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);

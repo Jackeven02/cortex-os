@@ -42,6 +42,61 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **A live kernel is now reachable from another `cortex` invocation.** Until
+  now the CLI was a short-lived process model: every command booted its own
+  kernel, did its work, wrote files, and exited. That made two commands
+  theatre.
+
+  `cortex send <pid> <message>` looked like it delivered something. It did
+  not: the fresh kernel's process table holds exactly one entry (init), so a
+  message addressed to a real agent had no inbox to land in, and the kernel
+  exited a millisecond later taking the message with it. The syscall was
+  *recorded*; nothing was delivered. `cortex kill` had the same problem from
+  the other side — with no live process to signal, it rewrote the on-disk
+  metadata and called it a day.
+
+  `cortex daemon run` was already the one command whose kernel stays alive,
+  so it is now the one command that can be *reached*. While it runs, the
+  kernel serves a loopback control port and publishes its endpoint in
+  `<CORTEX_HOME>/kernel.json` (host, port, its OS pid, a per-kernel shared
+  secret, and the ABI version it speaks).
+
+  - **`cortex send <pid> <message>`** delivers into a running agent's inbox.
+  - **`cortex kill <pid> --signal SIGTERM`** delivers a real signal: the
+    target's disposition is honoured (a `handler` runs, `ignore` drops it),
+    the signal is queued when the target is not running yet, and the
+    delivery is reported as `delivered` / `queued` / `dropped`.
+  - **`cortex attach <pid> --interactive`** pipes stdin into the live agent
+    while the syscall trace keeps scrolling — the interactive half of
+    BACKLOG #031, which was deferred to the daemon.
+  - **`cortex ps` / `cortex top`** merge the live kernel's process table
+    with the on-disk index, so an agent that is running *right now* is
+    visible instead of missing (it has no `meta.json` until it exits).
+
+  Every one of those actions is answered by an existing kernel API through
+  the ordinary dispatcher path: a remote `cortex kill` is recorded in the
+  kernel's `.crec` exactly like a local one (enter frame, exit frame, the
+  `__signal` record in the target's log), and a remote `cortex send` goes
+  through the same prepare/commit transaction that keeps a message from
+  being half-delivered. The transport adds reachability; it adds no side
+  door around the kernel's guarantees. Nothing in `src/kernel/` knows the
+  transport exists.
+
+  The wire format is newline-delimited JSON over loopback TCP, chosen so it
+  stays inspectable — `nc 127.0.0.1 <port>` and a typed request is a
+  legitimate way to ask the kernel what it is doing. Every request carries
+  a per-kernel token: a loopback port is reachable by every user on the
+  machine, and the commands behind it are not read-only.
+
+  Without a live kernel, `cortex send` now says so plainly instead of
+  claiming a delivery it did not make, and `cortex kill` says that what it
+  did was bookkeeping rather than a signal.
+
+  (docs/ARCHITECTURE.md §12.1; `src/cli/kernel_endpoint.ts`,
+  `kernel_protocol.ts`, `kernel_server.ts`, `kernel_client.ts`,
+  `process_view.ts`; new example `examples/listener-agent.ts`; 10 smoke
+  checks.)
+
 - **`--module` resolves a bundled example inside the package, not the cwd.**
   Every demo in the README, the cookbook and the example files themselves is
   spelled `--module ./examples/<name>.ts` — but `--module` was resolved

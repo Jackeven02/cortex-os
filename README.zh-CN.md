@@ -46,7 +46,8 @@ $ cortex attach 1234
 14:23:01 1234  __state     exit  idempotent
 14:23:01 1234  memory_read  exit  idempotent
 14:23:04 1234  llm_call     exit  reversible
-# （交互式发送 / 实时 prompt 随 cortex daemon install 落地，#039）
+# （有活内核时：cortex attach 1234 --interactive
+#  会把你输入的每一行投递到运行中的 agent）
 
 # fork 状态，去试另一条路
 $ cortex fork 1234
@@ -77,7 +78,7 @@ $ cortex daemon run inbox-watcher
 [daemon inbox-watcher pid 2] running (restart=on-failure)
 ```
 
-上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 在 v0 里是一个只读的、基于磁盘的 follow-mode syscall 追踪（它对磁盘上的 `.crec` 做 tail，而不是连一个活着的内存进程 —— 它诚实的说明见 [BACKLOG.md](./BACKLOG.md) #031）；`cortex daemon run` 才是真正的长命监督者（BACKLOG #039）。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
+上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 是基于磁盘的 follow-mode syscall 追踪；如果有活内核在跑，它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
 
 ---
 
@@ -129,7 +130,7 @@ syscall 从 19 个变成 24 个。**从此以后**：破坏性变更需要大版
 
 **Phase 1–3 —— 大体完成。** 内核能启动；十二个内核模块加上驱动注册表都在；七个驱动全部交付（mock / deepseek / openai 三个 LLM，MCP 与文件系统两个工具驱动，inmem 与 sqlite 两个记忆驱动）；CLI 大部分可用。`cortex spawn → llm_call → exit → reap` 能跑，checkpoint/restore 能跨不同的 CLI 调用存活。v0 的已知缺口都诚实地记录在 [BACKLOG.md](./BACKLOG.md) 里，没有藏。
 
-**Phase 4 —— 杀手级 demo。** 三个 demo 全部打磨完毕，并录成了回放。Demo A（监督树）：几个 coder 各自生成一个虚构库 README 的一个章节（见 `examples/supervision-tree.ts`、[`docs/demo-a.html`](./docs/demo-a.html)）。Demo B（跨重启暂停）：一个收件箱监听器给工单分类，跑到一半 checkpoint，重启后恢复（见 `examples/checkpoint-agent.ts`、[`docs/demo-b.html`](./docs/demo-b.html)）。Demo C（fork 对比）：一个 coder fork 出两个分支并行探索两种去重策略，然后 `cortex diff` 把两个分支对齐，好让你留下赢的那个（见 `examples/fork-compare-agent.ts`、[`docs/demo-c.html`](./docs/demo-c.html)）。`cortex attach` 以 follow-mode syscall 追踪的形式交付（BACKLOG #031），`cortex daemon install/run` 能注册并监督长命 agent，正是它让 `attach` 的交互式发送成为可能（BACKLOG #039）。**Phase 3 至此完成** —— 上面 demo 里的每一条命令都能跑。
+**Phase 4 —— 杀手级 demo。** 三个 demo 全部打磨完毕，并录成了回放。Demo A（监督树）：几个 coder 各自生成一个虚构库 README 的一章（见 `examples/supervision-tree.ts`、[`docs/demo-a.html`](./docs/demo-a.html)）。Demo B（跨重启暂停）：一个收件箱监听器给工单分类，跑到一半 checkpoint，重启后恢复（见 `examples/checkpoint-agent.ts`、[`docs/demo-b.html`](./docs/demo-b.html)）。Demo C（fork 对比）：一个 coder fork 出两个分支并行探索两种去重策略，然后 `cortex diff` 把两个分支对齐，好让你留下赢的那个（见 `examples/fork-compare-agent.ts`、[`docs/demo-c.html`](./docs/demo-c.html)）。`cortex attach` 以 follow-mode syscall 追踪的形式交付（BACKLOG #031），有活内核时它还是交互式会话；`cortex daemon install/run` 能注册并监督长命 agent，并发布内核的 endpoint —— 那正是运行中的 agent 能被连上的原因（BACKLOG #039）。**Phase 3 至此完成** —— 上面 demo 里的每一条命令都能跑。
 
 Demo A 值得单独说一下，因为它改变了内核：以前 agent 会在派发它的那个 quantum 里跑到结束，所以一个停在 `wait()` 里的父进程会一直占着自己的 tick，它的子进程永远没法被调度 —— `wait()` 在结构上就死锁，监督树根本写不出来。现在 continuation 是协作式的（见 PROCESS.md §8.2），所以下面这些不需要任何编排器就能跑：
 
@@ -220,7 +221,7 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
 
 - `spawn` —— 把新 agent 跑到终态（或自行挂起，或 `--timeout` 兜底）。默认上限 30 秒，避免 HTTP 请求长挂。
-- `kill` —— v0 的 `cortex kill` 本来就是纯磁盘操作：把进程标记为 zombie，不发信号。
+- `kill` —— 把信号发给该进程。状态目录里没有活内核时，它把进程在磁盘上标记为 zombie；有活内核时，信号会通过内核的信号引擎真的投递出去。
 - `restore` —— 把快照写回，把进程以新 PID 重新实体化。
 
 授权是细粒度的：`--ops spawn` 只给你一个 spawn 按钮。`GET /api/ops` 回报当前服务器被授了哪些操作，未授权的 `POST /api/ops/<op>` 直接 `403`。服务器默认绑 `127.0.0.1`（除非 `--host` 指定），页面是静态 HTML + 严格 CSP，不挂 CDN、不需要构建、零依赖。也可以在自己的 Node 应用里通过 `cortex-agent-os/dashboard` 嵌入。完整接口见 [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md#embedded-dashboard)。

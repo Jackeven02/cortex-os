@@ -3,15 +3,23 @@
  *
  * BACKLOG #032: *"send signals."*
  *
- * v0 model: since the kernel is not long-running, `kill` cannot signal a
- * live process. Instead it:
- *   - Reads the process's `.meta.json` from disk.
- *   - If the process is already terminal (zombie/exited), prints that.
- *   - Otherwise, marks it as killed in the meta (state → zombie, exitCode
- *     set from the signal's default exit code).
+ * ## Two kinds of kill
  *
- * When the long-running daemon model lands, this command will connect to
- * the live kernel and send a real signal.
+ * A signal only means something to a process that is alive. There are two
+ * situations, and they are genuinely different:
+ *
+ *   - **A live kernel is running.** `cortex daemon run` keeps one alive and
+ *     publishes its endpoint in `<CORTEX_HOME>/kernel.json`
+ *     (docs/ARCHITECTURE.md §12.1). This command then delivers the signal
+ *     *for real*, through the kernel's own signal engine: the target's
+ *     disposition is honoured (a `handler` runs, `ignore` drops it), the
+ *     signal is queued when the target is not running yet, and the whole
+ *     thing is recorded — the `kill` syscall in the caller's log, the
+ *     `__signal` record in the target's.
+ *   - **No live kernel.** There is nobody to signal. This command then does
+ *     what it has always done: mark the process as terminated in the
+ *     on-disk metadata, so `cortex ps` stops showing it as running. That is
+ *     bookkeeping, not a signal, and the command says which one it did.
  *
  * Usage:
  *   cortex kill <pid> [--signal SIGTERM]
@@ -22,6 +30,7 @@
 import { parseArgs } from 'node:util';
 import { defaultKernelDir, parsePid, readMeta, writeMeta, type ProcessMeta } from '../index.js';
 import { type Signal } from '../../kernel/types.js';
+import { KernelCommandError, probeKernel } from '../kernel_client.js';
 
 const VALID_SIGNALS = new Set([
   'SIGHUP', 'SIGINT', 'SIGTERM', 'SIGKILL', 'SIGSTOP', 'SIGCONT',
@@ -67,10 +76,12 @@ OPTIONS
                              SIGCONT, SIGUSR1, SIGUSR2, SIGXCPU, SIGSYS
   -h, --help          Show this help
 
-NOTE
-  v0 does not have a long-running daemon. 'kill' marks the process as
-  terminated in the on-disk metadata. When the daemon model lands, this
-  will send a real signal to a live process.
+NOTES
+  With a live kernel ('cortex daemon run'), the signal is delivered for
+  real: the target's disposition is honoured, and the delivery is recorded
+  in the kernel's .crec log. Without one, there is no process to signal, so
+  the command marks the process terminated in the on-disk metadata instead
+  and says so.
 
 EXAMPLES
   cortex kill 2
@@ -89,6 +100,36 @@ EXAMPLES
   }
 
   const dir = defaultKernelDir();
+  const probe = await probeKernel(dir);
+
+  if (probe.kind === 'live') {
+    const client = probe.client;
+    try {
+      const result = await client.request<{ outcome: string; pid: number; signal: string }>(
+        'kill',
+        { pid, signal },
+      );
+      console.log(`sent ${signal} to pid ${pid} → ${result.outcome}`);
+      return 0;
+    } catch (err) {
+      if (err instanceof KernelCommandError) {
+        console.error(`cortex kill: ${err.errno}: ${err.message}`);
+        return 1;
+      }
+      throw err;
+    } finally {
+      client.close();
+    }
+  }
+
+  // ---- no live kernel ----------------------------------------------------
+  if (probe.kind === 'stale') {
+    console.error(
+      `cortex kill: the kernel that published ${probe.endpoint.host}:${probe.endpoint.port} ` +
+      `is not reachable (${probe.reason})`,
+    );
+  }
+
   const meta = readMeta(dir, pid);
 
   if (meta === undefined) {
@@ -116,5 +157,6 @@ EXAMPLES
   writeMeta(dir, updatedMeta);
 
   console.log(`sent ${signal} to pid ${pid} → marked as zombie (exit ${exitCode})`);
+  console.log('  (no live kernel was reachable, so this is bookkeeping — nothing was signalled)');
   return 0;
 }

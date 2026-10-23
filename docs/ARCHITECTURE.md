@@ -480,8 +480,8 @@ For v0, **only install drivers you trust**. Same advice as npm packages generall
 
 ```
 .cortex/                              # kernel state directory (per-kernel)
-├── kernel.json                       # kernel config (drivers, defaults)
-├── processes/
+├── kernel.json                       # the live kernel's endpoint descriptor
+├── processes/                        # one directory per PID — a PID's CLAIM
 │   ├── 1/                            # init
 │   │   ├── log.crec                  # append-only syscall log
 │   │   └── meta.json                 # cached ProcessInfo (for fast ps)
@@ -507,6 +507,10 @@ For v0, **only install drivers you trust**. Same advice as npm packages generall
 ```
 
 **Why one directory per process.** So you can `rm -rf .cortex/processes/1234/` to fully remove a dead process. No global indices to clean up.
+
+**Why the process directory is also the PID's claim.** A state directory can host more than one kernel — `cortex daemon run` keeps one alive there while other `cortex` invocations work in the same directory — and each kernel counts PIDs up from its own seed. The directory is created with an *exclusive* `mkdir`, so exactly one kernel can win a given PID. Without it, the two counters walk into each other and the loser opens the winner's `log.crec` in append mode: two unrelated processes sharing one syscall log, silently. See §12.1.
+
+**What `kernel.json` holds.** The endpoint descriptor of the kernel serving this directory: the loopback host and port, the kernel's OS pid, a per-kernel shared secret, and the ABI version it speaks. It is written when a kernel starts serving and removed when it stops. (The "kernel config (drivers, defaults)" role this file was sketched for is still aspirational — v0 has no config file.)
 
 **Why `.crec` separate from `.csnap`.** Logs grow continuously and we want them streamable. Snapshots are discrete and we want them content-addressed. Mixing them is a mistake every workflow engine eventually regrets (STATE.md §4).
 
@@ -678,7 +682,47 @@ The CLI talks to a running kernel via... what?
 - **Localhost TCP** — cross-platform, slight overhead, requires picking a port.
 - **File-based mailbox** — simplest, slowest.
 
-**v0 instinct:** localhost TCP on a port written to `.cortex/kernel.json`. Cross-platform, debuggable with `nc`. Revisit if it hurts.
+**v0 answer: localhost TCP, and the port is published in `.cortex/kernel.json`.** Implemented (`src/cli/kernel_endpoint.ts`, `kernel_protocol.ts`, `kernel_server.ts`, `kernel_client.ts`). The instinct held up; here is what the implementation added on top of it:
+
+- **The descriptor is the address, not the port.** `kernel.json` names the
+  host, the port, the kernel's OS pid, a per-kernel token, and the ABI
+  version. The port is ephemeral (the OS picks it), so two kernels — one per
+  project directory, §12.2 — never fight over it.
+- **A token, because the port is not a secret.** Every request carries a
+  per-kernel random token; the server rejects anything else with `EPERM`.
+  A loopback port is reachable by every user on the machine, and the
+  commands behind it are not read-only. The token lives beside the logs it
+  protects, so the guarantee it buys is "another local user cannot drive
+  your kernel", not "another local user cannot read your home directory".
+- **Newline-delimited JSON.** One JSON object per line. NDJSON was chosen
+  so the transport stays inspectable: `nc 127.0.0.1 <port>` and a typed
+  request is a legitimate way to ask the kernel what it is doing.
+- **Every command is an existing kernel API, through the dispatcher.** A
+  remote `cortex kill` is recorded in the kernel's `.crec` exactly like a
+  local one, and a remote `cortex send` goes through the same
+  prepare/commit transaction that keeps a message from being half-delivered.
+  The transport adds reachability; it adds no side door.
+- **The kernel stays transport-agnostic.** Nothing in `src/kernel/` knows
+  the transport exists. The server is a *client* of the kernel.
+
+**What it bought.** `cortex send <pid> <msg>` used to be a recording, not a
+delivery: a short-lived CLI kernel holds exactly one process (init), so the
+message had no inbox to land in and the kernel exited a millisecond later
+taking it away. `cortex kill` could not signal anything either — it
+rewrote the on-disk metadata. Both are real now, against a live kernel.
+
+**Known limits (v0).**
+
+- The transport carries commands, not streams: there is no live trace
+  subscription yet. `cortex attach` still follows the `.crec` file on disk
+  (which the daemon writes to) and delivers the interactive half over the
+  wire.
+- `cortex spawn` still boots its own short-lived kernel rather than
+  spawning into the live one. That is why the PID claim exists (§7): the
+  two kernels share one directory, and the claim keeps them off each
+  other's PIDs.
+- A crashed kernel leaves a stale `kernel.json` behind. Clients detect it
+  (the port refuses the connection) and fall back to the disk view.
 
 ### 12.2 Multiple kernels on one machine
 

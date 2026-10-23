@@ -19,6 +19,18 @@
  *   run [name]          boot a kernel, register the daemon(s), and stay alive
  *                       until SIGTERM/SIGINT (or --max-runtime-ms, for tests)
  *
+ * ## `run` is also the kernel's transport endpoint
+ *
+ * `run` is the one command whose kernel stays alive, so it is the one command
+ * that can be *reached*. While it runs, the kernel serves a loopback control
+ * port and publishes its endpoint in `<CORTEX_HOME>/kernel.json`
+ * (docs/ARCHITECTURE.md §12.1). That is what turns `cortex send` from a
+ * recording into a delivery: the message lands in a live agent's inbox
+ * instead of in a kernel that exits a millisecond later. The transport is
+ * implemented in `cli/kernel_server.ts` + `cli/kernel_client.ts` and never
+ * touches the kernel's internals — it calls the same dispatcher an agent
+ * calls.
+ *
  * What `install` does NOT do: it does not itself `enable` the unit (that needs
  * the operator's session / root and is OS-specific), but it writes the unit
  * file where one is expected and prints the exact `enable` command. On Windows
@@ -52,6 +64,8 @@ import {
   writeDaemon,
   deleteDaemon,
 } from '../daemon_store.js';
+import { startKernelServer } from '../kernel_server.js';
+import { clearEndpoint, endpointPath, writeEndpoint } from '../kernel_endpoint.js';
 
 // =============================================================================
 // Subcommand dispatch
@@ -307,6 +321,7 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
     options: {
       'max-runtime-ms': { type: 'string', default: '0' },
       'max-region-entries': { type: 'string' },
+      port: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: true,
@@ -336,6 +351,19 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
     maxRegionEntries = parsed;
   }
 
+  let port: number | undefined;
+  if (values.port !== undefined) {
+    const parsed = parseInt(values.port, 10);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 65535) {
+      console.error(
+        `cortex daemon run: invalid --port: '${values.port}' ` +
+        `(expected 0 for an ephemeral port, or 1-65535)`,
+      );
+      return 1;
+    }
+    port = parsed;
+  }
+
   const dir = defaultKernelDir();
   ensureKernelDirs(dir);
 
@@ -356,6 +384,24 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
     dir,
     maxRegionEntries !== undefined ? { maxRegionEntries } : {},
   );
+
+  // The kernel is the only thing in the process that lives long enough to be
+  // worth reaching into, so this is where the transport is published: the
+  // endpoint descriptor goes next to the logs it protects, and every later
+  // `cortex send` / `cortex kill` / `cortex attach --interactive` finds the
+  // live kernel through it (docs/ARCHITECTURE.md §12.1).
+  const stop = createStopSignal(maxRuntimeMs);
+  const server = await startKernelServer(kernel, {
+    ...(port !== undefined ? { port } : {}),
+    onShutdown: () => stop.request(),
+  });
+  writeEndpoint(dir, server.endpoint);
+  console.log(
+    `[kernel] serving on ${server.endpoint.host}:${server.endpoint.port} (pid ${server.endpoint.pid})`,
+  );
+  console.log(`  endpoint published at ${endpointPath(dir)}`);
+  console.log(`  other cortex invocations in this directory can now reach it`);
+
   try {
     for (const d of targets) {
       if (d === undefined) continue;
@@ -363,12 +409,14 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
       console.log(`[daemon ${d.name} pid ${unbrand(pid)}] running (restart=${d.spec.restart?.kind ?? 'never'})`);
     }
 
-    await waitForStop(maxRuntimeMs);
+    await stop.promise;
 
     console.log('# daemon stop requested');
     return 0;
   } finally {
     console.log('# shutting down kernel');
+    await server.close();
+    clearEndpoint(dir, server.endpoint);
     await kernel.shutdown();
   }
 }
@@ -514,16 +562,37 @@ function dirnameOf(p: string): string {
 // Block until a stop signal (or optional timeout)
 // =============================================================================
 
-function waitForStop(maxRuntimeMs: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const onSignal = (): void => resolve();
-    process.on('SIGINT', onSignal);
-    process.on('SIGTERM', onSignal);
-    if (maxRuntimeMs > 0) {
-      const t = setTimeout(resolve, maxRuntimeMs);
-      t.unref?.();
-    }
+/**
+ * The signal the daemon waits on before it shuts the kernel down.
+ *
+ * Three things can raise it: SIGINT / SIGTERM (the operator's Ctrl-C), the
+ * `--max-runtime-ms` timeout (headless and test use), and a client of the
+ * loopback transport asking the kernel to stop.
+ */
+interface StopSignal {
+  /** Resolves when the daemon should stop. */
+  readonly promise: Promise<void>;
+  /** Raise the stop signal. Idempotent. */
+  request(): void;
+}
+
+function createStopSignal(maxRuntimeMs = 0): StopSignal {
+  let settle: () => void = () => {};
+  const promise = new Promise<void>((resolve) => {
+    settle = resolve;
   });
+
+  const onSignal = (): void => settle();
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+
+  if (maxRuntimeMs > 0) {
+    const timer = setTimeout(settle, maxRuntimeMs);
+    // Don't let the timer keep the event loop alive on its own.
+    timer.unref?.();
+  }
+
+  return { promise, request: settle };
 }
 
 // =============================================================================
@@ -611,6 +680,16 @@ USAGE
   --max-region-entries <n>  Cap writes per memory region for this supervisor
                         kernel; a region exceeding n writes traps ENOMEM (omit =
                         unlimited)
+  --port <n>           Bind the control port to n (default: an ephemeral port
+                        chosen by the OS)
+
+TRANSPORT
+  While it runs, the kernel publishes its endpoint in <CORTEX_HOME>/kernel.json
+  and serves it on 127.0.0.1. Other 'cortex' invocations in the same directory
+  use it to reach the *running* kernel: 'cortex send' delivers a message to a
+  live agent's inbox, 'cortex kill' delivers a real signal, 'cortex attach
+  --interactive' pipes stdin into it. Every one of those actions is recorded
+  in the kernel's .crec log exactly as if it had been issued locally.
 
 EXAMPLE
   cortex daemon run watcher

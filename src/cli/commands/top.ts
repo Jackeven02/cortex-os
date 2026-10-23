@@ -18,11 +18,12 @@
 
 import { parseArgs } from 'node:util';
 
-import { defaultKernelDir, readAllMetas, type ProcessMeta } from '../index.js';
+import { defaultKernelDir } from '../index.js';
+import { readProcessView, type ProcessRow } from '../process_view.js';
 
 /** A node in the rendered tree. */
 interface TreeNode {
-  readonly meta: ProcessMeta;
+  readonly row: ProcessRow;
   readonly children: TreeNode[];
 }
 
@@ -43,7 +44,8 @@ USAGE
 
 Reads the process index on disk (like \`ps\`) and draws it as a tree: parent
 above children, each with its state, its spend, and — when it is blocked —
-what it is blocked on.
+what it is blocked on. When a live kernel is running, its own process table
+is merged in, so running agents appear in the tree too.
 
   STATE     running, ready, blocked, stopped, suspended, zombie
   WAITING   sleep (a timer), wait (a child), recv (a channel),
@@ -56,36 +58,12 @@ what it is blocked on.
   }
 
   const dir = defaultKernelDir();
-  const metas = readAllMetas(dir);
+  const view = await readProcessView(dir);
+  const all = view.rows;
 
-  // init (PID 1) is the root of everything and is never on disk itself.
-  const initMeta: ProcessMeta = {
-    pid: 1,
-    ppid: null,
-    pgid: 1,
-    role: 'init',
-    state: 'running',
-    exitCode: null,
-    exitReason: null,
-    startedAt: '—',
-    lastTransitionAt: '—',
-    budgetsSpent: {
-      tokensIn: 0,
-      tokensOut: 0,
-      tokensCached: 0,
-      usdSpent: 0,
-      wallTimeMs: 0,
-      syscallCount: 0,
-    },
-    budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
-    agent: { system: 'init' },
-    kernelAbiVersion: '1.0.0',
-  };
-
-  const roots = buildTree([initMeta, ...metas]);
+  const roots = buildTree(all);
 
   // --- header: one line that says what the whole thing adds up to ----------
-  const all = [initMeta, ...metas];
   const byState = new Map<string, number>();
   for (const m of all) byState.set(m.state, (byState.get(m.state) ?? 0) + 1);
   const stateSummary = [...byState.entries()]
@@ -96,7 +74,8 @@ what it is blocked on.
   const usd = all.reduce((n, m) => n + m.budgetsSpent.usdSpent, 0) / 1_000_000;
 
   console.log(
-    `cortex top — ${all.length} process${all.length === 1 ? '' : 'es'} · ${stateSummary}`,
+    `cortex top — ${all.length} process${all.length === 1 ? '' : 'es'} · ${stateSummary}` +
+    `${view.live ? ' · live kernel' : ''}`,
   );
   console.log(`${formatTokens(tokens)} tokens · $${usd.toFixed(4)} spent · home ${dir}`);
   console.log('');
@@ -121,15 +100,15 @@ what it is blocked on.
  * cannot be its own ancestor) but are defended against anyway, since this
  * reads files a human could have edited.
  */
-function buildTree(metas: readonly ProcessMeta[]): TreeNode[] {
+function buildTree(rows: readonly ProcessRow[]): TreeNode[] {
   const nodes = new Map<number, TreeNode>();
-  for (const meta of metas) nodes.set(meta.pid, { meta, children: [] });
+  for (const row of rows) nodes.set(row.pid, { row, children: [] });
 
   const roots: TreeNode[] = [];
-  for (const meta of metas) {
-    const node = nodes.get(meta.pid) as TreeNode;
+  for (const row of rows) {
+    const node = nodes.get(row.pid) as TreeNode;
     const parent =
-      meta.ppid === null || meta.ppid === meta.pid ? undefined : nodes.get(meta.ppid);
+      row.ppid === null || row.ppid === row.pid ? undefined : nodes.get(row.ppid);
     if (parent === undefined) roots.push(node);
     else parent.children.push(node);
   }
@@ -139,20 +118,20 @@ function buildTree(metas: readonly ProcessMeta[]): TreeNode[] {
 }
 
 function sortTree(node: TreeNode): void {
-  node.children.sort((a, b) => a.meta.pid - b.meta.pid);
+  node.children.sort((a, b) => a.row.pid - b.row.pid);
   for (const child of node.children) sortTree(child);
 }
 
 function render(node: TreeNode, prefix: string, isLast: boolean): void {
   const branch = prefix === '' ? '' : `${prefix}${isLast ? '└─ ' : '├─ '}`;
-  console.log(`${branch}${lineFor(node.meta)}`);
+  console.log(`${branch}${lineFor(node.row)}`);
   const childPrefix = prefix === '' ? '   ' : `${prefix}${isLast ? '   ' : '│  '}`;
   node.children.forEach((child, i) => {
     render(child, childPrefix, i === node.children.length - 1);
   });
 }
 
-function lineFor(m: ProcessMeta): string {
+function lineFor(m: ProcessRow): string {
   const pid = String(m.pid).padEnd(5);
   const role = m.role.padEnd(16);
   const state = m.state.padEnd(10);
@@ -172,7 +151,7 @@ function lineFor(m: ProcessMeta): string {
 }
 
 /** Render a `BlockedReason` without importing the kernel type. */
-function describeBlocked(blockedOn: ProcessMeta['blockedOn']): string {
+function describeBlocked(blockedOn: ProcessRow['blockedOn']): string {
   if (blockedOn === undefined || blockedOn === null) return 'something';
   const kind = (blockedOn as { kind?: string }).kind ?? 'something';
   switch (kind) {
