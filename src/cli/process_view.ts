@@ -59,6 +59,17 @@ export interface ProcessRow {
   readonly budgetsSpent: BudgetCounters;
   readonly budgetsRemaining: BudgetLimits;
   readonly blockedOn?: BlockedReason | null;
+  /**
+   * Whether the kernel still has this process.
+   *
+   * A process that is *running* has no `meta.json` yet (the kernel writes it
+   * when the process exits), so the disk view cannot say "this one is alive".
+   * The live kernel can — and it is the difference between a process that is
+   * still inside a call and a process that was killed in the middle of one.
+   * A dead process's log can have an unpaired `enter` frame, and reading
+   * that as "it is still inside that call" would be a lie.
+   */
+  readonly live: boolean;
 }
 
 /** The process list the read-only views render. */
@@ -91,6 +102,7 @@ function syntheticInit(): ProcessRow {
     },
     budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
     blockedOn: null,
+    live: false,
   };
 }
 
@@ -124,6 +136,7 @@ function rowFromMeta(meta: ProcessMeta): ProcessRow {
     budgetsSpent: meta.budgetsSpent,
     budgetsRemaining: meta.budgetsRemaining,
     ...(meta.blockedOn !== undefined ? { blockedOn: meta.blockedOn } : {}),
+    live: false,
   };
 }
 
@@ -141,6 +154,7 @@ function rowFromLive(info: LiveProcessInfo): ProcessRow {
     budgetsSpent: info.budgetsSpent,
     budgetsRemaining: info.budgetsRemaining,
     blockedOn: info.blockedOn,
+    live: true,
   };
 }
 

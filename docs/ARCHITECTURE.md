@@ -1016,6 +1016,20 @@ exactly as long as the gap between the two frames. That is a precise stall
 signal, and it is the one the supervisor uses. `sleep` is exempt: a sleep is
 a **declared wait**, not a stall.
 
+**And now the view says it too.** `cortex top` answers the same question —
+*is this agent waiting, or is it stuck?* — and it answers it from the same
+place: the same reading of the same log, with the same exemption, in one
+module (`src/cli/open_call.ts`). Two commands that answer the same question
+must read the same source, or they will disagree — and a supervisor that
+kills a process the operator's view calls healthy is worse than either
+command existing. `cortex top --stall-after 30000` marks what is over the
+operator's own threshold and hands over the command to act on it.
+
+The reading is also the only way to see a stall in a **driver call**. The
+kernel does not park a process while its LLM call is in flight (PROCESS.md
+§3.7), so such a process is `running`, not `blocked`, and the process table
+says nothing is wrong. The log says it is four minutes into an `llm_call`.
+
 **The startup window is real, and the log closes it.** The stream only
 carries what happens *after* a subscriber connects — a supervisor that
 starts while the agent is already blocked would never see that `recv`'s
@@ -1064,6 +1078,14 @@ different endings, and the operator is told which one happened.
   issue the `kill` itself. That is deliberate — an operator watching a
   kernel must not be able to change what the kernel does by watching it —
   but it means the supervisor is a program, not a kernel feature.
+- **A driver call does not park the process.** The kernel does not preempt a
+  running process to mark it BLOCKED, so an agent in a slow `llm_call` reads
+  as `running` in `cortex ps`, and `blockedOn` is `null` (PROCESS.md §3.7).
+  `cortex top` finds the stall anyway — it reads the log — but `ps` is the
+  flat table and does not, and a *host* that only looks at the process table
+  will not see it either. The reserved `llm` / `tool` blocked reasons exist
+  for exactly this and are not yet produced; turning them on is a state-model
+  change (BACKLOG #060).
 - **The supervisor cannot see a hang that never made a syscall.** Its signal
   is "this process is inside one syscall, and has been for too long". A
   process that stops calling the kernel altogether — spinning in plain

@@ -42,6 +42,75 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex top` can now tell a waiting process from a stuck one.** The
+  process table says a process is BLOCKED, and that is all it says. A
+  listener parked on a channel and an agent that will never be answered read
+  *identically* — "waiting on a channel" — so the operator's first view could
+  not answer the only question that matters: *is anything stuck?*
+
+  The difference is how long, and the difference is not in the process table.
+  It is in the log: every syscall is an `enter` frame and an `exit`/`trap`
+  frame **with the same `callId`**, so a call whose `enter` never got a
+  partner is the call the process is sitting inside — and the `enter` frame's
+  timestamp is when it started.
+
+  ```console
+  $ cortex top
+  cortex top — 3 processes · 2 blocked · 1 running · 1 stuck · live kernel
+  0 tokens · $0.0000 spent · home .cortex
+
+     PID  ROLE            STATE     TOKENS  USD      NOTE
+  -------------------------------------------------------
+     1    init            running   0       $0.0000  1 syscall
+  ├─ 2    holder          blocked   0       $0.0000  waiting on a channel for 327ms
+  └─ 3    stuck           blocked   0       $0.0000  waiting on a channel for 14m40s — stuck
+
+  # pid 3 has been inside recv for 880154ms — over your 30000ms threshold.
+  #   cortex supervise 3 --kill-after 30000
+  ```
+
+  **`--stall-after <ms>`** marks what is over *your* threshold and hands over
+  the command to act on it. The threshold and the exemption are the ones
+  `cortex supervise --kill-after` uses — the same ones, from the same module
+  (`src/cli/open_call.ts`), because two commands that answer the same question
+  must read the same source. A supervisor that killed a process the
+  operator's view called healthy would be worse than either command existing.
+
+  This is also the only way to see a stall in a **driver call**. The kernel
+  does not park a process while its LLM call is in flight, so such a process
+  reads as `running` and the process table says nothing is wrong; the log
+  says it is four minutes into an `llm_call`. PROCESS.md §3.7 now says which
+  blocked reasons the kernel actually sets, and the reserved `llm` / `tool`
+  ones are recorded as BACKLOG #060 — a state-model question, not a change.
+
+  **A declared wait is not a stall — and that now covers `wait` as well.** A
+  `sleep` was already exempt. A `wait` that carries its own deadline
+  (`wait(pid, { timeoutMs })`) ends whether or not the child does, so a
+  planner waiting for a coder is doing exactly what it said it would do, and
+  a supervisor that called it stuck would be killing the supervisor. Without
+  that, the view would have called Demo A's planner stuck and handed the
+  operator the command to kill it. A `wait` with *no* deadline is still a
+  stall — that is the call that hangs when the child hangs.
+
+  The tree's columns line up now too: the gutter is as wide as the deepest
+  branch, so the root's numbers sit in the same columns as its children's.
+  And `cortex top` — the view this project calls "one a stranger understands
+  in five minutes" (BACKLOG #041) — had **no smoke coverage at all** before
+  this.
+
+  **6 smoke checks** (645 → 651), all six reverse-verified: dropping the
+  duration → the row stops saying how long; dropping the "stuck" marker →
+  the threshold does nothing; making every open call a stall → a process that
+  keeps making progress gets called stuck; removing the gutter → the columns
+  stop lining up; removing the validation → a nonsense `--stall-after` is
+  accepted; and dropping the bounded-`wait` exemption → Demo A's planner is
+  called stuck. (That last break needed a second attempt: the first version
+  was a no-op line, and the assertion passed anyway — which is what a
+  reverse-verification is *for*.)
+
+  No ABI change: this is the CLI's reading of the log, and
+  `KERNEL_ABI_VERSION` stays 1.0.0.
+
 - **`cortex supervise <pid>` — the shell supervises a live agent.** A stream is
   only half a story. Everything the shell could do with a live agent was
   something a human had to do — the moment an agent got stuck, the operator

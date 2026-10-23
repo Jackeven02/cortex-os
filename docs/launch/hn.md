@@ -39,7 +39,7 @@ against a deterministic mock driver, no API key):
   your own children and calling reversible tools never need a capability —
   otherwise `kill` would be handed to every supervisor and mean nothing.
 - 12 kernel modules, 24 syscalls, 7 drivers (mock/deepseek/openai LLMs;
-  filesystem + MCP tools; inmem + sqlite memory), 645 assertions in the test
+  filesystem + MCP tools; inmem + sqlite memory), 651 assertions in the test
   suite.
 
 **1.0 means the syscall ABI is frozen.** This is the part I'd want a skeptic to

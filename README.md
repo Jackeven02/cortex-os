@@ -30,15 +30,25 @@ PID    PPID   ROLE       STATE     TOKENS   AGE
 1235   1234   tester     waiting   0        30s
 1236   1234   reviewer   blocked   2.1k     10s
 
-# Same processes, as the tree they actually are — and what each is waiting on
+# Same processes, as the tree they actually are — and what each is waiting
+# on, and for how long
 $ cortex top
-cortex top — 4 processes · 2 blocked · 1 running · 1 zombie
-31.4k tokens · $0.0480 spent · home .cortex
+cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
+0 tokens · $0.0000 spent · home .cortex
 
-1     init             running   0        $0.0000   0 syscalls
-└─ 1234 coder          blocked   12.3k    $0.0190   waiting on a model call
-   ├─ 1235 tester      blocked   0        $0.0000   waiting on a timer
-   └─ 1236 reviewer    zombie    2.1k     $0.0040   exit 0 (completed)
+      PID  ROLE            STATE     TOKENS  USD      NOTE
+----------------------------------------------------------
+      1    init            running   0       $0.0000  1 syscall
+├─    2    holder          blocked   0       $0.0000  waiting on a channel for 88ms
+└─    3    planner         blocked   0       $0.0000  waiting on child 6 for 3.2s
+   ├─ 4    coder:overview  zombie    0       $0.0000  exit 0 (coder overview complete)
+   ├─ 5    coder:install   zombie    0       $0.0000  exit 0 (coder install complete)
+   └─ 6    coder:api       blocked   0       $0.0000  waiting on a timer for 3.2s
+
+# ...and the one that is stuck, with the command to act on it
+$ cortex top --stall-after 30000
+# pid 6 has been inside recv for 880154ms — over your 30000ms threshold.
+#   cortex supervise 6 --kill-after 30000
 
 # Follow a running agent's syscall stream (tail -f on its .crec)
 $ cortex attach 1234
@@ -144,7 +154,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a disk-based follow-mode syscall trace, and with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a disk-based follow-mode syscall trace, and with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. `cortex top` reads each live process's log the same way `cortex supervise` does, so the view and the command that acts on it cannot disagree — with `--stall-after <ms>` it marks what is over *your* threshold and hands you the command to run. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 
@@ -177,7 +187,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 645 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 651 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

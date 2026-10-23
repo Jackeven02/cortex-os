@@ -56,16 +56,15 @@
  */
 
 import { parseArgs } from 'node:util';
-import { existsSync } from 'node:fs';
 
-import { defaultKernelDir, readSpec, existingCrecPath } from '../index.js';
+import { defaultKernelDir, readSpec } from '../index.js';
 import {
   explainKernelGone,
   probeKernel,
   KernelCommandError,
   type KernelClient,
 } from '../kernel_client.js';
-import { readRecords } from '../../kernel/recorder.js';
+import { readOpenCall, isStalled, type OpenCall } from '../open_call.js';
 import { asProcessId } from '../../kernel/types.js';
 
 /** How often the supervisor looks at its own state, in ms. */
@@ -79,12 +78,6 @@ const POLL_INTERVAL_MS = 250;
  */
 const TERMINATE_GRACE_MS = 5000;
 
-/**
- * Syscalls that are a *declared wait* rather than work in progress, and so
- * are not stalls no matter how long they take.
- */
-const EXEMPT_FROM_STALL: ReadonlySet<string> = new Set(['sleep']);
-
 /** The exit code `timeout(1)` uses for "I had to intervene". */
 const EXIT_INTERVENED = 124;
 
@@ -97,16 +90,10 @@ interface WireEvent {
     readonly callId: string;
     readonly syscall: string;
     readonly args?: unknown;
+    readonly timestamp?: string;
   };
   readonly exitCode?: number | null;
   readonly exitReason?: string | null;
-}
-
-/** A syscall the process entered and has not come out of. */
-interface OpenCall {
-  readonly callId: string;
-  readonly syscall: string;
-  readonly since: number;
 }
 
 /** The result of parsing one millisecond option. */
@@ -276,7 +263,15 @@ export async function cmdSupervise(args: string[]): Promise<number> {
           // Internal frames (`__state`, `__sched`, …) are the kernel's own
           // bookkeeping and do not open a call the agent is sitting in.
           if (record.syscall.startsWith('__')) return;
-          openCall = { callId: record.callId, syscall: record.syscall, since: Date.now() };
+          // The call's own timestamp, not the moment the event was handled:
+          // the two commands that read this must measure the same thing.
+          const at = Date.parse(record.timestamp ?? '');
+          openCall = {
+            callId: record.callId,
+            syscall: record.syscall,
+            since: Number.isNaN(at) ? Date.now() : at,
+            ...(record.args !== undefined ? { args: record.args } : {}),
+          };
           return;
         }
         if (openCall !== undefined && openCall.callId === record.callId) {
@@ -365,26 +360,24 @@ export async function cmdSupervise(args: string[]): Promise<number> {
         killAfterMs !== null &&
         openCall !== undefined &&
         !terminating &&
-        !EXEMPT_FROM_STALL.has(openCall.syscall)
+        isStalled(openCall, Date.now(), killAfterMs)
       ) {
         const stuckMs = Date.now() - openCall.since;
-        if (stuckMs > killAfterMs) {
-          console.log(
-            `# pid ${currentPid} has been inside ${openCall.syscall} for ${stuckMs}ms — killing it`,
-          );
-          openCall = undefined;
-          intervened = true;
-          terminating = true;
-          terminateDeadline = Date.now() + TERMINATE_GRACE_MS;
-          try {
-            await client.request('kill', { pid: currentPid, signal: 'SIGTERM' });
-          } catch (err) {
-            if (err instanceof KernelCommandError) {
-              // ESRCH: it died on its own between the check and the signal.
-              terminating = false;
-            } else {
-              throw err;
-            }
+        console.log(
+          `# pid ${currentPid} has been inside ${openCall.syscall} for ${stuckMs}ms — killing it`,
+        );
+        openCall = undefined;
+        intervened = true;
+        terminating = true;
+        terminateDeadline = Date.now() + TERMINATE_GRACE_MS;
+        try {
+          await client.request('kill', { pid: currentPid, signal: 'SIGTERM' });
+        } catch (err) {
+          if (err instanceof KernelCommandError) {
+            // ESRCH: it died on its own between the check and the signal.
+            terminating = false;
+          } else {
+            throw err;
           }
         }
       }
@@ -446,61 +439,6 @@ export async function cmdSupervise(args: string[]): Promise<number> {
   }
 
   return exitCode;
-}
-
-/**
- * Read the syscall a process is *currently inside*, from its log.
- *
- * ## Why this has to exist
- *
- * The event stream only carries what happens **after** a subscriber
- * connects. A supervisor that starts while the agent is already blocked
- * inside a `recv` would never see that `recv`'s `enter` frame — it was
- * written before the supervisor was listening — and would sit there watching
- * a process that is stuck, seeing nothing.
- *
- * The log knows the answer. Every syscall is an `enter` frame and an
- * `exit`/`trap` frame with the same `callId`, so the calls that are still
- * open are the ones whose `enter` never got a partner. And the `enter`
- * frame's timestamp is *when the call started*, which is exactly what a
- * stall detector needs to know.
- *
- * The cost is one full read of the process's log, at startup — the same read
- * `cortex trace` does. It is paid once, not per poll.
- */
-async function readOpenCall(dir: string, pid: number): Promise<OpenCall | undefined> {
-  const path = existingCrecPath(dir, asProcessId(pid));
-  if (!existsSync(path)) return undefined;
-
-  /** callId → the call it opened, and when it opened. */
-  const open = new Map<string, { syscall: string; since: number }>();
-  try {
-    for await (const record of readRecords(path)) {
-      // Internal frames (`__state`, `__sched`, …) are the kernel's own
-      // bookkeeping: they are never a call an agent is sitting inside.
-      if (record.syscall.startsWith('__')) continue;
-      if (record.phase === 'enter') {
-        const at = Date.parse(record.timestamp);
-        open.set(record.callId, {
-          syscall: record.syscall,
-          since: Number.isNaN(at) ? Date.now() : at,
-        });
-        continue;
-      }
-      open.delete(record.callId);
-    }
-  } catch {
-    // A log we cannot read is a log we cannot learn from; the supervisor
-    // still works from the stream alone.
-    return undefined;
-  }
-
-  if (open.size === 0) return undefined;
-  // A process makes one syscall at a time, so there is at most one open
-  // call. If there are more (a hand-edited log, say), the last one wins.
-  const entries = [...open.entries()];
-  const [callId, info] = entries[entries.length - 1]!;
-  return { callId, syscall: info.syscall, since: info.since };
 }
 
 /**

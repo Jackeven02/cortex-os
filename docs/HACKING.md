@@ -347,6 +347,7 @@ transition.
 | be told when a process is created | `KernelOptions.onProcessStart` |
 | be told when a process ends | `KernelOptions.onProcessExit` |
 | **watch everything, as it happens** | **`kernel.subscribe(listener)`** |
+| see whether a process is *stuck* | read its `.crec` and pair the `enter`/`exit` frames |
 
 `KernelOptions.onProcessExit` is still worth wiring — it is how you persist
 your own metadata, and it fires at the same instant as `awaitExit` resolves.
@@ -398,6 +399,24 @@ One trap worth naming: the stream only carries what happens **after** you
 subscribe. If the process is already stuck when you start watching, its
 `enter` frame is in the past — read the process's `.crec` once at startup
 to find out what it is already inside. (`cortex supervise` does.)
+
+**And to see whether a process is *stuck*.** The process table cannot tell
+you: a listener parked on a channel and an agent that will never be answered
+are both `blocked`, and a process in a long model call is not even blocked —
+the kernel does not park a process while its driver call is in flight. The
+log can tell you. Every syscall is an `enter` frame and an `exit`/`trap`
+frame **with the same `callId`**, so a call whose `enter` never got a
+partner is the call the process is sitting inside, and the `enter` frame's
+timestamp is when it started.
+
+The CLI does this in one place (`src/cli/open_call.ts`), and both
+`cortex top` (which shows it) and `cortex supervise` (which acts on it) use
+it — so the view and the command that acts on it cannot disagree. A host
+wanting the same fact should read it the same way. Two details are worth
+copying: a `sleep` is a **declared wait**, not a stall; and so is a `wait`
+that carries its own deadline (`wait(pid, { timeoutMs })` ends whether or not
+the child does). A `wait` with no deadline is not — that is the call that
+hangs when the child hangs.
 
 **And a host that watches a kernel it does not own must notice it leaving.**
 The API above is for a host that booted the kernel, so the kernel cannot

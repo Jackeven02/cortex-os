@@ -18,7 +18,7 @@ COMMANDS
   spawn        Start an agent as a background process
   wrap         Run any command as a supervised process (no code changes)
   ps           List processes with state, tokens, age
-  top          The process tree, and what each process is waiting for
+  top          The process tree, what each is waiting for, and what is stuck
   kill         Send a signal to a process
   trace        strace-style syscall log
   logs         What a process printed (per-process stdout capture)

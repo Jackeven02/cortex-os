@@ -248,6 +248,7 @@ import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise } from '../src/cli/commands/supervise.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
+import { cmdTop } from '../src/cli/commands/top.js';
 import {
   listDaemons,
   readDaemon,
@@ -13128,9 +13129,247 @@ async function runSuperviseChecks(): Promise<void> {
 }
 
 // =============================================================================
-// Kernel-gone checks (#058)
+// `cortex top` checks (#059)
 // =============================================================================
 
+/**
+ * The row a process is on, in `cortex top`'s output.
+ *
+ * The tree markers are not word characters, so "starts with non-words, then
+ * the pid" finds the row and not the header or the summary line.
+ */
+function topRow(out: string, pid: number): string {
+  const re = new RegExp(`^[^\\w]*${pid}\\s`);
+  return out.split('\n').find((line) => re.test(line)) ?? '';
+}
+
+/**
+ * `cortex top` — the view that tells the operator what is stuck.
+ *
+ * The process table cannot answer this. A listener parked on a channel and an
+ * agent that will never be answered both read as `blocked`, both read as
+ * "waiting on a channel"; the difference is how long, and the difference is
+ * only in the log. So `top` reads the same log `cortex supervise` reads.
+ */
+async function runTopChecks(): Promise<void> {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-top-'));
+  const kernels: Kernel[] = [];
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevLog = console.log;
+  const prevErr = console.error;
+
+  try {
+    const kernel = await bootKernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: tmp,
+      autoStart: true,
+      loadDrivers: (reg) => {
+        reg.registerMemory(inmemMemory());
+      },
+      agentLoader: async () => async (ctx, args) => {
+        const mode = typeof args['mode'] === 'string' ? args['mode'] : 'ok';
+        if (mode === 'wedged') {
+          // A `recv` with no timeout: the call opens and never closes. This
+          // is what a stall looks like in the log — an `enter` frame with no
+          // partner.
+          await ctx.recv();
+          return;
+        }
+        if (mode === 'listener') {
+          // A `recv` that times out every 100ms. Each call opens and closes,
+          // so the process is never inside one call for long — it is waiting,
+          // but it is making progress, and must never be called stuck.
+          for (let i = 0; i < 40; i += 1) {
+            try {
+              await ctx.recv(undefined, { timeoutMs: 100 });
+            } catch (err) {
+              if ((err as { errno?: string }).errno !== 'ETIMEDOUT') throw err;
+            }
+          }
+          ctx.exit(0, 'listened');
+          return;
+        }
+        if (mode === 'waiter') {
+          // A planner waiting on a child, with a deadline. The wait is a
+          // *declared* wait — it ends whether or not the child does — so a
+          // supervisor that called it stuck would be killing the supervisor.
+          const child = await ctx.spawn({
+            role: 'child',
+            agent: { module: 'test:wedged', args: { mode: 'wedged' } },
+          });
+          try {
+            await ctx.wait(child.pid, { timeoutMs: 5000 });
+          } catch {
+            // ETIMEDOUT: the child never finished. That is the point.
+          }
+          ctx.exit(0, 'waited');
+          return;
+        }
+        ctx.exit(0, 'all good');
+      },
+    });
+    kernels.push(kernel);
+
+    const server = await startKernelServer(kernel, { log: () => {} });
+    servers.push(server);
+    writeEndpoint(tmp, server.endpoint);
+    process.env['CORTEX_HOME'] = tmp;
+
+    const capture = async (
+      run: () => Promise<number>,
+    ): Promise<{ code: number; out: string; err: string }> => {
+      let out = '';
+      let err = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      console.error = (...parts: unknown[]): void => {
+        err += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      try {
+        const code = await run();
+        return { code, out, err };
+      } finally {
+        process.stdout.write = prevWrite;
+        console.error = prevErr;
+      }
+    };
+
+    // A process wedged in a `recv` that never returns.
+    const wedged = await kernel.spawn({
+      role: 'wedged',
+      agent: { module: 'test:wedged', args: { mode: 'wedged' } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    await checkAsync('cortex top says what a process is waiting for, and for how long', async () => {
+      const result = await capture(() => cmdTop([]));
+
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const row = topRow(result.out, unbrand(wedged));
+      assert(row !== '', `the process is in the tree, got: ${result.out}`);
+      assert(
+        /waiting on a channel for \d/.test(row),
+        `it says what it is waiting for and for how long, got: ${row}`,
+      );
+    });
+
+    await checkAsync('cortex top --stall-after marks the wedged one and hands over the command', async () => {
+      const result = await capture(() => cmdTop(['--stall-after', '300']));
+
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const row = topRow(result.out, unbrand(wedged));
+      assert(row.includes('— stuck'), `the row is marked, got: ${row}`);
+      assert(result.out.includes('1 stuck'), `the header counts it, got: ${result.out}`);
+      assert(
+        result.out.includes(`cortex supervise ${unbrand(wedged)} --kill-after 300`),
+        `the command to act on it is handed over, got: ${result.out}`,
+      );
+    });
+
+    await checkAsync('cortex top does not call a process that is making progress stuck', async () => {
+      const listener = await kernel.spawn({
+        role: 'listener',
+        agent: { module: 'test:listener', args: { mode: 'listener' } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const result = await capture(() => cmdTop(['--stall-after', '1000']));
+
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const row = topRow(result.out, unbrand(listener));
+      assert(row !== '', `the listener is in the tree, got: ${result.out}`);
+      assert(
+        !row.includes('— stuck'),
+        `a process that keeps making progress is not called stuck, got: ${row}`,
+      );
+    });
+
+    await checkAsync('cortex top does not call a bounded wait stuck', async () => {
+      const planner = await kernel.spawn({
+        role: 'planner',
+        agent: { module: 'test:waiter', args: { mode: 'waiter' } },
+      });
+      // Let it get to the `wait` and stay there.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      const result = await capture(() => cmdTop(['--stall-after', '200']));
+
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const row = topRow(result.out, unbrand(planner));
+      assert(row !== '', `the planner is in the tree, got: ${result.out}`);
+      assert(
+        row.includes('waiting on child'),
+        `it says what it is waiting for, got: ${row}`,
+      );
+      assert(
+        !row.includes('— stuck'),
+        `a wait that carries its own deadline is a declared wait, not a stall, got: ${row}`,
+      );
+    });
+
+    await checkAsync("cortex top's tree lines its columns up", async () => {
+      const result = await capture(() => cmdTop([]));
+
+      const header = result.out.split('\n').find((l) => l.includes('PID') && l.includes('ROLE'));
+      assert(header !== undefined, `the columns are named, got: ${result.out}`);
+      const column = header!.indexOf('PID');
+
+      // Every row puts its pid in the column the header names. A tree whose
+      // numbers do not line up is a tree nobody can read. (The pid column is
+      // padded, so a row has at least two spaces after its number — which is
+      // what keeps the summary line, "0 tokens · …", out of the set.)
+      const rows = result.out.split('\n').filter((l) => /^[^\w]*\d+\s{2,}/.test(l));
+      assert(rows.length > 0, `there are rows, got: ${result.out}`);
+      for (const row of rows) {
+        assert(
+          row.search(/\d/) === column,
+          `every row's pid lines up with the header, got: ${row}`,
+        );
+      }
+    });
+
+    await checkAsync('cortex top refuses a --stall-after it cannot make sense of', async () => {
+      const result = await capture(() => cmdTop(['--stall-after', 'soon']));
+      assert(result.code === 1, `exit 1, got ${result.code}`);
+      assert(
+        result.err.includes('invalid --stall-after'),
+        `the reason is reported, got: ${result.err.trim()}`,
+      );
+    });
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
+// Kernel-gone checks (#058)
+// =============================================================================
 /**
  * A promise that must finish before a deadline.
  *
@@ -14241,6 +14480,7 @@ await runMemoryInspectChecks();
 await runHostWaitChecks();
 await runEventStreamChecks();
 await runSuperviseChecks();
+await runTopChecks();
 await runKernelGoneChecks();
 await runDaemonChecks();
 await runKernelHardeningChecks();

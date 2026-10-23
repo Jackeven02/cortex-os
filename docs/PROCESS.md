@@ -149,15 +149,32 @@ The process is waiting on an external event. The `blockedOn` field says which:
 type BlockedReason =
   | { kind: 'recv';  channel: ChannelId }   // waiting on IPC
   | { kind: 'wait';  pid: ProcessId }       // waiting on child
-  | { kind: 'tool';  callId: string }       // waiting on tool driver
-  | { kind: 'llm';   callId: string }       // waiting on LLM driver
-  | { kind: 'budget'; until: string }       // rate-limited, awaiting window
-  | { kind: 'lock';  resource: string };    // explicit lock (rare)
+  | { kind: 'sleep'; until: string }        // waiting on a timer
+  | { kind: 'tool';  callId: string }       // reserved — see below
+  | { kind: 'llm';   callId: string }       // reserved — see below
+  | { kind: 'budget'; until: string }       // reserved — see below
+  | { kind: 'lock';  resource: string };    // reserved — see below
 ```
 
 A blocked process is woken by the kernel when its condition is satisfied. Wake transitions BLOCKED → READY (not directly to RUNNING — the scheduler decides when to dispatch).
 
 Most of an agent's life is spent in BLOCKED. This is normal. It is also why cortex can run thousands of agents on a laptop: only RUNNING processes consume tokens; the rest are essentially free.
+
+**Which reasons the kernel actually sets.** Three, today: `recv` (parked on a
+channel), `wait` (parked on a child) and `sleep` (parked on a timer). The other
+four are in the type and reserved for reasons the kernel does not yet have a
+way to express — and, in particular, **a process is not parked while a driver
+call is in flight**. An agent in a slow `llm_call` is RUNNING, not BLOCKED,
+and `blockedOn` is `null`.
+
+That is a deliberate consequence of the cooperative scheduler (§8.2): the
+agent's JavaScript is *awaiting* the driver, and the kernel does not preempt a
+running process to mark it. The consequence is that a process table alone
+cannot tell you that an agent is wedged in a model call. The syscall log can
+— the `llm_call`'s `enter` frame is there and its `exit` frame is not — and
+that is what `cortex top` reads (docs/ARCHITECTURE.md §12.1). Turning the
+reserved reasons on would change the state model, so it is a discussion
+rather than a change (BACKLOG #060).
 
 ### 3.8 `EXITING`
 
@@ -532,6 +549,7 @@ export type ProcessState =
 export type BlockedReason =
   | { kind: 'recv';   channel: ChannelId }
   | { kind: 'wait';   pid: ProcessId }
+  | { kind: 'sleep';  until: string }
   | { kind: 'tool';   callId: string }
   | { kind: 'llm';    callId: string }
   | { kind: 'budget'; until: string }
