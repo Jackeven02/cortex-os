@@ -738,6 +738,27 @@ daemon's stdout (it is the daemon's child now), and its LLM drivers come from
 the daemon's environment — the API key the daemon was started with, not the
 one in the shell that typed the command.
 
+**And it completed the loop.** `cortex restore` had the same shape of problem
+from the other end: it boots a kernel of its own, restores the snapshot into
+it, runs the restored agent to completion (or to the timeout), and exits — so
+the restored agent's life is bounded by the command too. That is the right
+shape for a one-shot restore and the wrong one for the promise a checkpoint
+makes: *pause, and come back to work*. `cortex restore --live` asks the
+running kernel instead. The `.csnap` is found on disk by chain id (the
+checkpoint manager searches `processes/<pid>/checkpoints/`, so a snapshot taken
+by an earlier kernel loads too), the restored process is minted by that
+kernel, and it stays there — with a new PID, its role intact, and reachable by
+every other transport command.
+
+The kernel rebuilds the restored agent's spec from two places, in this order:
+**the process it is still running** (its role and agent spec are right there in
+the process table), and **the disk** (`<pid>.meta.json`, written when a
+process exits). The live one comes first because a running process has no
+`meta.json` yet — which is exactly the case `restore --live` exists for. The
+lookup cannot confuse two processes: a kernel seeds its PID counter past
+everything already on disk, so a PID from an earlier session is never handed
+out again, and a table hit is always the very process that took the snapshot.
+
 **Known limits (v0).**
 
 - The transport carries commands, not streams: there is no live trace
@@ -748,6 +769,15 @@ one in the shell that typed the command.
   `cortex spawn --live` opts into the live one. Either way the two kernels
   can share a directory, which is why the PID claim exists (§7): the claim
   keeps them off each other's PIDs and off each other's logs.
+- **A snapshot does not carry its agent's spec.** The `.csnap` body holds the
+  process image — state, memory, budgets, lineage — and deliberately not the
+  role/agent spec, which is why a restore needs a context (the kernel's
+  `restoreContext`). The disk half of that context is a `meta.json`, and the
+  CLI writes one when a process *exits*. So a snapshot of an agent that was
+  still running when its kernel went away cannot be restored in a later
+  session: the spec died with the kernel. Restoring it *into* that kernel
+  (`--live`) works; restoring it after the kernel is gone needs the spec to
+  have been persisted when the process was created.
 - A crashed kernel leaves a stale `kernel.json` behind. Clients detect it
   (the port refuses the connection) and fall back to the disk view.
 - A **queued** signal loses its sender. The pending queue holds the signal

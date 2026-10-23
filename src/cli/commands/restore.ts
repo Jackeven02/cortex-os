@@ -15,9 +15,10 @@
 
 import { parseArgs } from 'node:util';
 import { bootCliKernel, defaultKernelDir, writeMeta, unbrand, type ProcessMeta } from '../index.js';
-import { asProcessId, asChainId } from '../../kernel/types.js';
+import { asProcessId, asChainId, type ChainId } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
 import { findCheckpointByTag, listCheckpoints } from '../process_store.js';
+import { KernelCommandError, probeKernel, type KernelProbe } from '../kernel_client.js';
 
 export async function cmdRestore(args: string[]): Promise<number> {
   const { values } = parseArgs({
@@ -28,6 +29,7 @@ export async function cmdRestore(args: string[]): Promise<number> {
       driver: { type: 'string' },
       model: { type: 'string' },
       timeout: { type: 'string', short: 't' },
+      live: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: false,
@@ -49,6 +51,10 @@ OPTIONS
                      otherwise the restored process may silently fall back to the
                      mock driver (issue C4).
   --model <name>     Advisory model name (accepted for symmetry with spawn).
+  --live             Restore into the live kernel (one started by
+                     'cortex daemon run') instead of a kernel of this command's
+                     own, so the restored agent keeps running after this
+                     command exits. Its output goes to the daemon's stdout.
   -t, --timeout <ms>  Max wall time for the restored process (default 30000)
   -h, --help         Show this help
 
@@ -56,6 +62,7 @@ EXAMPLES
   cortex restore --chain "a1b2c3d4-..."
   cortex restore --tag "before risky edit"
   cortex restore --tag "before risky edit" --driver deepseek
+  cortex restore --tag "before risky edit" --live
 `);
     return values.help ? 0 : 1;
   }
@@ -77,6 +84,40 @@ EXAMPLES
   }
   const timeoutMs = values.timeout !== undefined ? parseInt(values.timeout, 10) : 30_000;
 
+  // `--live` restores into the kernel that is already running, so the restored
+  // agent keeps working after this command exits. Without it the command
+  // restores into a kernel of its own, runs the agent to completion (or up to
+  // the timeout), and exits — the restored agent's life is bounded by the
+  // command, which is the right shape for a one-shot restore and the wrong one
+  // for "come back and keep working".
+  //
+  // The live kernel is probed *before* the tag is resolved: if there is
+  // nothing to restore into, that is the thing to say — not "no checkpoint
+  // with that tag".
+  let live: KernelProbe | undefined;
+  if (values.live) {
+    if (values.driver !== undefined) {
+      console.error(
+        `cortex restore --live: --driver ${values.driver} is ignored — the restored agent ` +
+          `runs in the daemon's kernel, so it uses the drivers (and the API keys) the daemon ` +
+          `was started with.`,
+      );
+    }
+    live = await probeKernel(dir);
+    if (live.kind !== 'live') {
+      if (live.kind === 'stale') {
+        console.error(
+          `cortex restore --live: the kernel that published ${live.endpoint.host}:${live.endpoint.port} ` +
+          `is not reachable (${live.reason})`,
+        );
+      }
+      console.error('cortex restore --live: no live kernel is reachable in this directory.');
+      console.error("  (start one with 'cortex daemon run', or drop --live to restore into");
+      console.error('   a kernel of its own)');
+      return 1;
+    }
+  }
+
   // Resolve the chain ID.
   let chainId = values.chain !== undefined ? asChainId(values.chain) : undefined;
 
@@ -97,6 +138,10 @@ EXAMPLES
       return 1;
     }
     chainId = asChainId(found);
+  }
+
+  if (values.live) {
+    return await restoreLive(live!, chainId!);
   }
 
   const kernel = await bootCliKernel(dir, {
@@ -200,5 +245,49 @@ EXAMPLES
   } catch (err) {
     await kernel.shutdown();
     throw err;
+  }
+}
+
+/**
+ * Restore into the kernel that is already running.
+ *
+ * The local path restores into a kernel of this command's own, runs the
+ * restored agent to completion, and exits — so the agent's life is bounded by
+ * the command. That is the right shape for a one-shot restore and the wrong
+ * one for the promise the checkpoint makes: *pause, and come back to work*.
+ *
+ * With `--live` the snapshot is restored by the daemon's kernel instead. The
+ * `.csnap` is found on disk by chain id (the checkpoint manager searches
+ * `processes/<pid>/checkpoints/`), so a snapshot taken by an earlier kernel
+ * loads here too, and the restored process stays in the live kernel — where
+ * every other transport command can reach it.
+ *
+ * The restored agent's output goes to the daemon's stdout, and it runs with
+ * the daemon's drivers: the API key is the one the daemon was started with.
+ */
+async function restoreLive(probe: KernelProbe, chainId: ChainId): Promise<number> {
+  if (probe.kind !== 'live') {
+    console.error('cortex restore --live: no live kernel is reachable in this directory.');
+    return 1;
+  }
+  const client = probe.client;
+  try {
+    const result = await client.request<{ pid: number; chainId: string }>('restore', {
+      chainId: unbrand(chainId),
+    });
+    console.log(`[pid ${result.pid}]`);
+    console.log('  restored into the live kernel — it keeps running after this command');
+    console.log(
+      `  (its output goes to the daemon's stdout; 'cortex trace ${result.pid}' follows its syscalls)`,
+    );
+    return 0;
+  } catch (err) {
+    if (err instanceof KernelCommandError) {
+      console.error(`cortex restore --live: ${err.errno}: ${err.message}`);
+      return 1;
+    }
+    throw err;
+  } finally {
+    client.close();
   }
 }

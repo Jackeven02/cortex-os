@@ -72,6 +72,12 @@ $ cortex kill 1234
 $ cortex restore --tag "before risky edit"
 [restored as pid 1502]
 
+# ...or put the snapshot back into a kernel that is still running, so the
+# restored agent keeps working after the command exits
+$ cortex restore --live --tag "before risky edit"
+[pid 1503]
+  restored into the live kernel — it keeps running after this command
+
 # Register a long-running agent to start on boot, and supervise it
 $ cortex daemon install inbox-watcher --role inbox-watcher \
     --module ./examples/checkpoint-agent.ts --restart on-failure
@@ -88,7 +94,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a disk-based follow-mode syscall trace, and with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, and `cortex daemon stop` shuts it down again. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a disk-based follow-mode syscall trace, and with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, and `cortex daemon stop` shuts it down again. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 

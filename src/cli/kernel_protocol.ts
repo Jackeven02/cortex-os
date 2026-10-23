@@ -63,6 +63,7 @@ export type KernelCommand =
   | 'send'
   | 'kill'
   | 'checkpoint'
+  | 'restore'
   | 'spawn'
   | 'shutdown';
 

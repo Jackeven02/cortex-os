@@ -287,6 +287,7 @@ import {
   MemoryArgError,
 } from '../src/cli/regions.js';
 import { cmdSpawn } from '../src/cli/commands/spawn.js';
+import { cmdRestore } from '../src/cli/commands/restore.js';
 import { resolveModulePath } from '../src/cli/module_path.js';
 import { DEFAULT_MEMORY_REGIONS } from '../src/cli/index.js';
 import {
@@ -11710,6 +11711,22 @@ async function runCliChecks(): Promise<void> {
     const prevErr = console.error;
     process.env['CORTEX_HOME'] = tmp;
     try {
+      await checkAsync('cortex restore --live says plainly that there is no live kernel', async () => {
+        // Nothing is serving this directory, so there is nothing to restore
+        // into. The command must say *that* — not fall back to a kernel of its
+        // own (which would restore the agent and then take it away again when
+        // the command exits), and not complain about the tag.
+        let err = '';
+        console.log = () => {};
+        console.error = (...parts: unknown[]): void => { err += parts.map((p) => String(p)).join(' ') + '\n'; };
+        const code = await cmdRestore(['--live', '--tag', 'whatever']);
+        console.log = prevLog;
+        console.error = prevErr;
+        assert(code === 1, `exit 1, got ${code}`);
+        assert(err.includes('no live kernel'), `the reason is reported, got: ${err.trim()}`);
+        assert(!err.includes('no checkpoint found'), 'the tag is not what it complains about');
+      });
+
       await checkAsync('cortex spawn rejects a malformed --memory before booting', async () => {
         console.log = () => {};
         console.error = () => {};
@@ -12160,6 +12177,11 @@ async function runTransportChecks(): Promise<void> {
       const client = probe.kind === 'live' ? probe.client : undefined;
       assert(client !== undefined, 'client exists');
 
+      // The chain id of the last checkpoint taken over the wire. The tag
+      // lookup check below reads it back out of the log by tag — which is the
+      // path `cortex restore --tag` takes.
+      let midFlightChainId: string | undefined;
+
       await checkAsync('a remote send delivers into a live agent\'s inbox', async () => {
         const pid = await kernel.spawn({ role: 'listener', agent: { module: 'test:listener' } });
         assert(await waitFor(() => agentStarted), 'the agent started');
@@ -12274,6 +12296,7 @@ async function runTransportChecks(): Promise<void> {
         if (!response.ok) return;
         const result = response.result as { chainId: string; path: string | null; state: string | null };
         assert(typeof result.chainId === 'string' && result.chainId.length > 0, 'a chain id came back');
+        midFlightChainId = result.chainId;
         assert(result.path !== null, 'the snapshot path came back');
         assert(existsSync(result.path!), `the snapshot exists at ${String(result.path)}`);
         assert(result.path!.endsWith('.csnap'), 'the snapshot is a .csnap');
@@ -12306,6 +12329,85 @@ async function runTransportChecks(): Promise<void> {
         assert(
           await waitFor(() => received.length > before),
           'the agent still receives messages after the checkpoint',
+        );
+      });
+
+      await checkAsync('a checkpoint tag resolves back to its chain id', async () => {
+        // The tag is an *argument* and the chain id is a *result*, so since
+        // the checkpoint moved onto the dispatcher's recording path they live
+        // in different frames of the same call — the `enter` frame carries
+        // `{tag, detach}` and the `exit` frame carries `{chainId, …}`. The
+        // reader has to pair them.
+        //
+        // It did not, for a while. The old checkpoint module wrote ONE frame
+        // with both, so a reader that looked for a single frame carrying
+        // `args.tag` *and* `result.chainId` worked — and when the frames
+        // split, that reader quietly stopped finding anything. The symptom was
+        // `cortex restore --tag X` answering "no checkpoint found with tag X"
+        // for a checkpoint that was sitting on disk. The old check wrote a
+        // hand-made frame with both facts in it, so it kept passing.
+        assert(midFlightChainId !== undefined, 'the checkpoint above produced a chain id');
+        const resolved = await findCheckpointByTag(tmp, 'mid-flight');
+        assert(
+          resolved === midFlightChainId,
+          `the tag resolved to the chain id, got ${String(resolved)} (expected ${String(midFlightChainId)})`,
+        );
+        const unknown = await findCheckpointByTag(tmp, 'no-such-tag-anywhere');
+        assert(unknown === undefined, 'an unknown tag resolves to nothing');
+      });
+
+      await checkAsync('a remote restore revives a checkpointed agent in the live kernel', async () => {
+        // `cortex restore` normally boots a kernel of its own, runs the
+        // restored agent to completion, and exits — so the restored agent's
+        // life is bounded by the command. That is the wrong shape for the
+        // promise a checkpoint makes: *pause, and come back to work*.
+        //
+        // Asking the live kernel instead leaves the restored process running
+        // there, with a new PID, its role intact, and reachable by every other
+        // transport command.
+        const pid = await kernel.spawn({
+          role: 'restore-me',
+          agent: { module: 'test:listener', args: { timeoutMs: 5000 } },
+        });
+        assert(await waitFor(() => kernel.table.get(pid)?.state !== undefined), 'the agent exists');
+        assert(
+          await waitFor(() => kernel.table.get(pid)?.state === 'blocked'),
+          'the agent parked on recv',
+        );
+
+        const snap = await client!.requestRaw('checkpoint', { pid: unbrand(pid), tag: 'to-restore' });
+        assert(snap.ok === true, `the checkpoint is accepted, got ${JSON.stringify(snap)}`);
+        if (!snap.ok) return;
+        const chainId = (snap.result as { chainId: string }).chainId;
+
+        const response = await client!.requestRaw('restore', { chainId });
+        assert(response.ok === true, `the restore is accepted, got ${JSON.stringify(response)}`);
+        if (!response.ok) return;
+        const result = response.result as { pid: number };
+        assert(Number.isInteger(result.pid), `a pid came back, got ${String(result.pid)}`);
+        assert(result.pid !== unbrand(pid), 'the restored process has a new pid');
+
+        const entry = kernel.table.get(asProcessId(result.pid));
+        assert(entry !== undefined, 'the restored agent is in the live kernel');
+        assert(entry!.role === 'restore-me', `the role survived the restore, got ${entry!.role}`);
+
+        // It keeps running — that is the whole point of restoring into a live
+        // kernel rather than one of the command's own.
+        assert(
+          await waitFor(() => kernel.table.get(asProcessId(result.pid))?.state !== undefined),
+          'the restored agent is still there a moment later',
+        );
+        assert(
+          await waitFor(() => kernel.table.get(asProcessId(result.pid))?.state === 'blocked'),
+          'the restored agent parked on recv',
+        );
+
+        // And it is reachable like any other live agent.
+        const before = received.length;
+        await client!.request('send', { pid: result.pid, message: 'hello, restored agent' });
+        assert(
+          await waitFor(() => received.length > before),
+          'the restored agent receives messages',
         );
       });
 

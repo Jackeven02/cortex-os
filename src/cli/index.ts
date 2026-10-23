@@ -372,6 +372,21 @@ export async function bootCliKernel(
   } = {},
 ): Promise<Kernel> {
   ensureKernelDirs(dir);
+  // The restore context answers one question: *which agent does this
+  // checkpoint belong to, and what was its spec?* Two places know the answer,
+  // and the live one is better.
+  //
+  // A process this kernel is still running has its spec right here in the
+  // process table — and no `meta.json` has been written for it yet, because
+  // the CLI persists one when a process *exits*. So the live lookup is what
+  // makes `cortex restore --live` work for an agent the daemon is still
+  // running.
+  //
+  // The live lookup cannot confuse two processes: a kernel seeds its PID
+  // counter past everything already on disk (see below), so a PID from an
+  // earlier session is never handed out again in this one — a table hit is
+  // always the very process that took the snapshot.
+  let self: Kernel | null = null;
   const kernel = await bootKernel({
     kernelAbiVersion: KERNEL_ABI_VERSION,
     dir,
@@ -388,14 +403,26 @@ export async function bootCliKernel(
     // The kernel's default restoreContext reads an in-memory per-PID map that
     // is empty in a fresh CLI invocation, so cross-invocation `cortex restore`
     // would trap EINVAL ("no agent metadata"). The `.csnap` body deliberately
-    // does not carry role/agent — but the CLI persists them in <pid>.meta.json.
-    // Rebuild the RestoreContext from disk, keyed on the checkpoint's pid.
+    // does not carry role/agent — so the context has to come from elsewhere:
+    // from the process table while this kernel still has it, and from the
+    // CLI's `<pid>.meta.json` (written when a process exits) otherwise.
     restoreContext: (cp) => {
+      const live = self === null ? undefined : self.table.get(cp.pid);
+      if (live !== undefined) {
+        return {
+          role: live.role,
+          agent: live.agent,
+          memory: Object.fromEntries(live.memoryRegions),
+          ppid: cp.parentPid,
+        };
+      }
       const meta = readMeta(dir, cp.pid);
       if (meta === undefined) {
         throw new Error(
           `cortex restore: no on-disk meta for pid ${unbrand(cp.pid)} — ` +
-          `cannot rebuild the agent spec (was it spawned in this cortex home?)`,
+          `cannot rebuild the agent spec (was it spawned in this cortex home?)` +
+          ` — if the agent is still running in a live kernel, restore into that one with ` +
+          `'cortex restore --live'`,
         );
       }
       return {
@@ -415,6 +442,7 @@ export async function bootCliKernel(
       writeMeta(dir, meta as unknown as Parameters<typeof writeMeta>[1]);
     },
   });
+  self = kernel;
   // Seed the PID counter past anything already persisted, so this invocation
   // never reuses a PID (which would collide on <pid>.crec / <pid>.meta.json —
   // most visibly when `restore` re-mints the suspended original's PID).

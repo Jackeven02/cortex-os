@@ -72,6 +72,12 @@ $ cortex kill 1234
 $ cortex restore --tag "before risky edit"
 [restored as pid 1502]
 
+# ...或者把快照放回一个仍在运行的内核里，让恢复出来的 agent
+# 在命令退出之后继续工作
+$ cortex restore --live --tag "before risky edit"
+[pid 1503]
+  restored into the live kernel — it keeps running after this command
+
 # 注册一个开机自启的长命 agent，并监督它
 $ cortex daemon install inbox-watcher --role inbox-watcher \
     --module ./examples/checkpoint-agent.ts --restart on-failure
@@ -88,7 +94,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 是基于磁盘的 follow-mode syscall 追踪；如果有活内核在跑，它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex daemon stop` 还能再把它停下来。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
+上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 是基于磁盘的 follow-mode syscall 追踪；如果有活内核在跑，它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex restore --live` 能把快照**放回**那个内核，`cortex daemon stop` 还能再把它停下来。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
 
 ---
 

@@ -44,6 +44,7 @@ import { randomBytes } from 'node:crypto';
 
 import {
   asChannelId,
+  asChainId,
   asProcessId,
   unbrand,
   type AgentSpec,
@@ -497,6 +498,28 @@ async function dispatch(
         detach,
         state: after?.state ?? null,
       };
+    }
+
+    case 'restore': {
+      const chainId = args['chainId'];
+      if (typeof chainId !== 'string' || chainId.length === 0) {
+        throw new WireError('EINVAL', 'restore requires a chainId');
+      }
+      // The same call the local `cortex restore` makes. Init owns the spawn
+      // surface, so it is the caller that owns the restore too (docs/ABI.md
+      // §4.2) — and the new process is adopted by the dispatcher, exactly like
+      // a locally restored one.
+      //
+      // The snapshot is found on disk by chainId: the checkpoint manager
+      // searches `processes/<pid>/checkpoints/`, so a `.csnap` taken by an
+      // *earlier* kernel (or by an earlier boot of this one) loads here.
+      const result = await kernel.dispatcher.invoke(
+        asProcessId(1),
+        'restore',
+        asChainId(chainId),
+        {},
+      );
+      return { pid: unbrand(result.pid), chainId };
     }
 
     case 'spawn': {

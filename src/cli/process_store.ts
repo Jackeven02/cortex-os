@@ -273,9 +273,26 @@ export async function readExitRecord(
  * Resolve a checkpoint tag to its chain ID.
  *
  * The tag is NOT in the `.csnap` filename or body — it is recorded in the
- * checkpointing process's `.crec` (`syscall: 'checkpoint'`, `args.tag`,
- * `result.chainId`). So we scan every process log and return the chain ID of
- * the most recent checkpoint whose tag matches. Returns `undefined` if none.
+ * checkpointing process's `.crec`. So we scan every process log and return the
+ * chain ID of the most recent checkpoint whose tag matches. Returns
+ * `undefined` if none.
+ *
+ * ## The tag and the chain id live in different frames
+ *
+ * Since the `checkpoint` syscall moved onto the dispatcher's recording path,
+ * one call writes an `enter` frame and an `exit` frame, and the two facts
+ * fell into different ones: the `enter` frame carries the *arguments*
+ * (`{tag, detach}`) and the `exit` frame carries the *result*
+ * (`{chainId, byteSize, syscallLogOffset}`). So the two are paired by their
+ * call id.
+ *
+ * This used to work by accident: before the move, the checkpoint module wrote
+ * a single frame carrying both, and a reader that looked for one frame with
+ * `args.tag` *and* `result.chainId` found it. When the frames split, that
+ * reader quietly stopped finding anything — and `cortex restore --tag` began
+ * to answer "no checkpoint found with tag X" for a checkpoint that was right
+ * there on disk. A log written before the move still holds both in one
+ * frame, so both shapes are read.
  */
 export async function findCheckpointByTag(dir: string, tag: string): Promise<string | undefined> {
   const root = processesDir(dir);
@@ -294,15 +311,30 @@ export async function findCheckpointByTag(dir: string, tag: string): Promise<str
   }
 
   for (const logPath of logs) {
+    // callId → tag, for the `enter` frames seen so far in this log. The
+    // matching `exit` frame carries the chain id.
+    const tagByCallId = new Map<string, string>();
     try {
       for await (const rec of readRecords(logPath)) {
-        if (rec.syscall !== 'checkpoint' || rec.phase !== 'exit') continue;
+        if (rec.syscall !== 'checkpoint') continue;
         const args = rec.args as { tag?: unknown } | undefined;
         const result = rec.result as { chainId?: unknown } | undefined;
-        if (args?.tag === tag && typeof result?.chainId === 'string') {
-          if (latest === undefined || rec.timestamp > latest.at) {
-            latest = { chainId: result.chainId, at: rec.timestamp };
-          }
+
+        if (rec.phase === 'enter') {
+          if (typeof args?.tag === 'string') tagByCallId.set(rec.callId, args.tag);
+          continue;
+        }
+        if (rec.phase !== 'exit') continue;
+        if (typeof result?.chainId !== 'string') continue;
+
+        // The tag is either on this frame (the pre-dispatcher shape) or on the
+        // `enter` frame of the same call.
+        const frameTag =
+          typeof args?.tag === 'string' ? args.tag : tagByCallId.get(rec.callId);
+        if (frameTag !== tag) continue;
+
+        if (latest === undefined || rec.timestamp > latest.at) {
+          latest = { chainId: result.chainId, at: rec.timestamp };
         }
       }
     } catch {

@@ -42,6 +42,43 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex restore --live` — a restored agent that keeps working.** The
+  restore had the same shape of problem the spawn had, from the other end: it
+  boots a kernel of its own, restores the snapshot into it, runs the restored
+  agent to completion (or to the timeout), and exits. So the restored agent's
+  life was bounded by the command — which is the right shape for a one-shot
+  restore and the wrong one for the promise a checkpoint makes: *pause, and
+  come back to work*.
+
+  `cortex restore --live` asks the kernel that is already running. The
+  `.csnap` is found on disk by chain id — the checkpoint manager searches
+  `processes/<pid>/checkpoints/`, so a snapshot taken by an earlier kernel
+  loads too — the restored process is minted by *that* kernel, and it stays
+  there: a new PID, its role intact, and reachable by every other transport
+  command (`send`, `checkpoint`, `kill`, `attach --interactive`).
+
+  The kernel rebuilds the restored agent's spec from two places, in this
+  order: **the process it is still running** (role and agent spec are right
+  there in the process table), and **the disk** (`<pid>.meta.json`, written
+  when a process exits). The live one comes first because a running process
+  has no `meta.json` yet — which is exactly the case `--live` exists for. The
+  lookup cannot confuse two processes: a kernel seeds its PID counter past
+  everything already on disk, so a PID from an earlier session is never handed
+  out again, and a table hit is always the very process that took the
+  snapshot.
+
+  Two things are stated in the command's own output rather than left to be
+  discovered: the restored agent's output goes to the daemon's stdout, and it
+  runs with the daemon's drivers (the API key is the one the daemon was
+  started with). `--driver` is therefore ignored with `--live`, and says so.
+
+  Without a live kernel the command says plainly that there is nothing to
+  restore into — and it says *that* before it looks at the tag, because "there
+  is no kernel" is the more fundamental problem.
+
+  (docs/ARCHITECTURE.md §12.1; `src/cli/kernel_protocol.ts`,
+  `kernel_server.ts`, `commands/restore.ts`, `index.ts`; 3 smoke checks.)
+
 - **The shell can now start an agent inside a running kernel, and stop that
   kernel.** `cortex spawn` had two lifetimes and honoured only one of them. It
   booted a private kernel, ran the agent to completion, printed the result and
@@ -453,6 +490,31 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **`cortex restore --tag` could not find a checkpoint that was sitting on
+  disk.** The tag is an *argument* and the chain id is a *result*, and since
+  the `checkpoint` syscall moved onto the dispatcher's recording path the two
+  facts landed in different frames of the same call: the `enter` frame carries
+  `{tag, detach}`, the `exit` frame carries `{chainId, byteSize,
+  syscallLogOffset}`. The tag reader still looked for a single frame carrying
+  both — which the old checkpoint module happened to write, because it wrote
+  one frame for the whole call. When the frames split, the reader quietly
+  stopped finding anything: `cortex restore --tag X` answered *"no checkpoint
+  found with tag X"* for a checkpoint that was right there.
+
+  That is the documented way to resume after a reboot — the README's "pause and
+  resume across reboots" example, and Demo B's own resume line — so it was
+  worth more than a small fix.
+
+  The reader now pairs the two frames by call id, and still reads the old
+  single-frame shape so logs written before the move keep working.
+
+  The check that should have caught it did not: it wrote a *hand-made* record
+  carrying the tag and the chain id in one frame — a frame the kernel never
+  produces. The new check takes a real checkpoint through the kernel and
+  resolves its tag back out of the log.
+
+  (src/cli/process_store.ts; 1 smoke check, which fails without the fix.)
 
 - **A checkpoint no longer kills the agent it was saving.** Taking a snapshot
   of a *blocked* process moves it out of BLOCKED — the snapshot is taken
