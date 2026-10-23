@@ -3,9 +3,12 @@
  *
  * BACKLOG #034: *"clone a running process at its current state."*
  *
- * v0 model: fork requires a live process in this kernel invocation. The
- * process must be spawned or restored in the same `cortex fork` call chain.
- * For cross-invocation forking, `cortex restore` first, then fork.
+ * A fork snapshots a **running** process: its state, its memory, its budgets,
+ * its lineage. The short-lived CLI kernel holds exactly one process (init), so
+ * there was never a running process in it to clone — which made this command
+ * unable to succeed, in any scenario. It booted a kernel of its own, looked
+ * the PID up in that kernel's table, and answered "no such process" for a PID
+ * that was very much alive somewhere else.
  *
  * Usage:
  *   cortex fork <pid> [--tag <tag>] [--budgets reset|inherit|split]
@@ -14,7 +17,9 @@
  */
 
 import { parseArgs } from 'node:util';
-import { bootCliKernel, defaultKernelDir, parsePid, unbrand } from '../index.js';
+
+import { defaultKernelDir, parsePid, unbrand } from '../index.js';
+import { KernelCommandError, probeKernel } from '../kernel_client.js';
 
 export async function cmdFork(args: string[]): Promise<number> {
   const { positionals, values } = parseArgs({
@@ -38,6 +43,12 @@ OPTIONS
   --budgets <policy>     Budget policy: reset (default), inherit, or split
   -h, --help              Show this help
 
+NOTES
+  Forking needs the process to be running somewhere: a fork snapshots a live
+  process, so the command asks the kernel that has it (one started by
+  'cortex daemon run'). The child stays in that kernel and keeps running, and
+  'cortex diff <pid> <child>' compares the two branches.
+
 EXAMPLES
   cortex fork 2
   cortex fork 2 --tag "try dynamic programming" --budgets split
@@ -47,31 +58,54 @@ EXAMPLES
 
   const pid = parsePid(positionals[0]!);
   const dir = defaultKernelDir();
-  const kernel = await bootCliKernel(dir);
 
-  try {
-    const entry = kernel.table.get(pid);
-    if (entry === undefined) {
-      console.error(`cortex fork: no such process: ${unbrand(pid)}`);
-      console.error(`  (the process must exist in this kernel invocation)`);
-      await kernel.shutdown();
-      return 1;
+  // There is no local fallback: a fork needs a *live* parent, and a kernel
+  // of this command's own holds only init. So the command says plainly what
+  // is missing instead of reporting "no such process" for a process that is
+  // running somewhere else.
+  const probe = await probeKernel(dir);
+  if (probe.kind !== 'live') {
+    if (probe.kind === 'stale') {
+      console.error(
+        `cortex fork: the kernel that published ${probe.endpoint.host}:${probe.endpoint.port} ` +
+        `is not reachable (${probe.reason})`,
+      );
     }
+    console.error('cortex fork: forking needs a live kernel — the process has to be running somewhere.');
+    console.error("  (start one with 'cortex daemon run', then fork the agent inside it)");
+    return 1;
+  }
 
-    const result = await kernel.dispatcher.invoke(pid, 'fork', {
+  const client = probe.client;
+  try {
+    const result = await client.request<{
+      childPid: number;
+      childChainId: string;
+      sharedCausalPast: number;
+      irreversibleInPast: readonly string[];
+    }>('fork', {
+      pid: unbrand(pid),
       ...(values.tag !== undefined ? { tag: values.tag } : {}),
-      ...(values.budgets !== undefined ? { budgets: values.budgets as 'reset' | 'inherit' | 'split' } : {}),
+      ...(values.budgets !== undefined ? { budgets: values.budgets } : {}),
     });
-    console.log(`forked pid ${unbrand(pid)} → child pid ${unbrand(result.childPid)}`);
+    console.log(`forked pid ${unbrand(pid)} → child pid ${result.childPid}`);
     console.log(`  chain: ${result.childChainId}`);
     console.log(`  shared causal past at offset: ${result.sharedCausalPast}`);
     if (result.irreversibleInPast.length > 0) {
       console.log(`  irreversible actions in past: ${result.irreversibleInPast.join(', ')}`);
     }
-    await kernel.shutdown();
+    console.log(
+      `  (the child keeps running in the live kernel — 'cortex send ${result.childPid} "..."' reaches it, ` +
+        `and 'cortex diff ${unbrand(pid)} ${result.childPid}' compares the branches)`,
+    );
     return 0;
   } catch (err) {
-    await kernel.shutdown();
+    if (err instanceof KernelCommandError) {
+      console.error(`cortex fork: ${err.errno}: ${err.message}`);
+      return 1;
+    }
     throw err;
+  } finally {
+    client.close();
   }
 }

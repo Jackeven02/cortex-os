@@ -42,6 +42,36 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex fork <pid>` can now find the process it is asked to fork.** The
+  command booted a kernel of its own and looked the PID up in *that* kernel's
+  table — which holds exactly one entry, init — so it answered *"no such
+  process"* for a process that was very much alive somewhere else. It could
+  not succeed in any scenario: a fork snapshots a **running** process, and
+  there was never a running process in a kernel of the command's own.
+
+  It now asks the kernel that has one. The fork is the target's *own* syscall
+  — the ABI allows `fork` from RUNNING, BLOCKED, STOPPED and SUSPENDED — so
+  the frame lands in the parent's own log, and the shared causal past it
+  records is exactly where `cortex diff` cuts the two branches apart. The
+  child is minted by that kernel and keeps running there.
+
+  So the whole of Demo C is drivable from a shell: fork a running agent, send
+  the two branches different instructions, and diff them.
+
+  ```console
+  $ cortex fork 2 --tag "try the other way"
+  forked pid 2 → child pid 3
+    chain: eaa679ca-40cc-4617-ae3d-cd2297b2abac
+    shared causal past at offset: 15283
+    irreversible actions in past: recv
+  $ cortex send 3 "the other way"
+  $ cortex diff 2 3
+    diverged after 26 shared syscall(s) — fork recorded in pid 2 at byte offset 15283
+  ```
+
+  (docs/ARCHITECTURE.md §12.1; src/cli/kernel_protocol.ts, kernel_server.ts,
+  commands/fork.ts; 1 smoke check.)
+
 - **`cortex restore --live` — a restored agent that keeps working.** The
   restore had the same shape of problem the spawn had, from the other end: it
   boots a kernel of its own, restores the snapshot into it, runs the restored

@@ -576,6 +576,32 @@ async function dispatch(
       return { pid: unbrand(pid), role };
     }
 
+    case 'fork': {
+      const pid = Number(args['pid']);
+      if (!Number.isInteger(pid)) {
+        throw new WireError('EINVAL', `invalid pid: ${String(args['pid'])}`);
+      }
+      const target = asProcessId(pid);
+      if (kernel.table.get(target) === undefined) {
+        throw new WireError('ESRCH', `no such process: ${pid}`);
+      }
+      const tag = typeof args['tag'] === 'string' ? args['tag'] : undefined;
+      const budgets = args['budgets'];
+      // The target is the *caller* of the fork, exactly as in the local path:
+      // the fork frame lands in the target's log, and the shared causal past
+      // it records is what `cortex diff` cuts the two branches at.
+      const result = await kernel.dispatcher.invoke(target, 'fork', {
+        ...(tag !== undefined ? { tag } : {}),
+        ...(budgets === 'reset' || budgets === 'inherit' || budgets === 'split' ? { budgets } : {}),
+      });
+      return {
+        childPid: unbrand(result.childPid),
+        childChainId: unbrand(result.childChainId),
+        sharedCausalPast: unbrand(result.sharedCausalPast),
+        irreversibleInPast: [...result.irreversibleInPast],
+      };
+    }
+
     case 'shutdown': {
       log('[kernel] shutdown requested by a client');
       // Answer first, then stop: the client is waiting on this frame.

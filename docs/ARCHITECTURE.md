@@ -715,6 +715,20 @@ message had no inbox to land in and the kernel exited a millisecond later
 taking it away. `cortex kill` could not signal anything either — it
 rewrote the on-disk metadata. Both are real now, against a live kernel.
 
+**And the cognitive fork became reachable.** `cortex fork <pid>` was a
+command that could not succeed: a fork snapshots a *running* process, and the
+short-lived CLI kernel holds only init, so the PID it was asked about was
+never there — the answer was always "no such process", for a process that was
+very much alive somewhere else. It now asks the kernel that has the process.
+
+The fork is the target's *own* syscall — the ABI allows `fork` from RUNNING,
+BLOCKED, STOPPED and SUSPENDED (ABI.md §4.2) — so the frame lands in the
+parent's own log, and the shared causal past it records is exactly where
+`cortex diff` cuts the two branches apart. The child is minted by that kernel
+and keeps running there, so the whole of Demo C can be driven from a shell:
+fork a running agent, send the two branches different instructions, and diff
+them.
+
 **And it stopped polluting the log.** Every transport command that *acts* —
 `send`, `kill`, `checkpoint`, `restore`, `spawn` — is answered through the
 dispatcher, so it is recorded in the kernel's `.crec` exactly like the local

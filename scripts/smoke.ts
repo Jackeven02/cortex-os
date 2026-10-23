@@ -12540,6 +12540,63 @@ async function runTransportChecks(): Promise<void> {
         );
       });
 
+      await checkAsync('a remote fork clones a live agent', async () => {
+        // `cortex fork` used to be a command that could not succeed: it
+        // booted a kernel of its own, looked the PID up in *that* kernel's
+        // table, and answered "no such process" for a process that was very
+        // much alive somewhere else. A fork snapshots a *running* process, so
+        // it has to ask the kernel that has one.
+        const pid = await kernel.spawn({
+          role: 'fork-me',
+          agent: { module: 'test:listener', args: { timeoutMs: 5000 } },
+        });
+        assert(await waitFor(() => kernel.table.get(pid)?.state !== undefined), 'the agent exists');
+        assert(
+          await waitFor(() => kernel.table.get(pid)?.state === 'blocked'),
+          'the agent parked on recv',
+        );
+
+        const response = await client!.requestRaw('fork', {
+          pid: unbrand(pid),
+          tag: 'branch-b',
+        });
+        assert(response.ok === true, `the fork is accepted, got ${JSON.stringify(response)}`);
+        if (!response.ok) return;
+        const result = response.result as {
+          childPid: number;
+          childChainId: string;
+          sharedCausalPast: number;
+        };
+        assert(Number.isInteger(result.childPid), `a child pid came back, got ${String(result.childPid)}`);
+        assert(result.childPid !== unbrand(pid), 'the child has its own pid');
+
+        const child = kernel.table.get(asProcessId(result.childPid));
+        assert(child !== undefined, 'the child is in the live kernel');
+        assert(child!.ppid === pid, `the forked process is its parent, got ${String(child!.ppid)}`);
+        assert(child!.role === 'fork-me', `the role is inherited, got ${child!.role}`);
+
+        // The fork is recorded in the *parent's* log — that frame carries the
+        // shared causal past, which is where `cortex diff` cuts the two
+        // branches apart.
+        const frames: SyscallRecord[] = [];
+        for await (const r of readRecords(existingCrecPath(tmp, pid))) frames.push(r);
+        const forkFrames = frames.filter((r) => r.syscall === 'fork');
+        assert(forkFrames.length >= 2, `the fork frames landed, got ${forkFrames.length}`);
+        const exitFrame = forkFrames.find((r) => r.phase === 'exit');
+        const forkResult = (exitFrame?.result ?? {}) as { childPid?: unknown };
+        assert(forkResult.childPid === result.childPid, 'the record names the child');
+
+        // And the child keeps running — a branch, not a snapshot.
+        assert(
+          await waitFor(() => kernel.table.get(asProcessId(result.childPid))?.state === 'blocked'),
+          'the child parked on recv',
+        );
+
+        // Leave the kernel as we found it: the branch is still running, and
+        // the checks after this one share the same kernel.
+        await client!.requestRaw('kill', { pid: result.childPid, signal: 'SIGKILL' });
+      });
+
       await checkAsync('a remote shutdown asks the kernel to stop', async () => {
         const response = await client!.requestRaw('shutdown');
         assert(response.ok === true, `the shutdown is accepted, got ${JSON.stringify(response)}`);

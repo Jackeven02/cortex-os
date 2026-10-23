@@ -50,8 +50,12 @@ $ cortex attach 1234
 #  会把你输入的每一行投递到运行中的 agent）
 
 # fork 状态，去试另一条路
-$ cortex fork 1234
-[forked as pid 1240]
+# （fork 快照的是**正在运行**的进程，所以这需要活内核：
+#  `cortex daemon run` —— 子进程会留在那个内核里）
+$ cortex fork 1234 --tag "try the other way"
+forked pid 1234 → child pid 1240
+  chain: 7c1f0f2e-...
+  shared causal past at offset: 18244
 $ cortex send 1240 "try dynamic programming instead"
 
 # 对比两个分支，挑一个赢家
@@ -94,7 +98,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 是基于磁盘的 follow-mode syscall 追踪；如果有活内核在跑，它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex restore --live` 能把快照**放回**那个内核，`cortex daemon stop` 还能再把它停下来。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
+上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 是基于磁盘的 follow-mode syscall 追踪；如果有活内核在跑，它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex restore --live` 能把快照**放回**那个内核，`cortex fork <pid>` 能把运行中的 agent 克隆成第二条可以驱动、可以对比的分支，`cortex daemon stop` 还能再把它停下来。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
 
 ---
 

@@ -65,6 +65,7 @@ export type KernelCommand =
   | 'checkpoint'
   | 'restore'
   | 'spawn'
+  | 'fork'
   | 'shutdown';
 
 /** A request frame. */

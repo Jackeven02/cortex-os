@@ -20,7 +20,7 @@
 import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
 
-import { defaultKernelDir, existingCrecPath, readMeta } from '../index.js';
+import { defaultKernelDir, existingCrecPath, readMeta, readSpec } from '../index.js';
 import { readRecords } from '../../kernel/recorder.js';
 import { unbrand, asProcessId, type SyscallRecord } from '../../kernel/types.js';
 import {
@@ -134,20 +134,28 @@ EXAMPLES
 
   const aMeta = aPid !== null ? readMeta(dir, asProcessId(aPid)) : undefined;
   const bMeta = bPid !== null ? readMeta(dir, asProcessId(bPid)) : undefined;
+  // A branch that has not exited yet has no `meta.json` — the CLI writes that
+  // when a process *ends*. Its spec is on disk from the moment it was
+  // created, so the role is still known; the state is not (only a live kernel
+  // knows that, and `diff` reads the disk).
+  const aSpec = aPid !== null ? readSpec(dir, asProcessId(aPid)) : undefined;
+  const bSpec = bPid !== null ? readSpec(dir, asProcessId(bPid)) : undefined;
   const aSum = summarize(aRaw);
   const bSum = summarize(bRaw);
 
   // --- header --------------------------------------------------------------
   console.log('');
-  console.log(`  A  ${branchLabel(aPid, aMeta?.role, aMeta?.state, aSum)}`);
-  console.log(`  B  ${branchLabel(bPid, bMeta?.role, bMeta?.state, bSum)}`);
+  console.log(`  A  ${branchLabel(aPid, aMeta?.role ?? aSpec?.role, aMeta?.state, aSum)}`);
+  console.log(`  B  ${branchLabel(bPid, bMeta?.role ?? bSpec?.role, bMeta?.state, bSum)}`);
   if ((aPid !== null && aMeta === undefined) || (bPid !== null && bMeta === undefined)) {
-    // Honest gap: `cortex spawn` writes .meta.json for the process it spawned,
-    // not for processes the agent forks at runtime. The .crec logs — which is
-    // what diff actually reads — are complete for both.
+    // Honest gap: `meta.json` is written when a process *ends*, so a branch
+    // that is still running has none. The role comes from the spec the CLI
+    // wrote at creation; the state is unknown without a live kernel. The
+    // `.crec` logs — which is what diff actually reads — are complete for
+    // both.
     console.log(
-      `  note: no .meta.json for one branch (spawn persists meta only for the process it` +
-        ` started); role/state shown as '-'. Syscall logs are unaffected.`,
+      `  note: no .meta.json for one branch (it has not exited yet — meta is written when a` +
+        ` process ends); role shown from its spec, state unknown. Syscall logs are unaffected.`,
     );
   }
   console.log('');
