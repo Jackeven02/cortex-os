@@ -50,12 +50,14 @@ $ cortex top --stall-after 30000
 # pid 6 has been inside recv for 880154ms — over your 30000ms threshold.
 #   cortex supervise 6 --kill-after 30000
 
-# Follow a running agent's syscall stream (tail -f on its .crec)
+# Follow a running agent's syscall stream (push, when a kernel is running)
 $ cortex attach 1234
-# attach .cortex/processes/1234.crec (follow-mode)
+# attach .cortex/processes/1234/log.crec (live — frames by push from the kernel)
 14:23:01 1234  __state     exit  idempotent
 14:23:01 1234  memory_read  exit  idempotent
 14:23:04 1234  llm_call     exit  reversible
+# pid 1234 exited with code 0 (completed)
+# detached
 # (with a live kernel running: cortex attach 1234 --interactive
 #  delivers each line of stdin to the running agent)
 
@@ -154,7 +156,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` is a disk-based follow-mode syscall trace, and with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. `cortex top` reads each live process's log the same way `cortex supervise` does, so the view and the command that acts on it cannot disagree — with `--stall-after <ms>` it marks what is over *your* threshold and hands you the command to run. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` follows one agent's syscall stream — by push when a live kernel holds the process (median lag 1 ms, and the follow ends by itself when the agent does, with its real exit code), and by tailing the log file when there is no kernel; with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. `cortex top` reads each live process's log the same way `cortex supervise` does, so the view and the command that acts on it cannot disagree — with `--stall-after <ms>` it marks what is over *your* threshold and hands you the command to run. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 
@@ -187,7 +189,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 655 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 658 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

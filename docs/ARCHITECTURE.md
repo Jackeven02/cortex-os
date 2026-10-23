@@ -1103,6 +1103,48 @@ is still there with nothing listening means it died; a descriptor that
 answers means another kernel has taken the directory over. Those are three
 different endings, and the operator is told which one happened.
 
+**And `cortex attach` stopped polling.** The last poller in the CLI. It
+followed the process's `.crec` **file**: it re-read the whole file every
+250 ms and printed whatever was new, so a frame arrived up to a poll interval
+after the kernel wrote it, and a long-running agent's log was read over and
+over (a 135 KB log cost 540 KB/s of pointless reads). The transport carries
+streams now, so when there is a live kernel that still holds the process, the
+frames come by push instead — measured on the same live agent, the median
+lag fell from **204 ms to 1 ms**.
+
+The history still comes from the file (the kernel's stream only carries what
+happens from now on), and the two are stitched by the frame's `byteOffset`:
+a frame the history already showed is not printed twice, and a frame written
+while the history was being read is *held* and printed after it. The
+subscription opens **before** the history is read, so nothing is lost in
+between.
+
+**And the follow ended by itself.** Following a process's log was a
+*tailing* operation: it ended when the operator detached. But the kernel knows
+when a process ends, and says how — the same `process-exit` event `cortex
+watch` prints, with the real exit code. So `cortex attach <pid>` now ends
+when the agent ends:
+
+```console
+$ cortex attach 5 --follow
+# attach .cortex/processes/5/log.crec (live — frames by push from the kernel)
+time                  pid    syscall           phase   duration  reversibility
+-------------------------------------------------------------------------------------
+22:04:08.838  5      __signal         exit    -         idempotent
+# pid 5 exited with code 143 (signal:SIGTERM)
+# detached
+```
+
+That is the difference between *"I saw it finish"* and *"I stopped looking"*.
+And the other ending is reported too: when the kernel goes away mid-follow,
+the follow did not finish — the process's fate is unknown — and the command
+exits 1, like `cortex watch` and `cortex supervise` do.
+
+Without a live kernel — or for a process the kernel does not hold, because it
+exited or another kernel owns it — the file path is used, exactly as before.
+The header says which one is running, because "it is following something" and
+"it is following something *now*" are different promises.
+
 **Known limits (v0).**
 
 - **Watching is still not reacting — for a *host*.** The transport carries a
@@ -1126,11 +1168,13 @@ different endings, and the operator is told which one happened.
   JavaScript, or parked on a promise — is invisible to it, because there is
   no frame to pair. The kernel is cooperative and does not preempt
   (PROCESS.md §8.2); nothing short of real isolation would catch that.
-- `cortex attach` still follows the `.crec` file on disk (which the daemon
-  writes to) and delivers the interactive half over the wire. `cortex logs
-  --follow` has the same shape: it polls `output.log` every 250 ms. Both work
-  without a live kernel, which is why they keep that shape; `cortex watch` is
-  the live one.
+- `cortex attach` follows the `.crec` file on disk when there is no live
+  kernel (which the daemon writes to), and takes the frames by push when
+  there is one; `cortex logs --follow` has the same shape as the file
+  follower: it polls `output.log` every 250 ms — the kernel does not know
+  what a process *said*, so there is nothing for it to push. Both work
+  without a live kernel, which is why they keep that shape; `cortex watch`
+  and a live `cortex attach` are the live ones.
 - **Memory inspection needs the live kernel.** `cortex memory <pid>` reads a
   process's memory regions through the transport, because a region's contents
   live in the memory driver — with the default `inmem` backing, in the kernel

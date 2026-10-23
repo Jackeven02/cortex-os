@@ -30,7 +30,7 @@ COMMANDS
   restore      Restore a process from a checkpoint
   fork         Clone a running process at its current state
   diff         Compare two forked branches' syscall logs
-  attach       Follow a process's syscall stream (tail -f on .crec)
+  attach       Follow a process's syscall stream (live, by push, with a kernel)
   send         Send an IPC message to a process or channel
   limit        Set or show resource budgets per process
   audit        Surface tools untagged for reversibility

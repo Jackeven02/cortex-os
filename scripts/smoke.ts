@@ -13454,8 +13454,7 @@ async function runDashboardLiveChecks(): Promise<void> {
         assert(res.status === 200, `status ${res.status}`);
         const reader = res.body!.getReader();
         const decoder = new TextDecoder();
-        let text = '';
-        try {
+        let text = '';        try {
           // The stream opens with the history; the *push* is what we are
           // testing, so the frame we look for is one that does not exist yet.
           //
@@ -13489,6 +13488,7 @@ async function runDashboardLiveChecks(): Promise<void> {
           const pid = await kernel.spawn({
             role: 'pushed',
             agent: { module: 'test:live', args: { mode: 'push' } },
+            memory: { semantic: { kind: 'shared', backing: 'inmem' } },
           });
           assert(pid !== undefined, 'the process was spawned');
 
@@ -13573,8 +13573,179 @@ async function runDashboardLiveChecks(): Promise<void> {
 }
 
 // =============================================================================
-// Kernel-gone checks (#058)
+// Attach-by-push checks (#062)
 // =============================================================================
+/**
+ * `cortex attach <pid>` — following one agent, live.
+ *
+ * The command used to follow the process's `.crec` **file**: it polled it
+ * every 250 ms and re-read the whole thing each time, so a frame arrived up
+ * to a poll interval late and a long-running agent's log was read over and
+ * over. With a live kernel the frames can come by push instead, and the
+ * follow can end by itself — because the kernel says when the process ends,
+ * and says how it ended.
+ */
+async function runAttachPushChecks(): Promise<void> {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { format } = await import('node:util');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-attachpush-'));
+  const kernels: Kernel[] = [];
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevLog = console.log;
+  const prevErr = console.error;
+
+  try {
+    const kernel = await bootKernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: tmp,
+      autoStart: true,
+      loadDrivers: (reg) => {
+        reg.registerMemory(inmemMemory());
+      },
+      agentLoader: async () => async (ctx, args) => {
+        const mode = typeof args['mode'] === 'string' ? args['mode'] : 'wait';
+        if (mode === 'write-on-message') {
+          // One message in, one memory_write out, then the agent ends.
+          await ctx.recv();
+          await ctx.memory_write('semantic', 'attach-key', 'attach-value');
+          return;
+        }
+        if (mode === 'exit-on-message') {
+          await ctx.recv();
+          ctx.exit(7, 'done on purpose');
+          return;
+        }
+        await ctx.recv();
+        return;
+      },
+    });
+    kernels.push(kernel);
+
+    const server = await startKernelServer(kernel, { log: () => {} });
+    servers.push(server);
+    writeEndpoint(tmp, server.endpoint);
+    process.env['CORTEX_HOME'] = tmp;
+
+    const probe = await probeKernel(tmp);
+    assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+    const client = probe.kind === 'live' ? probe.client : undefined;
+
+    // Run `cortex attach` in-process and capture what it prints.
+    const runAttach = async (
+      pid: number,
+      timeoutMs: number,
+    ): Promise<{ code: number; out: string }> => {
+      const lines: string[] = [];
+      const origLog = console.log;
+      const origErr = console.error;
+      console.log = (...args: unknown[]) => { lines.push(format(...args)); };
+      console.error = (...args: unknown[]) => { lines.push(format(...args)); };
+      try {
+        const code = await cmdAttach([String(pid), '--follow', '--timeout-ms', String(timeoutMs)]);
+        return { code, out: lines.join('\n') };
+      } finally {
+        console.log = origLog;
+        console.error = origErr;
+      }
+    };
+
+    try {
+      await checkAsync('attach takes the frames by push when the kernel holds the process', async () => {
+        const pid = await kernel.spawn({
+          role: 'watched',
+          agent: { module: 'test:live', args: { mode: 'write-on-message' } },
+          // The CLI declares the standard regions for every process; the
+          // kernel API does not, so the write below needs one to exist.
+          memory: { semantic: { kind: 'shared', backing: 'inmem' } },
+        });
+        assert(pid !== undefined, 'the process was spawned');
+
+        const attach = runAttach(unbrand(pid), 3000);
+        // Give the attach a moment to open its subscription, then let the
+        // agent do something: the frame it produces must reach the operator.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await client!.request('send', { pid: unbrand(pid), message: 'go' });
+
+        const { code, out } = await attach;
+        assert(out.includes('frames by push from the kernel'), `the follow says how it gets its frames, got:\n${out.slice(0, 400)}`);
+        assert(out.includes('memory_write'), `the frame the agent produced is shown, got:\n${out.slice(0, 600)}`);
+        assert(code === 0, `the follow ended cleanly, got ${code}`);
+      });
+
+      await checkAsync('attach shows a frame exactly once', async () => {
+        const pid = await kernel.spawn({
+          role: 'once',
+          agent: { module: 'test:live', args: { mode: 'write-on-message' } },
+          memory: { semantic: { kind: 'shared', backing: 'inmem' } },
+        });
+        assert(pid !== undefined, 'the process was spawned');
+
+        const attach = runAttach(unbrand(pid), 3000);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await client!.request('send', { pid: unbrand(pid), message: 'go' });
+        const { out } = await attach;
+
+        // The history comes from the file and the live frames come from the
+        // kernel, so the two overlap — the frame the agent just wrote is in
+        // both. The byteOffset is what keeps it from being printed twice.
+        // (A call is two frames — enter and exit — so the exit phase is what
+        // is counted.)
+        const writes = out.split('\n').filter((line) => /memory_write\s+exit\b/.test(line));
+        assert(writes.length === 1, `the frame is printed once, got ${writes.length} copies:\n${writes.join('\n')}`);
+      });
+
+      await checkAsync('attach ends when the process ends, and says how it ended', async () => {
+        const pid = await kernel.spawn({
+          role: 'ending',
+          agent: { module: 'test:live', args: { mode: 'exit-on-message' } },
+        });
+        assert(pid !== undefined, 'the process was spawned');
+
+        const started = Date.now();
+        const attach = runAttach(unbrand(pid), 8000);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        await client!.request('send', { pid: unbrand(pid), message: 'go' });
+
+        const { code, out } = await attach;
+        const elapsed = Date.now() - started;
+        // The follow ended because the process ended, not because the
+        // timeout ran out — that is the difference between "I saw it finish"
+        // and "I stopped looking".
+        assert(elapsed < 8000, `the follow ended when the process did (took ${elapsed}ms)`);
+        assert(out.includes('exited with code 7'), `the real exit code is reported, got:\n${out.slice(-400)}`);
+        assert(code === 0, `a finished follow is a successful follow, got ${code}`);
+      });
+    } finally {
+      client?.close();
+    }
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+
 /**
  * A promise that must finish before a deadline.
  *
@@ -14674,6 +14845,7 @@ await runLLMTapChecks();
 await runWrapChecks();
 await runDashboardChecks();
 await runDashboardLiveChecks();
+await runAttachPushChecks();
 await runFsChecks();
 await runMcpChecks();
 await runDiffChecks();

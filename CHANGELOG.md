@@ -42,6 +42,60 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex attach <pid>` follows one agent live — and knows how it ended.**
+  The command is the operator's seat in front of a single agent, and it was
+  the last poller in the CLI: it followed the process's `.crec` **file**,
+  re-reading the whole thing every 250 ms to find what was new. So a frame
+  arrived up to a poll interval after the kernel wrote it, and a long-running
+  agent's log was read over and over — a 135 KB log cost 540 KB/s of
+  pointless reads.
+
+  The transport carries streams now, so when there is a live kernel that
+  still holds the process, the frames come **by push** instead. Measured on
+  the same live agent, the median lag fell from **204 ms to 1 ms**.
+
+  ```console
+  $ cortex attach 5 --follow
+  # attach .cortex/processes/5/log.crec (live — frames by push from the kernel)
+  time                  pid    syscall           phase   duration  reversibility
+  -------------------------------------------------------------------------------------
+  22:04:08.838  5      __signal         exit    -         idempotent
+  # pid 5 exited with code 143 (signal:SIGTERM)
+  # detached
+  ```
+
+  **The follow now ends by itself.** Tailing a log was a *tailing*
+  operation: it ended when the operator detached. But the kernel knows when
+  a process ends and says how — the same `process-exit` event `cortex watch`
+  prints, with the **real** exit code. That is the difference between *"I saw
+  it finish"* and *"I stopped looking"*. The other ending is reported too:
+  when the kernel goes away mid-follow, the follow did not finish, the
+  process's fate is unknown, and the command exits 1 — like `cortex watch`
+  and `cortex supervise` do.
+
+  **The history still comes from the file, and the two are stitched.** The
+  kernel's stream only carries what happens from now on, so the past is read
+  from the `.crec` as before. The two overlap — a frame written while the
+  history is being read is in both — and the frame's `byteOffset` is what
+  keeps it from being printed twice. The subscription opens *before* the
+  history is read, so nothing is lost in between.
+
+  **Without a live kernel it is still the file.** A process the kernel does
+  not hold (it exited, or another kernel owns it) can only be read from its
+  log, and that path is unchanged. The header says which one is running,
+  because "it is following something" and "it is following something *now*"
+  are different promises.
+
+  **3 smoke checks** (655 → 658), all three reverse-verified: forcing the
+  file path → the follow waits out its timeout instead of ending with the
+  process, and the header stops claiming the frames are pushed; dropping the
+  `byteOffset` dedupe → the frame is printed twice; and not ending the follow
+  on the `process-exit` event → the follow waits out its timeout.
+
+  No ABI change: `KERNEL_ABI_VERSION` stays 1.0.0, and the transport
+  protocol is unchanged — this is a client of the same `subscribe` command
+  `cortex watch` uses.
+
 - **`cortex dashboard` watches the live kernel, not just its leftovers.** The
   dashboard was the operator's window, and it was showing a window onto a
   graveyard. A process that has not exited has no `meta.json` yet — the kernel
