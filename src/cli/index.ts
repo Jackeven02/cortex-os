@@ -45,7 +45,8 @@ import { inmemMemory } from '../drivers/memory/inmem.js';
 import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type MemoryRegionPolicy } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
 import { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir } from '../kernel/recorder.js';
-import { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, type ProcessMeta, type ProcessSpec } from './process_store.js';
+import { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, outputPath, readOutput, appendOutput, type ProcessMeta, type ProcessSpec, type OutputEntry } from './process_store.js';
+import { OutputCapture } from './output_capture.js';
 
 import { cmdSpawn } from './commands/spawn.js';
 import { cmdWrap } from './commands/wrap.js';
@@ -53,6 +54,7 @@ import { cmdPs } from './commands/ps.js';
 import { cmdTop } from './commands/top.js';
 import { cmdKill } from './commands/kill.js';
 import { cmdTrace } from './commands/trace.js';
+import { cmdLogs } from './commands/logs.js';
 import { cmdAttach } from './commands/attach.js';
 import { cmdDaemon } from './commands/daemon.js';
 import { cmdCheckpoint } from './commands/checkpoint.js';
@@ -95,6 +97,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdKill(rest);
       case 'trace':
         return await cmdTrace(rest);
+      case 'logs':
+        return await cmdLogs(rest);
       case 'attach':
         return await cmdAttach(rest);
       case 'daemon':
@@ -387,6 +391,11 @@ export async function bootCliKernel(
   // earlier session is never handed out again in this one — a table hit is
   // always the very process that took the snapshot.
   let self: Kernel | null = null;
+  // Capture what each agent prints, and attribute it to the process that
+  // printed it. The kernel does not know what a process said — it only knows
+  // which process a body belongs to — so the CLI supplies the scope and owns
+  // the on-disk layout (`processes/<pid>/output.log`).
+  const capture = new OutputCapture(dir);
   const kernel = await bootKernel({
     kernelAbiVersion: KERNEL_ABI_VERSION,
     dir,
@@ -483,6 +492,13 @@ export async function bootCliKernel(
         );
       }
     },
+    // Run every agent body inside a scope that knows which PID it belongs
+    // to. The kernel supplies the body and the PID; the CLI decides what
+    // "inside a scope" means — here, that the agent's `console` output is
+    // attributed to that process and written to `processes/<pid>/output.log`,
+    // so `cortex logs <pid>` can answer "what did it say?".
+    agentScope: <T>(pid: ProcessId, body: () => Promise<T>): Promise<T> =>
+      capture.scope(pid, body),
   });
   self = kernel;
   // Seed the PID counter past anything already persisted, so this invocation
@@ -508,7 +524,7 @@ export function parsePid(s: string): ProcessId {
 // =============================================================================
 
 export { unbrand, asProcessId };
-export { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, type ProcessMeta, type ProcessSpec };
+export { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, outputPath, readOutput, appendOutput, type ProcessMeta, type ProcessSpec, type OutputEntry };
 export { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir };
 
 // =============================================================================

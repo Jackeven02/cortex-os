@@ -21,6 +21,7 @@ COMMANDS
   top          The process tree, and what each process is waiting for
   kill         Send a signal to a process
   trace        strace-style syscall log
+  logs         What a process printed (per-process stdout capture)
   checkpoint   Snapshot a process to disk
   restore      Restore a process from a checkpoint
   fork         Clone a running process at its current state
@@ -45,6 +46,7 @@ EXAMPLES
   cortex top
   cortex kill 1234 --signal SIGTERM
   cortex trace 1234
+  cortex logs 1234
   cortex checkpoint 1234 --tag "before risky edit"
   cortex restore --tag "before risky edit"
   cortex fork 1234

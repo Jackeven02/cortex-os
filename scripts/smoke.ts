@@ -241,6 +241,7 @@ import {
 
 import { cmdDiff } from '../src/cli/commands/diff.js';
 import { cmdTrace } from '../src/cli/commands/trace.js';
+import { cmdLogs } from '../src/cli/commands/logs.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import {
   listDaemons,
@@ -279,6 +280,8 @@ import {
   findCheckpointByTag,
   readSpec,
   specPath,
+  outputPath,
+  readOutput,
   type ProcessMeta,
 } from '../src/cli/process_store.js';
 
@@ -11835,6 +11838,152 @@ async function runCliChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Per-process output capture checks
+// =============================================================================
+
+/**
+ * An agent prints. Until now that print went to the daemon's stdout and
+ * nowhere else — one anonymous stream shared by everything in the kernel,
+ * so "what did that process say?" had no answer.
+ *
+ * These checks go after the whole chain: the kernel tells the CLI which
+ * process a body belongs to, the CLI scopes the body, and the scope decides
+ * that a printed line belongs to that process and goes to that process's
+ * `output.log`.
+ */
+async function runOutputCaptureChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, writeFileSync, existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { pathToFileURL } = await import('node:url');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-output-'));
+
+  const modulePath = join(tmp, 'printer-agent.ts');
+  writeFileSync(
+    modulePath,
+    'export default async function printerAgent(ctx: any, args: Record<string, unknown> = {}): Promise<void> {\n' +
+      "  const tag = String(args['tag'] ?? 'agent');\n" +
+      '  console.log(`[${tag}] hello`);\n' +
+      '  console.error(`[${tag}] trouble`);\n' +
+      '  console.log(`[${tag}] two`);\n' +
+      '}\n',
+    'utf8',
+  );
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevWrite = process.stdout.write;
+
+  /** Wait until the process's output file contains `needle`. */
+  async function waitForOutput(pid: number, needle: string, timeoutMs = 5000): Promise<string> {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const text = readOutput(tmp, asProcessId(pid));
+      if (text !== undefined && text.includes(needle)) return text;
+      if (Date.now() > deadline) {
+        return text ?? '';
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
+  try {
+    await checkAsync('a process keeps what it printed, in its own log', async () => {
+      const kernel = await bootCliKernel(tmp);
+      let pid: number | undefined;
+      try {
+        pid = unbrand(
+          await kernel.spawn({
+            role: 'printer',
+            agent: { module: pathToFileURL(modulePath).href, args: { tag: 'alpha' } },
+          }),
+        );
+        const text = await waitForOutput(pid, '[alpha] two');
+        assert(text.includes('[alpha] hello'), `the printed line was kept, got: ${text}`);
+        assert(text.includes('[alpha] trouble'), `the stderr line was kept, got: ${text}`);
+        assert(text.includes('| out |'), `stdout lines are tagged, got: ${text}`);
+        assert(text.includes('| err |'), `stderr lines are tagged, got: ${text}`);
+        // The init process printed nothing, so it has no output log at all:
+        // the lines above belong to the agent, not to the kernel.
+        assert(
+          !existsSync(outputPath(tmp, asProcessId(1))),
+          'init printed nothing, so it has no output log',
+        );
+      } finally {
+        await kernel.shutdown();
+      }
+    });
+
+    await checkAsync("two processes' output does not mix", async () => {
+      const kernel = await bootCliKernel(tmp);
+      try {
+        const alpha = unbrand(
+          await kernel.spawn({
+            role: 'alpha',
+            agent: { module: pathToFileURL(modulePath).href, args: { tag: 'alpha' } },
+          }),
+        );
+        const beta = unbrand(
+          await kernel.spawn({
+            role: 'beta',
+            agent: { module: pathToFileURL(modulePath).href, args: { tag: 'beta' } },
+          }),
+        );
+        const a = await waitForOutput(alpha, '[alpha] two');
+        const b = await waitForOutput(beta, '[beta] two');
+        assert(a.includes('[alpha] hello') && !a.includes('[beta]'), `alpha's log is its own, got: ${a}`);
+        assert(b.includes('[beta] hello') && !b.includes('[alpha]'), `beta's log is its own, got: ${b}`);
+      } finally {
+        await kernel.shutdown();
+      }
+    });
+
+    await checkAsync('cortex logs reads the captured output back', async () => {
+      process.env['CORTEX_HOME'] = tmp;
+      const pid = 2;
+      let out = '';
+      // `cortex logs` writes the captured lines to stdout, so stdout is what
+      // we read. The tap lives on the same function, so it is restored the
+      // moment the command returns.
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      let code: number;
+      try {
+        code = await cmdLogs([String(pid)]);
+      } finally {
+        process.stdout.write = prevWrite;
+      }
+      assert(code === 0, `exit 0, got ${code}`);
+      assert(out.includes('| out |'), `the captured lines are printed, got: ${out}`);
+      assert(out.includes('[alpha] hello') || out.includes('[beta] hello'), `the content is there, got: ${out}`);
+    });
+
+    await checkAsync('cortex logs says plainly when a process printed nothing', async () => {
+      process.env['CORTEX_HOME'] = tmp;
+      let err = '';
+      const prevErr = console.error;
+      console.error = (...parts: unknown[]): void => {
+        err += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      let code: number;
+      try {
+        code = await cmdLogs(['1']);
+      } finally {
+        console.error = prevErr;
+      }
+      assert(code === 1, `exit 1, got ${code}`);
+      assert(err.includes('no captured output'), `the reason is reported, got: ${err.trim()}`);
+    });
+  } finally {
+    process.stdout.write = prevWrite;
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // CLI daemon checks (#039)
 // =============================================================================
 
@@ -12690,6 +12839,7 @@ await runInMemChecks();
 await runSqliteChecks();
 runRegionsChecks();
 await runCliChecks();
+await runOutputCaptureChecks();
 await runDaemonChecks();
 await runKernelHardeningChecks();
 await runTransportChecks();

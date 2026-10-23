@@ -34,7 +34,7 @@
  * @module cli/process_store
  */
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, unlinkSync, mkdirSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, unlinkSync, mkdirSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
 import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy, type BlockedReason } from '../kernel/types.js';
@@ -123,6 +123,38 @@ export function specPath(dir: string, pid: ProcessId): string {
 /** The pre-`0.2.1` flat form, `.cortex/processes/<pid>.meta.json`. */
 export function legacyMetaPath(dir: string, pid: ProcessId): string {
   return join(dir, 'processes', `${unbrand(pid)}.meta.json`);
+}
+
+/**
+ * `.cortex/processes/<pid>/output.log` — what the process *printed*.
+ *
+ * The `.crec` log records what a process **did** (syscalls, with arguments
+ * and results). It says nothing about what the process said: an agent's
+ * `console.log` was, until now, a handful of bytes on the daemon's stdout,
+ * gone the moment the terminal scrolled or the daemon was restarted.
+ *
+ * So the output went nowhere it could be read back from. This file is where
+ * it goes — one line per printed line, stamped, tagged with the stream it
+ * came from:
+ *
+ *     2026-10-23T15:39:35.034Z | out | hello from the agent
+ *     2026-10-23T15:39:36.118Z | err | something went wrong
+ *
+ * It is written by the CLI, not the kernel (the kernel does not know what a
+ * process printed), and it is read back with `cortex logs <pid>`.
+ */
+export function outputPath(dir: string, pid: ProcessId): string {
+  return join(procDir(dir, pid), 'output.log');
+}
+
+/** One captured line of a process's output. */
+export interface OutputEntry {
+  /** ISO-8601 timestamp of the moment the line was completed. */
+  readonly at: string;
+  /** Which standard stream the line came from. */
+  readonly stream: 'out' | 'err';
+  /** The line itself, without its trailing newline. */
+  readonly text: string;
 }
 
 /** `.cortex/processes/<pid>/` — everything one process ever wrote. */
@@ -225,6 +257,24 @@ export function readSpec(dir: string, pid: ProcessId): ProcessSpec | undefined {
   };
 }
 
+/**
+ * Append one captured line to a process's `output.log`.
+ *
+ * Appends are synchronous on purpose: the daemon that owns the live agent can
+ * be killed at any moment, and an asynchronous write would lose exactly the
+ * lines that were printed just before it died — which is when you want them
+ * most.
+ */
+export function appendOutput(dir: string, pid: ProcessId, entry: OutputEntry): void {
+  const path = outputPath(dir, pid);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch {
+    // Best-effort: the append below reports the real failure.
+  }
+  appendFileSync(path, `${entry.at} | ${entry.stream} | ${entry.text}\n`, 'utf8');
+}
+
 export function deleteMeta(dir: string, pid: ProcessId): void {
   for (const path of [metaPath(dir, pid), legacyMetaPath(dir, pid)]) {
     try {
@@ -250,6 +300,23 @@ export function readMeta(dir: string, pid: ProcessId): ProcessMeta | undefined {
     }
   }
   return undefined;
+}
+
+/**
+ * Read a process's captured output back.
+ *
+ * Returns `undefined` when the process never printed anything that was
+ * captured — an older home, a process that has not run yet, or one that said
+ * nothing at all.
+ */
+export function readOutput(dir: string, pid: ProcessId): string | undefined {
+  const path = outputPath(dir, pid);
+  if (!existsSync(path)) return undefined;
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return undefined;
+  }
 }
 
 /**

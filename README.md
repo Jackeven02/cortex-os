@@ -67,6 +67,13 @@ $ cortex trace 1234
 14:23:04 tool_call(grep, "TypeError") -> "src/foo.ts:42"
 14:23:06 llm_call(...) -> "Found it, editing now"
 
+# Read back what a process printed (kept per process, not mixed into the
+# daemon's stdout — stdout and stderr are tagged separately)
+$ cortex logs 1234
+2026-10-23T14:23:01.402Z | out | [coder] starting on issue #42
+2026-10-23T14:23:06.115Z | err | [coder] grep timed out, retrying
+# (--tail 20 for the last 20 lines; --follow to watch a live agent print)
+
 # Pause and resume across reboots
 # (a checkpoint captures a live process, so this needs a live kernel:
 #  `cortex daemon run` — and SIGUSR2 means "checkpoint now")
@@ -131,7 +138,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 580 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 610 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

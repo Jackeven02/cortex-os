@@ -353,6 +353,23 @@ export interface KernelOptions {
   readonly onProcessStart?: (birth: ProcessBirth) => void | Promise<void>;
 
   /**
+   * Run an agent's body inside a scope the caller defines.
+   *
+   * The kernel knows *which* process a body belongs to; it does not know what
+   * the caller wants to do with that knowledge. This option is the seam:
+   * the kernel hands the body to the caller's wrapper, which runs it inside
+   * whatever context it likes — an `AsyncLocalStorage` scope, say — and the
+   * body executes inside it.
+   *
+   * The CLI uses it to attribute the agent's `console` output to the process
+   * that printed it, so a live agent's output is addressable instead of
+   * being mixed into the daemon's stdout forever (docs/ARCHITECTURE.md §12.1).
+   *
+   * Optional: absent (the default) the body simply runs.
+   */
+  readonly agentScope?: <T>(pid: ProcessId, body: () => Promise<T>) => Promise<T>;
+
+  /**
    * Start the scheduler's auto-loop at the end of `boot()`. Defaults to
    * `false` so tests (and the CLI) drive `tick()` / `start()` explicitly;
    * docs/ARCHITECTURE.md §8 step 3f is then the caller's `kernel.start()`.
@@ -1027,7 +1044,18 @@ export class Kernel {
   ): Promise<void> {
     try {
       try {
-        await agentFn(ctx, args);
+        // The body runs inside the caller's scope, if it defined one — that
+        // is how "this output belongs to this process" is established
+        // (KernelOptions.agentScope). The wrapper is async so that a
+        // synchronous agent body is covered by the scope too.
+        const scope = this.#opts.agentScope;
+        if (scope !== undefined) {
+          await scope(pid, async () => {
+            await agentFn(ctx, args);
+          });
+        } else {
+          await agentFn(ctx, args);
+        }
         await this.#driveExit(pid, 0, 'completed');
       } catch (err) {
         if (isProcessExitSignal(err)) {

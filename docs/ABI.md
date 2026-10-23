@@ -81,6 +81,16 @@ Things that look like syscalls but aren't:
 - Property reads (`ctx.pid`, `ctx.ppid`, `ctx.pgid`, `ctx.role`) — these are immutable identity fields, not state queries.
 - Pure user-space computation in agent code (loops, conditionals, function calls within the agent).
 - Direct calls to npm libraries (e.g. `axios.get(...)`) — **these bypass the kernel and will not be recorded**. Agents that need observability should wrap external calls in `ctx.tool_call(...)`.
+- **`console.log` / `process.stdout.write` — printing is not a syscall.** An
+  agent's printed output is captured by the *host*, per process
+  (`processes/<pid>/output.log`, read back with `cortex logs <pid>`), not
+  through the dispatcher. The kernel has no opinion about what a process
+  says, and giving it a printing syscall would add an entry to a frozen ABI
+  for something it does not need to know. What the kernel *does* know is
+  which process a body belongs to, and it reports that to the host
+  (`KernelOptions.agentScope`); the host decides what a line means and where
+  it goes. The consequence is the one above: printed output is **not** part
+  of the causal history in the `.crec`, so a replay does not reproduce it.
 
 This last point is important. Cortex cannot record what it does not see. If your agent does `fetch(...)` directly, the recording has a hole in it and replay will diverge.
 

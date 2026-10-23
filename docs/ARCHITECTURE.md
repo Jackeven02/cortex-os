@@ -490,6 +490,7 @@ For v0, **only install drivers you trust**. Same advice as npm packages generall
 │   │   ├── log.crec
 │   │   ├── spec.json
 │   │   ├── meta.json
+│   │   ├── output.log                # what the process printed (see below)
 │   │   └── checkpoints/
 │   │       ├── 2026-09-17T10:23:01Z_<chainid>.csnap
 │   │       └── ...
@@ -513,6 +514,33 @@ For v0, **only install drivers you trust**. Same advice as npm packages generall
 **Why the process directory is also the PID's claim.** A state directory can host more than one kernel — `cortex daemon run` keeps one alive there while other `cortex` invocations work in the same directory — and each kernel counts PIDs up from its own seed. The directory is created with an *exclusive* `mkdir`, so exactly one kernel can win a given PID. Without it, the two counters walk into each other and the loser opens the winner's `log.crec` in append mode: two unrelated processes sharing one syscall log, silently. See §12.1.
 
 **What `spec.json` holds, and why it is written so early.** The role, the agent spec, and the memory region policies a process was created with — the facts a restore needs to rebuild it, and the facts the `.csnap` body deliberately omits (STATE.md §4). It is written when the process is **created**, not when it exits: `meta.json` (which carries the same facts) is written at exit, so a snapshot of an agent that was still running when its kernel died would have had no spec anywhere on disk and could not be restored in a later session. The kernel reports the birth (`KernelOptions.onProcessStart`) and the CLI decides what to write; the kernel itself never touches the disk layout.
+
+**What `output.log` holds, and why it is a separate file.** The `.crec` log
+records what a process **did** — its syscalls, with arguments and results. It
+says nothing about what the process **said**: `console.log` is not a syscall,
+is not in the ABI, and never appeared in the log. So an agent's output went to
+the daemon's stdout — one anonymous stream shared by the daemon, `init`, and
+every agent in the tree — and nowhere it could be read back from. The one
+stream an operator reaches for first, when an agent is behaving strangely,
+was the one stream the system did not keep.
+
+`output.log` is where it goes: one line per printed line, stamped, tagged with
+the stream it came from.
+
+```
+2026-10-23T15:39:35.034Z | out | [listener] listening (max=∞, tick=1000ms)
+2026-10-23T15:39:48.131Z | out | [listener] message 1 from 1: hello
+```
+
+The kernel does not know what a process printed — it only knows which process a
+body belongs to. So it reports the body and the PID (`KernelOptions.agentScope`)
+and the CLI decides what "inside a scope" means: an `AsyncLocalStorage` holding
+the PID, which survives every `await` inside the body, so a line printed three
+seconds later by an agent that was parked on `recv()` still knows it is PID 7's.
+The tap is on `process.stdout.write`, not on `console.log`, so the captured text
+is exactly what Node formatted and the original write still happens — the
+output goes to the daemon's stdout *and* to the log. `cortex logs <pid>` reads
+it back; the file is plain text and needs no live kernel.
 
 **What `kernel.json` holds.** The endpoint descriptor of the kernel serving this directory: the loopback host and port, the kernel's OS pid, a per-kernel shared secret, and the ABI version it speaks. It is written when a kernel starts serving and removed when it stops. (The "kernel config (drivers, defaults)" role this file was sketched for is still aspirational — v0 has no config file.)
 
@@ -768,6 +796,29 @@ daemon's stdout (it is the daemon's child now), and its LLM drivers come from
 the daemon's environment — the API key the daemon was started with, not the
 one in the shell that typed the command.
 
+**And it made the output addressable.** That first sentence was the last gap in
+the live-kernel story. A live agent's output went to the daemon's stdout — one
+anonymous stream shared by the daemon, `init`, and every agent in the tree —
+and nowhere else. With two agents running there was no way to tell which one
+printed what, and no way at all to read back what an agent said.
+
+Now every process's printed output is captured to `processes/<pid>/output.log`
+(§7), one stamped line per printed line, tagged with the stream it came from,
+and `cortex logs <pid>` reads it back. It is a disk read, like `cortex trace`,
+so it works for a process that has already exited and for one whose kernel is
+gone; `cortex logs <pid> --follow` tails it, so an operator can watch a live
+agent work without attaching a debugger to it.
+
+The mechanism is deliberately thin, because the kernel still does not know what
+a process said. It reports which process a body belongs to
+(`KernelOptions.agentScope`) and the CLI decides what "inside a scope" means:
+an `AsyncLocalStorage` holding the PID, which survives every `await` inside
+the body — so a line printed three seconds later by an agent that was parked on
+`recv()` and woken by another process still knows it is PID 7's. The tap is on
+`process.stdout.write` rather than on `console.log`, so the captured text is
+exactly what Node formatted, and the original write still happens: the output
+still goes to the daemon's stdout, and now it is also addressable.
+
 **And it completed the loop.** `cortex restore` had the same shape of problem
 from the other end: it boots a kernel of its own, restores the snapshot into
 it, runs the restored agent to completion (or to the timeout), and exits — so
@@ -795,7 +846,11 @@ out again, and a table hit is always the very process that took the snapshot.
 - The transport carries commands, not streams: there is no live trace
   subscription yet. `cortex attach` still follows the `.crec` file on disk
   (which the daemon writes to) and delivers the interactive half over the
-  wire.
+  wire. `cortex logs --follow` has the same shape: it polls
+  `output.log` every 250 ms rather than subscribing to anything.
+- Captured output is captured from the **kernel's** stdout, so it covers what
+  the agent printed inside this kernel. Output written by a process that ran
+  under an older build, or before the capture existed, is not there.
 - `cortex spawn` still boots its own short-lived kernel by default, and
   `cortex spawn --live` opts into the live one. Either way the two kernels
   can share a directory, which is why the PID claim exists (§7): the claim

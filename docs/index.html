@@ -295,6 +295,7 @@
         <div class="prim"><div class="k">checkpoint</div><div class="v">Snapshot the process image to disk, content-addressed.</div></div>
         <div class="prim"><div class="k">restore</div><div class="v">Re-materialise it as a new PID — after a reboot — with memory intact.</div></div>
         <div class="prim"><div class="k">trace</div><div class="v">Every syscall, enter/exit/trap, in an append-only <code>.crec</code> log.</div></div>
+        <div class="prim"><div class="k">logs</div><div class="v">Every line a process printed, kept per process, with its stream and timestamp.</div></div>
         <div class="prim"><div class="k">attach</div><div class="v">Follow a running process's syscall stream, like <code>tail -f</code>.</div></div>
         <div class="prim"><div class="k">limit</div><div class="v">Token, USD, and wall-time budgets per process.</div></div>
         <div class="prim"><div class="k">daemon</div><div class="v">Register a long-lived agent to start on boot and restart on failure.</div></div>
@@ -382,7 +383,7 @@ npx tsx src/cli/index.ts diff 2 3</pre>
         <div class="stat"><div class="n">12</div><div class="l">kernel modules</div></div>
         <div class="stat"><div class="n">24</div><div class="l">syscalls</div></div>
         <div class="stat"><div class="n">7</div><div class="l">drivers (LLM · MCP · FS · memory)</div></div>
-        <div class="stat"><div class="n">580</div><div class="l">smoke checks, all green</div></div>
+        <div class="stat"><div class="n">610</div><div class="l">smoke checks, all green</div></div>
       </div>
       <p class="sub">
         Phases 0–5 are complete: the kernel boots, all drivers ship, the whole CLI

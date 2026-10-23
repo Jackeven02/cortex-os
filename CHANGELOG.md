@@ -42,6 +42,49 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex logs <pid>` — a process's output, addressed to that process.** The
+  `.crec` log records what a process **did**: its syscalls, with arguments and
+  results. It never recorded what a process **said**, because `console.log` is
+  not a syscall, is not in the ABI, and never appeared in the log. So an
+  agent's output went to the daemon's stdout — one anonymous stream shared by
+  the daemon, `init` and every agent in the tree — and nowhere it could be
+  read back from. With two agents running there was no way to tell which one
+  printed what, and no way at all to ask an agent what it said after the
+  fact.
+
+  Now every process's printed output is captured to
+  `processes/<pid>/output.log` — one stamped line per printed line, tagged
+  with the stream it came from — and `cortex logs <pid>` reads it back. It is
+  a disk read, like `cortex trace`, so it works for a process that has
+  already exited and for one whose kernel is gone; `--tail N` shows the last
+  N lines, and `--follow` tails the file while a live agent keeps printing.
+
+  ```console
+  $ cortex send 2 "hello from the operator"
+  sent to pid 2
+  $ cortex logs 2
+  2026-10-23T18:48:38.338Z | out | [listener] listening (max=∞, tick=1000ms)
+  2026-10-23T18:48:48.131Z | out | [listener] message 1 from 1: hello from the operator
+  ```
+
+  The mechanism is thin on purpose. The kernel still does not know what a
+  process said: it reports which process a body belongs to
+  (`KernelOptions.agentScope`) and the CLI decides what "inside a scope"
+  means — an `AsyncLocalStorage` holding the PID, which survives every
+  `await` inside the body, so a line printed three seconds later by an agent
+  that was parked on `recv()` still knows it is PID 7's. The tap is on
+  `process.stdout.write` rather than on `console.log`, so the captured text
+  is exactly what Node formatted and the original write still happens: the
+  output still reaches the daemon's stdout, and now it is *also* addressable.
+
+  Four smoke checks: a process keeps what it printed (stdout and stderr
+  tagged separately, and `init` — which printed nothing — has no log at
+  all); two processes' output does not mix; `cortex logs` reads the captured
+  lines back; and `cortex logs` says plainly when a process printed nothing.
+
+  (docs/ARCHITECTURE.md §7, §12.1; `src/cli/output_capture.ts`,
+  `process_store.ts`, `commands/logs.ts`; 4 smoke checks.)
+
 - **`cortex fork <pid>` can now find the process it is asked to fork.** The
   command booted a kernel of its own and looked the PID up in *that* kernel's
   table — which holds exactly one entry, init — so it answered *"no such
@@ -138,7 +181,9 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   command's output so nobody has to guess:
 
   - **Output belongs to the daemon.** A live agent's stdout is the daemon's
-    stdout; the shell that spawned it gets no stream to read.
+    stdout; the shell that spawned it gets no stream to read. (It is also
+    captured per process — `cortex logs <pid>` reads it back; see the entry
+    above.)
   - **The LLM driver comes from the daemon's environment.** API keys and
     driver configuration are read where the process runs, not where the
     command was typed. Typing the key into the spawning shell does not give
@@ -520,6 +565,14 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **The published assertion count was stale.** The READMEs' quickstart, the
+  landing page's status panel and the HN launch draft all said "580 smoke
+  checks"; the suite is 610. The numbers were last refreshed when the landing
+  page was first built and were never moved again, so a reader who ran the
+  suite saw thirty more assertions than the documents promised. All four
+  places now say 610, and the landing page's primitive grid grew a `logs` tile
+  — the grid listed twelve verbs and there are now thirteen.
 
 - **Every `cortex ps` against a live kernel wrote a frame into the
   supervisor's log.** The transport's `ps` went through the dispatcher — init
