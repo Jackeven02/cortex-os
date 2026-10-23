@@ -25,8 +25,8 @@ $ cortex spawn --role coder --task "fix issue #42"
 
 # Inspect the process tree
 $ cortex ps
-PID    PPID   ROLE       STATE     TOKENS   AGE
-1234   1      coder      running   12.3k    2m
+PID    PPID   ROLE       STATE     TOKENS   CAPS    AGE
+1234   1      coder      running   12.3k    all     2m
 1235   1234   tester     waiting   0        30s
 1236   1234   reviewer   blocked   2.1k     10s
 
@@ -114,10 +114,12 @@ $ cortex watch --pid 1234
 
 # Supervise a live agent: kill it if it stops making progress, and put
 # a fresh one in its place. "Stuck" is read off the syscall log, not off
-# silence — a sleep is a declared wait, not a stall.
+# silence — a sleep is a declared wait, not a stall. The replacement is
+# the same agent: it gets the authority the original held, not more.
 $ cortex supervise 1234 --kill-after 30000 --restart
 # pid 1234 has been inside recv for 1588ms — killing it
 # pid 1234 exited with code 137 (signal:SIGKILL)
+# restarted as pid 1240 (role=coder, caps=all)
 
 # If the kernel dies underneath a watcher, the CLI says so — and refuses to
 # pretend the watch finished.
@@ -189,7 +191,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 658 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 663 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

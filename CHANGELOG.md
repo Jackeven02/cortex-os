@@ -42,6 +42,73 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **A replacement is the same agent — not a stronger one.** `cortex supervise
+  <pid> --restart` rebuilds a dead agent from the spec that was persisted when
+  it was born, and that spec carried the role, the module and the memory
+  policies — but not the **authority**. Since a spawn that says nothing about
+  capabilities means *fully privileged* (ABI §4.9), the replacement was born
+  holding everything the original had been carefully denied. Measured on a
+  live kernel, with an agent restricted to `spawn`:
+
+  ```console
+  original:    I am pid 3 and I hold [spawn]
+  replacement: I am pid 4 and I hold [spawn,kill,fork,tool:dangerous,ipc:any,admin]
+  ```
+
+  Nothing said so. The supervisor printed `# restarted as pid 4 (role=limited)`
+  and the agent had quietly become an administrator — "the same agent,
+  restarted" had become "a stronger agent".
+
+  **Two records carry the authority now, and they are not the same kind of
+  record.** The **spec** is the host's *recipe* — what the process was born
+  with: its capability set, the pool it may escalate from, and its budget
+  ceiling. It records `null` for "unnarrowed" rather than flattening that into
+  the full list, because the two are not the same process: an unnarrowed
+  process can `release()` a capability and `acquire()` it back, and one
+  holding an explicit set cannot. The **exit record**
+  (`processes/<pid>/meta.json`) is the **kernel's own fact** — what the
+  process held when it died; `PersistedProcessMeta` is documented as the
+  subset of `ProcessInfo` the kernel persists, and `capabilities` was missing
+  from it, so a process that ran with no capabilities and one that ran with all
+  of them left exactly the same files.
+
+  **The supervisor asks the recipe first and the kernel's fact second.**
+  Replay the spec; if the spec is too old to say, ask the exit record; and if
+  neither can say, take the documented default — full privilege, because that
+  is what a process whose spawner said nothing holds — **and say so**, because
+  a replacement that may be stronger than the one it replaces has to be
+  visible:
+
+  ```console
+  # the spec of pid 14 does not record what it was allowed to do, and it has no exit record that says either
+  #   the replacement holds every capability — the documented default for an agent whose spawner said nothing (docs/ABI.md §4.9).
+  #   if that is more than the original had: 'cortex supervise 14 --restart --restart-as none'
+  # restarted as pid 15 (role=limited, caps=every capability (assumed — nothing could say what the original held)))
+  ```
+
+  **`--restart-as same|full|none`** is the operator's own lever: `same` (the
+  default) replays what the original held, `full` and `none` say it out loud.
+
+  **`cortex ps` grew a CAPS column**, because "what was this agent allowed to
+  do?" used to have no answer in the CLI at all — a process that ran with no
+  capabilities and one that ran with all of them looked identical from the
+  outside.
+
+  **5 smoke checks** (658 → 663), all five reverse-verified: dropping the
+  authority from the spec → the replacement's spec has none; dropping it from
+  the exit record → the record has none; dropping both (which is how the
+  escalation was found) → the replacement comes back holding everything;
+  ignoring `--restart-as none` → the replacement is not held to less; and
+  removing the "assumed" marker → the supervisor no longer says that it had to
+  assume.
+
+  No ABI change: `KERNEL_ABI_VERSION` stays 1.0.0, `ProcessInfo` already
+  carried `capabilities`, and neither the `.crec` nor the `.csnap` format
+  changed. The two paths that create a process and still do *not* carry the
+  authority — `ctx.spawn()` and a cognitive `fork` — are state-model
+  questions, so they are written up (BACKLOG #063) instead of being changed
+  here.
+
 - **`cortex attach <pid>` follows one agent live — and knows how it ended.**
   The command is the operator's seat in front of a single agent, and it was
   the last poller in the CLI: it followed the process's `.crec` **file**,

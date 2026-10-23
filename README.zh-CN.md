@@ -25,8 +25,8 @@ $ cortex spawn --role coder --task "fix issue #42"
 
 # 看进程树
 $ cortex ps
-PID    PPID   ROLE       STATE     TOKENS   AGE
-1234   1      coder      running   12.3k    2m
+PID    PPID   ROLE       STATE     TOKENS   CAPS    AGE
+1234   1      coder      running   12.3k    all     2m
 1235   1234   tester     waiting   0        30s
 1236   1234   reviewer   blocked   2.1k     10s
 
@@ -115,9 +115,11 @@ $ cortex watch --pid 1234
 # 监督一个活着的 agent：卡住就杀掉，再换一个新的上来。
 # "卡住"是从 syscall 日志里读出来的，不是靠沉默判断 ——
 # sleep 是一次声明过的等待，不是停滞。
+# 换上来的是**同一个** agent：它拿到的权限和原来那个一样，不会更多。
 $ cortex supervise 1234 --kill-after 30000 --restart
 # pid 1234 has been inside recv for 1588ms — killing it
 # pid 1234 exited with code 137 (signal:SIGKILL)
+# restarted as pid 1240 (role=coder, caps=all)
 
 # 内核在监视者脚下死掉时，CLI 会说出来 —— 绝不假装"看完了"。
 $ cortex watch
@@ -183,7 +185,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 658 项断言，0 失败
+npx tsx scripts/smoke.ts                # 663 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。

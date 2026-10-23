@@ -492,6 +492,11 @@ export async function bootCliKernel(
           role: birth.role,
           agent: birth.agent,
           memory: birth.memory,
+          // What it was born allowed to do, so a replacement is the same
+          // process and not a stronger one (docs/ABI.md §4.9).
+          capabilities: birth.capabilities,
+          grantable: birth.grantable,
+          budgets: birth.budgets,
           startedAt: birth.startedAt,
           kernelAbiVersion: KERNEL_ABI_VERSION,
         });

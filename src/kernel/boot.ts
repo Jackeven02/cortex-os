@@ -116,6 +116,7 @@ import {
   type AgentSpec,
   asProcessId,
   type BudgetCounters,
+  type BudgetLimits,
   type Capability,
   type ChannelOpenOptions,
   type ChainId,
@@ -240,6 +241,36 @@ export interface ProcessBirth {
   readonly agent: AgentSpec;
   readonly memory: Readonly<Record<string, MemoryRegionPolicy>>;
   readonly startedAt: Timestamp;
+  /**
+   * The capabilities this process was born holding (docs/ABI.md §4.9).
+   *
+   * `null` means **unnarrowed** — it holds everything, because the spawner
+   * said nothing. That is not the same as holding the full set explicitly:
+   * an unnarrowed process can `release()` a capability and `acquire()` it
+   * back, while one holding an explicit set cannot (the kernel's
+   * `release` only keeps the full set grantable for an unnarrowed process).
+   *
+   * The host needs this to *re-create* the process faithfully: a supervisor
+   * that puts a fresh agent in a dead one's place must not hand it more
+   * authority than the one it replaces, or "the same agent, restarted"
+   * becomes "a stronger agent".
+   */
+  readonly capabilities: readonly Capability[] | null;
+  /**
+   * The capabilities this process may raise later with `acquire()`.
+   *
+   * The escalation pool is part of the process's authority too: an agent that
+   * was allowed to escalate for one call should be allowed to escalate again
+   * after a restart.
+   */
+  readonly grantable: readonly Capability[];
+  /**
+   * The budget limits this process was born with (docs/PROCESS.md §10).
+   *
+   * The *limits*, not what is left of them: a restart is a fresh attempt,
+   * and it starts with the same ceiling the original had.
+   */
+  readonly budgets: BudgetLimits;
 }
 
 /**
@@ -659,6 +690,11 @@ export class Kernel {
           agent: entry.agent,
           memory: Object.fromEntries(entry.memoryRegions),
           startedAt: entry.startedAt,
+          // `null` means "unnarrowed" — it holds everything (ABI.md §4.9),
+          // and that is not the same as holding the full set explicitly.
+          capabilities: entry.capabilities === null ? null : [...entry.capabilities],
+          grantable: [...entry.grantable],
+          budgets: { ...entry.budgetsRemaining },
         };
         this.#emit({ kind: 'process-start', pid: birth.pid, ppid: birth.ppid, role: birth.role });
         return onProcessStart?.(birth);

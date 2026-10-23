@@ -459,6 +459,15 @@ export interface PersistedProcessMeta {
   readonly budgetsSpent: BudgetCounters;
   readonly budgetsRemaining: BudgetLimits;
   readonly agent: AgentSpec;
+  /**
+   * The capabilities this process held when it ended (docs/ABI.md §4.9).
+   *
+   * Recorded so the *view* can say what an agent was allowed to do, not just
+   * what it did: a process that ran with no capabilities and a process that
+   * ran with all of them leave the same syscall log, and only this says
+   * which one it was.
+   */
+  readonly capabilities: readonly Capability[];
   readonly kernelAbiVersion: string;
 }
 

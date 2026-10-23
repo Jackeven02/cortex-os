@@ -38,6 +38,22 @@
  * legitimate call: an LLM call that legitimately takes 40 seconds will look
  * exactly like a stuck one at a 30-second threshold.
  *
+ * ## The replacement is the same agent
+ *
+ * `--restart` rebuilds the agent from the spec that was persisted when it was
+ * born. That spec carries the **authority** it was born with — its
+ * capabilities, the pool it may escalate from, its budget ceiling — because a
+ * spawn that says nothing about capabilities means *fully privileged*
+ * (docs/ABI.md §4.9), and a replacement born stronger than the one it
+ * replaces is a different agent, not a restarted one.
+ *
+ * Where the spec cannot say (it was written by a build that did not record
+ * capabilities), the kernel's exit record answers instead: it knows what the
+ * process held when it died. Where neither can say, the documented default is
+ * taken — full privilege — **and the supervisor says that it had to assume**,
+ * because a replacement that may be stronger than the original has to be
+ * visible. `--restart-as same|full|none` is the operator's own lever on that.
+ *
  * ## Exit codes
  *
  * - the supervised process's own exit code (so `cortex supervise 2 || echo
@@ -65,7 +81,9 @@ import {
   type KernelClient,
 } from '../kernel_client.js';
 import { readOpenCall, isStalled, type OpenCall } from '../open_call.js';
-import { asProcessId } from '../../kernel/types.js';
+import { asProcessId, CAPABILITIES, type Capability } from '../../kernel/types.js';
+import { parseSemver } from '../../kernel/driver_registry.js';
+import { readMeta, type ProcessMeta, type ProcessSpec } from '../process_store.js';
 
 /** How often the supervisor looks at its own state, in ms. */
 const POLL_INTERVAL_MS = 250;
@@ -102,6 +120,121 @@ type MsOption =
   | { readonly kind: 'value'; readonly ms: number }
   | { readonly kind: 'invalid' };
 
+/**
+ * What authority a replacement gets.
+ *
+ * - `same` — exactly what the original held. The default, and the only
+ *   answer that keeps "the same agent, restarted" true.
+ * - `full` — the operator says so explicitly.
+ * - `none` — the operator says so explicitly, and the replacement can do
+ *   nothing at all.
+ */
+type RestartAs = 'same' | 'full' | 'none';
+
+/**
+ * The authority a replacement is born with, and how to say it out loud.
+ *
+ * `capabilities: undefined` means **unnarrowed** — the process holds
+ * everything, exactly as a process whose spawner said nothing does. That is
+ * not the same as holding the full list explicitly: `release()` on an
+ * unnarrowed process keeps the full set grantable so `acquire()` can undo it,
+ * while `release()` on an explicit set does not (docs/ABI.md §4.9). A
+ * replacement that only *looks* the same is not the same agent.
+ */
+interface RestartAuthority {
+  readonly capabilities?: readonly Capability[];
+  readonly grantable?: readonly Capability[];
+  /** For the operator's eyes — never parsed. */
+  readonly label: string;
+  /**
+   * True when the authority was **assumed**, not known.
+   *
+   * Nothing could say what the original was allowed to do, so the
+   * replacement gets the documented default — full privilege, because that
+   * is what a process whose spawner said nothing holds (docs/ABI.md §4.9).
+   * The supervisor says so, because a replacement that may be stronger than
+   * the one it replaces is a thing the operator has to be able to see.
+   */
+  readonly assumed?: boolean;
+}
+
+/**
+ * Decide what authority the replacement gets.
+ *
+ * Two sources, and they are not equal:
+ *
+ *   - the **spec** is the host's recipe — what the process was *born* with.
+ *     It is the precise answer, because it also remembers whether the
+ *     process was unnarrowed (`null`) or held an explicit set.
+ *   - the **exit record** is the kernel's own fact — what the process held
+ *     when it died. It is the fallback for a spec written by a build that
+ *     did not record capabilities.
+ *
+ * When neither can say, the replacement gets the documented default (full
+ * privilege) and the supervisor says that it had to assume.
+ */
+export function decideAuthority(
+  spec: ProcessSpec,
+  meta: ProcessMeta | undefined,
+  mode: RestartAs,
+): RestartAuthority {
+  if (mode === 'full') {
+    return { label: 'every capability (the operator asked for it)' };
+  }
+  if (mode === 'none') {
+    return { capabilities: [], grantable: [], label: 'no capability (the operator asked for it)' };
+  }
+
+  // `same`: replay the original's authority exactly.
+  if (spec.capabilities !== undefined) {
+    if (spec.capabilities === null) {
+      // Unnarrowed — it holds everything, and it can drop a capability and
+      // take it back. Passing the full list explicitly would change that.
+      return { label: 'every capability (unnarrowed, as it was)' };
+    }
+    return {
+      capabilities: spec.capabilities,
+      grantable: spec.grantable ?? [],
+      label:
+        spec.capabilities.length === 0 ? 'no capability' : spec.capabilities.join(','),
+    };
+  }
+
+  // The spec cannot say — it was written by a build that did not record
+  // capabilities. The kernel's exit record can: it knows what the process
+  // held when it died.
+  const held = meta?.capabilities;
+  if (held !== undefined) {
+    if (held.length === CAPABILITIES.length) {
+      // Everything: indistinguishable from "unnarrowed", and the more
+      // capable of the two readings (an unnarrowed process can drop a
+      // capability and take it back).
+      return { label: 'every capability (from the kernel exit record)' };
+    }
+    return {
+      capabilities: held,
+      grantable: [],
+      label: held.length === 0 ? 'no capability (from the kernel exit record)' : held.join(','),
+    };
+  }
+
+  // Nothing can say. The documented default for "the spawner said nothing"
+  // is full privilege (docs/ABI.md §4.9) — and it is the default the
+  // original almost certainly had, because narrowing is opt-in. The
+  // supervisor says that it had to assume, because a replacement that may
+  // be stronger than the one it replaces has to be visible.
+  const abi = parseSemver(spec.kernelAbiVersion);
+  if (abi !== null && abi.major < 1) {
+    // The original predates capabilities, so it *could not* have been
+    // narrowed: full privilege is not an assumption here, it is a fact.
+    return { label: 'every capability (the original predates capabilities)' };
+  }
+  return {
+    label: 'every capability (assumed — nothing could say what the original held)',
+    assumed: true,
+  };
+}
+
 export async function cmdSupervise(args: string[]): Promise<number> {
   const { positionals, values } = parseArgs({
     args,
@@ -112,6 +245,7 @@ export async function cmdSupervise(args: string[]): Promise<number> {
       'max-restarts': { type: 'string', default: '5' },
       'backoff-ms': { type: 'string', default: '1000' },
       'timeout-ms': { type: 'string', default: '0' },
+      'restart-as': { type: 'string' },
     },
     allowPositionals: true,
   });
@@ -151,6 +285,21 @@ export async function cmdSupervise(args: string[]): Promise<number> {
 
   if (killAfterMs === null && values.restart !== true) {
     console.error('cortex supervise: nothing to do — pass --kill-after <ms> and/or --restart');
+    return 1;
+  }
+
+  // `--restart-as` only means something together with `--restart`. Accepting
+  // it alone would turn a mistyped command line into a silent no-op.
+  const restartAs = parseRestartAs(values['restart-as']);
+  if (restartAs === undefined) {
+    console.error(
+      `cortex supervise: invalid --restart-as: '${values['restart-as']}' ` +
+        `(expected same, full or none)`,
+    );
+    return 1;
+  }
+  if (values['restart-as'] !== undefined && values.restart !== true) {
+    console.error('cortex supervise: --restart-as only applies together with --restart');
     return 1;
   }
 
@@ -208,6 +357,11 @@ export async function cmdSupervise(args: string[]): Promise<number> {
   }
   if (values.restart === true) {
     console.log(`# restart it when it ends (at most ${restartLimit} time(s))`);
+    if (restartAs === 'same') {
+      console.log('# the replacement gets the authority the original had, as far as it is known');
+    } else {
+      console.log(`# the replacement gets ${restartAs === 'full' ? 'every capability' : 'no capability'}`);
+    }
   }
 
   let currentPid = pid;
@@ -401,21 +555,54 @@ export async function cmdSupervise(args: string[]): Promise<number> {
         if (spec === undefined) {
           console.error(
             `# cannot restart pid ${currentPid}: its spec was never persisted ` +
-              `(no ${currentPid}.spec.json in ${dir})`,
+              `(no spec.json under ${dir}/processes/${currentPid}/)`,
           );
           exitCode = ended.code ?? 1;
           break;
+        }
+        // A replacement must be the *same* agent. The spec carries what the
+        // original was born allowed to do — its capabilities, the pool it may
+        // escalate from, and its budget ceiling — because a spawn that says
+        // nothing means "fully privileged", and a replacement that was born
+        // silently promoted would be a different agent in every way that
+        // matters (docs/ABI.md §4.9).
+        const authority = decideAuthority(spec, readMeta(dir, asProcessId(currentPid)), restartAs);
+        if (authority.assumed === true) {
+          // Say it. A replacement that may be stronger than the one it
+          // replaces is a thing the operator has to be able to see — and
+          // the way to make it not happen is `--restart-as none`.
+          console.error(
+            `# the spec of pid ${currentPid} does not record what it was allowed to do, ` +
+              `and it has no exit record that says either`,
+          );
+          console.error(
+            `#   the replacement holds every capability — the documented default for an ` +
+              `agent whose spawner said nothing (docs/ABI.md §4.9).`,
+          );
+          console.error(
+            `#   if that is more than the original had: ` +
+              `'cortex supervise ${currentPid} --restart --restart-as none'`,
+          );
         }
         try {
           const spawned = await client.request<{ pid: number }>('spawn', {
             role: spec.role,
             agent: spec.agent,
             ...(spec.memory !== undefined ? { memory: spec.memory } : {}),
+            ...(authority.capabilities !== undefined
+              ? { capabilities: authority.capabilities }
+              : {}),
+            ...(authority.grantable !== undefined
+              ? { grantable: authority.grantable }
+              : {}),
+            ...(spec.budgets !== undefined ? { budgets: spec.budgets } : {}),
           });
           currentPid = spawned.pid;
           intervened = false;
           openCall = undefined;
-          console.log(`# restarted as pid ${currentPid} (role=${spec.role})`);
+          console.log(
+            `# restarted as pid ${currentPid} (role=${spec.role}, caps=${authority.label})`,
+          );
           continue;
         } catch (err) {
           if (err instanceof KernelCommandError) {
@@ -439,6 +626,19 @@ export async function cmdSupervise(args: string[]): Promise<number> {
   }
 
   return exitCode;
+}
+
+/**
+ * Parse the `--restart-as` policy.
+ *
+ * Absent means `same` — the replacement is the original agent, with the
+ * authority it had. Anything else is a policy the operator has to spell out.
+ */
+function parseRestartAs(raw: string | undefined): RestartAs | undefined {
+  if (raw === undefined) return 'same';
+  const value = raw.trim().toLowerCase();
+  if (value === 'same' || value === 'full' || value === 'none') return value;
+  return undefined;
 }
 
 /**
@@ -482,6 +682,15 @@ OPTIONS
   --backoff-ms <ms>    Wait this long before a restart (default 1000).
   --timeout-ms <ms>    Stop supervising after <ms> (default 0 = until it ends
                        or you interrupt).
+  --restart-as <mode>  What authority a replacement gets (default 'same'):
+                         same  exactly what the original held
+                         full  every capability
+                         none  no capability at all
+                       'same' replays what the original held — from its spec,
+                       or from the kernel's exit record when the spec is too
+                       old to say. If neither can say, the replacement gets
+                       the documented default (every capability) and the
+                       supervisor says that it had to assume.
   -h, --help           Show this help
 
 NOTES

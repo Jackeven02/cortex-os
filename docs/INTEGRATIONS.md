@@ -135,10 +135,10 @@ Afterwards the run is an ordinary cortex process:
 
 ```
 $ cortex ps
-PID     PPID    ROLE          STATE         TOKENS    AGE
----------------------------------------------------------
-1       -       init          running       0         0ms
-2       1       demo          zombie        0         5s
+PID     PPID    ROLE          STATE         TOKENS    CAPS              AGE
+---------------------------------------------------------------
+1       -       init          running       0         all               0ms
+2       1       demo          zombie        0         all               5s
 
 $ cortex trace 2
 time                  pid    syscall           phase   duration  reversibility

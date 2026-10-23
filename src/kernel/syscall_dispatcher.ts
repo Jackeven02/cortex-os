@@ -1444,6 +1444,8 @@ export class SyscallDispatcher {
       budgetsSpent: { ...entry.budgetsSpent },
       budgetsRemaining: { ...entry.budgetsRemaining },
       agent: entry.agent,
+      // What it was allowed to do, so the view can say so (docs/ABI.md §4.9).
+      capabilities: entry.capabilities === null ? DEFAULT_CAPABILITIES : [...entry.capabilities],
       kernelAbiVersion: this.kernelAbiVersion,
     };
     try {

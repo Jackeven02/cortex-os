@@ -515,7 +515,7 @@ For v0, **only install drivers you trust**. Same advice as npm packages generall
 
 **Why the process directory is also the PID's claim.** A state directory can host more than one kernel — `cortex daemon run` keeps one alive there while other `cortex` invocations work in the same directory — and each kernel counts PIDs up from its own seed. The directory is created with an *exclusive* `mkdir`, so exactly one kernel can win a given PID. Without it, the two counters walk into each other and the loser opens the winner's `log.crec` in append mode: two unrelated processes sharing one syscall log, silently. See §12.1.
 
-**What `spec.json` holds, and why it is written so early.** The role, the agent spec, and the memory region policies a process was created with — the facts a restore needs to rebuild it, and the facts the `.csnap` body deliberately omits (STATE.md §4). It is written when the process is **created**, not when it exits: `meta.json` (which carries the same facts) is written at exit, so a snapshot of an agent that was still running when its kernel died would have had no spec anywhere on disk and could not be restored in a later session. The kernel reports the birth (`KernelOptions.onProcessStart`) and the CLI decides what to write; the kernel itself never touches the disk layout.
+**What `spec.json` holds, and why it is written so early.** The role, the agent spec, the memory region policies a process was created with, and the authority it was born with — its capability set, the pool it may escalate from, and its budget ceiling. The first three are the facts a restore needs to rebuild it, and the facts the `.csnap` body deliberately omits (STATE.md §4); the last three are the facts a *replacement* needs to be the same process rather than a stronger one (ABI §4.9, §12.1 below). It is written when the process is **created**, not when it exits: `meta.json` (which carries the same facts) is written at exit, so a snapshot of an agent that was still running when its kernel died would have had no spec anywhere on disk and could not be restored in a later session. The kernel reports the birth (`KernelOptions.onProcessStart`) and the CLI decides what to write; the kernel itself never touches the disk layout.
 
 **What `output.log` holds, and why it is a separate file.** The `.crec` log
 records what a process **did** — its syscalls, with arguments and results. It
@@ -1145,6 +1145,60 @@ exited or another kernel owns it — the file path is used, exactly as before.
 The header says which one is running, because "it is following something" and
 "it is following something *now*" are different promises.
 
+**And the replacement was the same agent.** `cortex supervise --restart` puts a
+fresh agent in a dead one's place, rebuilt from the spec that was persisted
+when it was born (`processes/<pid>/spec.json`). That spec carried the role,
+the module and the memory policies — but not the **authority**. And a spawn
+that says nothing about capabilities means *fully privileged* (ABI §4.9), so
+the replacement was born with everything the original had been carefully
+denied. Measured, on a live kernel, with an agent restricted to `spawn`:
+
+```
+original:   I am pid 3 and I hold [spawn]
+replacement: I am pid 4 and I hold [spawn,kill,fork,tool:dangerous,ipc:any,admin]
+```
+
+Nothing said so. The supervisor printed `# restarted as pid 4 (role=limited)`
+and the agent had quietly become an administrator. "The same agent, restarted"
+had become "a stronger agent".
+
+Two records carry the authority now, and they are not the same kind of record:
+
+- The **spec** is the host's *recipe* — what the process was **born** with:
+  its capability set, the pool it may escalate from, and its budget ceiling.
+  It records `null` for "unnarrowed" rather than flattening that into the
+  full list, because the two are not the same process: an unnarrowed process
+  can `release()` a capability and `acquire()` it back, and one holding an
+  explicit set cannot (ABI §4.9). A replacement that only *looks* the same is
+  not the same agent.
+- The **exit record** (`processes/<pid>/meta.json`) is the **kernel's own
+  fact** — what the process held when it died. `PersistedProcessMeta` is
+  documented as the subset of `ProcessInfo` the kernel persists, and
+  `capabilities` was missing from it: a process that ran with no capabilities
+  and one that ran with all of them left exactly the same files.
+
+The supervisor's rule is to ask the recipe first and the kernel's fact second:
+replay the spec; if the spec is too old to say (written by a build that did
+not record capabilities), ask the exit record; and if neither can say, take
+the documented default — full privilege, because that is what a process whose
+spawner said nothing holds — **and say so**. The assumption is printed, in
+the place the operator is already looking:
+
+```console
+$ cortex supervise 14 --restart
+# the spec of pid 14 does not record what it was allowed to do, and it has no exit record that says either
+#   the replacement holds every capability — the documented default for an agent whose spawner said nothing (docs/ABI.md §4.9).
+#   if that is more than the original had: 'cortex supervise 14 --restart --restart-as none'
+# restarted as pid 15 (role=limited, caps=every capability (assumed — nothing could say what the original held))
+```
+
+`--restart-as same|full|none` is the operator's own lever on that last step:
+`same` (the default) replays what the original held, `full` and `none` say
+it out loud. And `cortex ps` grew a **CAPS** column, because the question
+"what was this agent allowed to do?" used to have no answer in the CLI at
+all — a process that ran with no capabilities and one that ran with all of
+them looked identical from the outside.
+
 **Known limits (v0).**
 
 - **Watching is still not reacting — for a *host*.** The transport carries a
@@ -1199,6 +1253,18 @@ The header says which one is running, because "it is following something" and
   `cortex spawn --live` opts into the live one. Either way the two kernels
   can share a directory, which is why the PID claim exists (§7): the claim
   keeps them off each other's PIDs and off each other's logs.
+- **Only the supervisor's replacement inherits the authority.** The paths that
+  *create* a process are three, and only one of them now carries the
+  authority across: `cortex supervise --restart` replays it (this section), and
+  the kernel's own daemon restart re-allocates from the `DaemonSpec`, which
+  has no capabilities at all — harmless today only because
+  `cortex daemon install` has no `--cap` either. The other two are **open
+  questions, not bugs**: `ctx.spawn()` lets the caller choose the child's
+  capabilities without reference to its own (ABI §4.9 says a capability cannot
+  be delegated, but does not say what a child may hold), and a cognitive
+  `fork` allocates its child with no capabilities at all — so it comes back
+  fully privileged. Both are state-model questions, so they are written up
+  (BACKLOG #063) instead of being changed here.
 - **A snapshot does not carry its agent's spec.** The `.csnap` body holds the
   process image — state, memory, budgets, lineage — and deliberately not the
   role/agent spec, which is why a restore needs a context (the kernel's

@@ -37,7 +37,7 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, unlinkSync, mkdirSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
-import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy, type BlockedReason } from '../kernel/types.js';
+import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy, type BlockedReason, type Capability, CAPABILITIES } from '../kernel/types.js';
 import { readRecords, existingCrecPath } from '../kernel/recorder.js';
 
 // =============================================================================
@@ -63,6 +63,20 @@ export interface ProcessSpec {
   readonly role: string;
   readonly agent: AgentSpec;
   readonly memory?: Readonly<Record<string, MemoryRegionPolicy>>;
+  /**
+   * The capabilities the process was born holding (docs/ABI.md §4.9).
+   *
+   * `null` means **unnarrowed** — the spawner said nothing, so the process
+   * holds everything. Persisted so a *replacement* is the same process and
+   * not a stronger one: the supervisor's `--restart` rebuilds the agent from
+   * this spec, and a spec without the capabilities would rebuild it fully
+   * privileged.
+   */
+  readonly capabilities?: readonly Capability[] | null;
+  /** The capabilities it may raise later with `acquire()`. */
+  readonly grantable?: readonly Capability[];
+  /** The budget limits it was born with. */
+  readonly budgets?: BudgetLimits;
   readonly startedAt: string;
   readonly kernelAbiVersion: string;
 }
@@ -95,6 +109,15 @@ export interface ProcessMeta {
    * "not blocked", or written by an older build that did not record it.
    */
   readonly blockedOn?: BlockedReason | null;
+  /**
+   * The capabilities this process held while it ran (docs/ABI.md §4.9).
+   *
+   * Persisted so the read-only views can say **what an agent was allowed to
+   * do**, not only what it did: a process that ran with no capabilities and
+   * one that ran with all of them leave the same syscall log. Optional:
+   * absent means "written by a build that did not record it".
+   */
+  readonly capabilities?: readonly Capability[];
   readonly kernelAbiVersion: string;
 }
 
@@ -226,6 +249,57 @@ export function writeSpec(dir: string, spec: ProcessSpec): void {
 }
 
 /**
+ * Read a persisted capability list back.
+ *
+ * Three outcomes, and the middle one matters:
+ *
+ *   - `null` — the file says the process was **unnarrowed** (it holds
+ *     everything). Distinct from "not recorded", because an unnarrowed
+ *     process can `release()` a capability and take it back, while a process
+ *     holding an explicit set cannot (docs/ABI.md §4.9).
+ *   - `undefined` — the file cannot say: the field is absent (a spec written
+ *     by a build that did not record capabilities) **or** it is malformed.
+ *     Both mean the same thing to a caller, and turning a corrupt list into
+ *     "everything" would be the one answer that is always wrong.
+ */
+function readCapabilities(raw: unknown): readonly Capability[] | null | undefined {
+  if (raw === null) return null;
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) return undefined;
+  const out: Capability[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'string') return undefined;
+    if (!(CAPABILITIES as readonly string[]).includes(item)) return undefined;
+    const cap = item as Capability;
+    if (!out.includes(cap)) out.push(cap);
+  }
+  return out;
+}
+
+/**
+ * Read persisted budget limits back, with the same rule: a file that cannot
+ * be read exactly is a file that says nothing.
+ */
+function readBudgets(raw: unknown): BudgetLimits | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const tokens = r['tokens'];
+  const usd = r['usd'];
+  const wallTimeMs = r['wallTimeMs'];
+  if (
+    typeof tokens !== 'number' ||
+    typeof usd !== 'number' ||
+    typeof wallTimeMs !== 'number' ||
+    !Number.isFinite(tokens) ||
+    !Number.isFinite(usd) ||
+    !Number.isFinite(wallTimeMs)
+  ) {
+    return undefined;
+  }
+  return { tokens, usd, wallTimeMs };
+}
+
+/**
  * Read a process's spec back.
  *
  * Returns `undefined` when there is none — an older home, a process created
@@ -246,12 +320,23 @@ export function readSpec(dir: string, pid: ProcessId): ProcessSpec | undefined {
   if (typeof r.role !== 'string' || typeof r.agent !== 'object' || r.agent === null) {
     return undefined;
   }
+  // The authority the process was born with. It has to survive the round
+  // trip: a supervisor that rebuilds the agent from this spec must not hand
+  // it more power than the one it replaces (docs/ABI.md §4.9).
+  const capabilities = readCapabilities(r.capabilities);
+  // `grantable` is only meaningful next to a capability list — a process
+  // that is unnarrowed has no escalation pool to speak of.
+  const grantable = readCapabilities(r.grantable);
+  const budgets = readBudgets(r.budgets);
   return {
     pid: unbrand(pid),
     ppid: typeof r.ppid === 'number' ? r.ppid : null,
     role: r.role,
     agent: r.agent as AgentSpec,
     ...(r.memory !== undefined ? { memory: r.memory } : {}),
+    ...(capabilities !== undefined ? { capabilities } : {}),
+    ...(grantable !== null && grantable !== undefined ? { grantable } : {}),
+    ...(budgets !== undefined ? { budgets } : {}),
     startedAt: typeof r.startedAt === 'string' ? r.startedAt : '',
     kernelAbiVersion: typeof r.kernelAbiVersion === 'string' ? r.kernelAbiVersion : '',
   };

@@ -246,7 +246,7 @@ import { cmdLogs } from '../src/cli/commands/logs.js';
 import { cmdMemory } from '../src/cli/commands/memory.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
-import { cmdSupervise } from '../src/cli/commands/supervise.js';
+import { cmdSupervise, decideAuthority } from '../src/cli/commands/supervise.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import { cmdTop } from '../src/cli/commands/top.js';
 import {
@@ -290,6 +290,7 @@ import {
   outputPath,
   readOutput,
   type ProcessMeta,
+  type ProcessSpec,
 } from '../src/cli/process_store.js';
 
 import {
@@ -13132,6 +13133,341 @@ async function runSuperviseChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Capability inheritance checks (#063)
+// =============================================================================
+
+/**
+ * A replacement must be the *same* agent.
+ *
+ * `cortex supervise --restart` rebuilds a dead agent from the spec that was
+ * persisted when it was born. That spec used to carry only the role, the
+ * module and the memory policies — so a restricted agent came back holding
+ * **every** capability, and the supervisor said nothing about it: "the same
+ * agent, restarted" quietly became "a stronger agent".
+ *
+ * These checks pin the whole chain: the host persists the authority, the
+ * spec reads it back, the exit record says what the agent could do, the
+ * supervisor's replacement is no stronger than the one it replaces — and a
+ * spec that *cannot* say is refused rather than guessed at.
+ */
+async function runCapabilityInheritanceChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, writeFileSync, readFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-caps-'));
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevLog = console.log;
+  const prevErr = console.error;
+
+  // An agent that ends on its own, so a supervisor has something to replace.
+  // It also says what it holds — the agent's own view of its authority.
+  const modulePath = join(tmp, 'short-agent.ts');
+  writeFileSync(
+    modulePath,
+    'export default async function shortAgent(ctx: any): Promise<void> {\n' +
+      "  console.log(`I hold [${ctx.caps().join(',')}]`);\n" +
+      '  await ctx.sleep(150);\n' +
+      "  ctx.exit(7, 'done on purpose');\n" +
+      '}\n',
+    'utf8',
+  );
+
+  /** Run a command with its stdout and stderr captured. */
+  const capture = async (
+    run: () => Promise<number>,
+  ): Promise<{ code: number; out: string; err: string }> => {
+    let out = '';
+    let err = '';
+    const prevWrite = process.stdout.write;
+    process.stdout.write = ((chunk: unknown): boolean => {
+      out += String(chunk);
+      return true;
+    }) as unknown as typeof process.stdout.write;
+    console.error = (...parts: unknown[]): void => {
+      err += parts.map((p) => String(p)).join(' ') + '\n';
+    };
+    try {
+      const code = await run();
+      return { code, out, err };
+    } finally {
+      process.stdout.write = prevWrite;
+      console.error = prevErr;
+    }
+  };
+
+  /** Wait until a process's exit record lands on disk. */
+  const waitForMeta = async (
+    pid: number,
+    timeoutMs = 5000,
+  ): Promise<ProcessMeta | undefined> => {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      const meta = readMeta(tmp, asProcessId(pid));
+      if (meta !== undefined) return meta;
+      if (Date.now() > deadline) return undefined;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  };
+
+  try {
+    await checkAsync("a process's spec remembers the authority it was born with", async () => {
+      const kernel = await bootCliKernel(tmp);
+      try {
+        const pid = unbrand(
+          await kernel.spawn({
+            role: 'limited',
+            agent: { module: pathToFileURL(modulePath).href },
+            capabilities: ['spawn'],
+          }),
+        );
+        const spec = readSpec(tmp, asProcessId(pid));
+        assert(spec !== undefined, 'the spec was persisted when the process was born');
+        const caps = spec!.capabilities;
+        assert(
+          caps !== undefined && caps !== null && caps.length === 1 && caps[0] === 'spawn',
+          `the spec records the narrowed capability set, got: ${JSON.stringify(caps)}`,
+        );
+        assert(
+          spec!.grantable !== undefined && spec!.grantable.length === 0,
+          `the spec records the escalation pool, got: ${JSON.stringify(spec!.grantable)}`,
+        );
+        assert(
+          spec!.budgets !== undefined,
+          'the spec records the budget ceiling it was born with',
+        );
+        // The file itself, not just the reader: a spec that cannot say what
+        // the process could do is a spec that cannot replace it.
+        const raw = JSON.parse(readFileSync(specPath(tmp, asProcessId(pid)), 'utf8'));
+        assert(
+          Array.isArray(raw.capabilities) && raw.capabilities[0] === 'spawn',
+          `the spec on disk carries the capability set, got: ${JSON.stringify(raw.capabilities)}`,
+        );
+      } finally {
+        await kernel.shutdown();
+      }
+    });
+
+    await checkAsync('the exit record says what the agent was allowed to do', async () => {
+      const kernel = await bootCliKernel(tmp);
+      try {
+        const pid = unbrand(
+          await kernel.spawn({
+            role: 'limited',
+            agent: { module: pathToFileURL(modulePath).href },
+            capabilities: ['spawn'],
+          }),
+        );
+        const meta = await waitForMeta(pid);
+        assert(meta !== undefined, 'the exit record was written');
+        assert(
+          meta!.capabilities !== undefined &&
+            meta!.capabilities.length === 1 &&
+            meta!.capabilities[0] === 'spawn',
+          `the exit record carries the capability set, got: ${JSON.stringify(meta!.capabilities)}`,
+        );
+      } finally {
+        await kernel.shutdown();
+      }
+    });
+
+    await checkAsync('a replacement is the same agent, not a stronger one', async () => {
+      const kernel = await bootCliKernel(tmp);
+      const server = await startKernelServer(kernel, { log: () => {} });
+      try {
+        writeEndpoint(tmp, server.endpoint);
+        process.env['CORTEX_HOME'] = tmp;
+        const probe = await probeKernel(tmp);
+        assert(probe.kind === 'live', `the kernel is reachable, got ${probe.kind}`);
+        const client = probe.kind === 'live' ? probe.client : undefined;
+
+        const spawned = await client!.request<{ pid: number }>('spawn', {
+          role: 'limited',
+          agent: { module: pathToFileURL(modulePath).href },
+          capabilities: ['spawn'],
+        });
+        const originalPid = spawned.pid;
+
+        const result = await capture(() =>
+          cmdSupervise([
+            String(originalPid),
+            '--restart',
+            '--max-restarts',
+            '1',
+            '--backoff-ms',
+            '0',
+          ]),
+        );
+        assert(
+          result.out.includes('caps=spawn'),
+          `the supervisor said what the replacement may do, got: ${result.out}`,
+        );
+        const restarted = /# restarted as pid (\d+)/.exec(result.out);
+        assert(restarted !== null, `the supervisor replaced the agent, got: ${result.out}`);
+        const newPid = Number(restarted![1]);
+
+        // The kernel's own record of the replacement says what it held. (The
+        // process table cannot answer this: a short agent is reaped and gone
+        // from the table by the time the supervisor is finished, and the
+        // record that outlives it is the one written on the way out.)
+        const meta = await waitForMeta(newPid);
+        assert(meta !== undefined, 'the replacement wrote its exit record');
+        assert(
+          meta!.capabilities !== undefined &&
+            meta!.capabilities.length === 1 &&
+            meta!.capabilities[0] === 'spawn',
+          `the replacement held exactly what the original held, got: ${JSON.stringify(meta!.capabilities)}`,
+        );
+        // And the spec it was born with says so too — that is what the *next*
+        // replacement will be built from.
+        const spec = readSpec(tmp, asProcessId(newPid));
+        assert(spec !== undefined, 'the replacement has a spec of its own');
+        const caps = spec!.capabilities;
+        assert(
+          caps !== undefined && caps !== null && caps.length === 1 && caps[0] === 'spawn',
+          `the replacement's spec records the same authority, got: ${JSON.stringify(caps)}`,
+        );
+        client!.close();
+      } finally {
+        await server.close();
+        await kernel.shutdown();
+      }
+    });
+
+    await checkAsync('the operator can hold the replacement to less', async () => {
+      const kernel = await bootCliKernel(tmp);
+      const server = await startKernelServer(kernel, { log: () => {} });
+      try {
+        writeEndpoint(tmp, server.endpoint);
+        process.env['CORTEX_HOME'] = tmp;
+        const probe = await probeKernel(tmp);
+        assert(probe.kind === 'live', `the kernel is reachable, got ${probe.kind}`);
+        const client = probe.kind === 'live' ? probe.client : undefined;
+
+        const spawned = await client!.request<{ pid: number }>('spawn', {
+          role: 'limited',
+          agent: { module: pathToFileURL(modulePath).href },
+          capabilities: ['spawn'],
+        });
+
+        const result = await capture(() =>
+          cmdSupervise([
+            String(spawned.pid),
+            '--restart',
+            '--restart-as',
+            'none',
+            '--max-restarts',
+            '1',
+            '--backoff-ms',
+            '0',
+          ]),
+        );
+        assert(
+          result.out.includes('caps=no capability'),
+          `the supervisor said what it did, got: ${result.out}`,
+        );
+        const restarted = /# restarted as pid (\d+)/.exec(result.out);
+        assert(restarted !== null, `the agent was replaced, got: ${result.out}`);
+        const meta = await waitForMeta(Number(restarted![1]));
+        assert(meta !== undefined, 'the replacement wrote its exit record');
+        assert(
+          meta!.capabilities !== undefined && meta!.capabilities.length === 0,
+          `the replacement holds nothing, got: ${JSON.stringify(meta!.capabilities)}`,
+        );
+        client!.close();
+      } finally {
+        await server.close();
+        await kernel.shutdown();
+      }
+    });
+
+    await checkAsync('the supervisor says so when it has to assume the authority', async () => {
+      // A spec written by a build that did not record capabilities, and no
+      // exit record to fall back on. Nothing can say what the agent was
+      // allowed to do — so the replacement gets the documented default, and
+      // the supervisor says that it had to assume.
+      const spec: ProcessSpec = {
+        pid: 2,
+        ppid: 1,
+        role: 'limited',
+        agent: { module: 'file:///nowhere.ts' },
+        startedAt: '2026-01-01T00:00:00.000Z',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      };
+      const assumed = decideAuthority(spec, undefined, 'same');
+      assert(
+        assumed.assumed === true,
+        'the decision is marked as an assumption, not a fact',
+      );
+      assert(
+        assumed.capabilities === undefined,
+        'the replacement is unnarrowed — the documented default',
+      );
+      assert(
+        decideAuthority(spec, undefined, 'full')?.assumed !== true,
+        'the operator can still insist on full privileges',
+      );
+      assert(
+        decideAuthority(spec, undefined, 'none')?.capabilities?.length === 0,
+        'the operator can still insist on no privileges',
+      );
+
+      // The kernel's exit record is the fallback for a spec that cannot say.
+      const meta = {
+        pid: 2,
+        ppid: 1,
+        pgid: 1,
+        role: 'limited',
+        state: 'zombie',
+        exitCode: 7,
+        exitReason: 'done',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        lastTransitionAt: '2026-01-01T00:00:01.000Z',
+        budgetsSpent: {
+          tokensIn: 0,
+          tokensOut: 0,
+          tokensCached: 0,
+          usdSpent: 0,
+          wallTimeMs: 0,
+          syscallCount: 0,
+        },
+        budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+        agent: { module: 'file:///nowhere.ts' },
+        capabilities: ['spawn'],
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      } as unknown as ProcessMeta;
+      const fromRecord = decideAuthority(spec, meta, 'same');
+      assert(
+        fromRecord.assumed !== true &&
+          fromRecord.capabilities?.length === 1 &&
+          fromRecord.capabilities[0] === 'spawn',
+        `the kernel's exit record answers what the spec cannot, got: ${JSON.stringify(fromRecord.capabilities)}`,
+      );
+
+      // And a spec that *can* say wins over the exit record: it remembers
+      // whether the process was unnarrowed, which the record cannot.
+      const withCaps: ProcessSpec = { ...spec, capabilities: ['kill'] };
+      const decided = decideAuthority(withCaps, meta, 'same');
+      assert(
+        decided.capabilities?.length === 1 && decided.capabilities[0] === 'kill',
+        `the spec is the recipe, got: ${JSON.stringify(decided.capabilities)}`,
+      );
+      const unnarrowed: ProcessSpec = { ...spec, capabilities: null };
+      assert(
+        decideAuthority(unnarrowed, meta, 'same').capabilities === undefined,
+        'an unnarrowed process stays unnarrowed',
+      );
+    });
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // `cortex top` checks (#059)
 // =============================================================================
 
@@ -14858,6 +15194,7 @@ await runMemoryInspectChecks();
 await runHostWaitChecks();
 await runEventStreamChecks();
 await runSuperviseChecks();
+await runCapabilityInheritanceChecks();
 await runTopChecks();
 await runKernelGoneChecks();
 await runDaemonChecks();

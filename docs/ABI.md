@@ -532,6 +532,30 @@ A process has two sets:
 
 **Default is full privilege, not least privilege.** A process whose spawner said nothing holds every capability. This is the compatibility decision, stated plainly: every agent, example and smoke check written before `1.0` predates capabilities, and defaulting to empty would turn all of them into `EPERM` traps on upgrade. Least privilege is opt-in — pass `capabilities` (and optionally `grantable`) to `spawn`.
 
+#### Where the authority is recorded
+
+Two records, and they answer different questions:
+
+- The **exit record** — what the kernel persists when a process dies
+  (`PersistedProcessMeta`, the subset of `ProcessInfo` it writes to
+  `processes/<pid>/meta.json`). It is the kernel's own fact: *what this
+  process held when it ended*. `capabilities` is part of it, because a
+  process that ran with no capabilities and one that ran with all of them
+  leave the same syscall log, and only this says which one it was.
+- The **spec** — what the host persists when a process is *born*
+  (`processes/<pid>/spec.json`): the capability set, the escalation pool and
+  the budget ceiling. It is the host's *recipe*, and it records `null` for
+  "unnarrowed" rather than flattening that into the full list: an unnarrowed
+  process can `release()` a capability and `acquire()` it back, and one
+  holding an explicit set cannot.
+
+Neither record changes what a syscall means — this is host bookkeeping around
+the model above, not a change to it. What it buys is that a process which is
+*re-created* (the supervisor's `--restart`) can be re-created as the same
+process rather than as a stronger one: the replacement replays the spec, and
+falls back to the kernel's exit record when the spec is too old to say. See
+docs/ARCHITECTURE.md §12.1.
+
 #### What each capability gates
 
 | Capability | Gates | Not required for |

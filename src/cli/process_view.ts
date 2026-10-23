@@ -35,6 +35,7 @@ import {
   type BlockedReason,
   type BudgetCounters,
   type BudgetLimits,
+  type Capability,
   type ProcessState,
 } from '../kernel/types.js';
 
@@ -72,6 +73,15 @@ export interface ProcessRow {
   readonly budgetsSpent: BudgetCounters;
   readonly budgetsRemaining: BudgetLimits;
   readonly blockedOn?: BlockedReason | null;
+  /**
+   * What this process was allowed to do (docs/ABI.md §4.9).
+   *
+   * Absent means *not recorded* — a `meta.json` written before the kernel
+   * started persisting capabilities. It does **not** mean "everything": a row
+   * that says nothing is a row that says nothing, and the view must not turn
+   * silence into a claim.
+   */
+  readonly capabilities?: readonly Capability[];
   /**
    * Whether the kernel still has this process.
    *
@@ -133,6 +143,8 @@ interface LiveProcessInfo {
   readonly budgetsSpent: BudgetCounters;
   readonly exitCode: number | null;
   readonly exitReason: string | null;
+  /** What it holds right now (docs/ABI.md §4.9). */
+  readonly capabilities: readonly Capability[];
 }
 
 function rowFromMeta(meta: ProcessMeta): ProcessRow {
@@ -149,6 +161,7 @@ function rowFromMeta(meta: ProcessMeta): ProcessRow {
     budgetsSpent: meta.budgetsSpent,
     budgetsRemaining: meta.budgetsRemaining,
     ...(meta.blockedOn !== undefined ? { blockedOn: meta.blockedOn } : {}),
+    ...(meta.capabilities !== undefined ? { capabilities: meta.capabilities } : {}),
     live: false,
   };
 }
@@ -167,6 +180,7 @@ function rowFromLive(info: LiveProcessInfo): ProcessRow {
     budgetsSpent: info.budgetsSpent,
     budgetsRemaining: info.budgetsRemaining,
     blockedOn: info.blockedOn,
+    capabilities: info.capabilities,
     live: true,
   };
 }
