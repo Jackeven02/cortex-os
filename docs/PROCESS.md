@@ -324,6 +324,16 @@ not exited in time (`timeoutMs: 0` polls without parking). The child is *not*
 killed — a timeout is an observation; the supervisor decides what to do about
 it, with `kill()` and a fresh `spawn()`. See ABI.md §4.1.
 
+**A host is not a parent.** `wait` is a parent-child syscall: the kernel parks
+the caller, and when the child exits it wakes the caller's run queue. A process
+started *on a host's behalf* is a child of `init`, not of the host — so a host
+that waits through the dispatcher (`dispatcher.invoke(asProcessId(1), 'wait',
+…)`) waits forever, because the caller it names is init, and init does not wait
+on its own children the way a parent does. The host-facing primitive is
+`Kernel.awaitExit(pid, { timeoutMs })`: it resolves with the exit code, it
+still answers for a process that has already been reaped, and it refuses a pid
+the kernel has never known with `ESRCH` (docs/HACKING.md §7).
+
 ---
 
 ## 7. Signals

@@ -241,6 +241,26 @@ export interface ProcessBirth {
   readonly startedAt: Timestamp;
 }
 
+/**
+ * How a process ended.
+ *
+ * The exit code and reason are the same facts `KernelOptions.onProcessExit`
+ * reports and the same ones the CLI persists to `meta.json` — one truth, three
+ * ways to reach it. `exitCode` is `null` when the process died without
+ * recording an exit (a hard crash), and `exitReason` says so.
+ */
+export interface ProcessExit {
+  readonly pid: number;
+  readonly exitCode: number | null;
+  readonly exitReason: string | null;
+}
+
+/** One host waiting for a process to end. */
+interface ExitWaiter {
+  readonly resolve: (exit: ProcessExit | undefined) => void;
+  timer: ReturnType<typeof setTimeout> | undefined;
+}
+
 export interface KernelOptions {
   /** Written into every `.crec` / `.csnap` record. Required (no silent default). */
   readonly kernelAbiVersion: string;
@@ -491,6 +511,15 @@ export class Kernel {
   #launched = new Set<number>();
   /** pid → spec metadata, surviving reap, so `restore` can rebuild an agent. */
   #processMeta = new Map<number, ProcessMeta>();
+  /**
+   * pid → how it ended. The table entry is reaped at the ZOMBIE transition,
+   * but the *facts* of the exit outlive it — so a host that asks about a
+   * process that has already died still gets the real exit code. See
+   * `awaitExit`.
+   */
+  #exits = new Map<number, ProcessExit>();
+  /** pid → the hosts waiting for it to end. */
+  #exitWaiters = new Map<number, ExitWaiter[]>();
 
   #booted = false;
   #shutdownReport: ShutdownReport | null = null;
@@ -732,7 +761,14 @@ export class Kernel {
       ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
       ...(opts.clearTimeoutFn !== undefined ? { clearTimeoutFn: opts.clearTimeoutFn } : {}),
       ...(opts.onBudgetExhausted !== undefined ? { onBudgetExhausted: opts.onBudgetExhausted } : {}),
-      ...(opts.onProcessExit !== undefined ? { onProcessExit: opts.onProcessExit } : {}),
+      // The kernel's own exit bookkeeping runs first, then the host's hook.
+      // Both see the same facts at the same moment — the ZOMBIE transition,
+      // before init reaps the entry — so a host that awaits a process and a
+      // host that persists its metadata cannot disagree about how it ended.
+      onProcessExit: (meta) => {
+        this.#recordExit(meta);
+        return opts.onProcessExit?.(meta);
+      },
       wakeGate: this.#gate,
     });
   }
@@ -823,6 +859,120 @@ export class Kernel {
   async registerDaemon(spec: DaemonSpec): Promise<ProcessId> {
     this.#assertBooted('kernel.registerDaemon');
     return await this.init.registerDaemon(spec);
+  }
+
+  // ---------------------------------------------------------------------------
+  // §4.2b Waiting for a process to end (the host-facing primitive)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Wait for a process to finish, and report how it ended.
+   *
+   * ## Why a host needs this
+   *
+   * The `wait` *syscall* is a parent-child operation: only a process's own
+   * parent may wait for it, and the wake-up is enqueued into the parent's run
+   * queue. A **host** — a program that boots a kernel — is not in the process
+   * tree: the processes it spawns are children of init. So a host cannot use
+   * `dispatcher.invoke(pid, 'wait', …)` to wait for them: the syscall is
+   * addressed to a process that is never scheduled, and the promise never
+   * settles.
+   *
+   * The only thing a host can do today is hand-roll the wait: poll
+   * `kernel.table.get(pid)` for liveness and wire `KernelOptions.onProcessExit`
+   * at boot to capture the exit code — and then be careful not to default a
+   * missing exit code to `0`, which turns a crash into a success. Every host
+   * ends up writing that same twenty lines, and getting the race wrong.
+   *
+   * This is the supported version of it. It resolves when the process reaches
+   * ZOMBIE — which is *before* init reaps the entry, so the exit code is
+   * still there to be read — and it reports the real code and reason.
+   *
+   * @param pid    The process to wait for.
+   * @param opts   `timeoutMs` bounds the wait; omit it to wait indefinitely.
+   *              `signal` cancels the wait (used when the client goes away).
+   * @returns The exit facts, or `undefined` if the wait was cancelled or the
+   *          timeout elapsed first.
+   * @throws CortexError ESRCH when this kernel has never heard of that PID.
+   */
+  async awaitExit(
+    pid: ProcessId,
+    opts: { readonly timeoutMs?: number; readonly signal?: AbortSignal } = {},
+  ): Promise<ProcessExit | undefined> {
+    this.#assertBooted('kernel.awaitExit');
+    const key = unbrand(pid);
+
+    // Already gone? The exit record outlives the table entry, so the answer
+    // is still available — and the race ("it exited while I was setting up
+    // the wait") cannot happen.
+    const recorded = this.#exits.get(key);
+    if (recorded !== undefined) return recorded;
+
+    if (this.table.get(pid) === undefined) {
+      trap('ESRCH', 'kernel.awaitExit', {
+        pid: key,
+        reason: 'no such process in this kernel',
+      });
+    }
+
+    if (opts.signal?.aborted === true) return undefined;
+
+    const timeoutMs = opts.timeoutMs ?? 0;
+    return await new Promise<ProcessExit | undefined>((resolve) => {
+      const waiter: ExitWaiter = { resolve, timer: undefined };
+      const list = this.#exitWaiters.get(key);
+      if (list === undefined) this.#exitWaiters.set(key, [waiter]);
+      else list.push(waiter);
+
+      /** Give up on this wait: take the waiter out and resolve with nothing. */
+      const abandon = (): void => {
+        const current = this.#exitWaiters.get(key);
+        if (current !== undefined) {
+          const at = current.indexOf(waiter);
+          if (at >= 0) current.splice(at, 1);
+          if (current.length === 0) this.#exitWaiters.delete(key);
+        }
+        resolve(undefined);
+      };
+
+      if (opts.signal !== undefined) {
+        opts.signal.addEventListener('abort', abandon, { once: true });
+      }
+
+      if (timeoutMs > 0) {
+        const timer = setTimeout(abandon, timeoutMs);
+        // A pending wait must not keep the process alive on its own.
+        timer.unref?.();
+        waiter.timer = timer;
+      }
+    });
+  }
+
+  /**
+   * Record a process's exit and release anyone waiting for it.
+   *
+   * Called from the dispatcher's exit path at the ZOMBIE transition — before
+   * init reaps the entry, because once it is reaped there is nothing left to
+   * describe. The host's own `onProcessExit` hook runs after this, so a host
+   * that writes its own metadata and a host that awaits both see the same
+   * facts.
+   */
+  #recordExit(meta: PersistedProcessMeta): void {
+    const key = meta.pid;
+    if (this.#exits.has(key)) return;
+    const exit: ProcessExit = {
+      pid: key,
+      exitCode: meta.exitCode,
+      exitReason: meta.exitReason,
+    };
+    this.#exits.set(key, exit);
+    const waiters = this.#exitWaiters.get(key);
+    if (waiters === undefined) return;
+    this.#exitWaiters.delete(key);
+    for (const waiter of waiters) {
+      if (waiter.timer !== undefined) clearTimeout(waiter.timer);
+      waiter.resolve(exit);
+    }
   }
 
   // ---------------------------------------------------------------------------

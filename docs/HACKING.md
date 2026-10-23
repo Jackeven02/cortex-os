@@ -274,7 +274,99 @@ syscalls.
 
 ---
 
-## 7. Add a syscall
+## 7. Write a host
+
+An **agent** is a module the kernel runs. A **host** is a program that boots
+the kernel and drives it: a test harness, a server, an orchestrator, your own
+agent framework. You are the host when you call `bootKernel()` yourself
+instead of going through the `cortex` CLI.
+
+This section is the API boundary a host needs to know, and the two places
+where it is genuinely different from what an agent sees.
+
+### 7.1 You are not in the process tree
+
+The processes a host spawns are **children of init** — `kernel.spawn()` runs
+the `spawn` syscall with init as the caller. The host itself is not a process
+in that kernel.
+
+That matters for exactly one syscall: **`wait`**.
+
+- `wait` is a **parent-child** operation. Only a process's own parent may
+  wait for it.
+- Its wake-up is enqueued into the **parent's** run queue.
+
+So a host that tries `await kernel.dispatcher.invoke(asProcessId(1), 'wait',
+pid, { timeoutMs })` gets a promise that **never settles**: the wake-up is
+queued against init, which is parked in RUNNING and never dispatched. It is
+not a timeout and not a deadlock in your code — it is the syscall being
+addressed to a process that is not scheduled.
+
+**Use `kernel.awaitExit(pid)` instead.** It is the host-facing primitive for
+exactly this, and it resolves when the process reaches ZOMBIE — *before* init
+reaps the entry, so the exit code is still there to read:
+
+```ts
+const kernel = await bootKernel({ /* … */ });
+const pid = await kernel.spawn({ role: 'worker', agent: { module: 'file:///…' } });
+
+const exit = await kernel.awaitExit(pid, { timeoutMs: 30_000 });
+if (exit === undefined) {
+  // still running — the timeout elapsed
+} else {
+  console.log(exit.exitCode, exit.exitReason);
+}
+```
+
+Three properties it guarantees, which the hand-rolled version does not:
+
+1. **It reports the real exit code.** A process that died without recording
+   an exit comes back with `exitCode: null` — not `0`. Never default a
+   missing exit code to success; that is how a crash gets reported as a
+   clean run.
+2. **It still answers after the entry is reaped.** init reaps a process
+   whose parent is init, so the table entry is gone — but the *facts* of the
+   exit outlive it, and the kernel keeps them. Asking a moment too late
+   still gets the right answer.
+3. **It fails loudly on a PID the kernel never knew** (`ESRCH`), instead of
+   waiting forever for something that will not arrive.
+
+The same facts reach you three ways — `awaitExit`, the
+`KernelOptions.onProcessExit` hook, and the `meta.json` the CLI persists —
+and they cannot disagree: all three are taken at the same moment, the ZOMBIE
+transition.
+
+### 7.2 The other host-facing surface
+
+| What you want | What to use |
+|---|---|
+| wait for a process to end | `kernel.awaitExit(pid, { timeoutMs })` |
+| read a process's memory regions | `kernel.memory.regionsOf(pid)` / `kernel.memory.read(pid, region, query)` |
+| see the live process table | `kernel.table.list(filter)` |
+| snapshot a running process | `kernel.dispatcher.invoke(pid, 'checkpoint', { tag })` |
+| be told when a process is created | `KernelOptions.onProcessStart` |
+| be told when a process ends | `KernelOptions.onProcessExit` |
+
+`KernelOptions.onProcessExit` is still worth wiring — it is how you persist
+your own metadata, and it fires at the same instant as `awaitExit` resolves.
+But it is a *notification*, not a *join*: it tells you a process ended, it
+does not wait for one.
+
+### 7.3 What a host cannot do
+
+- **Call syscalls as a process.** `dispatcher.invoke(pid, …)` runs the
+  syscall *as that process* — its state gate, its capability gate and its
+  `.crec` log apply. Invoking it as init means init is the actor: the frame
+  lands in init's log, and init's capabilities are the ones checked. The
+  transport's read-only commands (`ps`, `memory`) deliberately avoid the
+  dispatcher for exactly this reason (ARCHITECTURE §12.1).
+- **Get at a process's JS call stack.** A checkpoint captures the process
+  image — state, memory, budgets, lineage — not the live stack. A restored
+  agent re-runs its module from the top (PROCESS.md §8.2).
+
+---
+
+## 8. Add a syscall
 
 A syscall touches five places. Do them together:
 
@@ -294,7 +386,7 @@ If it changes the state model (a new process state, a new transition), update
 
 ---
 
-## 8. Tests
+## 9. Tests
 
 The harness is tiny and lives at the top of `scripts/smoke.ts`:
 
@@ -310,7 +402,7 @@ output (see the `cortex diff` / `cortex attach` / `cortex daemon` checks).
 
 ---
 
-## 9. Submitting
+## 10. Submitting
 
 - One logical change per commit; reference the issue: `kernel: implement X (#0NN)`.
 - Never skip hooks (`--no-verify`).

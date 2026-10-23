@@ -215,8 +215,14 @@ function attachConnection(
   const decoder = new LineDecoder();
   socket.setEncoding('utf8');
 
+  // A long-running command (a `wait`) must not outlive the client that asked
+  // for it: when the socket closes, the pending wait is cancelled so the
+  // kernel does not hold a waiter for a process nobody is watching.
+  const abort = new AbortController();
+
   const cleanup = (): void => {
     socket.removeAllListeners();
+    abort.abort();
   };
   socket.on('close', cleanup);
   socket.on('error', (err: Error) => {
@@ -226,7 +232,7 @@ function attachConnection(
 
   socket.on('data', (chunk: string) => {
     for (const line of decoder.push(chunk)) {
-      void handleLine(kernel, socket, line, token, opts, log);
+      void handleLine(kernel, socket, line, token, opts, log, abort.signal);
     }
   });
 }
@@ -238,6 +244,7 @@ async function handleLine(
   token: string,
   opts: KernelServerOptions,
   log: (message: string) => void,
+  signal: AbortSignal,
 ): Promise<void> {
   let request: KernelRequest;
   try {
@@ -286,7 +293,7 @@ async function handleLine(
   }
 
   try {
-    const result = await dispatch(kernel, request, opts, log);
+    const result = await dispatch(kernel, request, opts, log, signal);
     writeFrame(socket, { v: KERNEL_PROTOCOL_VERSION, id, ok: true, result });
   } catch (err) {
     writeFrame(socket, { v: KERNEL_PROTOCOL_VERSION, id, ok: false, error: toWireError(err) });
@@ -391,6 +398,7 @@ async function dispatch(
   request: KernelRequest,
   opts: KernelServerOptions,
   log: (message: string) => void,
+  signal: AbortSignal,
 ): Promise<unknown> {
   const cmd: KernelCommand = request.cmd;
   const args = request.args ?? {};
@@ -559,6 +567,36 @@ async function dispatch(
                 ? 'delivered'
                 : 'dropped';
       return { outcome, pid, signal, state: after?.state ?? null };
+    }
+
+    case 'wait': {
+      // Block until the process ends, and report how it ended.
+      //
+      // The `wait` *syscall* cannot be used here: it is a parent-child
+      // operation, and the process an operator is waiting for is a child of
+      // init, not of the operator. The kernel's host-facing `awaitExit` is
+      // the supported way to do this — it resolves at the ZOMBIE transition,
+      // before init reaps the entry, so the exit code is still there.
+      const pid = Number(args['pid']);
+      if (!Number.isInteger(pid)) {
+        throw new WireError('EINVAL', `invalid pid: ${String(args['pid'])}`);
+      }
+      const target = asProcessId(pid);
+      const timeoutRaw = args['timeoutMs'];
+      const timeoutMs = typeof timeoutRaw === 'number' ? timeoutRaw : 0;
+      const exit = await kernel.awaitExit(target, {
+        ...(timeoutMs > 0 ? { timeoutMs } : {}),
+        signal,
+      });
+      if (exit === undefined) {
+        return { exited: false, pid };
+      }
+      return {
+        exited: true,
+        pid,
+        exitCode: exit.exitCode,
+        exitReason: exit.exitReason,
+      };
     }
 
     case 'checkpoint': {

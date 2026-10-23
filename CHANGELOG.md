@@ -42,6 +42,54 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex wait <pid>` — a process's ending, addressed to that process.** The
+  transport could show a process's state (`ps`), its output (`logs`) and its
+  knowledge (`memory`), but nothing could **block**: there was no verb for
+  "tell me when this finishes". A shell sequencing work after a live agent had
+  to poll `cortex ps` in a loop, or sleep and hope.
+
+  `cortex wait <pid>` blocks until the process ends and reports how.
+
+  ```console
+  $ cortex wait 1234
+  pid 1234 exited with code 0 (finished the task)
+  ```
+
+  The code is the **real** one — the number the agent passed to `exit()`, not a
+  default. That distinction is the whole point: a shell that answers "exited 0"
+  for a process that died without recording an exit is worse than no answer at
+  all, because it is a lie you can script against. `cortex wait` also exits
+  with the child's own exit code, so `cortex wait 2 || echo failed` behaves the
+  way it does in any shell.
+
+  It is a **read**, like `ps` and `memory`: answered by the kernel directly, not
+  through the dispatcher, and not recorded in the `.crec` — an operator waiting
+  for a process is not something the process did. It answers from the live
+  kernel when there is one and from the process's exit record on disk when
+  there is not, so a finished process still says how it ended after the daemon
+  is gone; a pid that never existed is `ESRCH`, and a still-running process
+  with `--timeout-ms` is a timeout — never a silent "exited 0".
+
+  Behind it is a host-facing kernel primitive, `Kernel.awaitExit(pid,
+  { timeoutMs })`. It exists because a **host is not in the process tree**:
+  `wait` is a parent-child syscall — the kernel parks the caller and wakes the
+  caller's run queue — and the agent a host starts is a child of `init`, so
+  `dispatcher.invoke(asProcessId(1), 'wait', …)` never settles, however long
+  you wait for it. `awaitExit` resolves with the exit code, still answers for a
+  process that has already been reaped, and refuses an unknown pid with
+  `ESRCH`. docs/HACKING.md §7 is the guide for the next person writing a host.
+
+  Eight smoke checks: `awaitExit` resolves with the real exit code, it still
+  answers after the table entry has been reaped, an unknown pid is `ESRCH`, a
+  timeout resolves to `undefined`, the transport's `wait` blocks and carries the
+  exit code, `cortex wait` prints and returns the child's exit code, it answers
+  for an already-finished process from disk, and it says plainly when there is
+  no live kernel and no record — without ever claiming "exited with code 0".
+
+  (docs/ARCHITECTURE.md §12.1; docs/PROCESS.md §6.4; docs/HACKING.md §7;
+  `src/kernel/boot.ts`, `src/cli/kernel_protocol.ts`, `kernel_server.ts`,
+  `commands/wait.ts`; 8 smoke checks.)
+
 - **`cortex memory <pid>` — a running process's knowledge, addressed to that
   process.** The `.crec` log records what a process **did**, and for a
   `memory_write` the argument it records is a **hash**, not the value
@@ -640,10 +688,10 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 - **The published assertion count was stale.** The READMEs' quickstart, the
   landing page's status panel and the HN launch draft all said "580 smoke
-  checks"; the suite is 616. The numbers were last refreshed when the landing
+  checks"; the suite is 624. The numbers were last refreshed when the landing
   page was first built and were never moved again, so a reader who ran the
-  suite saw thirty-six more assertions than the documents promised. All four
-  places now say 616, and the landing page's primitive grid grew a `logs` and
+  suite saw forty-four more assertions than the documents promised. All four
+  places now say 624, and the landing page's primitive grid grew a `logs` and
   a `memory` tile — the grid listed twelve verbs and there are now fourteen.
 
 - **Every `cortex ps` against a live kernel wrote a frame into the

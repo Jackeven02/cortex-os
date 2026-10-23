@@ -66,6 +66,7 @@ export type KernelCommand =
   | 'memory'
   | 'send'
   | 'kill'
+  | 'wait'
   | 'checkpoint'
   | 'restore'
   | 'spawn'

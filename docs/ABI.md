@@ -91,6 +91,13 @@ Things that look like syscalls but aren't:
   (`KernelOptions.agentScope`); the host decides what a line means and where
   it goes. The consequence is the one above: printed output is **not** part
   of the causal history in the `.crec`, so a replay does not reproduce it.
+- **Waiting for a process from outside the kernel.** `wait` *is* a syscall, but
+  it is a **parent-child** syscall: only a process can wait on its own child.
+  A host — a program embedding the kernel, or a CLI reaching it over the
+  transport — is not in the process tree, so waiting is a **host API**
+  (`Kernel.awaitExit(pid, { timeoutMs })`), not a syscall. Nothing is added to
+  the ABI for it: the frozen syscall set is unchanged, and an agent's own
+  `ctx.wait(pid)` keeps its exact meaning.
 
 This last point is important. Cortex cannot record what it does not see. If your agent does `fetch(...)` directly, the recording has a hole in it and replay will diverge.
 

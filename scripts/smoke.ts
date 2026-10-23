@@ -243,6 +243,7 @@ import { cmdDiff } from '../src/cli/commands/diff.js';
 import { cmdTrace } from '../src/cli/commands/trace.js';
 import { cmdLogs } from '../src/cli/commands/logs.js';
 import { cmdMemory } from '../src/cli/commands/memory.js';
+import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import {
   listDaemons,
@@ -12218,6 +12219,242 @@ async function runMemoryInspectChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Host-facing wait checks
+// =============================================================================
+
+/**
+ * A host — a program that boots a kernel — is not in the process tree: the
+ * processes it spawns are children of init. So it cannot use the `wait`
+ * *syscall* to wait for them (that syscall is parent-child, and its wake-up
+ * is enqueued into the parent's run queue, which a host does not have).
+ *
+ * `Kernel.awaitExit` is the supported way to do it, and these checks pin the
+ * three properties that make it usable: it resolves with the *real* exit code
+ * (not a default), it still answers after the table entry has been reaped,
+ * and it fails loudly on a PID the kernel never knew.
+ */
+async function runHostWaitChecks(): Promise<void> {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-wait-'));
+  const kernels: Kernel[] = [];
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+
+  try {
+    await checkAsync('awaitExit resolves with the real exit code of a process', async () => {
+      const kernel = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir: tmp,
+        autoStart: true,
+        loadDrivers: (reg) => {
+          reg.registerMemory(inmemMemory());
+        },
+        agentLoader: async () => async (ctx, args) => {
+          const code = typeof args['code'] === 'number' ? args['code'] : undefined;
+          if (code !== undefined) {
+            ctx.exit(code, 'probe finished');
+            return;
+          }
+          // No exit code asked for: park, so a wait on this one can time out.
+          for (;;) {
+            try {
+              await ctx.recv(undefined, { timeoutMs: 50 });
+            } catch (err) {
+              if ((err as { errno?: string }).errno !== 'ETIMEDOUT') throw err;
+            }
+          }
+        },
+      });
+      kernels.push(kernel);
+
+      const pid = await kernel.spawn({
+        role: 'probe',
+        agent: { module: 'test:probe', args: { code: 3 } },
+        memory: { semantic: { kind: 'shared', backing: 'inmem' } },
+      });
+
+      const exit = await kernel.awaitExit(pid);
+      assert(exit !== undefined, 'the wait resolved');
+      assert(exit!.exitCode === 3, `the exit code is 3, got ${String(exit!.exitCode)}`);
+      assert(exit!.exitReason === 'probe finished', `the reason, got ${String(exit!.exitReason)}`);
+    });
+
+    await checkAsync('awaitExit still answers after the entry has been reaped', async () => {
+      const kernel = kernels[0]!;
+      const pid = await kernel.spawn({
+        role: 'probe2',
+        agent: { module: 'test:probe', args: { code: 7 } },
+      });
+      await kernel.awaitExit(pid);
+      // init reaps a process whose parent is init, so the table entry is
+      // gone by now — but the *facts* of the exit outlive it. A host that
+      // asked a moment too late must still get the real code, not a default.
+      const again = await kernel.awaitExit(pid);
+      assert(again !== undefined, 'the second wait resolved');
+      assert(again!.exitCode === 7, `the same exit code, got ${String(again!.exitCode)}`);
+    });
+
+    await checkAsync('awaitExit on a pid the kernel never knew is ESRCH', async () => {
+      const kernel = kernels[0]!;
+      let caught: unknown = null;
+      try {
+        await kernel.awaitExit(asProcessId(999999));
+      } catch (err) {
+        caught = err;
+      }
+      assert(isCortexError(caught) && caught.errno === 'ESRCH', `expected ESRCH, got ${String(caught)}`);
+    });
+
+    await checkAsync('awaitExit gives up when the timeout elapses', async () => {
+      const kernel = kernels[0]!;
+      const pid = await kernel.spawn({ role: 'sleeper', agent: { module: 'test:sleeper' } });
+      const exit = await kernel.awaitExit(pid, { timeoutMs: 50 });
+      assert(exit === undefined, 'the wait timed out with nothing to report');
+    });
+
+    await checkAsync("the transport's wait command blocks until the process ends", async () => {
+      const kernel = kernels[0]!;
+      const server = await startKernelServer(kernel, { log: () => {} });
+      servers.push(server);
+      writeEndpoint(tmp, server.endpoint);
+
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+
+      const pid = await kernel.spawn({
+        role: 'slow',
+        agent: { module: 'test:probe', args: { code: 5 } },
+      });
+
+      const result = await client!.request<{
+        exited: boolean;
+        exitCode?: number | null;
+        exitReason?: string | null;
+      }>('wait', { pid: unbrand(pid) });
+      assert(result.exited, 'the process had exited');
+      assert(result.exitCode === 5, `the exit code came back, got ${String(result.exitCode)}`);
+
+      // A PID the kernel never knew is refused, not silently "not exited".
+      const missing = await client!.requestRaw('wait', { pid: 999999 });
+      assert(!missing.ok, 'an unknown pid is refused');
+      assert(
+        missing.ok === false && missing.error.errno === 'ESRCH',
+        `the refusal is ESRCH, got ${missing.ok === false ? missing.error.errno : 'ok'}`,
+      );
+
+      client!.close();
+    });
+
+    await checkAsync('cortex wait reports the exit code and returns it', async () => {
+      process.env['CORTEX_HOME'] = tmp;
+      const kernel = kernels[0]!;
+      const pid = await kernel.spawn({
+        role: 'cli-waited',
+        agent: { module: 'test:probe', args: { code: 4 } },
+      });
+
+      let out = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      let code: number;
+      try {
+        code = await cmdWait([String(unbrand(pid))]);
+      } finally {
+        process.stdout.write = prevWrite;
+      }
+      assert(code === 4, `the child's exit code is this command's exit code, got ${code}`);
+      assert(out.includes('exited with code 4'), `the exit is reported, got: ${out}`);
+    });
+
+    await checkAsync('cortex wait answers for a process that already ended', async () => {
+      // No live kernel involved on this path: the exit code was persisted to
+      // meta.json when the process died, and that is the answer.
+      const done = mkdtempSync(join(tmpdir(), 'cortex-waitdisk-'));
+      process.env['CORTEX_HOME'] = done;
+      try {
+        writeMeta(done, {
+          pid: 42,
+          ppid: 1,
+          pgid: 42,
+          role: 'old',
+          state: 'zombie',
+          exitCode: 9,
+          exitReason: 'finished long ago',
+          startedAt: '2026-01-01T00:00:00.000Z',
+          lastTransitionAt: '2026-01-01T00:00:01.000Z',
+          budgetsSpent: { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 0, syscallCount: 0 },
+          budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+          agent: { system: 'old' },
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        });
+
+        let out = '';
+        const prevWrite = process.stdout.write;
+        process.stdout.write = ((chunk: unknown): boolean => {
+          out += String(chunk);
+          return true;
+        }) as unknown as typeof process.stdout.write;
+        let code: number;
+        try {
+          code = await cmdWait(['42']);
+        } finally {
+          process.stdout.write = prevWrite;
+        }
+        assert(code === 9, `the recorded exit code, got ${code}`);
+        assert(out.includes('exited with code 9'), `the exit is reported, got: ${out}`);
+      } finally {
+        rmSync(done, { recursive: true, force: true });
+      }
+    });
+
+    await checkAsync('cortex wait says plainly that it needs a live kernel', async () => {
+      const empty = mkdtempSync(join(tmpdir(), 'cortex-waitnokernel-'));
+      process.env['CORTEX_HOME'] = empty;
+      let err = '';
+      const prevErr = console.error;
+      console.error = (...parts: unknown[]): void => {
+        err += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      let code: number;
+      try {
+        code = await cmdWait(['2']);
+      } finally {
+        console.error = prevErr;
+        rmSync(empty, { recursive: true, force: true });
+      }
+      assert(code === 1, `exit 1, got ${code}`);
+      assert(err.includes('no live kernel'), `the reason is reported, got: ${err.trim()}`);
+      assert(!err.includes('exited with code 0'), 'it is not reported as a success');
+    });
+  } finally {
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // CLI daemon checks (#039)
 // =============================================================================
 
@@ -13075,6 +13312,7 @@ runRegionsChecks();
 await runCliChecks();
 await runOutputCaptureChecks();
 await runMemoryInspectChecks();
+await runHostWaitChecks();
 await runDaemonChecks();
 await runKernelHardeningChecks();
 await runTransportChecks();

@@ -88,6 +88,11 @@ $ cortex memory 1234 semantic
 # memory of pid 1234 (coder) — region 'semantic'
 issue:42        "found it — src/foo.ts:42"  2026-10-23T14:23:04.881Z
 
+# Wait for a process to end — and get its REAL exit code
+# (the exit code is the child's own, so `cortex wait 2 || echo failed` works)
+$ cortex wait 1234
+pid 1234 exited with code 0 (finished the task)
+
 # Pause and resume across reboots
 # (a checkpoint captures a live process, so this needs a live kernel:
 #  `cortex daemon run` — and SIGUSR2 means "checkpoint now")
@@ -152,7 +157,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 616 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 624 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

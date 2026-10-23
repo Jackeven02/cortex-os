@@ -885,6 +885,45 @@ lookup cannot confuse two processes: a kernel seeds its PID counter past
 everything already on disk, so a PID from an earlier session is never handed
 out again, and a table hit is always the very process that took the snapshot.
 
+**And it made the ending addressable.** The last thing an operator wants is the
+one thing no log records plainly: *how did it end?* The `.crec` does hold the
+`exit` frame, but reading it means parsing the causal history of a process that
+may be long gone, and the transport had no verb for "tell me when this
+finishes" — `cortex ps` shows state, `cortex logs` shows output, `cortex memory`
+shows knowledge, and none of them can block.
+
+`cortex wait <pid>` blocks until the process ends and reports how.
+
+```console
+$ cortex wait 1234
+pid 1234 exited with code 0 (finished the task)
+```
+
+The code is the **real** one — the number the agent passed to `exit()`, not a
+default. That distinction is the whole point: a shell that answers "exited 0"
+for a process that died without recording an exit is worse than no answer at
+all, because it is a lie you can script against. `cortex wait` also exits with
+the child's own exit code, so `cortex wait 2 || echo failed` behaves the way it
+does in any shell.
+
+It is a **read**, like `ps` and `memory`: answered by the kernel directly, not
+through the dispatcher, and not recorded in the `.crec` — an operator waiting
+for a process is not something the process did. It answers from the live kernel
+when there is one, and from the process's exit record on disk when there is
+not, so a finished process still says how it ended after the daemon is gone. A
+pid that never existed is `ESRCH`, and a process that is still running with
+`--timeout-ms` set is a timeout — never a silent "exited 0".
+
+**And a host is not in the process tree.** `wait` is a *parent-child* syscall:
+the kernel parks the caller, and when the child exits it wakes the caller's run
+queue. A host that starts an agent through the kernel is not that agent's
+parent — the agent is a child of `init` — so
+`dispatcher.invoke(asProcessId(1), 'wait', …)` never settles, however long you
+wait for it. The host-facing primitive is `Kernel.awaitExit(pid, { timeoutMs })`:
+it resolves with the exit code, it still answers for a process that has already
+been reaped, and it refuses a pid the kernel has never known with `ESRCH`.
+docs/HACKING.md §7 is the whole story.
+
 **Known limits (v0).**
 
 - The transport carries commands, not streams: there is no live trace
@@ -899,6 +938,11 @@ out again, and a table hit is always the very process that took the snapshot.
   place a region's contents appear is inside a `.csnap`, and that is a
   snapshot of one moment, not the present. So the command says plainly that
   it needs a running kernel instead of reporting an empty region.
+- **The `wait` syscall is unavailable to a host.** It is a parent-child
+  operation — the kernel parks the caller and wakes the caller's run queue —
+  and a host is not in the process tree: the agent it started is a child of
+  `init`. A host waits with `Kernel.awaitExit(pid, { timeoutMs })` instead
+  (docs/HACKING.md §7).
 - **The syscall log deliberately does not carry memory values.** It stores a
   hash and a byte count (ABI.md §4.4 — "full values would bloat the log"), so
   `cortex trace` can show that an agent wrote something down and never what.

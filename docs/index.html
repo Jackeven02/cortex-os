@@ -289,7 +289,7 @@
         <div class="prim"><div class="k">spawn</div><div class="v">Start an agent as a real process with a PID, budgets, and lineage.</div></div>
         <div class="prim"><div class="k">ps</div><div class="v">Inspect the process tree: state, tokens, age.</div></div>
         <div class="prim"><div class="k">kill</div><div class="v">Thirteen signals, from SIGINT to SIGXCPU.</div></div>
-        <div class="prim"><div class="k">wait</div><div class="v">Block on a child — or bound it with a deadline (<code>ETIMEDOUT</code>).</div></div>
+        <div class="prim"><div class="k">wait</div><div class="v">Block until a process ends — and get its <b>real</b> exit code, never a defaulted zero.</div></div>
         <div class="prim"><div class="k">fork</div><div class="v">Cognitive fork: clone a process at its current state, diverge.</div></div>
         <div class="prim"><div class="k">diff</div><div class="v">Compare two forked branches' syscall logs, from their shared past.</div></div>
         <div class="prim"><div class="k">checkpoint</div><div class="v">Snapshot the process image to disk, content-addressed.</div></div>
@@ -384,7 +384,7 @@ npx tsx src/cli/index.ts diff 2 3</pre>
         <div class="stat"><div class="n">12</div><div class="l">kernel modules</div></div>
         <div class="stat"><div class="n">24</div><div class="l">syscalls</div></div>
         <div class="stat"><div class="n">7</div><div class="l">drivers (LLM · MCP · FS · memory)</div></div>
-        <div class="stat"><div class="n">616</div><div class="l">smoke checks, all green</div></div>
+        <div class="stat"><div class="n">624</div><div class="l">smoke checks, all green</div></div>
       </div>
       <p class="sub">
         Phases 0–5 are complete: the kernel boots, all drivers ship, the whole CLI
