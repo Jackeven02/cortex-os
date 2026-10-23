@@ -59,7 +59,12 @@ import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
 
 import { defaultKernelDir, readSpec, existingCrecPath } from '../index.js';
-import { probeKernel, KernelCommandError, type KernelClient } from '../kernel_client.js';
+import {
+  explainKernelGone,
+  probeKernel,
+  KernelCommandError,
+  type KernelClient,
+} from '../kernel_client.js';
 import { readRecords } from '../../kernel/recorder.js';
 import { asProcessId } from '../../kernel/types.js';
 
@@ -179,6 +184,17 @@ export async function cmdSupervise(args: string[]): Promise<number> {
 
   const client = probe.client;
 
+  /** Set when the kernel goes away while we are supervising. */
+  let kernelGone = false;
+
+  // If the kernel goes away, the supervisor has to say so and stop. A
+  // supervisor that hangs on after its kernel died is worse than useless: it
+  // looks like it is still supervising, and the process it was watching is
+  // nobody's business any more.
+  client.onClose(() => {
+    kernelGone = true;
+  });
+
   // The process has to exist before it can be supervised.
   try {
     const listing = await client.request<{ processes: { pid: number }[] }>('ps');
@@ -297,6 +313,19 @@ export async function cmdSupervise(args: string[]): Promise<number> {
       if (stopped) {
         console.log('# interrupted');
         exitCode = 130;
+        break;
+      }
+
+      // The kernel went away. Nothing more can be supervised, and nothing
+      // more can be *reported*: the fate of the process we were watching is
+      // unknown, and a supervisor must not invent one.
+      if (kernelGone) {
+        const why = await explainKernelGone(dir);
+        console.error(`cortex supervise: ${why}`);
+        console.error(
+          `  the fate of pid ${currentPid} is unknown — the supervisor stopped when the kernel did.`,
+        );
+        exitCode = 1;
         break;
       }
 
@@ -528,7 +557,9 @@ NOTES
 
 EXIT CODES
   the supervised process's own exit code; 124 when the supervisor had to kill
-  it (the convention timeout(1) uses); 130 when you interrupted it.
+  it (the convention timeout(1) uses); 130 when you interrupted it; 1 when
+  the kernel went away — the supervised process's fate is then unknown, and
+  the supervisor says so rather than inventing an ending.
 
 EXAMPLES
   cortex supervise 2 --kill-after 30000

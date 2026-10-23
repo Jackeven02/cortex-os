@@ -51,7 +51,7 @@ import { parseArgs } from 'node:util';
 
 import { defaultKernelDir } from '../index.js';
 import { readMeta } from '../process_store.js';
-import { probeKernel, KernelCommandError } from '../kernel_client.js';
+import { explainKernelGone, probeKernel, KernelCommandError } from '../kernel_client.js';
 import { asProcessId } from '../../kernel/types.js';
 
 interface WaitResult {
@@ -91,6 +91,9 @@ NOTES
   persisted a meta.json for it), so waiting on a finished process answers
   immediately. A pid with neither a live process nor a recorded exit is
   reported as such — never as "exited 0".
+
+  If the kernel goes away while you are waiting, this says so and exits 1: no
+  exit was seen, and none is invented.
 
 EXAMPLES
   cortex wait 2
@@ -140,6 +143,15 @@ EXAMPLES
     } catch (err) {
       if (err instanceof KernelCommandError) {
         console.error(`cortex wait: ${err.errno}: ${err.message}`);
+        return 1;
+      }
+      // The kernel went away mid-wait. The raw socket error ("read
+      // ECONNRESET") says nothing an operator can act on; the directory can
+      // say whether the kernel shut down or died.
+      if (client.closed) {
+        const why = await explainKernelGone(dir);
+        console.error(`cortex wait: ${why}`);
+        console.error(`  pid ${pid} did not report an exit — nobody is waiting on it now.`);
         return 1;
       }
       throw err;

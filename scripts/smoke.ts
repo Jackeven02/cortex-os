@@ -13128,6 +13128,259 @@ async function runSuperviseChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Kernel-gone checks (#058)
+// =============================================================================
+
+/**
+ * A promise that must finish before a deadline.
+ *
+ * The failure this guards against is a *hang*, so the deadline has to be
+ * part of the test: without it, a command that never returns would take the
+ * whole smoke run with it.
+ */
+async function withDeadline<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`${label} did not finish within ${ms}ms`));
+        }, ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * What happens when the kernel goes away under a command that is watching it.
+ *
+ * The failure is not a crash — it is a **lie**. A watch that ends quietly
+ * reads as "the watch finished"; a supervisor that keeps running reads as
+ * "the process is still supervised"; a wait that prints a raw socket error
+ * says nothing an operator can act on. Each of them has to end, say what
+ * happened, and refuse to report a success it did not have.
+ */
+async function runKernelGoneChecks(): Promise<void> {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-kernelgone-'));
+  const kernels: Kernel[] = [];
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevLog = console.log;
+  const prevErr = console.error;
+
+  try {
+    const kernel = await bootKernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: tmp,
+      autoStart: true,
+      loadDrivers: (reg) => {
+        reg.registerMemory(inmemMemory());
+      },
+      agentLoader: async () => async (ctx, args) => {
+        const mode = typeof args['mode'] === 'string' ? args['mode'] : 'ok';
+        if (mode === 'stuck') {
+          // Blocks forever, inside a call. There is something to watch, and
+          // something to wait for.
+          await ctx.recv();
+          return;
+        }
+        ctx.exit(0, 'all good');
+      },
+    });
+    kernels.push(kernel);
+    process.env['CORTEX_HOME'] = tmp;
+
+    const capture = async (
+      run: () => Promise<number>,
+    ): Promise<{ code: number; out: string; err: string }> => {
+      let out = '';
+      let err = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      console.error = (...parts: unknown[]): void => {
+        err += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      try {
+        const code = await run();
+        return { code, out, err };
+      } finally {
+        process.stdout.write = prevWrite;
+        console.error = prevErr;
+      }
+    };
+
+    // One server per test: closing it *is* the kernel going away. The
+    // descriptor stays on disk, so the directory can tell "shut down" from
+    // "died" — which is exactly the diagnosis the command has to give.
+    const startServer = async (): Promise<{ close: () => Promise<void> }> => {
+      const server = await startKernelServer(kernel, { log: () => {} });
+      servers.push(server);
+      writeEndpoint(tmp, server.endpoint);
+      return server;
+    };
+
+    await checkAsync('cortex watch says the kernel went away instead of exiting quietly', async () => {
+      const server = await startServer();
+
+      // No timeout: the watch waits for the operator. The only thing that
+      // can end it is the kernel going away.
+      const watching = capture(() => cmdWatch([]));
+
+      // Let it subscribe before pulling the kernel out from under it.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await server.close();
+
+      const result = await withDeadline(watching, 5000, 'the watch');
+      assert(result.code === 1, `the watch reports the failure, got ${result.code}`);
+      assert(
+        result.err.includes('the watch did not finish'),
+        `the watch says it did not finish, got: ${result.err.trim()}`,
+      );
+      assert(
+        result.err.includes('kernel'),
+        `the diagnosis names the kernel, got: ${result.err.trim()}`,
+      );
+      assert(
+        !result.out.includes('# detached'),
+        `the watch did not claim a clean detach, got: ${result.out}`,
+      );
+    });
+
+    await checkAsync('cortex wait says the kernel went away instead of printing a socket error', async () => {
+      const server = await startServer();
+      const pid = await kernel.spawn({
+        role: 'stuck',
+        agent: { module: 'test:stuck', args: { mode: 'stuck' } },
+      });
+
+      const waiting = capture(() => cmdWait([String(unbrand(pid))]));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await server.close();
+
+      const result = await withDeadline(waiting, 5000, 'the wait');
+      assert(result.code === 1, `the wait reports the failure, got ${result.code}`);
+      assert(
+        result.err.includes('did not report an exit'),
+        `the wait says the exit is unknown, got: ${result.err.trim()}`,
+      );
+      assert(
+        !result.err.includes('ECONNRESET'),
+        `the raw socket error is not what the operator sees, got: ${result.err.trim()}`,
+      );
+    });
+
+    await checkAsync('cortex supervise stops when the kernel goes away instead of hanging', async () => {
+      const server = await startServer();
+      const pid = await kernel.spawn({
+        role: 'stuck',
+        agent: { module: 'test:stuck', args: { mode: 'stuck' } },
+      });
+
+      // A threshold far beyond the test: the supervisor must not kill
+      // anything — the kernel is what goes away.
+      const supervising = capture(() =>
+        cmdSupervise([String(unbrand(pid)), '--kill-after', '30000']),
+      );
+
+      // Let the supervisor attach before the kernel disappears.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await server.close();
+
+      const outcome = await Promise.race([
+        supervising.then((result) => ({ kind: 'done' as const, result })),
+        new Promise<{ kind: 'timeout' }>((resolve) => {
+          const timer = setTimeout(() => resolve({ kind: 'timeout' }), 5000);
+          timer.unref?.();
+        }),
+      ]);
+
+      if (outcome.kind === 'timeout') {
+        // A supervisor that is still running when the deadline hits is the
+        // failure being tested for. Let it wind down *first*: it is still
+        // holding the console, and a failure that swallows its own report
+        // is no report at all.
+        process.emit('SIGINT');
+        await supervising.catch(() => undefined);
+        assert(false, 'the supervisor did not stop when the kernel went away');
+      }
+
+      const result = outcome.result;
+      assert(result.code === 1, `the supervisor reports the failure, got ${result.code}`);
+      assert(
+        result.err.includes('the fate of pid'),
+        `the supervisor says the process's fate is unknown, got: ${result.err.trim()}`,
+      );
+      assert(
+        !result.out.includes('exited'),
+        `the supervisor did not invent an ending, got: ${result.out}`,
+      );
+    });
+
+    await checkAsync('a client knows when the kernel has gone', async () => {
+      const server = await startServer();
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+
+      let closed = false;
+      let told = false;
+      client!.onClose(() => {
+        told = true;
+      });
+
+      await server.close();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      closed = client!.closed;
+      assert(closed, 'the client knows the connection is gone');
+      assert(told, 'the client told the listener the connection is gone');
+
+      // And a listener that arrives late is told at once.
+      let late = false;
+      client!.onClose(() => {
+        late = true;
+      });
+      assert(late, 'a late listener is told the connection is already gone');
+    });
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // CLI daemon checks (#039)
 // =============================================================================
 
@@ -13988,6 +14241,7 @@ await runMemoryInspectChecks();
 await runHostWaitChecks();
 await runEventStreamChecks();
 await runSuperviseChecks();
+await runKernelGoneChecks();
 await runDaemonChecks();
 await runKernelHardeningChecks();
 await runTransportChecks();

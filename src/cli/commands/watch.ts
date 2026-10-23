@@ -44,7 +44,7 @@
 import { parseArgs } from 'node:util';
 
 import { defaultKernelDir } from '../index.js';
-import { KernelCommandError, probeKernel } from '../kernel_client.js';
+import { explainKernelGone, KernelCommandError, probeKernel } from '../kernel_client.js';
 import { formatRecordLine } from './trace.js';
 import type { SyscallRecord } from '../../kernel/types.js';
 
@@ -112,7 +112,8 @@ export async function cmdWatch(args: string[]): Promise<number> {
       ? Number.parseInt(timeoutRaw, 10) || 0
       : 0;
 
-  const probe = await probeKernel(defaultKernelDir());
+  const dir = defaultKernelDir();
+  const probe = await probeKernel(dir);
   if (probe.kind !== 'live') {
     if (probe.kind === 'stale') {
       console.error(
@@ -128,6 +129,18 @@ export async function cmdWatch(args: string[]): Promise<number> {
 
   const client = probe.client;
   console.log('# watching the kernel event stream (Ctrl-C to stop)');
+
+  // The kernel can go away while we are watching — it can be stopped, or it
+  // can die. Without this, the watch used to end *silently*, and because
+  // nothing was holding the event loop open any more, the process simply
+  // exited — with a success code, as if the watch had finished its work.
+  // A watch that lost its kernel has not succeeded at anything.
+  let kernelGone = false;
+  let finish: (() => void) | undefined;
+  client.onClose(() => {
+    kernelGone = true;
+    finish?.();
+  });
 
   let headerPrinted = false;
   let unsubscribe: (() => void) | undefined;
@@ -159,13 +172,24 @@ export async function cmdWatch(args: string[]): Promise<number> {
       client.close();
       return 1;
     }
+    // The kernel may have died *while* we were subscribing. That is the same
+    // ending as losing it a moment later, and it deserves the same words —
+    // not a stack trace out of the transport.
+    if (client.closed) {
+      const why = await explainKernelGone(dir);
+      console.error(`cortex watch: ${why}`);
+      console.error('  the watch did not finish — it lost the kernel it was watching.');
+      client.close();
+      return 1;
+    }
     client.close();
     throw err;
   }
 
-  // Wait until the operator interrupts, or the timeout elapses.
+  // Wait until the operator interrupts, the timeout elapses, or the kernel
+  // goes away.
   await new Promise<void>((resolve) => {
-    const finish = (): void => {
+    finish = (): void => {
       resolve();
     };
     process.once('SIGINT', finish);
@@ -175,10 +199,20 @@ export async function cmdWatch(args: string[]): Promise<number> {
       // The open socket keeps the process alive; the timer must not.
       timer.unref?.();
     }
+    // The kernel may already be gone by the time we got here.
+    if (kernelGone) finish();
   });
 
   unsubscribe?.();
   client.close();
+
+  if (kernelGone) {
+    const why = await explainKernelGone(dir);
+    console.error(`cortex watch: ${why}`);
+    console.error('  the watch did not finish — it lost the kernel it was watching.');
+    return 1;
+  }
+
   console.log('# detached');
   return 0;
 }
@@ -220,6 +254,9 @@ NOTES
 
   'record' lines are printed in the same layout as 'cortex trace', so the two
   can be read side by side.
+
+  If the kernel goes away while you are watching, this says so and exits 1.
+  It never pretends the watch finished.
 
 EXAMPLES
   cortex watch

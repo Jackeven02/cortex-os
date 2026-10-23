@@ -272,11 +272,19 @@ EXAMPLES
   // agent's inbox through the running kernel. It runs beside the trace
   // poller, so the two halves of `attach` — read and write — are live at the
   // same time.
+  let kernelGone = false;
   const reader =
     interactive && client !== undefined && targetPid !== undefined
-      ? startInteractiveReader(client, targetPid, () => {
-          stopped = true;
-        })
+      ? startInteractiveReader(
+          client,
+          targetPid,
+          () => {
+            stopped = true;
+          },
+          () => {
+            kernelGone = true;
+          },
+        )
       : undefined;
 
   try {
@@ -317,6 +325,13 @@ EXAMPLES
     client?.close();
   }
 
+  if (kernelGone) {
+    // The follow kept working — the log is on disk — but the delivery half
+    // of this command is over, and it did not end the way it was asked to.
+    console.error('cortex attach: the kernel went away — the log was followed, but nothing was delivered');
+    return 1;
+  }
+
   console.log('# detached');
   return 0;
 }
@@ -342,8 +357,11 @@ function startInteractiveReader(
   client: KernelClient,
   pid: number,
   onEof: () => void,
+  onKernelGone: () => void,
 ): InteractiveReader {
   const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  /** True once the kernel left and delivery became impossible. */
+  let deliveryGone = false;
 
   const loop = (async (): Promise<void> => {
     try {
@@ -354,6 +372,21 @@ function startInteractiveReader(
           await client.request('send', { pid, message });
           console.log(`> delivered to pid ${pid}: ${message}`);
         } catch (err) {
+          if (client.closed) {
+            // The kernel went away. Nothing can be *delivered* any more, and
+            // saying "read ECONNRESET" for every keystroke would be noise.
+            // The trace half follows the file and does not need a kernel, so
+            // it keeps going — but the operator is told, once, that half of
+            // this command is over.
+            console.error(
+              'cortex attach: the kernel went away — messages can no longer be delivered',
+            );
+            console.error('  the log is still on disk, so this keeps following it; Ctrl-C to detach');
+            deliveryGone = true;
+            onKernelGone();
+            rl.close();
+            break;
+          }
           if (err instanceof KernelCommandError) {
             console.error(`cortex attach: ${err.errno}: ${err.message}`);
           } else {
@@ -364,7 +397,9 @@ function startInteractiveReader(
     } catch {
       // stdin closed underneath us — treat it like EOF.
     } finally {
-      onEof();
+      // Only a real EOF ends the session. The kernel leaving ends the
+      // *delivery*, not the follow.
+      if (!deliveryGone) onEof();
     }
   })();
 

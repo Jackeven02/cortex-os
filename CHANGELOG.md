@@ -788,6 +788,72 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The CLI lied when the kernel went away.** Three commands watch a live
+  kernel, and all three had a different way of failing when that kernel died
+  — and every one of those ways was a lie.
+
+  `cortex watch` **exited silently, with a success code**. Nothing was
+  holding its event loop open any more, so the process simply ended — exit 0,
+  no message. To the operator that reads exactly like "the watch finished".
+  `cortex wait` printed the raw socket error (`cortex: read ECONNRESET`) —
+  technically true, and actionable by nobody. And `cortex supervise`, the
+  worst of the three, **hung forever**: its polling timer kept the event
+  loop alive, so it sat there supervising a kernel that was no longer there,
+  watching a process whose fate nobody would ever learn.
+
+  The transport now says when the connection ends. `KernelClient` exposes it
+  (`closed`, `onClose(handler)`), and each command turns it into an ending
+  that means something and an exit code that tells the truth:
+
+  ```console
+  $ cortex watch          # the daemon dies underneath it
+  cortex watch: the connection to the kernel was lost — it looks like the kernel died (connect ECONNREFUSED 127.0.0.1:60869)
+    the watch did not finish — it lost the kernel it was watching.
+  $ echo $?
+  1
+  ```
+
+  `cortex wait` reports that no exit was seen ("pid 8 did not report an exit
+  — nobody is waiting on it now"), and `cortex supervise` reports that the
+  supervised process's fate is unknown ("the fate of pid 10 is unknown — the
+  supervisor stopped when the kernel did"). Both exit 1. **None of them
+  invents an outcome it did not observe**, and none of them reports success.
+
+  `cortex attach --interactive` is the odd one out, because it has two
+  halves: its trace half follows the `.crec` file and does not need a kernel,
+  so it keeps going — but it says that delivery is over ("the kernel went
+  away — messages can no longer be delivered", said once, not once per
+  keystroke) and exits 1, because half of the command failed.
+
+  The client knows *that* the connection ended; the directory says *why*. A
+  descriptor that is gone means the kernel shut down cleanly; a descriptor
+  that is still there with nothing listening means it died; a descriptor that
+  answers means another kernel has taken the directory over. Those are three
+  different endings, and the operator is told which one happened.
+
+  **A bug the fix was built on.** `KernelClient.closed` only ever became true
+  when the *client* closed the connection — the socket's own `close` handler
+  did not set it. So the first version of this fix consulted a flag that was
+  never set, and `cortex wait` printed the raw socket error exactly as
+  before. The smoke suite caught it: with the flag reverted, two of the four
+  new checks fail.
+
+  **4 smoke checks** (641 → 645), all four reverse-verified: reverting the
+  watch's ending → it exits 0 again ("the watch reports the failure, got 0");
+  reverting the wait's ending → the raw "connection closed" surfaces; and
+  reverting the supervisor's ending → **it hangs**, and the check's deadline
+  catches it ("the supervisor did not stop when the kernel went away").
+
+  **Real run** (daemon + live kernel, killed with `Stop-Process -Force`):
+  `cortex watch` → exit 1, "the watch did not finish — it lost the kernel it
+  was watching"; `cortex wait 8` → exit 1, "pid 8 did not report an exit —
+  nobody is waiting on it now"; `cortex supervise 10 --kill-after 30000` →
+  exit 1, "the fate of pid 10 is unknown — the supervisor stopped when the
+  kernel did".
+
+  No ABI change: this is the CLI's side of the transport, and
+  `KERNEL_ABI_VERSION` stays 1.0.0.
+
 - **A daemon-registered agent had no memory regions, and died on its first
   memory access.** The regions were *declared* on the process-table entry and
   never *bound* in the memory engine: `syncFromTable` was called on two of the

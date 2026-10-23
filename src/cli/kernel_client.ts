@@ -54,6 +54,11 @@ export class KernelClient {
   /** Subscribe request id → the handler that wants its events. */
   #events = new Map<string, (event: unknown) => void>();
   #closed = false;
+  /** Set when *we* closed the connection, as opposed to it ending. */
+  #closedByUs = false;
+  /** Why the connection ended, once it has. */
+  #closeReason: Error | undefined;
+  #closeHandlers = new Set<(reason: Error) => void>();
 
   constructor(endpoint: KernelEndpoint, socket: Socket) {
     this.endpoint = endpoint;
@@ -65,8 +70,57 @@ export class KernelClient {
         this.#resolveLine(line);
       }
     });
-    socket.on('close', () => this.#failAll(new Error('connection closed')));
-    socket.on('error', (err: Error) => this.#failAll(err));
+    socket.on('close', () => {
+      const err = new Error('connection closed');
+      // The connection is gone *now* — whether we asked for it or not. A
+      // caller that checks `closed` to decide whether the kernel left must
+      // not be told "still open" just because this end was not our doing.
+      this.#closed = true;
+      this.#failAll(err);
+      // A close we asked for is not the kernel going away. Only an *un*
+      // asked-for end is news, and only the news is worth reporting.
+      if (!this.#closedByUs) this.#notifyClose(err);
+    });
+    socket.on('error', (err: Error) => {
+      this.#closed = true;
+      this.#failAll(err);
+      if (!this.#closedByUs) this.#notifyClose(err);
+    });
+  }
+
+  /**
+   * Whether the connection to the kernel is gone.
+   *
+   * `close()` sets it too — but a command that closed the connection itself
+   * knows why, and does not need the diagnosis.
+   */
+  get closed(): boolean {
+    return this.#closed;
+  }
+
+  /**
+   * Be told when the connection to the kernel ends — for any reason other
+   * than this client closing it.
+   *
+   * ## Why this exists
+   *
+   * A long-lived command (a `watch`, a `supervise`, a `wait`) can have the
+   * kernel pulled out from under it. Without this, the command's fate
+   * depends on what else its event loop happens to be holding: `cortex
+   * watch` used to **exit silently with a success code** — which reads as
+   * "the watch finished" — and `cortex supervise` used to **hang forever**,
+   * leaving the process it was supervising unobserved.
+   *
+   * The handler is called once. If the connection has already ended, it is
+   * called immediately, so a caller cannot miss the event by subscribing
+   * late.
+   */
+  onClose(handler: (reason: Error) => void): void {
+    if (this.#closeReason !== undefined) {
+      handler(this.#closeReason);
+      return;
+    }
+    this.#closeHandlers.add(handler);
   }
 
   /**
@@ -160,6 +214,10 @@ export class KernelClient {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    // Our own close is not news: the `onClose` handlers exist to report the
+    // kernel going away, and a command that closed the connection because
+    // it was finished must not be told the kernel left.
+    this.#closedByUs = true;
     this.#failAll(new Error('connection closed'));
     this.#socket.destroy();
   }
@@ -206,6 +264,51 @@ export class KernelClient {
     this.#pending.clear();
     for (const waiter of waiters) waiter.reject(err);
   }
+
+  /** Tell everyone watching that the connection has ended. */
+  #notifyClose(reason: Error): void {
+    if (this.#closeReason !== undefined) return;
+    this.#closeReason = reason;
+    const handlers = [...this.#closeHandlers];
+    this.#closeHandlers.clear();
+    for (const handler of handlers) {
+      try {
+        handler(reason);
+      } catch {
+        // The handler is the caller's code. It must not be able to take the
+        // process down on the way out.
+      }
+    }
+  }
+}
+
+/**
+ * Explain why the connection to the kernel ended.
+ *
+ * The client knows *that* the connection ended; it does not know *why*. The
+ * directory can usually tell: a kernel that shut down cleanly removes its
+ * descriptor, a kernel that died leaves the descriptor behind with nothing
+ * listening, and a kernel that was replaced leaves one that answers.
+ *
+ * The distinction matters to whoever was watching. "The kernel shut down" is
+ * an ending; "the kernel died" is a failure; and neither of them is the same
+ * as "the watch finished" — which is what a command that cannot tell the
+ * difference ends up claiming.
+ */
+export async function explainKernelGone(dir: string): Promise<string> {
+  let probe: KernelProbe;
+  try {
+    probe = await probeKernel(dir, { timeoutMs: 1000 });
+  } catch {
+    return 'the connection to the kernel was lost';
+  }
+  if (probe.kind === 'absent') return 'the kernel shut down';
+  if (probe.kind === 'stale') {
+    return `the connection to the kernel was lost — it looks like the kernel died (${probe.reason})`;
+  }
+  // A live kernel answered, so it is a different one.
+  probe.client.close();
+  return 'the kernel went away, and another one is now serving this directory';
 }
 
 /** A command's outcome: the kernel's payload, or the kernel's refusal. */

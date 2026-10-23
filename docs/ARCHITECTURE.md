@@ -1034,6 +1034,27 @@ wait for, so it escalates to `SIGKILL` at once instead of burning the grace
 period. The alternative — waiting out a grace period for a signal that will
 never be seen — is how a supervisor ends up waiting on a corpse.
 
+**A stream needs an ending.** A subscriber is watching something that can
+leave. The kernel can be stopped, and it can crash — and when it does, the
+socket closes and the stream stops without saying a word. That silence is
+the dangerous kind: a `watch` that ends because its kernel died looks exactly
+like a watch that finished, and a supervisor that keeps polling a dead socket
+looks exactly like a supervisor that is still supervising.
+
+So the transport says when the connection ends. `KernelClient` reports it
+(`closed`, `onClose(handler)`), and each command turns it into an ending that
+means something and an exit code that tells the truth: `cortex watch` reports
+that the watch did not finish and exits 1; `cortex wait` reports that no exit
+was seen and exits 1; `cortex supervise` reports that the supervised
+process's fate is unknown and exits 1. **None of them invents an outcome it
+did not observe.**
+
+The client knows *that* the connection ended; the directory says *why*. A
+descriptor that is gone means the kernel shut down cleanly; a descriptor that
+is still there with nothing listening means it died; a descriptor that
+answers means another kernel has taken the directory over. Those are three
+different endings, and the operator is told which one happened.
+
 **Known limits (v0).**
 
 - **Watching is still not reacting — for a *host*.** The transport carries a

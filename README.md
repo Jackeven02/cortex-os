@@ -107,6 +107,12 @@ $ cortex supervise 1234 --kill-after 30000 --restart
 # pid 1234 has been inside recv for 1588ms — killing it
 # pid 1234 exited with code 137 (signal:SIGKILL)
 
+# If the kernel dies underneath a watcher, the CLI says so — and refuses to
+# pretend the watch finished.
+$ cortex watch
+cortex watch: the connection to the kernel was lost — it looks like the kernel died (connect ECONNREFUSED 127.0.0.1:60869)
+  the watch did not finish — it lost the kernel it was watching.
+
 # Pause and resume across reboots
 # (a checkpoint captures a live process, so this needs a live kernel:
 #  `cortex daemon run` — and SIGUSR2 means "checkpoint now")
@@ -171,7 +177,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 641 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 645 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

@@ -399,6 +399,19 @@ subscribe. If the process is already stuck when you start watching, its
 `enter` frame is in the past — read the process's `.crec` once at startup
 to find out what it is already inside. (`cortex supervise` does.)
 
+**And a host that watches a kernel it does not own must notice it leaving.**
+The API above is for a host that booted the kernel, so the kernel cannot
+vanish from under it. A host that talks to a kernel **over the transport** —
+the way the CLI does — is in a different position: the kernel can be stopped,
+or crash, and the connection ends without a word.
+
+The client reports that (`KernelClient.closed`, `KernelClient.onClose`), and
+the directory can say why: a descriptor that is gone means the kernel shut
+down, a descriptor that is still there with nothing listening means it died,
+and a descriptor that answers means another kernel has taken over. What a
+host must *not* do is treat a dead connection as a finished watch — that is
+how "the kernel died" gets reported as "the agent exited cleanly".
+
 ### 7.3 What a host cannot do
 
 - **Call syscalls as a process.** `dispatcher.invoke(pid, …)` runs the
