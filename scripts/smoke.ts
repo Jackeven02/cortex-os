@@ -277,6 +277,8 @@ import {
   listProcDirs,
   readExitRecord,
   findCheckpointByTag,
+  readSpec,
+  specPath,
   type ProcessMeta,
 } from '../src/cli/process_store.js';
 
@@ -288,6 +290,8 @@ import {
 } from '../src/cli/regions.js';
 import { cmdSpawn } from '../src/cli/commands/spawn.js';
 import { cmdRestore } from '../src/cli/commands/restore.js';
+import { bootCliKernel } from '../src/cli/index.js';
+import { pathToFileURL } from 'node:url';
 import { resolveModulePath } from '../src/cli/module_path.js';
 import { DEFAULT_MEMORY_REGIONS } from '../src/cli/index.js';
 import {
@@ -11725,6 +11729,70 @@ async function runCliChecks(): Promise<void> {
         assert(code === 1, `exit 1, got ${code}`);
         assert(err.includes('no live kernel'), `the reason is reported, got: ${err.trim()}`);
         assert(!err.includes('no checkpoint found'), 'the tag is not what it complains about');
+      });
+
+      await checkAsync('a process keeps its spec while it runs, so its snapshot outlives its kernel', async () => {
+        // The `.csnap` body deliberately omits the agent spec, and the
+        // `meta.json` carries it only once the process *exits* — so a snapshot
+        // of an agent that was still running had no spec anywhere on disk,
+        // and could not be restored once its kernel was gone. The spec is
+        // written when the process is created instead.
+        const modulePath = join(tmp, 'self-checkpoint-agent.ts');
+        writeFileSync(
+          modulePath,
+          'export default async function selfCheckpointAgent(ctx: any): Promise<void> {\n' +
+            "  await ctx.checkpoint({ tag: 'before-crash', detach: true });\n" +
+            '}\n',
+        );
+
+        const first = await bootCliKernel(tmp);
+        let chainId: string | undefined;
+        try {
+          const pid = await first.spawn({
+            role: 'self-check',
+            agent: { module: pathToFileURL(modulePath).href },
+          });
+
+          // The spec is there from the moment the process exists.
+          const spec = readSpec(tmp, pid);
+          assert(spec !== undefined, 'the spec was written at creation');
+          assert(spec!.role === 'self-check', `the role is recorded, got ${spec!.role}`);
+          assert('module' in spec!.agent, 'the agent spec is recorded');
+          assert(!existsSync(metaPath(tmp, pid)), 'no meta yet — the process has not exited');
+
+          // The agent checkpoints itself and detaches: the snapshot exists and
+          // the process is suspended (not exited), so nothing wrote a meta.
+          const deadline = Date.now() + 5000;
+          while (Date.now() < deadline && chainId === undefined) {
+            chainId = await findCheckpointByTag(tmp, 'before-crash');
+            if (chainId === undefined) await new Promise((r) => setTimeout(r, 20));
+          }
+          assert(chainId !== undefined, 'the agent checkpointed itself');
+          assert(
+            !existsSync(metaPath(tmp, pid)),
+            'still no meta — a suspended process never exits, so nothing wrote one',
+          );
+        } finally {
+          await first.shutdown();
+        }
+
+        // A later session — one that never saw the process — restores it.
+        // This is the "the laptop rebooted" case: the snapshot and the spec
+        // are on disk, and nothing else is.
+        const second = await bootCliKernel(tmp);
+        try {
+          const restored = await second.dispatcher.invoke(
+            asProcessId(1),
+            'restore',
+            asChainId(chainId!),
+            {},
+          );
+          const entry = second.table.get(restored.pid);
+          assert(entry !== undefined, 'the restored process exists');
+          assert(entry!.role === 'self-check', `the role survived, got ${entry!.role}`);
+        } finally {
+          await second.shutdown();
+        }
       });
 
       await checkAsync('cortex spawn rejects a malformed --memory before booting', async () => {

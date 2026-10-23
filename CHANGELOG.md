@@ -491,6 +491,38 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A snapshot of a running agent could not be restored once its kernel was
+  gone.** The `.csnap` body deliberately omits the agent spec (docs/STATE.md
+  §4) — a restore has to be told what to rebuild. The only thing on disk that
+  carried it was the `meta.json`, and the CLI writes that when a process
+  *exits*. So a snapshot of an agent that was still running had no spec
+  anywhere once its kernel was gone, and a later `cortex restore` answered
+  *"no on-disk meta for pid N — cannot rebuild the agent spec"*. That is the
+  flagship case: a daemon's agent checkpoints itself, the machine reboots, and
+  the agent cannot come back.
+
+  The kernel now reports every birth — `KernelOptions.onProcessStart`, the
+  counterpart of `onProcessExit` — and the CLI writes the spec down at
+  creation, in `processes/<pid>/spec.json`: role, agent spec, and the memory
+  region policies the process was declared with. Every process is born
+  through `table.allocate()` — the dispatcher's `spawn`, init's daemon
+  registration, and `restore` all land there — so one hook covers all of
+  them.
+
+  The restore context now has three sources, best first: the process this
+  kernel is still running, the spec written at creation, and the meta written
+  at exit. The spec comes before the meta because it carries the memory
+  policies the process was actually declared with, which the exit meta
+  usually does not.
+
+  Verified end to end: a daemon's agent is checkpointed, the daemon is killed
+  uncleanly (no clean shutdown, so no `meta.json` is ever written), and
+  `cortex restore --tag` restores it in a fresh session. The check fails
+  without the change — it was confirmed to fail, not merely to pass.
+
+  (src/kernel/boot.ts, process_table.ts; src/cli/process_store.ts,
+  index.ts; 1 smoke check.)
+
 - **`cortex restore --tag` could not find a checkpoint that was sitting on
   disk.** The tag is an *argument* and the chain id is a *result*, and since
   the `checkpoint` syscall moved onto the dispatcher's recording path the two

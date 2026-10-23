@@ -44,6 +44,29 @@ import { readRecords, existingCrecPath } from '../kernel/recorder.js';
 // Types
 // =============================================================================
 
+/**
+ * How a process was **born**: the role, the agent spec, and the memory
+ * region policies it was declared with.
+ *
+ * The `.csnap` body deliberately omits all of this (docs/STATE.md §4), so a
+ * restore has to be told what to materialise. `meta.json` carries the same
+ * facts — but it is written when a process *exits*, so a process that was
+ * still running when its kernel went away had its spec nowhere on disk, and
+ * a snapshot of it could not be restored in a later session.
+ *
+ * This document is written when the process is created, for exactly that
+ * reason: before the process can ever be snapshotted.
+ */
+export interface ProcessSpec {
+  readonly pid: number;
+  readonly ppid: number | null;
+  readonly role: string;
+  readonly agent: AgentSpec;
+  readonly memory?: Readonly<Record<string, MemoryRegionPolicy>>;
+  readonly startedAt: string;
+  readonly kernelAbiVersion: string;
+}
+
 export interface ProcessMeta {
   readonly pid: number;
   readonly ppid: number | null;
@@ -85,6 +108,16 @@ export interface ProcessMeta {
  */
 export function metaPath(dir: string, pid: ProcessId): string {
   return join(procDir(dir, pid), 'meta.json');
+}
+
+/**
+ * `.cortex/processes/<pid>/spec.json` — how the process was born.
+ *
+ * Written when the process is created; read when a snapshot of it has to be
+ * restored in a session that never saw the process itself.
+ */
+export function specPath(dir: string, pid: ProcessId): string {
+  return join(procDir(dir, pid), 'spec.json');
 }
 
 /** The pre-`0.2.1` flat form, `.cortex/processes/<pid>.meta.json`. */
@@ -140,6 +173,56 @@ export function writeMeta(dir: string, meta: ProcessMeta): void {
     // could not be created.
   }
   writeFileSync(path, JSON.stringify(meta, null, 2), 'utf8');
+}
+
+/**
+ * Write a process's spec — how it was born.
+ *
+ * Written when the process is created, not when it ends: a snapshot of a
+ * process that was still running has to be restorable after its kernel is
+ * gone, and by then nothing else would know what the process was.
+ */
+export function writeSpec(dir: string, spec: ProcessSpec): void {
+  const path = specPath(dir, asProcessId(spec.pid));
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch {
+    // Best-effort: the write below reports the real failure if the directory
+    // could not be created.
+  }
+  writeFileSync(path, JSON.stringify(spec, null, 2), 'utf8');
+}
+
+/**
+ * Read a process's spec back.
+ *
+ * Returns `undefined` when there is none — an older home, a process created
+ * by a kernel that did not persist specs, or a truncated file. The caller
+ * falls back to whatever else it can find.
+ */
+export function readSpec(dir: string, pid: ProcessId): ProcessSpec | undefined {
+  const path = specPath(dir, pid);
+  if (!existsSync(path)) return undefined;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return undefined;
+  }
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const r = raw as Partial<ProcessSpec>;
+  if (typeof r.role !== 'string' || typeof r.agent !== 'object' || r.agent === null) {
+    return undefined;
+  }
+  return {
+    pid: unbrand(pid),
+    ppid: typeof r.ppid === 'number' ? r.ppid : null,
+    role: r.role,
+    agent: r.agent as AgentSpec,
+    ...(r.memory !== undefined ? { memory: r.memory } : {}),
+    startedAt: typeof r.startedAt === 'string' ? r.startedAt : '',
+    kernelAbiVersion: typeof r.kernelAbiVersion === 'string' ? r.kernelAbiVersion : '',
+  };
 }
 
 export function deleteMeta(dir: string, pid: ProcessId): void {

@@ -225,6 +225,22 @@ interface ProcessMeta {
   readonly memory?: Readonly<Record<string, MemoryRegionPolicy>>;
 }
 
+/**
+ * What a process was **born** as — the facts a restore needs to rebuild it.
+ *
+ * The `.csnap` body deliberately omits the role/agent spec (docs/STATE.md §4),
+ * so a restore has to be told what to materialise. The kernel knows the spec
+ * of every process it creates; this is how it says so out loud.
+ */
+export interface ProcessBirth {
+  readonly pid: number;
+  readonly ppid: number | null;
+  readonly role: string;
+  readonly agent: AgentSpec;
+  readonly memory: Readonly<Record<string, MemoryRegionPolicy>>;
+  readonly startedAt: Timestamp;
+}
+
 export interface KernelOptions {
   /** Written into every `.crec` / `.csnap` record. Required (no silent default). */
   readonly kernelAbiVersion: string;
@@ -318,6 +334,23 @@ export interface KernelOptions {
    * disk beyond its own `.crec` logs.
    */
   readonly onProcessExit?: (meta: PersistedProcessMeta) => void | Promise<void>;
+
+  /**
+   * Fired when a process is **created**, with the facts it was born as.
+   *
+   * The counterpart of {@link KernelOptions.onProcessExit}: that one reports
+   * how a process ended, this one reports how it began.
+   *
+   * It exists because the `.csnap` body does not carry the agent spec, and
+   * the CLI's `meta.json` — which does — is only written when a process
+   * *exits*. So a snapshot of an agent that was still running when its kernel
+   * went away had no spec anywhere on disk, and could not be restored in a
+   * later session. The CLI uses this to write the spec down at creation time,
+   * before the process can ever be snapshotted.
+   *
+   * Optional: absent (the default) the kernel keeps no record of it.
+   */
+  readonly onProcessStart?: (birth: ProcessBirth) => void | Promise<void>;
 
   /**
    * Start the scheduler's auto-loop at the end of `boot()`. Defaults to
@@ -473,6 +506,7 @@ export class Kernel {
         Recorder.open({ pid, dir: join(this.#processesDir, String(unbrand(pid))) }));
 
     // --- process_table ------------------------------------------------------
+    const onProcessStart = opts.onProcessStart;
     this.table = new ProcessTable({
       kernelAbiVersion: this.kernelAbiVersion,
       now: this.#now,
@@ -486,6 +520,22 @@ export class Kernel {
       // its PID path.
       ...(opts.recorderFactory === undefined
         ? { pidClaim: (pid: number) => claimPidDirectory(this.#processesDir, pid) }
+        : {}),
+      // Every process is born through `table.allocate()` — the dispatcher's
+      // `spawn`, init's daemon registration, and `restore` all land here — so
+      // this is the one place that sees every birth.
+      ...(onProcessStart !== undefined
+        ? {
+            onCreate: (entry) =>
+              onProcessStart({
+                pid: unbrand(entry.pid),
+                ppid: entry.ppid === null ? null : unbrand(entry.ppid),
+                role: entry.role,
+                agent: entry.agent,
+                memory: Object.fromEntries(entry.memoryRegions),
+                startedAt: entry.startedAt,
+              }),
+          }
         : {}),
     });
 

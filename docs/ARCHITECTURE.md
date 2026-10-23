@@ -484,9 +484,11 @@ For v0, **only install drivers you trust**. Same advice as npm packages generall
 ├── processes/                        # one directory per PID — a PID's CLAIM
 │   ├── 1/                            # init
 │   │   ├── log.crec                  # append-only syscall log
+│   │   ├── spec.json                 # how the process was born (see below)
 │   │   └── meta.json                 # cached ProcessInfo (for fast ps)
 │   ├── 2/
 │   │   ├── log.crec
+│   │   ├── spec.json
 │   │   ├── meta.json
 │   │   └── checkpoints/
 │   │       ├── 2026-09-17T10:23:01Z_<chainid>.csnap
@@ -509,6 +511,8 @@ For v0, **only install drivers you trust**. Same advice as npm packages generall
 **Why one directory per process.** So you can `rm -rf .cortex/processes/1234/` to fully remove a dead process. No global indices to clean up.
 
 **Why the process directory is also the PID's claim.** A state directory can host more than one kernel — `cortex daemon run` keeps one alive there while other `cortex` invocations work in the same directory — and each kernel counts PIDs up from its own seed. The directory is created with an *exclusive* `mkdir`, so exactly one kernel can win a given PID. Without it, the two counters walk into each other and the loser opens the winner's `log.crec` in append mode: two unrelated processes sharing one syscall log, silently. See §12.1.
+
+**What `spec.json` holds, and why it is written so early.** The role, the agent spec, and the memory region policies a process was created with — the facts a restore needs to rebuild it, and the facts the `.csnap` body deliberately omits (STATE.md §4). It is written when the process is **created**, not when it exits: `meta.json` (which carries the same facts) is written at exit, so a snapshot of an agent that was still running when its kernel died would have had no spec anywhere on disk and could not be restored in a later session. The kernel reports the birth (`KernelOptions.onProcessStart`) and the CLI decides what to write; the kernel itself never touches the disk layout.
 
 **What `kernel.json` holds.** The endpoint descriptor of the kernel serving this directory: the loopback host and port, the kernel's OS pid, a per-kernel shared secret, and the ABI version it speaks. It is written when a kernel starts serving and removed when it stops. (The "kernel config (drivers, defaults)" role this file was sketched for is still aspirational — v0 has no config file.)
 
@@ -750,10 +754,11 @@ by an earlier kernel loads too), the restored process is minted by that
 kernel, and it stays there — with a new PID, its role intact, and reachable by
 every other transport command.
 
-The kernel rebuilds the restored agent's spec from two places, in this order:
+The kernel rebuilds the restored agent's spec from three places, best first:
 **the process it is still running** (its role and agent spec are right there in
-the process table), and **the disk** (`<pid>.meta.json`, written when a
-process exits). The live one comes first because a running process has no
+the process table), **the spec written when it was created**
+(`<pid>.spec.json`, §7), and **the meta written when it exited**
+(`<pid>.meta.json`). The live one comes first because a running process has no
 `meta.json` yet — which is exactly the case `restore --live` exists for. The
 lookup cannot confuse two processes: a kernel seeds its PID counter past
 everything already on disk, so a PID from an earlier session is never handed
@@ -772,12 +777,12 @@ out again, and a table hit is always the very process that took the snapshot.
 - **A snapshot does not carry its agent's spec.** The `.csnap` body holds the
   process image — state, memory, budgets, lineage — and deliberately not the
   role/agent spec, which is why a restore needs a context (the kernel's
-  `restoreContext`). The disk half of that context is a `meta.json`, and the
-  CLI writes one when a process *exits*. So a snapshot of an agent that was
-  still running when its kernel went away cannot be restored in a later
-  session: the spec died with the kernel. Restoring it *into* that kernel
-  (`--live`) works; restoring it after the kernel is gone needs the spec to
-  have been persisted when the process was created.
+  `restoreContext`). That context comes from the process table, from
+  `<pid>.spec.json` (written when the process was created, §7), or from
+  `<pid>.meta.json` (written when it exited). A snapshot taken before this
+  round's change — or by a kernel that persisted no specs — can only be
+  restored while its process is still around, or after the process has
+  exited and written its meta.
 - A crashed kernel leaves a stale `kernel.json` behind. Clients detect it
   (the port refuses the connection) and fall back to the disk view.
 - A **queued** signal loses its sender. The pending queue holds the signal

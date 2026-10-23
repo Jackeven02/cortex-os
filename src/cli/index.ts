@@ -45,7 +45,7 @@ import { inmemMemory } from '../drivers/memory/inmem.js';
 import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type MemoryRegionPolicy } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
 import { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir } from '../kernel/recorder.js';
-import { readAllMetas, readMeta, writeMeta, maxPidOnDisk, readExitRecord, type ProcessMeta } from './process_store.js';
+import { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, type ProcessMeta, type ProcessSpec } from './process_store.js';
 
 import { cmdSpawn } from './commands/spawn.js';
 import { cmdWrap } from './commands/wrap.js';
@@ -403,9 +403,17 @@ export async function bootCliKernel(
     // The kernel's default restoreContext reads an in-memory per-PID map that
     // is empty in a fresh CLI invocation, so cross-invocation `cortex restore`
     // would trap EINVAL ("no agent metadata"). The `.csnap` body deliberately
-    // does not carry role/agent — so the context has to come from elsewhere:
-    // from the process table while this kernel still has it, and from the
-    // CLI's `<pid>.meta.json` (written when a process exits) otherwise.
+    // does not carry role/agent — so the context has to come from elsewhere.
+    // Three sources, best first:
+    //
+    //   1. the process this kernel is still running (its spec is in the table),
+    //   2. the spec written when the process was *created* (`spec.json`),
+    //   3. the meta written when it exited (`meta.json`).
+    //
+    // (2) comes before (3) because the spec carries the memory region
+    // policies the process was actually declared with, while the exit meta
+    // usually carries none. And (2) is what makes a snapshot of a process
+    // that was still running restorable after its kernel is gone.
     restoreContext: (cp) => {
       const live = self === null ? undefined : self.table.get(cp.pid);
       if (live !== undefined) {
@@ -413,6 +421,15 @@ export async function bootCliKernel(
           role: live.role,
           agent: live.agent,
           memory: Object.fromEntries(live.memoryRegions),
+          ppid: cp.parentPid,
+        };
+      }
+      const spec = readSpec(dir, cp.pid);
+      if (spec !== undefined) {
+        return {
+          role: spec.role,
+          agent: spec.agent,
+          ...(spec.memory !== undefined ? { memory: spec.memory } : {}),
           ppid: cp.parentPid,
         };
       }
@@ -441,6 +458,31 @@ export async function bootCliKernel(
     onProcessExit: (meta) => {
       writeMeta(dir, meta as unknown as Parameters<typeof writeMeta>[1]);
     },
+    // Persist a process's spec — role, agent, memory policies — when it is
+    // *created*. The `.csnap` body deliberately omits it, and the meta.json
+    // above is only written when a process exits, so without this a snapshot
+    // of an agent that was still running when its kernel went away had no
+    // spec anywhere on disk and could not be restored in a later session.
+    onProcessStart: (birth) => {
+      try {
+        writeSpec(dir, {
+          pid: birth.pid,
+          ppid: birth.ppid,
+          role: birth.role,
+          agent: birth.agent,
+          memory: birth.memory,
+          startedAt: birth.startedAt,
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        });
+      } catch (err) {
+        // The process exists; only its spec is missing. Say so rather than
+        // losing the fact silently — a snapshot taken now would not be
+        // restorable elsewhere.
+        console.error(
+          `cortex: could not persist the spec of pid ${birth.pid}: ${(err as Error).message}`,
+        );
+      }
+    },
   });
   self = kernel;
   // Seed the PID counter past anything already persisted, so this invocation
@@ -466,7 +508,7 @@ export function parsePid(s: string): ProcessId {
 // =============================================================================
 
 export { unbrand, asProcessId };
-export { readAllMetas, readMeta, writeMeta, maxPidOnDisk, readExitRecord, type ProcessMeta };
+export { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, type ProcessMeta, type ProcessSpec };
 export { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir };
 
 // =============================================================================

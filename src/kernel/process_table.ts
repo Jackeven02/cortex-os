@@ -352,6 +352,19 @@ export interface ProcessTableOptions {
    * which is what an in-memory kernel wants.
    */
   readonly pidClaim?: (pid: number) => boolean;
+
+  /**
+   * Called once per allocated process, right after the entry is registered.
+   *
+   * The kernel reports the fact; whoever owns the disk decides what to do with
+   * it. Every process is born through `allocate()` — the dispatcher's
+   * `spawn`, init's daemon registration, and `restore` all land here — so
+   * this is the one place that sees every birth.
+   *
+   * A failure here must not stop the process from existing: the hook is a
+   * notification, not part of the allocation.
+   */
+  readonly onCreate?: (entry: ProcessEntry) => void | Promise<void>;
 }
 
 /**
@@ -384,12 +397,14 @@ export class ProcessTable {
   #recorderFactory: RecorderFactory;
   #now: () => Timestamp;
   #pidClaim: ((pid: number) => boolean) | null;
+  #onCreate: ((entry: ProcessEntry) => void | Promise<void>) | null;
 
   constructor(opts: ProcessTableOptions) {
     this.kernelAbiVersion = opts.kernelAbiVersion;
     this.#recorderFactory = opts.recorderFactory ?? nullRecorderFactory;
     this.#now = opts.now ?? (() => new Date().toISOString());
     this.#pidClaim = opts.pidClaim ?? null;
+    this.#onCreate = opts.onCreate ?? null;
   }
 
   // ---------------------------------------------------------------------------
@@ -562,6 +577,16 @@ export class ProcessTable {
 
     this.#entries.set(unbrand(pid), entry);
     this.#recorders.set(unbrand(pid), recorder);
+
+    // Report the birth. This is a notification, not part of the allocation:
+    // a listener that fails must not stop the process from existing.
+    if (this.#onCreate !== null) {
+      try {
+        await this.#onCreate(entry);
+      } catch {
+        /* the birth report is best-effort */
+      }
+    }
 
     return pid;
   }
