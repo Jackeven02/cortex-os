@@ -589,11 +589,24 @@ export class Kernel {
       },
     });
 
+    // --- memory (drivers are copied in from the registry at boot) -----------
+    // Constructed before init, because init needs it to bind a daemon's
+    // declared memory regions when it allocates the process (see
+    // InitProcessOptions.memory).
+    this.memory = new MemoryManager({
+      table: this.table,
+      kernelAbiVersion: this.kernelAbiVersion,
+      now: this.#now,
+      ...(opts.nextCallId !== undefined ? { nextCallId: opts.nextCallId } : {}),
+      ...(opts.maxRegionEntries !== undefined ? { maxRegionEntries: opts.maxRegionEntries } : {}),
+    });
+
     this.init = new InitProcess({
       table: this.table,
       signals: this.signals,
       kernelAbiVersion: this.kernelAbiVersion,
       now: this.#now,
+      memory: this.memory,
       ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
       ...(opts.clearTimeoutFn !== undefined ? { clearTimeoutFn: opts.clearTimeoutFn } : {}),
       ...(opts.onAlarm !== undefined ? { onAlarm: opts.onAlarm } : {}),
@@ -620,15 +633,6 @@ export class Kernel {
         ...(opts.defaultMemory !== undefined ? { defaultMemory: opts.defaultMemory } : {}),
         ...(opts.onCloseError !== undefined ? { onCloseError: opts.onCloseError } : {}),
       });
-
-    // --- memory (drivers copied from the registry at boot) -------------------
-    this.memory = new MemoryManager({
-      table: this.table,
-      kernelAbiVersion: this.kernelAbiVersion,
-      now: this.#now,
-      ...(opts.nextCallId !== undefined ? { nextCallId: opts.nextCallId } : {}),
-      ...(opts.maxRegionEntries !== undefined ? { maxRegionEntries: opts.maxRegionEntries } : {}),
-    });
 
     // --- ipc ----------------------------------------------------------------
     // NOTE: IpcManager types its timer hooks as `typeof setTimeout`, which does

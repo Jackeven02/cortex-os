@@ -42,6 +42,57 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex memory <pid>` — a running process's knowledge, addressed to that
+  process.** The `.crec` log records what a process **did**, and for a
+  `memory_write` the argument it records is a **hash**, not the value
+  (docs/ABI.md §4.4 — "full values would bloat the log"). So the causal
+  history can say that an agent *wrote something down* and never *what it
+  wrote down* — and the knowledge is the whole point of an agent that
+  remembers. The live kernel still had it; nothing could reach in.
+
+  `cortex memory <pid>` now answers "what does this process know?": which
+  regions it has, what kind each one is, how much is in each, **who else can
+  see them**, and the entries themselves.
+
+  ```
+  $ cortex memory 2
+  # memory of pid 2 (inbox-watcher)
+  REGION          KIND      BACKING     ENTRIES   SHARED WITH
+  -----------------------------------------------------------
+  episodic        cow       inmem       2         -
+  semantic        shared    inmem       3         3
+  procedural      private   inmem       0         -
+
+  $ cortex memory 2 semantic
+  # memory of pid 2 (inbox-watcher) — region 'semantic'
+  ticket:T-1180  {"id":"T-1180","category":"bug","reply":"Thanks for the report …"}  2026-10-23T19:05:33.842Z
+  ```
+
+  The `SHARED WITH` column is the one that earns its keep: a `shared` region
+  is visible to every process that declared it, so knowing that agent 3 is
+  reading agent 2's notes is the difference between a shared scratchpad and a
+  leak. It falls out of comparing physical keys, and it catches the other
+  case too — a `cow` region whose forked child has not written yet.
+
+  It is a **read**, like `ps`: answered by the memory engine directly, not
+  through the dispatcher, and not recorded in the `.crec` — the operator
+  looking at a process's memory is not something the process did. (An
+  agent's own `ctx.memory_read()` is unaffected: still a syscall, still
+  recorded.) It does need a live kernel, though — a region's contents live in
+  the memory driver, and the default `inmem` backing is the kernel process's
+  RAM, so there is no on-disk copy to fall back on. The command says plainly
+  that it needs one rather than reporting an empty region and letting the
+  operator wonder whether the agent really had forgotten everything.
+
+  Six smoke checks: a daemon-registered agent gets its memory regions bound,
+  the transport reads a live process's regions and their entries, an unknown
+  pid is refused with `ESRCH`, the transport read does not grow the log,
+  `cortex memory` prints the regions and dumps a region, and it says plainly
+  when there is no live kernel.
+
+  (docs/ARCHITECTURE.md §4.5, §12.1; `src/cli/kernel_protocol.ts`,
+  `kernel_server.ts`, `commands/memory.ts`; 6 smoke checks.)
+
 - **`cortex logs <pid>` — a process's output, addressed to that process.** The
   `.crec` log records what a process **did**: its syscalls, with arguments and
   results. It never recorded what a process **said**, because `console.log` is
@@ -566,13 +617,34 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A daemon-registered agent had no memory regions, and died on its first
+  memory access.** The regions were *declared* on the process-table entry and
+  never *bound* in the memory engine: `syncFromTable` was called on two of the
+  three birth paths — the `spawn` syscall (in the dispatcher) and `restore` (in
+  the checkpoint manager) — and not on the third, a daemon registration in
+  init. So a daemon's agent trapped `ENOENT` ("no such memory region") the
+  first time it tried to remember anything, while the same agent under
+  `cortex spawn` worked.
+
+  The asymmetry is what hid it. The Demo B agent reads its `done` set from
+  memory, and it is run with `cortex spawn`; the daemon path had only ever
+  been exercised with agents that touch no memory at all. PROCESS.md §6.1 has
+  always promised "sets up memory regions per policy" for every process — the
+  daemon path was the one that did not keep the promise.
+
+  Init now takes the memory engine (`InitProcessOptions.memory`) and syncs the
+  regions it allocates, which also covers daemon **restarts** (they go through
+  the same allocation path). Reproduced on a real daemon first: the
+  `checkpoint-agent` — Demo B's own agent — died with `no such memory region
+  'episodic'` the moment it started.
+
 - **The published assertion count was stale.** The READMEs' quickstart, the
   landing page's status panel and the HN launch draft all said "580 smoke
-  checks"; the suite is 610. The numbers were last refreshed when the landing
+  checks"; the suite is 616. The numbers were last refreshed when the landing
   page was first built and were never moved again, so a reader who ran the
-  suite saw thirty more assertions than the documents promised. All four
-  places now say 610, and the landing page's primitive grid grew a `logs` tile
-  — the grid listed twelve verbs and there are now thirteen.
+  suite saw thirty-six more assertions than the documents promised. All four
+  places now say 616, and the landing page's primitive grid grew a `logs` and
+  a `memory` tile — the grid listed twelve verbs and there are now fourteen.
 
 - **Every `cortex ps` against a live kernel wrote a frame into the
   supervisor's log.** The transport's `ps` went through the dispatcher — init

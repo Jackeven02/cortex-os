@@ -76,6 +76,7 @@ import {
 import { CortexError, isCortexError, trap } from './errors.js';
 import { PID_INIT, type ProcessTable } from './process_table.js';
 import type { SignalManager } from './signals.js';
+import type { MemoryManager } from './memory.js';
 import type { SyscallRecordInput } from './recorder.js';
 
 // =============================================================================
@@ -214,6 +215,21 @@ export interface InitProcessOptions {
    * clear any deferred wake-gate callback — none of which init owns directly.
    */
   readonly onReaped?: (pid: ProcessId) => void | Promise<void>;
+  /**
+   * The memory engine. Init needs it to *bind* a daemon's declared memory
+   * regions when it allocates the process.
+   *
+   * The regions are declared in the process table at `allocate()` time, but a
+   * declaration is not a binding: the memory engine is what turns a logical
+   * region into a physical key. Without the sync, a daemon's first
+   * `ctx.memory_read` traps `ENOENT` ("no such memory region") even though the
+   * region was declared — the daemon dies on its first memory access, while
+   * the same agent started with `cortex spawn` works, because the `spawn`
+   * syscall path does the sync.
+   *
+   * Optional: absent, a daemon gets no regions bound (and no region to read).
+   */
+  readonly memory?: MemoryManager | null;
   /** Override the default restart-storm threshold (see §1). */
   readonly restartStormThreshold?: number;
 }
@@ -262,6 +278,7 @@ export class InitProcess {
   #clearTimeoutFn: (handle: unknown) => void;
   #onAlarm: OnAlarmHook | null;
   #onReaped: ((pid: ProcessId) => void | Promise<void>) | null;
+  #memory: MemoryManager | null;
   #stormThreshold: number;
 
   /** Keyed by `unbrand(daemonId)`. */
@@ -286,6 +303,7 @@ export class InitProcess {
       opts.clearTimeoutFn ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
     this.#onAlarm = opts.onAlarm ?? null;
     this.#onReaped = opts.onReaped ?? null;
+    this.#memory = opts.memory ?? null;
     this.#stormThreshold = opts.restartStormThreshold ?? DEFAULT_RESTART_STORM_THRESHOLD;
   }
 
@@ -774,6 +792,13 @@ export class InitProcess {
     });
     // NEW → READY; the scheduler's reconcile() adopts it on the next tick.
     await this.#table.setState(pid, 'ready', { trigger: 'init-register-daemon' });
+    // A daemon's memory regions are declared in the table at allocate; sync the
+    // memory engine so they are *bound* before the daemon first runs. Without
+    // this the daemon's first `ctx.memory_read` traps ENOENT — the region was
+    // declared but never attached — and the daemon dies on its first memory
+    // access. The `spawn` syscall path does the same sync, which is why the
+    // same agent works under `cortex spawn` and dies under `cortex daemon`.
+    this.#memory?.syncFromTable(pid);
     return pid;
   }
 

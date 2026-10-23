@@ -242,6 +242,7 @@ import {
 import { cmdDiff } from '../src/cli/commands/diff.js';
 import { cmdTrace } from '../src/cli/commands/trace.js';
 import { cmdLogs } from '../src/cli/commands/logs.js';
+import { cmdMemory } from '../src/cli/commands/memory.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import {
   listDaemons,
@@ -11984,6 +11985,239 @@ async function runOutputCaptureChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Live-process memory inspection checks
+// =============================================================================
+
+/**
+ * An agent's memory is its knowledge. The syscall log deliberately stores a
+ * *hash* of a memory value rather than the value (ABI.md §4.4 — "full values
+ * would bloat the log"), so the causal history can say that an agent wrote
+ * something down and never what. These checks cover the two halves of
+ * closing that gap:
+ *
+ *   - the kernel binds a daemon's declared regions. It used to not, and a
+ *     daemon whose agent touched memory died on its first `memory_read` with
+ *     ENOENT — while the same agent under `cortex spawn` worked, because the
+ *     `spawn` syscall path did the sync.
+ *   - the transport can read a live process's regions and their entries.
+ */
+async function runMemoryInspectChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-meminspect-'));
+  const kernels: Kernel[] = [];
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+
+  try {
+    let daemonPid: number | undefined;
+
+    await checkAsync('a daemon-registered agent gets its memory regions bound', async () => {
+      const kernel = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir: tmp,
+        autoStart: true,
+        loadDrivers: (reg) => {
+          reg.registerMemory(inmemMemory());
+        },
+        agentLoader: async () => async (ctx) => {
+          // This used to trap ENOENT: the regions were declared in the
+          // process table but never bound in the memory engine, because the
+          // daemon birth path did not sync them.
+          await ctx.memory_write('semantic', 'note', { hello: 'world' });
+          for (;;) {
+            try {
+              await ctx.recv(undefined, { timeoutMs: 50 });
+            } catch (err) {
+              if ((err as { errno?: string }).errno !== 'ETIMEDOUT') throw err;
+            }
+          }
+        },
+      });
+      kernels.push(kernel);
+
+      const pid = await kernel.registerDaemon({
+        role: 'rememberer',
+        agent: { module: 'test:rememberer' },
+        memory: {
+          episodic: { kind: 'private', backing: 'inmem' },
+          semantic: { kind: 'shared', backing: 'inmem' },
+        },
+      });
+      daemonPid = unbrand(pid);
+
+      // The regions are *bound*, not merely declared.
+      const regions = kernel.memory.regionsOf(pid);
+      assert(regions.length === 2, `both regions are bound, got ${regions.length}`);
+      assert(
+        regions.some((r) => r.region === 'semantic' && r.kind === 'shared'),
+        'the shared region kept its declared kind',
+      );
+
+      // And the daemon's agent can actually use them.
+      const deadline = Date.now() + 5000;
+      let entries: readonly { key: string; value: unknown }[] = [];
+      while (Date.now() < deadline && entries.length === 0) {
+        entries = await kernel.memory.read(pid, 'semantic', {});
+        if (entries.length === 0) await new Promise((r) => setTimeout(r, 20));
+      }
+      assert(entries.length === 1, `the daemon wrote one note, got ${entries.length}`);
+      assert(
+        JSON.stringify(entries[0]!.value) === '{"hello":"world"}',
+        `the note is what it wrote, got ${JSON.stringify(entries[0]!.value)}`,
+      );
+    });
+
+    await checkAsync("the transport's memory command reads a live process's regions", async () => {
+      const kernel = kernels[0]!;
+      const pid = daemonPid!;
+      const server = await startKernelServer(kernel, { log: () => {} });
+      servers.push(server);
+      writeEndpoint(tmp, server.endpoint);
+
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+
+      const listed = await client!.request<{
+        regions: readonly { region: string; kind: string; entries: number }[];
+      }>('memory', { pid });
+      assert(listed.regions.length === 2, `both regions are reported, got ${listed.regions.length}`);
+      const semantic = listed.regions.find((r) => r.region === 'semantic');
+      assert(semantic !== undefined, 'the semantic region is reported');
+      assert(semantic!.kind === 'shared', `its kind is shared, got ${semantic!.kind}`);
+      assert(semantic!.entries === 1, `it holds one entry, got ${semantic!.entries}`);
+
+      const dumped = await client!.request<{
+        entries: readonly { key: string; value: unknown }[];
+      }>('memory', { pid, region: 'semantic' });
+      assert(dumped.entries.length === 1, `one entry dumped, got ${dumped.entries.length}`);
+      assert(dumped.entries[0]!.key === 'note', `the key, got ${dumped.entries[0]!.key}`);
+      assert(
+        JSON.stringify(dumped.entries[0]!.value) === '{"hello":"world"}',
+        `the value the agent actually wrote, got ${JSON.stringify(dumped.entries[0]!.value)}`,
+      );
+
+      // A pid the kernel does not know is ESRCH, not an empty answer.
+      const missing = await client!.requestRaw('memory', { pid: 999999 });
+      assert(!missing.ok, 'an unknown pid is refused');
+      assert(
+        missing.ok === false && missing.error.errno === 'ESRCH',
+        `the refusal is ESRCH, got ${missing.ok === false ? missing.error.errno : 'ok'}`,
+      );
+
+      client!.close();
+    });
+
+    await checkAsync('the transport read does not write a frame into the log', async () => {
+      // A read is a read: the operator looking at a process's memory is not
+      // something the process did, so it must not grow the causal history.
+      const kernel = kernels[0]!;
+      const pid = daemonPid!;
+      const logPath = existingCrecPath(tmp, asProcessId(pid));
+      assert(existsSync(logPath), 'the daemon has a log');
+
+      const countFrames = async (): Promise<number> => {
+        let n = 0;
+        for await (const _rec of readRecords(logPath)) n++;
+        return n;
+      };
+
+      const before = await countFrames();
+      const probe = await probeKernel(tmp);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+      await client!.request('memory', { pid });
+      await client!.request('memory', { pid, region: 'semantic' });
+      client!.close();
+      const after = await countFrames();
+      assert(before === after, `the log did not grow (${before} -> ${after})`);
+      assert(kernel.table.get(asProcessId(pid)) !== undefined, 'the process is still there');
+    });
+
+    await checkAsync('cortex memory prints the regions of a live process', async () => {
+      process.env['CORTEX_HOME'] = tmp;
+      const pid = daemonPid!;
+      let out = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      let code: number;
+      try {
+        code = await cmdMemory([String(pid)]);
+      } finally {
+        process.stdout.write = prevWrite;
+      }
+      assert(code === 0, `exit 0, got ${code}`);
+      assert(out.includes('semantic'), `the region is listed, got: ${out}`);
+      assert(out.includes('episodic'), `the other region is listed, got: ${out}`);
+      assert(out.includes('SHARED WITH'), `the sharing column is there, got: ${out}`);
+    });
+
+    await checkAsync('cortex memory dumps a region', async () => {
+      process.env['CORTEX_HOME'] = tmp;
+      const pid = daemonPid!;
+      let out = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      let code: number;
+      try {
+        code = await cmdMemory([String(pid), 'semantic']);
+      } finally {
+        process.stdout.write = prevWrite;
+      }
+      assert(code === 0, `exit 0, got ${code}`);
+      assert(out.includes('note'), `the entry is printed, got: ${out}`);
+      assert(out.includes('hello'), `the value is printed, got: ${out}`);
+    });
+
+    await checkAsync('cortex memory says plainly that it needs a live kernel', async () => {
+      const empty = mkdtempSync(join(tmpdir(), 'cortex-nokernel-'));
+      process.env['CORTEX_HOME'] = empty;
+      let err = '';
+      const prevErr = console.error;
+      console.error = (...parts: unknown[]): void => {
+        err += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      let code: number;
+      try {
+        code = await cmdMemory(['2']);
+      } finally {
+        console.error = prevErr;
+        rmSync(empty, { recursive: true, force: true });
+      }
+      assert(code === 1, `exit 1, got ${code}`);
+      assert(err.includes('no live kernel'), `the reason is reported, got: ${err.trim()}`);
+    });
+  } finally {
+    process.stdout.write = process.stdout.write;
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // CLI daemon checks (#039)
 // =============================================================================
 
@@ -12840,6 +13074,7 @@ await runSqliteChecks();
 runRegionsChecks();
 await runCliChecks();
 await runOutputCaptureChecks();
+await runMemoryInspectChecks();
 await runDaemonChecks();
 await runKernelHardeningChecks();
 await runTransportChecks();

@@ -26,7 +26,7 @@
  * being half-delivered. The transport adds reachability; it does not add a
  * side door around the kernel's guarantees.
  *
- * The exceptions are the three commands that are **not actions by an agent**,
+ * The exceptions are the four commands that are **not actions by an agent**,
  * and they are exceptions for that reason alone.
  *
  * - `ping` and `shutdown` are transport-level housekeeping.
@@ -37,6 +37,10 @@
  *   read is not something the kernel's causal history should record. (An
  *   agent's own `ctx.ps()` is still a syscall and is still recorded, per
  *   ABI.md §4.1. Only the transport's view of the table is not.)
+ * - `memory` is the operator looking at what a process wrote down. Same
+ *   reasoning: it is a read of the process's memory regions, not something
+ *   the process did. (An agent's own `ctx.memory_read()` is still a syscall,
+ *   and still recorded — ABI.md §4.4.)
  *
  * Everything that *acts* — `send`, `kill`, `checkpoint`, `restore`, `spawn` —
  * goes through the dispatcher, and is recorded exactly like the local
@@ -64,6 +68,7 @@ import {
   type BudgetLimits,
   type Capability,
   type MemoryRegionPolicy,
+  type MemoryQuery,
   type ProcessFilter,
   type ProcessId,
   type Signal,
@@ -339,6 +344,16 @@ function toWireError(err: unknown): { errno: string; message: string; details?: 
 const CHECKPOINTABLE: ReadonlySet<string> = new Set(['running', 'blocked']);
 
 /**
+ * How many entries of a region are read to answer "how much is in there?".
+ *
+ * The region *list* is a shape, not a dump: the operator wants to know that
+ * an agent has 400 notes in `semantic`, not to read 400 notes to find out.
+ * Past the cap the count is reported as a lower bound rather than growing
+ * without limit.
+ */
+const REGION_COUNT_CAP = 1000;
+
+/**
  * States that are worth waiting through.
  *
  * A process that has just been created or scheduled (`NEW` / `READY`) reaches
@@ -401,6 +416,77 @@ async function dispatch(
       // is still a syscall, and still recorded (ABI.md §4.1).
       const processes = kernel.table.list(filter);
       return { processes };
+    }
+
+    case 'memory': {
+      const pid = Number(args['pid']);
+      if (!Number.isInteger(pid)) {
+        throw new WireError('EINVAL', `invalid pid: ${String(args['pid'])}`);
+      }
+      const target = asProcessId(pid);
+      const entry = kernel.table.get(target);
+      if (entry === undefined) {
+        throw new WireError('ESRCH', `pid ${pid} is not in this kernel's process table`);
+      }
+
+      const region = args['region'];
+      if (typeof region === 'string') {
+        // Dump one region. A read, like `ps`: the operator is *looking* at
+        // what the process wrote down, and that question is not part of the
+        // process's causal history. (An agent's own `ctx.memory_read()` is
+        // unaffected — that is a syscall, and still recorded, ABI.md §4.4.)
+        const query: MemoryQuery = {
+          ...(typeof args['key'] === 'string' ? { key: args['key'] } : {}),
+          ...(typeof args['prefix'] === 'string' ? { prefix: args['prefix'] } : {}),
+          ...(typeof args['limit'] === 'number' ? { limit: args['limit'] } : {}),
+        };
+        const entries = await kernel.memory.read(target, region, query);
+        return {
+          pid,
+          role: entry.role,
+          region,
+          entries: entries.map((e) => ({ key: e.key, value: e.value, at: e.at })),
+        };
+      }
+
+      // List the regions: what this process knows where it keeps it.
+      //
+      // `entryCount` on a region is the *write* count (it is what the ENOMEM
+      // ceiling is measured against), not the number of entries, so the real
+      // count is read from the driver — capped, because a region can be large
+      // and the operator asked for a shape, not a dump.
+      const regions = kernel.memory.regionsOf(target);
+      const all = kernel.table.list();
+      const described = [];
+      for (const info of regions) {
+        const entries = await kernel.memory.read(target, info.region, { limit: REGION_COUNT_CAP });
+        // Who else is bound to the same physical key? For a `shared` region
+        // that is every process that declared it — and for a `cow` region it
+        // is a forked child that has not written yet. Either way it is the
+        // answer to "who else can see this?".
+        const sharedWith: number[] = [];
+        for (const other of all) {
+          if (unbrand(other.pid) === pid) continue;
+          for (const otherRegion of kernel.memory.regionsOf(other.pid)) {
+            if (otherRegion.bindingKey === info.bindingKey) {
+              sharedWith.push(unbrand(other.pid));
+              break;
+            }
+          }
+        }
+        described.push({
+          region: info.region,
+          kind: info.kind,
+          backing: info.backing,
+          readOnly: info.readOnly,
+          refCount: info.refCount,
+          writes: info.entryCount,
+          entries: entries.length,
+          truncated: entries.length >= REGION_COUNT_CAP,
+          sharedWith,
+        });
+      }
+      return { pid, role: entry.role, regions: described };
     }
 
     case 'send': {

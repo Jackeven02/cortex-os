@@ -54,12 +54,16 @@ export const KERNEL_PROTOCOL_VERSION = 1;
  * The commands a client may issue.
  *
  * `ping` and `shutdown` are transport-level: they are *not* syscalls and are
- * deliberately not recorded in the `.crec` log. Everything else is answered
- * by the ordinary dispatcher path and therefore is recorded.
+ * deliberately not recorded in the `.crec` log. `ps` and `memory` are the
+ * operator *looking* at the kernel's state rather than acting through it, so
+ * they are not recorded either — a monitoring loop that polls every second
+ * would otherwise grow the log without doing any work. Everything else is
+ * answered by the ordinary dispatcher path and therefore is recorded.
  */
 export type KernelCommand =
   | 'ping'
   | 'ps'
+  | 'memory'
   | 'send'
   | 'kill'
   | 'checkpoint'

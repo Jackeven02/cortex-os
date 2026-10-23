@@ -55,6 +55,7 @@ import { cmdTop } from './commands/top.js';
 import { cmdKill } from './commands/kill.js';
 import { cmdTrace } from './commands/trace.js';
 import { cmdLogs } from './commands/logs.js';
+import { cmdMemory } from './commands/memory.js';
 import { cmdAttach } from './commands/attach.js';
 import { cmdDaemon } from './commands/daemon.js';
 import { cmdCheckpoint } from './commands/checkpoint.js';
@@ -99,6 +100,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdTrace(rest);
       case 'logs':
         return await cmdLogs(rest);
+      case 'memory':
+        return await cmdMemory(rest);
       case 'attach':
         return await cmdAttach(rest);
       case 'daemon':

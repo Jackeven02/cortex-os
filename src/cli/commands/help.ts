@@ -22,6 +22,7 @@ COMMANDS
   kill         Send a signal to a process
   trace        strace-style syscall log
   logs         What a process printed (per-process stdout capture)
+  memory       What a running process knows (its memory regions)
   checkpoint   Snapshot a process to disk
   restore      Restore a process from a checkpoint
   fork         Clone a running process at its current state
@@ -47,6 +48,7 @@ EXAMPLES
   cortex kill 1234 --signal SIGTERM
   cortex trace 1234
   cortex logs 1234
+  cortex memory 1234
   cortex checkpoint 1234 --tag "before risky edit"
   cortex restore --tag "before risky edit"
   cortex fork 1234

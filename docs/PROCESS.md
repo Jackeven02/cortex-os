@@ -279,6 +279,13 @@ The kernel:
 6. Records the spawn syscall in the parent's `.crec` log
 7. Transitions NEW → READY
 
+Step 3 is a **binding**, not a declaration, and it applies to every way a
+process comes into being: a `spawn` syscall, a `restore`, and a daemon
+registration by init all have to turn the declared regions into live ones. A
+daemon whose registration skipped that binding had a process that *looked*
+like it had memory regions and trapped `ENOENT` on its first `memory_read` —
+so the agent died at the moment it tried to remember anything.
+
 ### 6.2 Life
 
 The process spends most of its life cycling between READY, RUNNING, and BLOCKED. The kernel records every syscall to the `.crec` log. Budgets decrement on every LLM call.

@@ -224,6 +224,8 @@ interface MemoryManager {
 
 Per-region policies are declared on the CLI via `cortex spawn --memory <json>` and `cortex daemon install --memory <json>` — a JSON object keyed by region name, merged over the standard `episodic`/`semantic`/`procedural` defaults (override-by-name, add-new, keep-untouched). For daemons the resolved policies are persisted in the daemon spec (`daemons.json`) and applied on every (re)spawn; for spawned and restored processes they are written to the process's `.meta.json`, so a cross-invocation `cortex restore` re-declares the same regions (including their `maxEntries`/`readOnly`) rather than silently reverting to defaults. Fork inherits a region's `maxEntries` by reference; `memoryOverrides` may supply a different one for the child.
 
+**A declared region is not yet a bound one.** The policies live on the process-table entry; turning a logical region into a physical key is the memory engine's job (`attachRegion`, and `syncFromTable` to pull the declarations in). Every birth path has to do that sync, and the three are not the same code: the `spawn` syscall does it in the dispatcher, `restore` does it in the checkpoint manager, and a **daemon registration** does it in init. When the daemon path skipped it, a daemon's agent died on its *first* `memory_read` with `ENOENT` ("no such memory region") while the same agent under `cortex spawn` worked — the regions were declared, just never bound. PROCESS.md §6.1 has always promised "sets up memory regions per policy" for every process; the daemon path was the one that did not keep the promise.
+
 **Performance.** Reads and writes are O(1) plus driver overhead. COW duplication is O(region size) on first write. Acceptable for v0; per-key COW is post-v0.
 
 ### 4.6 `checkpoint.ts`
@@ -767,7 +769,10 @@ call the `ps` syscall on the operator's behalf — because a monitoring loop
 that polls every second would otherwise write a frame into init's log for
 every poll, and a read is not something the kernel's causal history should
 record. (An agent's own `ctx.ps()` is unaffected: still a syscall, still
-recorded — ABI.md §4.1.)
+recorded — ABI.md §4.1.) `memory` is a read for the same reason and by the
+same rule: the operator looking at a process's memory is not something the
+process did. (An agent's own `ctx.memory_read()` is unaffected too — still a
+syscall, still recorded, ABI.md §4.4.)
 
 **And it made the snapshot reachable.** `cortex checkpoint <pid>` used to be
 a command that could not succeed: a checkpoint captures a *running* process,
@@ -819,6 +824,45 @@ the body — so a line printed three seconds later by an agent that was parked o
 exactly what Node formatted, and the original write still happens: the output
 still goes to the daemon's stdout, and now it is also addressable.
 
+**And it made the memory addressable.** The other half of "why did the agent
+do that?", and the half the syscall log cannot answer. ABI.md §4.4 records a
+`memory_write` as a **hash** and a byte count rather than the value — "full
+values would bloat the log" — so `cortex trace` can tell you that an agent
+wrote something down and never what it wrote down. The knowledge is the whole
+point of an agent that remembers, and the log deliberately does not carry it.
+
+The live kernel still has it. `cortex memory <pid>` reaches in: which regions
+a process has, what kind each one is, how much is in each, **who else can see
+them**, and the entries themselves.
+
+```
+$ cortex memory 2
+# memory of pid 2 (inbox-watcher)
+REGION          KIND      BACKING     ENTRIES   SHARED WITH
+-----------------------------------------------------------
+episodic        cow       inmem       2         -
+semantic        shared    inmem       3         3
+procedural      private   inmem       0         -
+
+$ cortex memory 2 semantic
+# memory of pid 2 (inbox-watcher) — region 'semantic'
+ticket:T-1180  {"id":"T-1180","category":"bug","reply":"Thanks for the report …"}  2026-10-23T19:05:33.842Z
+```
+
+The `SHARED WITH` column is the one that earns its keep: a `shared` region is
+visible to every process that declared it, so knowing that agent 3 is reading
+agent 2's notes is the difference between a shared scratchpad and a leak. It
+falls out of comparing physical keys, and it also catches the other case — a
+`cow` region whose forked child has not written yet.
+
+It is a **read**, like `ps`: answered by the memory engine directly, not
+through the dispatcher, and not recorded in the `.crec`. It does need the live
+kernel, though — a region's contents live in the memory driver (the default
+`inmem` backing is the kernel process's RAM), and there is no on-disk copy to
+fall back on. So the command says plainly that it needs one rather than
+reporting an empty region and letting the operator wonder whether the agent
+really had forgotten everything.
+
 **And it completed the loop.** `cortex restore` had the same shape of problem
 from the other end: it boots a kernel of its own, restores the snapshot into
 it, runs the restored agent to completion (or to the timeout), and exits — so
@@ -848,6 +892,18 @@ out again, and a table hit is always the very process that took the snapshot.
   (which the daemon writes to) and delivers the interactive half over the
   wire. `cortex logs --follow` has the same shape: it polls
   `output.log` every 250 ms rather than subscribing to anything.
+- **Memory inspection needs the live kernel.** `cortex memory <pid>` reads a
+  process's memory regions through the transport, because a region's contents
+  live in the memory driver — with the default `inmem` backing, in the kernel
+  process's RAM — and there is no on-disk copy to fall back on. The only other
+  place a region's contents appear is inside a `.csnap`, and that is a
+  snapshot of one moment, not the present. So the command says plainly that
+  it needs a running kernel instead of reporting an empty region.
+- **The syscall log deliberately does not carry memory values.** It stores a
+  hash and a byte count (ABI.md §4.4 — "full values would bloat the log"), so
+  `cortex trace` can show that an agent wrote something down and never what.
+  That is a deliberate trade, and it is the gap `cortex memory` exists to
+  close — but it also means a *replay* cannot reproduce the values.
 - Captured output is captured from the **kernel's** stdout, so it covers what
   the agent printed inside this kernel. Output written by a process that ran
   under an older build, or before the capture existed, is not there.

@@ -74,6 +74,20 @@ $ cortex logs 1234
 2026-10-23T14:23:06.115Z | err | [coder] grep timed out, retrying
 # (--tail 20 for the last 20 lines; --follow to watch a live agent print)
 
+# Read back what a running process KNOWS — its memory regions.
+# The syscall log stores a hash of a memory value, not the value, so
+# `cortex trace` can show that the agent wrote something down and never what.
+$ cortex memory 1234
+# memory of pid 1234 (coder)
+REGION          KIND      BACKING     ENTRIES   SHARED WITH
+-----------------------------------------------------------
+episodic        cow       inmem       12        -
+semantic        shared    inmem       3         1240
+procedural      private   inmem       0         -
+$ cortex memory 1234 semantic
+# memory of pid 1234 (coder) — region 'semantic'
+issue:42        "found it — src/foo.ts:42"  2026-10-23T14:23:04.881Z
+
 # Pause and resume across reboots
 # (a checkpoint captures a live process, so this needs a live kernel:
 #  `cortex daemon run` — and SIGUSR2 means "checkpoint now")
@@ -138,7 +152,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 610 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 616 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

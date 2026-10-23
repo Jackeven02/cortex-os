@@ -74,6 +74,20 @@ $ cortex logs 1234
 2026-10-23T14:23:06.115Z | err | [coder] grep timed out, retrying
 # （--tail 20 只看最后 20 行；--follow 可以盯着一个活着的 agent 打印）
 
+# 读回一个活着的进程**知道**的东西 —— 它的内存区域
+# syscall 日志里存的是 memory 值的哈希而不是值，所以
+# `cortex trace` 只能告诉你"它写了点什么"，永远不告诉你"写了什么"
+$ cortex memory 1234
+# memory of pid 1234 (coder)
+REGION          KIND      BACKING     ENTRIES   SHARED WITH
+-----------------------------------------------------------
+episodic        cow       inmem       12        -
+semantic        shared    inmem       3         1240
+procedural      private   inmem       0         -
+$ cortex memory 1234 semantic
+# memory of pid 1234 (coder) — region 'semantic'
+issue:42        "found it — src/foo.ts:42"  2026-10-23T14:23:04.881Z
+
 # 跨重启暂停和恢复
 # （快照捕获的是**正在运行**的进程，所以这需要活内核：
 #   `cortex daemon run` —— SIGUSR2 的语义就是"立刻做快照"）
@@ -133,7 +147,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 610 项断言，0 失败
+npx tsx scripts/smoke.ts                # 616 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
