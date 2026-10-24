@@ -10,6 +10,7 @@ import type { BlockedReason, ProcessInfo, Signal, SyscallRecord } from '../kerne
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView } from '../cli/process_view.js';
+import { usdToDollars } from '../cli/process_budget.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
 import {
   ActivityStore,
@@ -211,10 +212,28 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
   };
 
   if (options.processes !== undefined) {
-    return [...options.processes()].map((row) => withCapsLabel(withInside(withPendingLabel(row))));
+    return [...options.processes()].map((row) => withCapsLabel(withUsdDollars(withInside(withPendingLabel(row)))));
   }
   const view = await readProcessView(dir, options.kernel);
-  return [...view.rows].map((row) => withCapsLabel(withInside(withPendingLabel(row))));
+  return [...view.rows].map((row) => withCapsLabel(withUsdDollars(withInside(withPendingLabel(row)))));
+}
+
+/**
+ * Put the cost on the row, in **dollars**.
+ *
+ * `budgetsSpent.usdSpent` is in **microdollars** — an integer count, 1 USD =
+ * 1_000_000 (docs/STATE.md §2.4). The page used to add those numbers up and
+ * print them as dollars, so a process that had spent **$0.0034** was shown in
+ * the operator's window as having spent **$3400.0000** — a thousand times the
+ * money, which is the kind of number that gets a budget cut.
+ *
+ * The conversion happens here, once, and the page is handed dollars. The page
+ * cannot get the scale wrong, because it never sees microdollars.
+ */
+function withUsdDollars<T extends { budgetsSpent?: { usdSpent?: number } }>(
+  row: T,
+): T & { usdSpentDollars: number } {
+  return { ...row, usdSpentDollars: usdToDollars(row.budgetsSpent?.usdSpent ?? 0) };
 }
 
 /**

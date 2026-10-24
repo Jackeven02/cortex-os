@@ -55,6 +55,7 @@ import {
 import type { ProcessMeta } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
 import { processOutcome } from '../process_outcome.js';
+import { dollarsToMicrodollars } from '../process_budget.js';
 import type { AgentSpec, MemoryRegionPolicy, ProcessState, RestartPolicy } from '../../kernel/types.js';
 import { PID_INIT } from '../../kernel/process_table.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
@@ -466,15 +467,21 @@ export async function cmdWrap(args: string[]): Promise<number> {
     // than no number, so this is a correctness fix, not a feature.
     let tapCalls = 0;
     let tapFailedCalls = 0;
+    // The tap prices its calls in **dollars**; the budget counts
+    // **microdollars**. The tap's own number is kept for the summary line,
+    // and converted once on the way into the budget — so the run's spend is
+    // the same number the kernel's counters would have produced.
+    let tapUsd = 0;
     if (values.tap) {
       const spend = await readTapSpend(dir, unbrand(current));
       tapCalls = spend.calls + spend.failedCalls;
       tapFailedCalls = spend.failedCalls;
+      tapUsd = spend.usd;
       spent = {
         tokensIn: spent.tokensIn + spend.inputTokens,
         tokensOut: spent.tokensOut + spend.outputTokens,
         tokensCached: spent.tokensCached + spend.cachedTokens,
-        usdSpent: spent.usdSpent + spend.usd,
+        usdSpent: spent.usdSpent + dollarsToMicrodollars(spend.usd),
         syscallCount: spent.syscallCount,
         wallTimeMs: spent.wallTimeMs,
       };
@@ -499,7 +506,7 @@ export async function cmdWrap(args: string[]): Promise<number> {
     if (tapCalls > 0) {
       const plural = tapCalls === 1 ? '' : 's';
       const failed = tapFailedCalls > 0 ? `, ${tapFailedCalls} failed` : '';
-      console.log(`tap: ${tapCalls} llm call${plural} ($${spent.usdSpent.toFixed(6)}${failed})`);
+      console.log(`tap: ${tapCalls} llm call${plural} ($${tapUsd.toFixed(6)}${failed})`);
     }
 
     // Persist so `cortex ps` / `trace` / the dashboard see this run after the

@@ -234,6 +234,21 @@ Three details worth knowing:
 - **A failed call is counted separately, and still billed.** A request the provider answered with a 500 cost money. `failedCalls` keeps it visible without pretending it succeeded.
 - **A killed run keeps its spend.** The frames are on disk by the time the child is stopped, so a run that hung and was killed still reports what it cost before it died — which is the question you actually have at that moment.
 
+**And the units are converted on the way in.** The tap prices its calls in
+**dollars** — that is what `result.usd` in an `llm_call` frame holds, and that
+is what `readTapSpend()` returns. The budget counts **microdollars**: an
+integer count where 1 USD = 1_000_000 (STATE.md §2.4). Those are not the same
+number, and adding them together is not an option.
+
+The fold used to skip the conversion, so `meta.json` ended up holding
+`0.00005325` — a *fraction*, in a field the state model defines as an integer
+count — where it meant `53`. Every other view then read a run that had spent
+money as a run that had spent nothing: `cortex limit` printed
+`usd: spent $0.000000`. The conversion now happens at that boundary, in one
+place (`dollarsToMicrodollars`, in `src/cli/process_budget.ts`), and the
+summary line prints the tap's own dollars — the same money, in the unit the
+operator reads.
+
 This is also why `llmTapStats()` and `readTapSpend()` are not redundant: the first answers "how much has this process spent" from *inside* the tapped process, the second answers "how much did that process spend" from *outside*, after it exited. Only the second vantage point exists for a supervisor, a dashboard or `cortex ps`.
 
 ### What checkpoint means here
@@ -279,7 +294,7 @@ The event table includes model name and token usage from completed LLM calls, pl
 
 The API is available at:
 
-- `GET /api/processes` — process table (live or persisted).
+- `GET /api/processes` — process table (live or persisted). Each row carries the kernel's own `budgetsSpent` **in microdollars** (STATE.md §2.4) *and* `usdSpentDollars`, the same spend already converted to dollars — the page is handed dollars so it cannot print a microdollar counter next to a dollar sign.
 - `GET /api/trace/:pid` — redacted syscall timeline.
 - `GET /api/events?from=&to=&offset=&limit=` — merged callback + syscall events, newest first. `from`/`to` are millisecond timestamps; results are paginated and the total count is returned in the `x-total-count` header.
 - `GET /api/checkpoints` — checkpoints under `processes/<pid>/checkpoints/`, parsed from file names (`createdAt`/`chainId`) plus on-disk size.

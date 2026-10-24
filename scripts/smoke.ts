@@ -9559,7 +9559,14 @@ async function runWrapChecks(): Promise<void> {
       await rm(home, { recursive: true, force: true });
     });
 
+    // The tapped run's record outlives the check that produced it: the next
+    // one reads the same money back through `cortex limit`.
+    let tapHome = '';
+
     await checkAsync('the tap spend is folded back into the recorded budgets', async () => {      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+      // The record outlives this check: the next one reads the same money
+      // back through `cortex limit`.
+      tapHome = home;
       process.env['CORTEX_HOME'] = home;
       // The child's LLM calls never went through the dispatcher, so the
       // kernel's own counters read zero for a run that spent real tokens. If
@@ -9600,17 +9607,27 @@ async function runWrapChecks(): Promise<void> {
         'await uninstall();',
       ].join('\n');
 
-      const code = await cmdWrap([
-        '--role',
-        'tapped',
-        '--tap',
-        '--',
-        process.execPath,
-        '--import',
-        'tsx',
-        '-e',
-        child,
-      ]);
+      let wrapOut = '';
+      const prevLog = console.log;
+      console.log = (...parts: unknown[]): void => {
+        wrapOut += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      let code: number;
+      try {
+        code = await cmdWrap([
+          '--role',
+          'tapped',
+          '--tap',
+          '--',
+          process.execPath,
+          '--import',
+          'tsx',
+          '-e',
+          child,
+        ]);
+      } finally {
+        console.log = prevLog;
+      }
       server.close();
       assert(code === 0, `the child should succeed, got ${code}`);
 
@@ -9622,17 +9639,64 @@ async function runWrapChecks(): Promise<void> {
       assert(spend.cachedTokens === 10, `10 cached, got ${spend.cachedTokens}`);
       assert(spend.failedCalls === 0, 'no failures');
 
+      // The summary line the operator reads is in **dollars**, like the tap's
+      // own price. It used to print the budget's counter, which is
+      // microdollars — the same number in a millionth of the size.
+      const tapLine = wrapOut.split('\n').find((l) => l.startsWith('tap:')) ?? '';
+      assert(tapLine !== '', `the tap summary line is printed, got: ${wrapOut}`);
+      assert(
+        tapLine.includes(`$${spend.usd.toFixed(6)}`),
+        `the summary line is in dollars, got "${tapLine}" for ${spend.usd} dollars`,
+      );
+
       // And the same numbers must be what a read-only view reports, or the
       // summary line and `cortex ps` would disagree with `cortex trace`.
       const meta = readMeta(home, pid);
       assert(meta !== undefined, 'meta.json was written');
       assert(meta.budgetsSpent.tokensIn === 200, `meta tokensIn, got ${meta.budgetsSpent.tokensIn}`);
       assert(meta.budgetsSpent.tokensOut === 40, `meta tokensOut, got ${meta.budgetsSpent.tokensOut}`);
+      // The budget counts **microdollars** — an integer, 1 USD = 1_000_000
+      // (docs/STATE.md §2.4). The tap prices its calls in *dollars*, and the
+      // fold used to add the two together without converting: `meta.json`
+      // ended up holding 0.00005325 (dollars) in a field that means 53
+      // (microdollars), so every other view — `cortex top`, `cortex limit` —
+      // read a run that had spent money as a run that had spent nothing.
       assert(
-        meta.budgetsSpent.usdSpent > 0,
-        `meta usdSpent must be non-zero for a run that spent money, got ${meta.budgetsSpent.usdSpent}`,
+        meta.budgetsSpent.usdSpent === Math.round(spend.usd * 1_000_000),
+        `meta usdSpent is in microdollars, got ${meta.budgetsSpent.usdSpent} for ${spend.usd} dollars`,
       );
-      await rm(home, { recursive: true, force: true });
+      assert(
+        Number.isInteger(meta.budgetsSpent.usdSpent),
+        `the counter stays an integer, got ${meta.budgetsSpent.usdSpent}`,
+      );
+      // The record outlives this check: the next one reads the same money
+      // back through `cortex limit`.
+    });
+
+    await checkAsync('a tapped run reports the money it spent', async () => {
+      // The last mile. `meta.json` holds the spend in microdollars; `cortex
+      // limit` is what an operator actually types. If the two units drift
+      // apart, the run looks free — a $0.000053 spend reads as $0.000000,
+      // and a budget that should have stopped it looks untouched.
+      assert(tapHome !== '', 'the tapped run left a record to read');
+      process.env['CORTEX_HOME'] = tapHome;
+      const meta = readMeta(tapHome, asPid(2));
+      assert(meta !== undefined, 'meta.json was written');
+      const expected = `$${(meta.budgetsSpent.usdSpent / 1_000_000).toFixed(6)}`;
+      assert(expected !== '$0.000000', 'the run is not free');
+
+      let out = '';
+      const prevLog = console.log;
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      try {
+        await cmdLimit([String(asPid(2))]);
+      } finally {
+        console.log = prevLog;
+      }
+      assert(out.includes(expected), `cortex limit shows ${expected}, got: ${out}`);
+      await rm(tapHome, { recursive: true, force: true });
     });
 
     await checkAsync('a cancelled run still leaves its token spend on record', async () => {
@@ -9889,7 +9953,7 @@ async function runDashboardChecks(): Promise<void> {
       pid: 2, ppid: 1, pgid: 2, role: 'hello', state: 'zombie',
       exitCode: 0, exitReason: 'done',
       startedAt: '2026-09-28T00:00:00.000Z', lastTransitionAt: '2026-09-28T00:00:03.000Z',
-      budgetsSpent: { tokensIn: 1, tokensOut: 1, tokensCached: 0, usdSpent: 0, wallTimeMs: 10, syscallCount: 3 },
+      budgetsSpent: { tokensIn: 1, tokensOut: 1, tokensCached: 0, usdSpent: 3400, wallTimeMs: 10, syscallCount: 3 },
       budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
       agent: { module: './agents/noop.js' } as ProcessMeta['agent'],
       kernelAbiVersion: KERNEL_ABI_VERSION,
@@ -9957,6 +10021,60 @@ async function runDashboardChecks(): Promise<void> {
         assert(metas.some((m) => m['role'] === 'hello'), 'persisted meta served');
         const post = await fetch(`${dash.url}/api/processes`, { method: 'POST' });
         assert(post.status === 405, `POST status ${post.status}`);
+      });
+
+      await checkAsync('the dashboard and cortex top say the same cost', async () => {
+        // `budgetsSpent.usdSpent` is in **microdollars** — an integer count,
+        // 1 USD = 1_000_000 (docs/STATE.md §2.4). The dashboard used to add
+        // those numbers up and print them as dollars, so the process that had
+        // spent $0.0034 was shown in the operator's window as having spent
+        // **$3400.0000**: a thousand times the money, which is the kind of
+        // number that gets a budget cut. Two views of one process's cost have
+        // to be the same number.
+        const prevHome = process.env['CORTEX_HOME'];
+        process.env['CORTEX_HOME'] = tmp;
+        try {
+          const res = await fetch(`${dash.url}/api/processes`);
+          const rows = (await res.json()) as Array<Record<string, unknown>>;
+          const row = rows.find((r) => r['pid'] === 2);
+          assert(row !== undefined, 'the process is in the list');
+
+          const dollars = Number(row!['usdSpentDollars']);
+          assert(
+            Math.abs(dollars - 0.0034) < 1e-12,
+            `the dashboard reports dollars, got ${dollars}`,
+          );
+          // The counter the kernel owns is untouched — still microdollars.
+          const raw = (row!['budgetsSpent'] as Record<string, unknown> | undefined)?.['usdSpent'];
+          assert(raw === 3400, `the raw counter stays in microdollars, got ${String(raw)}`);
+
+          // ...and the CLI says the same thing about the same record.
+          let out = '';
+          const prevLog = console.log;
+          console.log = (...parts: unknown[]): void => {
+            out += parts.map((p) => String(p)).join(' ') + '\n';
+          };
+          try {
+            await cmdTop([]);
+          } finally {
+            console.log = prevLog;
+          }
+          assert(out.includes('$0.0034'), `cortex top reports the same cost, got: ${out}`);
+        } finally {
+          if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+          else process.env['CORTEX_HOME'] = prevHome;
+        }
+      });
+
+      await checkAsync('the dashboard page adds up dollars, not microdollars', async () => {
+        // The page used to read `budgetsSpent.usdSpent` and add it up as if it
+        // were dollars. The server converts once now and hands the page
+        // dollars, so the page must not be doing the arithmetic on the raw
+        // counter — that arithmetic is where the million-fold error lived.
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        assert(html.includes('usdSpentDollars'), 'the page reads the dollar value');
+        assert(!html.includes('spent.usdSpent'), 'the page never adds up the raw microdollars');
       });
 
       await checkAsync('dashboard serves the supervision tree and budget panels', async () => {

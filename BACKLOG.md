@@ -489,6 +489,67 @@ The user-facing surface. Should feel like a real OS shell.
   ("the frame records the state it came from, got null") — the exact frame
   the real kernel wrote; and a mistyped trigger → the build fails.
 
+- [x] **#082** A cost in two units → **fixed.** `budgetsSpent.usdSpent` is in
+  **microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4) — and
+  two places were reading it as if it were dollars.
+
+  The dashboard's budget panel added the raw counters up and printed them next
+  to a dollar sign, so the operator's window showed a process that had spent
+  **$0.0034** as having spent **$3400.0000** — while `cortex top`, reading the
+  same record, said `$0.0034`. Found by running the dashboard against a seeded
+  record and reading the panel, not by reading the code.
+
+  The other direction was quieter. `cortex wrap --tap` folds the tap's spend
+  back into the budget (the tapped child's calls never went through the
+  dispatcher, so the kernel's counters read zero for a run that spent real
+  money) — and the fold added the tap's **dollars** to the budget's
+  **microdollars** without converting. `meta.json` ended up holding
+  `0.00005325`, a fraction, in a field the state model defines as an integer
+  count, where it meant `53`. Every other view then read a run that had spent
+  money as a run that had spent nothing: `cortex limit` printed
+  `usd: spent $0.000000`.
+
+  The conversion now lives in exactly one place
+  (`usdToDollars` / `dollarsToMicrodollars`, in `src/cli/process_budget.ts`),
+  the tap's summary line prints the tap's own dollars, and **the dashboard
+  does not convert at all**: the server converts once and hands the page
+  `usdSpentDollars`, so the page can never get the scale wrong. The page
+  still receives the kernel's raw `budgetsSpent` — that counter is the
+  kernel's, and its unit is unchanged.
+
+  **Three new smoke checks** (737 → 740), all reverse-verified: the server
+  stops converting → "the dashboard and cortex top say the same cost" fails
+  ("the dashboard reports dollars, got NaN"); the page goes back to adding up
+  the raw counter → "the dashboard page adds up dollars, not microdollars"
+  fails; the fold skips the conversion again → "the tap spend is folded back
+  into the recorded budgets" fails with the exact number the real run wrote
+  ("got 0.00005325 for 0.00005325 dollars"), and "a tapped run reports the
+  money it spent" fails ("the run is not free").
+
+  Docs: STATE.md §2.4 (the counter is an integer count of microdollars, and
+  there is one conversion point), ARCHITECTURE (a unit has exactly one
+  conversion point), INTEGRATIONS (the tap's dollars, the budget's
+  microdollars, and the boundary where they meet).
+
+- [ ] **#083** A tapped `llm_call` frame does not carry the ABI's `usage`
+  shape. The tap writes its result flat —
+  `{ model, inputTokens, outputTokens, cachedTokens, usd, httpStatus }` — while
+  ABI.md's `llm_call` result is
+  `{ text, toolCalls, finishReason, usage: { inputTokens, outputTokens,
+  cachedTokens, usd }, model, driverVersion }`. Two consequences, both
+  "a fact the kernel knows that does not reach the operator":
+
+  - The dashboard's event table reads `result.usage.usd` (and the token
+    counts), so a **tapped** call shows its model but no tokens and no cost —
+    while `cortex wrap`'s summary line shows both, from the same frames.
+  - Anything else that reads an `llm_call` result by the ABI's shape sees
+    nothing for a tapped call.
+
+  The fix is to make the tap write the ABI's shape (and keep
+  `readTapSpend` reading both shapes, so old logs still add up). Not done
+  yet: changing what the tap writes to a log is a bigger step than changing
+  a view, and it deserves its own pass with its own reverse-verification.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

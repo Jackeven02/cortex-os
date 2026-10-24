@@ -395,11 +395,16 @@
     }
 
     function renderBudgets() {
+      // The cost is already in **dollars** on the row: the server converted
+      // the kernel's microdollars once (`usdSpentDollars`). Adding up
+      // `budgetsSpent.usdSpent` here would add up microdollars and print them
+      // as dollars — a process that spent $0.0034 showed up as $3400.0000.
+      const processUsd = (process) => Number(process.usdSpentDollars ?? 0);
       const totals = processData.reduce((acc, process) => {
         const spent = process.budgetsSpent ?? {};
         acc.tokensIn += spent.tokensIn ?? 0;
         acc.tokensOut += spent.tokensOut ?? 0;
-        acc.usd += spent.usdSpent ?? 0;
+        acc.usd += processUsd(process);
         acc.wall += spent.wallTimeMs ?? 0;
         acc.syscalls += spent.syscallCount ?? 0;
         return acc;
@@ -419,7 +424,7 @@
         row.count += 1;
         row.tokensIn += spent.tokensIn ?? 0;
         row.tokensOut += spent.tokensOut ?? 0;
-        row.usd += spent.usdSpent ?? 0;
+        row.usd += processUsd(process);
         row.wall += spent.wallTimeMs ?? 0;
         row.syscalls += spent.syscallCount ?? 0;
       }

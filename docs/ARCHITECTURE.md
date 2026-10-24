@@ -1570,6 +1570,28 @@ process, and no way for the operator to tell which one was the truth. The
 rule now lives in one place (`formatTokens`, in `src/cli/process_view.ts`),
 next to the capability wording, so both views say `999`.
 
+**And a unit has exactly one conversion point.** `budgetsSpent.usdSpent` is in
+**microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4). Three
+places disagreed about that, and two of them were wrong by a factor of a
+million. The dashboard's budget panel added the raw counters up and printed
+them as dollars, so a process that had spent **$0.0034** was shown in the
+operator's window as having spent **$3400.0000** — while `cortex top`, reading
+the same record, said `$0.0034`. In the other direction, `cortex wrap --tap`
+folded the tap's spend into the budget **without converting**: the tap prices
+its calls in dollars, the budget counts microdollars, and the two were added
+together. `meta.json` ended up holding `0.00005325` — a *fraction*, in a
+field the state model defines as an integer count — where it meant `53`. Every
+other view then read a run that had spent money as a run that had spent
+nothing: `cortex limit` printed `usd: spent $0.000000`.
+
+So the conversion lives in one module (`src/cli/process_budget.ts`:
+`usdToDollars` / `dollarsToMicrodollars`), and the dashboard does not do it at
+all: the server converts once and hands the page `usdSpentDollars`, so the page
+is never in a position to get the scale wrong. A view that reads a raw
+microdollar counter and prints it next to a dollar sign is not a formatting
+choice — it is a number about money, and it has to be the same number
+everywhere it appears.
+
 **A view that cannot ask does not go silent.** A kernel too old to know the
 `openCalls` command must not turn the column into a row of blanks: a blank
 says "nothing is being waited on", which is a claim, and it is false

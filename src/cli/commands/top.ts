@@ -63,6 +63,7 @@ import {
 } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
 import { formatOutcomeCode } from '../process_outcome.js';
+import { usdToDollars } from '../process_budget.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
 import { PROCESS_STATES } from '../../kernel/process_table.js';
 
@@ -170,7 +171,7 @@ function renderTop(
     .map(([state, n]) => `${n} ${state}`)
     .join(' · ');
   const tokens = all.reduce((n, m) => n + m.budgetsSpent.tokensIn + m.budgetsSpent.tokensOut, 0);
-  const usd = all.reduce((n, m) => n + m.budgetsSpent.usdSpent, 0) / 1_000_000;
+  const usd = usdToDollars(all.reduce((n, m) => n + m.budgetsSpent.usdSpent, 0));
 
   const stalled = [...inside.entries()].filter(([, call]) =>
     stallAfterMs !== null ? isStalled(call, now, stallAfterMs) : false,
@@ -357,7 +358,7 @@ function cellsFor(
     m.role,
     m.state,
     formatTokens(m.budgetsSpent.tokensIn + m.budgetsSpent.tokensOut),
-    `$${(m.budgetsSpent.usdSpent / 1_000_000).toFixed(4)}`,
+    `$${usdToDollars(m.budgetsSpent.usdSpent).toFixed(4)}`,
     noteWithSignals,
   ];
 }

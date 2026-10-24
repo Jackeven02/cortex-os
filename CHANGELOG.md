@@ -1546,6 +1546,57 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The operator's window priced money a million times too high, and `cortex wrap`
+  priced it a million times too low.** `budgetsSpent.usdSpent` is in
+  **microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4) — and
+  two places were reading it as if it were dollars.
+
+  The dashboard's budget panel added the raw counters up and printed them next
+  to a dollar sign. A process that had spent **$0.0034** was shown, in the
+  operator's window, as having spent **$3400.0000**:
+
+  ```
+  资源预算
+  USD 成本          $3400.0000
+  角色     进程    TOKEN IN  TOKEN OUT  USD         墙钟    SYSCALLS  TOKEN 占比
+  spender  1       1,200     300        $3400.0000  5.0 s   4         100%
+  ```
+
+  `cortex top`, reading the same record, said `$0.0034`. Two views of one
+  process, a million apart — and the window is the one an operator makes
+  budget decisions in.
+
+  The other direction was quieter and worse. `cortex wrap --tap` folds the
+  tap's spend back into the budget — the tapped child's calls never went
+  through the dispatcher, so the kernel's own counters read zero for a run
+  that spent real money. The tap prices its calls in **dollars**; the budget
+  counts **microdollars**; and the fold added the two together without
+  converting. `meta.json` ended up holding `0.00005325` — a *fraction*, in a
+  field the state model defines as an integer count — where it meant `53`.
+  Every other view then read a run that had spent money as a run that had
+  spent nothing: `cortex limit` printed `usd: spent $0.000000`.
+
+  So the conversion now lives in exactly one place
+  (`usdToDollars` / `dollarsToMicrodollars`, in `src/cli/process_budget.ts`),
+  the tap's summary line prints the tap's own dollars, and **the dashboard
+  does not convert at all**: the server converts once and hands the page
+  `usdSpentDollars`, so the page is never in a position to get the scale
+  wrong. The page still receives the kernel's raw `budgetsSpent` — that
+  counter is the kernel's, and its unit is unchanged.
+
+  **Three new smoke checks** (737 → 740), each reverse-verified: the server
+  stops converting → "the dashboard and cortex top say the same cost" fails
+  ("the dashboard reports dollars, got NaN"); the page goes back to adding up
+  the raw counter → "the dashboard page adds up dollars, not microdollars"
+  fails; the fold skips the conversion again → "the tap spend is folded back
+  into the recorded budgets" fails with the exact number the real run wrote
+  ("got 0.00005325 for 0.00005325 dollars"), and "a tapped run reports the
+  money it spent" fails ("the run is not free").
+
+  Additive only: the dashboard's `/api/processes` rows gain one field. No
+  syscall, no `.crec`/`.csnap` format change, no change to `BudgetCounters`
+  or to the ABI frozen at `1.0.0`.
+
 - **A crashed agent could be reported as a successful one.** `cortex spawn` on
   an agent that threw an exception — a `TypeError`, a failed await — sometimes
   printed `process exited (code 0: completed)` and **exited 0**. The kernel
