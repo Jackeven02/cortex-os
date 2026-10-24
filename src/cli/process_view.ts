@@ -98,6 +98,27 @@ export function describePendingSignals(
 }
 
 /**
+ * How a token count is printed.
+ *
+ * It lives here, and not in one command, because two views answer the same
+ * question — `cortex ps` in its TOKENS column, `cortex top` in its own — and
+ * they must not be able to disagree about the same process. They used to:
+ * `cortex ps` had its own inline rule that rounded anything under a thousand
+ * up to `1.0k`, while `cortex top` printed the exact number. So 999 tokens
+ * read as `1.0k` in one view and `999` in the other — two views of one
+ * process, two different numbers, and no way for the operator to tell which
+ * one was the truth.
+ *
+ * One rule, both views: exact below a thousand, then `k`, then `M`.
+ */
+export function formatTokens(n: number): string {
+  if (n === 0) return '0';
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(1)}M`;
+}
+
+/**
  * The bit of a live kernel the read-only views need.
  *
  * A `KernelClient` satisfies this. It is a separate interface so that a

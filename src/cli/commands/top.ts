@@ -47,7 +47,13 @@
 import { parseArgs } from 'node:util';
 
 import { defaultKernelDir } from '../index.js';
-import { readProcessView, describePendingSignals, type ProcessRow, type ProcessView } from '../process_view.js';
+import {
+  readProcessView,
+  describePendingSignals,
+  formatTokens,
+  type ProcessRow,
+  type ProcessView,
+} from '../process_view.js';
 import {
   isStalled,
   readOpenCalls,
@@ -57,6 +63,8 @@ import {
 } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
 import { formatOutcomeCode } from '../process_outcome.js';
+import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
+import { PROCESS_STATES } from '../../kernel/process_table.js';
 
 /** A node in the rendered tree. */
 interface TreeNode {
@@ -64,14 +72,29 @@ interface TreeNode {
   readonly children: TreeNode[];
 }
 
-/** The column widths. Fixed, so two runs line up under each other. */
-const COL = {
-  pid: 5,
-  role: 16,
-  state: 10,
-  tokens: 8,
-  usd: 9,
-} as const;
+/** The length of the longest string in a list. */
+function longest(values: readonly string[]): number {
+  return values.reduce((max, value) => Math.max(max, value.length), 0);
+}
+
+/**
+ * The columns of the tree, and the widest each one may be.
+ *
+ * Every maximum is derived from the value domain it holds, except the **role**
+ * — that is whatever the operator typed, so no domain can be derived for it
+ * and it gets a stated maximum. A value longer than its column is cut and
+ * marked (`…`), never allowed to run on into the next one: a role that ran
+ * into the state column made the two read as one word.
+ */
+const TOP_COLUMNS: readonly ColumnSpec[] = [
+  { header: 'PID', max: 8, gap: 2 },
+  { header: 'ROLE', max: 24, gap: 2 },
+  { header: 'STATE', max: longest(PROCESS_STATES), gap: 2 },
+  { header: 'TOKENS', max: longest(['0', '999', '999.9k', '999.9M']), gap: 2 },
+  { header: 'USD', max: 9, gap: 2 },
+  { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 0 },
+];
+
 
 export async function cmdTop(args: string[]): Promise<number> {
   const { values } = parseArgs({
@@ -169,18 +192,25 @@ function renderTop(
   // The gutter is as wide as the deepest branch, so every row's columns line
   // up — a tree whose numbers do not line up is a tree nobody can read.
   const gutter = gutterWidth(roots);
-  const header =
-    ' '.repeat(gutter) +
-    'PID'.padEnd(COL.pid) +
-    'ROLE'.padEnd(COL.role) +
-    'STATE'.padEnd(COL.state) +
-    'TOKENS'.padEnd(COL.tokens) +
-    'USD'.padEnd(COL.usd) +
-    'NOTE';
-  console.log(header);
-  console.log('-'.repeat(header.length));
 
-  for (const root of roots) render(root, '', true, true, gutter, inside, now, stallAfterMs);
+  // The rows are built before they are printed, because a column is as wide
+  // as the widest value in *this* table: the tree has to be known before its
+  // shape can be.
+  const rows: { prefix: string; cells: string[] }[] = [];
+  for (const root of roots) {
+    render(root, '', true, true, gutter, inside, now, stallAfterMs, rows);
+  }
+  const columns = sizeColumns(
+    TOP_COLUMNS,
+    rows.map((row) => row.cells),
+  );
+
+  const header = ' '.repeat(gutter) + renderHeader(columns);
+  console.log(header);
+  console.log(ruleUnder(header));
+  for (const row of rows) {
+    console.log(`${row.prefix.padEnd(gutter)}${renderRow(columns, row.cells)}`);
+  }
 
   console.log('');
 
@@ -259,13 +289,16 @@ function render(
   inside: ReadonlyMap<number, OpenCall>,
   now: number,
   stallAfterMs: number | null,
+  rows: { prefix: string; cells: string[] }[],
 ): void {
   // Every node but the root draws a slot for itself: `├─ ` or `└─ `. The
   // root has no slot — it is the top of the tree — but it is still padded to
   // the full gutter, which is what makes the columns line up.
   const own = isRoot ? '' : isLast ? '└─ ' : '├─ ';
-  const line = (ancestors + own).padEnd(gutter);
-  console.log(`${line}${lineFor(node.row, inside.get(node.row.pid), now, stallAfterMs)}`);
+  rows.push({
+    prefix: ancestors + own,
+    cells: cellsFor(node.row, inside.get(node.row.pid), now, stallAfterMs),
+  });
 
   // A child inherits its ancestors' slots, and its own slot is decided by
   // whether it is the last of them.
@@ -280,24 +313,23 @@ function render(
       inside,
       now,
       stallAfterMs,
+      rows,
     );
   });
 }
 
-function lineFor(
+/**
+ * The cells of one row: the facts, in the order the columns ask for them.
+ *
+ * They are returned as cells rather than as a finished line, because the
+ * column widths are only known once every row has been seen.
+ */
+function cellsFor(
   m: ProcessRow,
   call: OpenCall | undefined,
   now: number,
   stallAfterMs: number | null,
-): string {
-  const pid = String(m.pid).padEnd(COL.pid);
-  const role = m.role.padEnd(COL.role);
-  const state = m.state.padEnd(COL.state);
-  const spend = `${formatTokens(m.budgetsSpent.tokensIn + m.budgetsSpent.tokensOut)}`.padEnd(
-    COL.tokens,
-  );
-  const usd = `$${(m.budgetsSpent.usdSpent / 1_000_000).toFixed(4)}`.padEnd(COL.usd);
-
+): string[] {
   // The column that makes the state legible: why is it not running, and for
   // how long.
   let note = '';
@@ -318,14 +350,16 @@ function lineFor(
   // delivered until the process runs again, so it belongs with the note that
   // says why the process is not running — and the wording is the same one
   // `cortex ps` uses, so the two views cannot disagree.
-  return `${pid}${role}${state}${spend}${usd}${describePendingSignals(note, m.pendingSignals)}`;
-}
+  const noteWithSignals = describePendingSignals(note, m.pendingSignals);
 
-function formatTokens(n: number): string {
-  if (n === 0) return '0';
-  if (n < 1000) return String(n);
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
-  return `${(n / 1_000_000).toFixed(1)}M`;
+  return [
+    String(m.pid),
+    m.role,
+    m.state,
+    formatTokens(m.budgetsSpent.tokensIn + m.budgetsSpent.tokensOut),
+    `$${(m.budgetsSpent.usdSpent / 1_000_000).toFixed(4)}`,
+    noteWithSignals,
+  ];
 }
 
 function printHelp(): void {

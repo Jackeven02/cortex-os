@@ -381,6 +381,56 @@ The user-facing surface. Should feel like a real OS shell.
   process allowed to have its budget rewritten → "a finished process refuses to
   have its budget rewritten" fails ("exit 1, got 0").
 
+- [x] **#080** A table that lost its shape → **fixed.** `cortex ps` and
+  `cortex top` built every cell with `String(value).padEnd(width)`, and
+  **`padEnd` does not cut**: a value longer than the column ran on into the
+  next one. The values are not tame — a role is whatever the operator typed,
+  and a narrowed capability set is wider than any sensible column — so this
+  was the *first* thing that happened:
+
+  ```console
+  $ cortex ps
+  PID     PPID    ROLE          STATE         TOKENS    CAPS              AGE       WAITING
+  -----------------------------------------------------------------------------------------
+  2       1       researcher:deep-dive-agentzombie        15.0k     spawn,kill,fork,tool:dangerous,ipc:any7113.8h
+  ```
+
+  Two fields had become one word: `researcher:deep-dive-agent` and `zombie`,
+  and the capability list and the age. `cortex top` had the same fault plus
+  one of its own — its state column was ten characters wide, and
+  `checkpointing` is thirteen.
+
+  The three tables — `cortex trace` (and `attach`/`watch`), `cortex ps` and
+  `cortex top` — now share one shape (`src/cli/table.ts`): **a column is as
+  wide as the widest value in this table**, up to a stated maximum (derived
+  from the value domain where it is knowable — the process states, the
+  capability vocabulary, the token format — and a stated constant where it is
+  not, because a role is the operator's own text); **a value that does not
+  fit is cut and marked** with `…`; and **the heading and the rows come from
+  one column list**, so they cannot drift apart.
+
+  **And the two views stopped disagreeing about a number.** `cortex ps` had
+  its own token rule and `cortex top` had another: anything under a thousand
+  rounded up to `1.0k` in the table and was printed exactly in the tree. So
+  999 tokens read as `1.0k` in one view and `999` in the other — two views of
+  one process, and no way for the operator to tell which was the truth. The
+  rule now lives in one place (`formatTokens`).
+
+  **Three new smoke checks** (732 → 735), all reverse-verified: the table not
+  cutting at all → "cortex ps keeps its columns when a value is wider than
+  them" fails ("the state is its own word, in the column the header names,
+  got: …"); cutting without marking → the same check fails on the mark
+  instead ("the cut value says it was cut"); the capability column capped
+  below its data → the same check fails ("the capability list is shown in
+  full — the column grew to fit it"); `cortex top` not cutting → "cortex top
+  keeps its columns when a value is wider than them" fails the same way; and
+  `cortex ps` back to its own token rule → "the two process views say the same
+  number for the same spend" fails ("cortex ps says the exact number, got: …
+  1.0k …").
+
+  The README's example tree is now real output — captured from a live kernel,
+  not drawn by hand.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

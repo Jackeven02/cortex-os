@@ -15233,6 +15233,175 @@ async function runTopChecks(): Promise<void> {
       }
     });
 
+    // -----------------------------------------------------------------------
+    // The shape of the table — the same fact in three commands
+    // -----------------------------------------------------------------------
+
+    /**
+     * A home with one process whose **role** is longer than any sensible
+     * column and whose **capabilities** are a narrowed set.
+     *
+     * Both used to break the table: `padEnd` does not cut, so the role ran
+     * straight into the state column and the capability list straight into
+     * the age column — two fields reading as one word.
+     */
+    const wideHome = mkdtempSync(join(tmpdir(), 'cortex-wide-table-'));
+    writeMeta(wideHome, {
+      pid: 2,
+      ppid: 1,
+      pgid: 2,
+      role: 'researcher:deep-dive-agent-with-a-very-long-name',
+      state: 'zombie',
+      exitCode: 0,
+      exitReason: 'done',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      lastTransitionAt: '2026-01-01T00:00:10.000Z',
+      // 999 tokens: the number the two views used to disagree about.
+      budgetsSpent: {
+        tokensIn: 999,
+        tokensOut: 0,
+        tokensCached: 0,
+        usdSpent: 0,
+        wallTimeMs: 10,
+        syscallCount: 1,
+      },
+      budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+      agent: { module: './agents/noop.js' } as ProcessMeta['agent'],
+      capabilities: ['spawn', 'kill', 'fork', 'tool:dangerous', 'ipc:any'],
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+    });
+
+    /** Every state the kernel knows — a state column that says one of these is aligned. */
+    const states = [
+      'new',
+      'ready',
+      'running',
+      'blocked',
+      'stopped',
+      'suspended',
+      'checkpointing',
+      'exiting',
+      'zombie',
+    ];
+
+    /** The line of a table that carries the given pid. */
+    const rowOf = (out: string, pid: number): string =>
+      out.split('\n').find((l) => new RegExp(`^[\\s│├└─]*${pid}\\s`).test(l)) ?? '';
+
+    await checkAsync('cortex ps keeps its columns when a value is wider than them', async () => {
+      const prevHome = process.env['CORTEX_HOME'];
+      process.env['CORTEX_HOME'] = wideHome;
+      try {
+        const result = await capture(() => cmdPs([]));
+        assert(result.code === 0, `exit 0, got ${result.code}: ${result.err}`);
+
+        const lines = result.out.split('\n');
+        const header = lines.find((l) => l.includes('PID') && l.includes('ROLE'));
+        assert(header !== undefined, `the columns are named, got: ${result.out}`);
+        const stateAt = header!.indexOf('STATE');
+        const capsAt = header!.indexOf('CAPS');
+
+        // The row that used to break: the role is longer than its column, and
+        // the capability list is longer than any sensible one.
+        const row = rowOf(result.out, 2);
+        assert(row !== '', `the process is listed, got: ${result.out}`);
+        assert(
+          !row.includes('agentzombie') && !row.includes('ipc:any7'),
+          `no two fields are glued into one word, got: ${row}`,
+        );
+        assert(
+          states.some((state) => row.slice(stateAt).startsWith(state)),
+          `the state is its own word, in the column the header names, got: ${row}`,
+        );
+        assert(
+          row.slice(capsAt).startsWith('spawn'),
+          `the capabilities are their own word too, got: ${row}`,
+        );
+        assert(
+          row.includes('spawn,kill,fork,tool:dangerous,ipc:any'),
+          `the capability list is shown in full — the column grew to fit it, got: ${row}`,
+        );
+        assert(row.includes('…'), `the cut value says it was cut, got: ${row}`);
+
+        // And every other row lines up under the same header.
+        for (const line of lines) {
+          if (!/^\d+\s/.test(line)) continue;
+          assert(
+            states.some((state) => line.slice(stateAt).startsWith(state)),
+            `every row's state is in the header's column, got: ${line}`,
+          );
+        }
+      } finally {
+        if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+        else process.env['CORTEX_HOME'] = prevHome;
+      }
+    });
+
+    await checkAsync('cortex top keeps its columns when a value is wider than them', async () => {
+      const prevHome = process.env['CORTEX_HOME'];
+      process.env['CORTEX_HOME'] = wideHome;
+      try {
+        const result = await capture(() => cmdTop([]));
+        assert(result.code === 0, `exit 0, got ${result.code}: ${result.err}`);
+
+        const lines = result.out.split('\n');
+        const header = lines.find((l) => l.includes('PID') && l.includes('ROLE'));
+        assert(header !== undefined, `the columns are named, got: ${result.out}`);
+        const stateAt = header!.indexOf('STATE');
+
+        const row = rowOf(result.out, 2);
+        assert(row !== '', `the process is in the tree, got: ${result.out}`);
+        assert(
+          !row.includes('agentzombie'),
+          `no two fields are glued into one word, got: ${row}`,
+        );
+        assert(
+          states.some((state) => row.slice(stateAt).startsWith(state)),
+          `the state is its own word, in the column the header names, got: ${row}`,
+        );
+        assert(row.includes('…'), `the cut value says it was cut, got: ${row}`);
+      } finally {
+        if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+        else process.env['CORTEX_HOME'] = prevHome;
+      }
+    });
+
+    await checkAsync('the two process views say the same number for the same spend', async () => {
+      // `cortex ps` had its own token rule and `cortex top` had another, so
+      // the same process read as `1.0k` in one view and `999` in the other —
+      // two views of one number, and no way to tell which was the truth.
+      const prevHome = process.env['CORTEX_HOME'];
+      process.env['CORTEX_HOME'] = wideHome;
+      try {
+        const ps = await capture(() => cmdPs([]));
+        const top = await capture(() => cmdTop([]));
+
+        const psHeader = ps.out.split('\n').find((l) => l.includes('PID') && l.includes('ROLE'));
+        const topHeader = top.out.split('\n').find((l) => l.includes('PID') && l.includes('ROLE'));
+        assert(psHeader !== undefined && topHeader !== undefined, 'both views have a header');
+
+        const psTokens = psHeader!.indexOf('TOKENS');
+        const topTokens = topHeader!.indexOf('TOKENS');
+        const psRow = rowOf(ps.out, 2);
+        const topRow = rowOf(top.out, 2);
+        assert(psRow !== '' && topRow !== '', `both views list the process: ${ps.out} / ${top.out}`);
+
+        assert(
+          psRow.slice(psTokens).trimStart().startsWith('999'),
+          `cortex ps says the exact number, got: ${psRow}`,
+        );
+        assert(
+          topRow.slice(topTokens).trimStart().startsWith('999'),
+          `cortex top says the same number, got: ${topRow}`,
+        );
+      } finally {
+        if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+        else process.env['CORTEX_HOME'] = prevHome;
+      }
+    });
+
+    rmSync(wideHome, { recursive: true, force: true });
+
     await checkAsync('cortex top refuses a --stall-after it cannot make sense of', async () => {
       const result = await capture(() => cmdTop(['--stall-after', 'soon']));
       assert(result.code === 1, `exit 1, got ${result.code}`);

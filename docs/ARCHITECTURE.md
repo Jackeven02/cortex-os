@@ -1478,9 +1478,11 @@ a **WAITING** column, and it says "a channel", "child 5", "a model call".
 
 Two decisions make it fit rather than crowd the table:
 
-- **The column is last.** The existing seven columns keep their positions, so
-  a script that reads `cortex ps` by column number still reads the column it
-  read before.
+- **The column is last.** The existing seven columns keep their order, so a
+  script that reads `cortex ps` by field still reads the field it read before.
+  (Their *widths* are now sized to the data — see "the table keeps its shape"
+  below — so a script that counted characters would have to count again. The
+  fields themselves, and the two spaces that separate them, are the same.)
 - **The cell is a noun; the duration is `top`'s job.** `ps` says "a channel",
   `top` says "waiting on a channel for 44.4s". The two are deliberately
   different in shape because they answer different questions — *what* is it
@@ -1495,6 +1497,50 @@ answers* is shared too: the kernel's blocked reason wins when it has one — it
 knows *which* child — and the open call is used otherwise, which is how a
 driver call shows up at all, since the kernel does not park a process while
 its model call is in flight.
+
+**And the table keeps its shape.** A table makes a promise: *the thing under
+STATE is the state*. That promise was broken by the simplest thing there is —
+`String(value).padEnd(width)`, which **does not cut**: a value longer than the
+column simply ran on into the next one. And the values are not tame. A role is
+whatever the operator typed, and a narrowed capability set is wider than any
+sensible column:
+
+```console
+$ cortex ps
+PID     PPID    ROLE          STATE         TOKENS    CAPS              AGE       WAITING
+-----------------------------------------------------------------------------------------
+2       1       researcher:deep-dive-agentzombie        15.0k     spawn,kill,fork,tool:dangerous,ipc:any7113.8h
+```
+
+Two fields had become one word — `researcher:deep-dive-agent` and `zombie`,
+and the capability list and the age — and the reader had to count characters
+to find out what they were looking at. (`cortex top` had the same fault, and
+one more: its state column was ten characters wide, and `checkpointing` is
+thirteen.)
+
+So the three tables — `cortex trace` (and `attach`/`watch`), `cortex ps` and
+`cortex top` — now share one shape (`src/cli/table.ts`), and the shape has
+three rules:
+
+- **A column is as wide as the widest value in this table**, up to a stated
+  maximum — so the table is compact when the data is compact, and wide enough
+  to say everything when the data is wide. The maximum is derived from the
+  value domain wherever that domain is knowable (the process states, the
+  capability vocabulary, the token format) and is a stated constant where it
+  is not, because a role is the operator's own text.
+- **A value that does not fit is cut, and marked** — `…` says "there was more
+  here". Silently dropping the tail would be the same lie the table exists to
+  avoid.
+- **The heading and the rows come from one column list**, so they cannot
+  drift apart, and the rule under the heading is generated from it too.
+
+**And the two views stopped disagreeing about a number.** `cortex ps` had its
+own token rule and `cortex top` had another: anything under a thousand
+rounded up to `1.0k` in the table and was printed exactly in the tree. So 999
+tokens read as `1.0k` in one view and `999` in the other — two views of one
+process, and no way for the operator to tell which one was the truth. The
+rule now lives in one place (`formatTokens`, in `src/cli/process_view.ts`),
+next to the capability wording, so both views say `999`.
 
 **A view that cannot ask does not go silent.** A kernel too old to know the
 `openCalls` command must not turn the column into a row of blanks: a blank

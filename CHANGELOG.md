@@ -2296,6 +2296,68 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   `1.0.0`, and the transport's own version stays `1` (a new command is
   additive).
 
+- **A table that lost its shape.** `cortex ps` and `cortex top` built every
+  cell with `String(value).padEnd(width)` — and **`padEnd` does not cut**: a
+  value longer than the column simply ran on into the next one. And the
+  values are not tame. A role is whatever the operator typed; a narrowed
+  capability set is wider than any sensible column.
+
+  ```console
+  $ cortex ps
+  PID     PPID    ROLE          STATE         TOKENS    CAPS              AGE       WAITING
+  -----------------------------------------------------------------------------------------
+  2       1       researcher:deep-dive-agentzombie        15.0k     spawn,kill,fork,tool:dangerous,ipc:any7113.8h
+  ```
+
+  Two fields had become one word: `researcher:deep-dive-agent` and `zombie`,
+  and the capability list and the age. The reader had to count characters to
+  find out what they were looking at — and `cortex top` had the same fault
+  plus one of its own: its state column was ten characters wide, and
+  `checkpointing` is thirteen.
+
+  The three tables — `cortex trace` (and `attach`/`watch`), `cortex ps` and
+  `cortex top` — now share one shape (`src/cli/table.ts`), with three rules:
+
+  - **A column is as wide as the widest value in this table**, up to a stated
+    maximum. The maximum is derived from the value domain wherever that
+    domain is knowable (the process states, the capability vocabulary, the
+    token format) and is a stated constant where it is not — a role is the
+    operator's own text, so no domain can be derived for it.
+  - **A value that does not fit is cut, and marked** — `…` says "there was
+    more here". Silently dropping the tail would be the same lie the table
+    exists to avoid.
+  - **The heading and the rows come from one column list**, so they cannot
+    drift apart, and the rule under the heading is generated from it too.
+
+  **And the two views stopped disagreeing about a number.** `cortex ps` had
+  its own token rule and `cortex top` had another: anything under a thousand
+  rounded up to `1.0k` in the table and was printed exactly in the tree. So
+  999 tokens read as `1.0k` in one view and `999` in the other — two views of
+  one process, and no way for the operator to tell which was the truth. The
+  rule now lives in one place (`formatTokens`, next to the capability
+  wording), so both views say `999`.
+
+  **Three new smoke checks** (732 → 735), each one reverse-verified: the
+  table not cutting at all → "cortex ps keeps its columns when a value is
+  wider than them" fails ("the state is its own word, in the column the
+  header names, got: 2 1 researcher:deep-dive-agent-with-a-very-long-name
+  zombie …" — the row pushed out of alignment); cutting without marking →
+  the same check fails on the mark instead ("the cut value says it was cut");
+  the capability column capped below its data → the same check fails ("the
+  capability list is shown in full — the column grew to fit it"); the table
+  not cutting → "cortex top keeps its columns when a value is wider than
+  them" fails the same way; and `cortex ps` back to its own token rule →
+  "the two process views say the same number for the same spend" fails
+  ("cortex ps says the exact number, got: … 1.0k …").
+
+  The README's example tree is now **real output** — a live kernel, a holder
+  wedged on a channel with a `SIGTERM` queued for it, a planner waiting on a
+  child, and the planner's two finished children — captured from the command
+  rather than drawn by hand.
+
+  No syscall, `.crec`, or `.csnap` format change — the ABI frozen at `1.0.0`
+  is untouched. This is the CLI's own rendering.
+
 ### Documentation
 
 - **The kernel-size claim was off by more than half.** MANIFESTO §II.3

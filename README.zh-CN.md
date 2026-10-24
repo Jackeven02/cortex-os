@@ -25,10 +25,14 @@ $ cortex spawn --role coder --task "fix issue #42"
 
 # 看进程树
 $ cortex ps
-PID    PPID   ROLE       STATE     TOKENS   CAPS    AGE
-1234   1      coder      running   12.3k    all     2m
-1235   1234   tester     waiting   0        30s
-1236   1234   reviewer   blocked   2.1k     10s
+PID  PPID  ROLE            STATE    TOKENS  CAPS  AGE  WAITING
+--------------------------------------------------------------
+1    -     init            running  0       all   18s
+2    1     holder          blocked  0       all   18s  a channel — SIGTERM queued
+3    1     planner         blocked  0       all   18s  child 6 — SIGCHLD queued
+4    3     coder:overview  zombie   0       all   18s
+5    3     coder:install   zombie   0       all   18s
+6    3     coder:api       blocked  0       all   18s  a timer
 
 # 同样这些进程，但按它们真实的父子关系画成树，
 # 并标出各自在等什么、已经等了多久
@@ -36,14 +40,14 @@ $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
 0 tokens · $0.0000 spent · home .cortex
 
-      PID  ROLE            STATE     TOKENS  USD      NOTE
-----------------------------------------------------------
-      1    init            running   0       $0.0000  1 syscall
-├─    2    holder          blocked   0       $0.0000  waiting on a channel for 88ms — SIGTERM queued
-└─    3    planner         blocked   0       $0.0000  waiting on child 6 for 3.2s
-   ├─ 4    coder:overview  zombie    0       $0.0000  exit 0 (coder overview complete)
-   ├─ 5    coder:install   zombie    0       $0.0000  exit 0 (coder install complete)
-   └─ 6    coder:api       blocked   0       $0.0000  waiting on a timer for 3.2s
+      PID  ROLE            STATE    TOKENS  USD      NOTE
+---------------------------------------------------------
+      1    init            running  0       $0.0000  1 syscall
+├─    2    holder          blocked  0       $0.0000  waiting on a channel for 18.7s — SIGTERM queued
+└─    3    planner         blocked  0       $0.0000  waiting on child 6 for 18.7s — SIGCHLD queued
+   ├─ 4    coder:overview  zombie   0       $0.0000  exit 0 (coder overview complete)
+   ├─ 5    coder:install   zombie   0       $0.0000  exit 0 (coder install complete)
+   └─ 6    coder:api       blocked  0       $0.0000  waiting on a timer for 18.6s
 
 # ...以及卡住的那一个，顺带把该跑的命令给你
 $ cortex top --stall-after 30000
@@ -197,7 +201,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`replay`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 跟着一个 agent 的 syscall 流 —— 有活内核且那个进程还在内核里时，帧是**推**过来的（中位延迟 1 毫秒，而且 agent 一结束，跟随就自己收尾，并报出它真实的退出码）；没有内核时才去 tail 日志文件；有活内核时它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex restore --live` 能把快照**放回**那个内核，`cortex fork <pid>` 能把运行中的 agent 克隆成第二条可以驱动、可以对比的分支，`cortex daemon stop` 还能再把它停下来。`cortex top` 读的是每个活进程自己的日志 —— 读法跟 `cortex supervise` 完全一样，所以这个视图和那个会动手的命令**不可能各说各话**；加上 `--stall-after <ms>`，它会把超过**你的**阈值的进程标出来，顺带把该跑的命令给你。它还会说清楚**哪些信号正在排队**：发给一个卡死 agent 的 `kill` 不会立刻送达，而是排队等着一次可能永远不会来的唤醒 —— 视图会说出来，而不是把这件事只留给刚刚发出它的那条命令。`cortex limit` 也能碰到**运行中** agent 的预算 —— 预算是内核持有的东西，所以这条命令去问真正持有这个进程的内核，而不是自己 boot 一个除了 init 什么都没有的内核；它还把**上限**（这个进程总共可以花多少）和**还剩多少**分开说，因为一个会在你脚底下变小的数字不是上限。`--tokens N` 设的就是这个上限；已经结束的进程会**拒绝**改预算 —— 它花了多少是内核的记录。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
+上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`replay`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 跟着一个 agent 的 syscall 流 —— 有活内核且那个进程还在内核里时，帧是**推**过来的（中位延迟 1 毫秒，而且 agent 一结束，跟随就自己收尾，并报出它真实的退出码）；没有内核时才去 tail 日志文件；有活内核时它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex restore --live` 能把快照**放回**那个内核，`cortex fork <pid>` 能把运行中的 agent 克隆成第二条可以驱动、可以对比的分支，`cortex daemon stop` 还能再把它停下来。`cortex top` 读的是每个活进程自己的日志 —— 读法跟 `cortex supervise` 完全一样，所以这个视图和那个会动手的命令**不可能各说各话**；加上 `--stall-after <ms>`，它会把超过**你的**阈值的进程标出来，顺带把该跑的命令给你。它还会说清楚**哪些信号正在排队**：发给一个卡死 agent 的 `kill` 不会立刻送达，而是排队等着一次可能永远不会来的唤醒 —— 视图会说出来，而不是把这件事只留给刚刚发出它的那条命令。`cortex limit` 也能碰到**运行中** agent 的预算 —— 预算是内核持有的东西，所以这条命令去问真正持有这个进程的内核，而不是自己 boot 一个除了 init 什么都没有的内核；它还把**上限**（这个进程总共可以花多少）和**还剩多少**分开说，因为一个会在你脚底下变小的数字不是上限。`--tokens N` 设的就是这个上限；已经结束的进程会**拒绝**改预算 —— 它花了多少是内核的记录。表格也保住了自己的形状：一列有多宽取决于这一列里最宽的值，放不下的值会被**截断并标记**（`…`），而 `cortex ps` 和 `cortex top` 对同一笔花费说的是同一个数。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
 
 ---
 
@@ -225,7 +229,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 732 项断言，0 失败
+npx tsx scripts/smoke.ts                # 735 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。

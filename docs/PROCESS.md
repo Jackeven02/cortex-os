@@ -448,14 +448,19 @@ kernel's own word (`queued`), and in the same words everywhere:
 
 ```console
 $ cortex ps
-PID     PPID    ROLE          STATE         TOKENS    CAPS              AGE       WAITING
------------------------------------------------------------------------------------------
-2       1       blocker       blocked       0         all               31s       a channel — SIGTERM queued
+PID  PPID  ROLE     STATE    TOKENS  CAPS  AGE  WAITING
+-------------------------------------------------------
+1    -     init     running  0       all   40s
+2    1     blocker  blocked  0       all   40s  a channel — SIGTERM queued
 
 $ cortex top
-   PID  ROLE            STATE     TOKENS  USD      NOTE
--------------------------------------------------------
-└─ 2    blocker         blocked   0       $0.0000  waiting on a channel for 31.6s — SIGTERM queued
+cortex top — 2 processes · 1 running · 1 blocked · live kernel
+0 tokens · $0.0000 spent · home .cortex
+
+   PID  ROLE     STATE    TOKENS  USD      NOTE
+-----------------------------------------------
+   1    init     running  0       $0.0000  1 syscall
+└─ 2    blocker  blocked  0       $0.0000  waiting on a channel for 40.3s — SIGTERM queued
 ```
 
 `cortex ps` puts it in the WAITING column, `cortex top` in its NOTE, and the

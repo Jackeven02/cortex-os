@@ -21,6 +21,7 @@ import { PROCESS_STATES } from '../../kernel/process_table.js';
 import { ALL_SIGNALS, DELIVERY_OUTCOMES } from '../../kernel/signals.js';
 import { INIT_ACTIONS } from '../../kernel/init.js';
 import { DISPATCH_ACTIONS } from '../../kernel/scheduler.js';
+import { renderHeader, renderRow, ruleUnder, type Column } from '../table.js';
 
 /** The length of the longest string in a list. */
 function longest(values: readonly string[]): number {
@@ -66,43 +67,16 @@ export const TRACE_SYSCALL_WIDTH = Math.max(
  * it was longer than the header it ruled. Reading a row meant counting
  * characters. Now the header is generated from the same layout the rows use.
  */
-const TRACE_COLUMNS: readonly (readonly [header: string, width: number, gap: number])[] = [
-  ['time', 12, 2],
-  ['pid', 7, 1],
-  ['syscall', TRACE_SYSCALL_WIDTH, 1],
-  ['phase', 6, 1],
-  ['duration', 10, 1],
+const TRACE_COLUMNS: readonly Column[] = [
+  { header: 'time', width: 12, gap: 2 },
+  { header: 'pid', width: 7, gap: 1 },
+  { header: 'syscall', width: TRACE_SYSCALL_WIDTH, gap: 1 },
+  { header: 'phase', width: 6, gap: 1 },
+  { header: 'duration', width: 10, gap: 1 },
   // `reversibility` is 13 characters — the longest value is `irreversible`,
   // and the heading itself is longer still.
-  ['reversibility', 13, 0],
+  { header: 'reversibility', width: 13, gap: 0 },
 ];
-
-/**
- * Fit a cell to its column.
- *
- * A cell that is too long is **cut, and marked** — a name that does not fit
- * is a fact that does not fit, and silently dropping its tail would be the
- * same lie this whole table exists to avoid. The `…` says "there was more
- * here". (Nothing the kernel records can actually reach this: the syscall
- * column is sized for the widest name the kernel can produce, so only a
- * driver that registers an unusually long syscall name could.)
- */
-function fit(cell: string, width: number): string {
-  if (cell.length <= width) return cell.padEnd(width);
-  if (width <= 1) return cell.slice(0, width);
-  return `${cell.slice(0, width - 1)}…`;
-}
-
-/** Render one row of cells in the shared layout. */
-function renderRow(cells: readonly string[]): string {
-  const parts = cells.map((cell, i) => {
-    const column = TRACE_COLUMNS[i];
-    if (column === undefined) return cell;
-    const [, width, gap] = column;
-    return `${fit(cell, width)}${' '.repeat(gap)}`;
-  });
-  return parts.join('').trimEnd();
-}
 
 /**
  * The name a frame is shown under.
@@ -160,7 +134,7 @@ export function frameName(rec: SyscallRecord): string {
  * source of truth for the on-disk log's human-readable shape.
  */
 export function formatRecordLine(rec: SyscallRecord): string {
-  return renderRow([
+  return renderRow(TRACE_COLUMNS, [
     rec.timestamp.substring(11, 23), // HH:MM:SS.mmm
     String(unbrand(rec.pid)),
     frameName(rec),
@@ -171,10 +145,10 @@ export function formatRecordLine(rec: SyscallRecord): string {
 }
 
 /** The header row that goes with {@link formatRecordLine}. */
-export const TRACE_HEADER = renderRow(TRACE_COLUMNS.map(([header]) => header));
+export const TRACE_HEADER = renderHeader(TRACE_COLUMNS);
 
 /** The rule under the header. */
-export const TRACE_RULE = '-'.repeat(TRACE_HEADER.length);
+export const TRACE_RULE = ruleUnder(TRACE_HEADER);
 
 export async function cmdTrace(args: string[]): Promise<number> {
   const { positionals, values } = parseArgs({

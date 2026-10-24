@@ -13,9 +13,60 @@
 
 import { parseArgs } from 'node:util';
 import { defaultKernelDir } from '../index.js';
-import { formatCaps, describePendingSignals, readProcessView, type ProcessRow } from '../process_view.js';
+import {
+  formatCaps,
+  describePendingSignals,
+  formatTokens,
+  readProcessView,
+  type ProcessRow,
+} from '../process_view.js';
 import { describeWait, readOpenCalls, type OpenCall } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
+import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
+import { PROCESS_STATES } from '../../kernel/process_table.js';
+import { CAPABILITIES } from '../../kernel/types.js';
+
+/** The length of the longest string in a list. */
+function longest(values: readonly string[]): number {
+  return values.reduce((max, value) => Math.max(max, value.length), 0);
+}
+
+/**
+ * How wide the capabilities column may be.
+ *
+ * `formatCaps` prints `all` for the full set, `none` for an empty one, `-` for
+ * "never recorded", and the comma-joined list for a narrowed one. The widest
+ * list is every capability but one — and the one that can be left out is the
+ * shortest name, so the widest list is all of them joined, minus the shortest
+ * name and its separator.
+ */
+const CAPS_MAX = (() => {
+  const joined = CAPABILITIES.join(',');
+  const shortest = Math.min(...CAPABILITIES.map((capability) => capability.length));
+  const widestList = joined.length - shortest - 1;
+  return Math.max(widestList, 'all'.length, 'none'.length, '-'.length);
+})();
+
+/**
+ * The columns of the process table, and the widest each one may be.
+ *
+ * Every maximum is derived from the value domain it holds, except the two
+ * that cannot be: a **role** is whatever the operator typed, and an **age** is
+ * however long the process has been alive. Those get a stated maximum, and a
+ * value longer than it is cut and marked (`…`) rather than running on into the
+ * next column — which is what used to happen, and which glued a role name to
+ * a state and a capability list to an age.
+ */
+const PS_COLUMNS: readonly ColumnSpec[] = [
+  { header: 'PID', max: 8, gap: 2 },
+  { header: 'PPID', max: 8, gap: 2 },
+  { header: 'ROLE', max: 24, gap: 2 },
+  { header: 'STATE', max: longest(PROCESS_STATES), gap: 2 },
+  { header: 'TOKENS', max: longest(['0', '999', '999.9k', '999.9M']), gap: 2 },
+  { header: 'CAPS', max: CAPS_MAX, gap: 2 },
+  { header: 'AGE', max: 10, gap: 2 },
+  { header: 'WAITING', max: Number.POSITIVE_INFINITY, gap: 0 },
+];
 
 export async function cmdPs(args: string[]): Promise<number> {
   const { values } = parseArgs({
@@ -120,36 +171,32 @@ COLUMNS
     return 0;
   }
 
-  // Print table header.
-  const header =
-    'PID'.padEnd(8) +
-    'PPID'.padEnd(8) +
-    'ROLE'.padEnd(14) +
-    'STATE'.padEnd(14) +
-    'TOKENS'.padEnd(10) +
-    'CAPS'.padEnd(18) +
-    'AGE'.padEnd(10) +
-    'WAITING';
-  console.log(header);
-  console.log('-'.repeat(header.length));
-
   const now = Date.now();
-  for (const p of filtered) {
+
+  // The cells first, then the columns: a column is as wide as the widest
+  // value in *this* table, so the table is compact when the data is compact
+  // and wide enough to say everything when the data is wide. The heading and
+  // the rows come from the same list, so they cannot drift apart.
+  const cells: string[][] = filtered.map((p) => {
     const ageMs = p.startedAt === '—' ? 0 : now - new Date(p.startedAt).getTime();
-    const age = formatAge(ageMs);
-    const tokens = p.budgetsSpent.tokensIn + p.budgetsSpent.tokensOut;
-    const tokensStr = tokens > 0 ? `${(tokens / 1000).toFixed(1)}k` : '0';
-    const ppidStr = p.ppid !== null ? String(p.ppid) : '-';
-    console.log(
-      String(p.pid).padEnd(8) +
-        ppidStr.padEnd(8) +
-        p.role.padEnd(14) +
-        p.state.padEnd(14) +
-        tokensStr.padEnd(10) +
-        formatCaps(p.capabilities).padEnd(18) +
-        age.padEnd(10) +
-        waitingFor(p),
-    );
+    return [
+      String(p.pid),
+      p.ppid !== null ? String(p.ppid) : '-',
+      p.role,
+      p.state,
+      formatTokens(p.budgetsSpent.tokensIn + p.budgetsSpent.tokensOut),
+      formatCaps(p.capabilities),
+      formatAge(ageMs),
+      waitingFor(p),
+    ];
+  });
+  const columns = sizeColumns(PS_COLUMNS, cells);
+
+  const header = renderHeader(columns);
+  console.log(header);
+  console.log(ruleUnder(header));
+  for (const row of cells) {
+    console.log(renderRow(columns, row));
   }
 
   return 0;

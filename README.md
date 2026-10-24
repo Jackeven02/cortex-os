@@ -25,10 +25,14 @@ $ cortex spawn --role coder --task "fix issue #42"
 
 # Inspect the process tree
 $ cortex ps
-PID    PPID   ROLE       STATE     TOKENS   CAPS    AGE
-1234   1      coder      running   12.3k    all     2m
-1235   1234   tester     waiting   0        30s
-1236   1234   reviewer   blocked   2.1k     10s
+PID  PPID  ROLE            STATE    TOKENS  CAPS  AGE  WAITING
+--------------------------------------------------------------
+1    -     init            running  0       all   18s
+2    1     holder          blocked  0       all   18s  a channel — SIGTERM queued
+3    1     planner         blocked  0       all   18s  child 6 — SIGCHLD queued
+4    3     coder:overview  zombie   0       all   18s
+5    3     coder:install   zombie   0       all   18s
+6    3     coder:api       blocked  0       all   18s  a timer
 
 # Same processes, as the tree they actually are — and what each is waiting
 # on, and for how long
@@ -36,14 +40,14 @@ $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
 0 tokens · $0.0000 spent · home .cortex
 
-      PID  ROLE            STATE     TOKENS  USD      NOTE
-----------------------------------------------------------
-      1    init            running   0       $0.0000  1 syscall
-├─    2    holder          blocked   0       $0.0000  waiting on a channel for 88ms — SIGTERM queued
-└─    3    planner         blocked   0       $0.0000  waiting on child 6 for 3.2s
-   ├─ 4    coder:overview  zombie    0       $0.0000  exit 0 (coder overview complete)
-   ├─ 5    coder:install   zombie    0       $0.0000  exit 0 (coder install complete)
-   └─ 6    coder:api       blocked   0       $0.0000  waiting on a timer for 3.2s
+      PID  ROLE            STATE    TOKENS  USD      NOTE
+---------------------------------------------------------
+      1    init            running  0       $0.0000  1 syscall
+├─    2    holder          blocked  0       $0.0000  waiting on a channel for 18.7s — SIGTERM queued
+└─    3    planner         blocked  0       $0.0000  waiting on child 6 for 18.7s — SIGCHLD queued
+   ├─ 4    coder:overview  zombie   0       $0.0000  exit 0 (coder overview complete)
+   ├─ 5    coder:install   zombie   0       $0.0000  exit 0 (coder install complete)
+   └─ 6    coder:api       blocked  0       $0.0000  waiting on a timer for 18.6s
 
 # ...and the one that is stuck, with the command to act on it
 $ cortex top --stall-after 30000
@@ -196,7 +200,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `replay`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` follows one agent's syscall stream — by push when a live kernel holds the process (median lag 1 ms, and the follow ends by itself when the agent does, with its real exit code), and by tailing the log file when there is no kernel; with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. `cortex top` reads each live process's log the same way `cortex supervise` does, so the view and the command that acts on it cannot disagree — with `--stall-after <ms>` it marks what is over *your* threshold and hands you the command to run. It also says **which signals are queued** for a process: a `kill` aimed at a wedged agent is not delivered but queued, waiting for a wake-up that may never come, and the view says so instead of leaving it to the command that sent it. And `cortex limit` reaches a running agent's budget — a budget is a thing the *kernel* holds, so the command asks the kernel that holds the process rather than a kernel of its own that holds nothing but init — and it names the **ceiling** (what the process may spend in total) apart from what is left of it, because a remainder that shrinks under your feet is not a limit. `--tokens N` sets that ceiling; a finished process refuses to have its budget rewritten, because what it spent is the kernel's record. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `replay`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` follows one agent's syscall stream — by push when a live kernel holds the process (median lag 1 ms, and the follow ends by itself when the agent does, with its real exit code), and by tailing the log file when there is no kernel; with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. `cortex top` reads each live process's log the same way `cortex supervise` does, so the view and the command that acts on it cannot disagree — with `--stall-after <ms>` it marks what is over *your* threshold and hands you the command to run. It also says **which signals are queued** for a process: a `kill` aimed at a wedged agent is not delivered but queued, waiting for a wake-up that may never come, and the view says so instead of leaving it to the command that sent it. And `cortex limit` reaches a running agent's budget — a budget is a thing the *kernel* holds, so the command asks the kernel that holds the process rather than a kernel of its own that holds nothing but init — and it names the **ceiling** (what the process may spend in total) apart from what is left of it, because a remainder that shrinks under your feet is not a limit. `--tokens N` sets that ceiling; a finished process refuses to have its budget rewritten, because what it spent is the kernel's record. The tables keep their shape, too: a column is as wide as the widest value in it, a value that does not fit is cut **and marked** (`…`), and `cortex ps` and `cortex top` say the same number for the same spend. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 
@@ -229,7 +233,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 732 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 735 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
