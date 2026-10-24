@@ -722,17 +722,84 @@
       return `<div class="trace-item"><span class="trace-time">${esc(new Date(record.timestamp).toLocaleTimeString())}</span><span class="trace-syscall">${esc(parts.join(' · '))}</span><span class="trace-phase">${esc(record.phase)}${record.durationMs === undefined ? '' : ` · ${esc(record.durationMs)} ms`}</span></div>`;
     }
 
+    // **The process dialog has two views of one process.**
+    //
+    // What it **did** — the syscall timeline — and what it **knows** — its
+    // memory regions. The window had only the first, and for an agent the
+    // knowledge is the point: the event table says what it called, and
+    // nothing said what it wrote down. Both answers come from the kernel:
+    // the frames from the log, the regions from the memory engine.
+    const processTabs = (active) => `<div class="view-toggle" style="margin-bottom:12px"><button type="button" class="${active === 'trace' ? 'active' : ''}" data-tab="trace">Syscall 时间线</button><button type="button" class="${active === 'memory' ? 'active' : ''}" data-tab="memory">记忆</button></div>`;
+
+    const wireProcessTabs = (pid) => {
+      $('traceBody').querySelectorAll('button[data-tab]').forEach((button) => button.addEventListener('click', () => {
+        if (button.dataset.tab === 'memory') showMemory(pid);
+        else showTrace(pid);
+      }));
+    };
+
+    const openDialog = (title, html) => {
+      $('traceTitle').textContent = title;
+      $('traceBody').innerHTML = html;
+      // `showModal()` on an open dialog throws — and the operator clicking a
+      // second process while the first is still open is not an edge case.
+      if (!$('traceDialog').open) $('traceDialog').showModal();
+    };
+
     async function showTrace(pid) {
-      $('traceTitle').textContent = `进程 ${pid} · Syscall 时间线`;
-      $('traceBody').innerHTML = '<div class="empty">正在读取记录…</div>';
-      $('traceDialog').showModal();
+      openDialog(`进程 ${pid} · Syscall 时间线`, processTabs('trace') + '<div class="empty">正在读取记录…</div>');
+      wireProcessTabs(pid);
       try {
         const response = await fetch(`/api/trace/${encodeURIComponent(pid)}`);
         const records = await response.json();
         if (!response.ok) throw new Error(records.error ?? '读取失败');
-        $('traceBody').innerHTML = records.length ? `<div class="trace-list">${records.map((record) => traceItem(record)).join('')}</div>` : '<div class="empty">这个进程还没有 syscall 记录。</div>';
+        const body = records.length ? `<div class="trace-list">${records.map((record) => traceItem(record)).join('')}</div>` : '<div class="empty">这个进程还没有 syscall 记录。</div>';
+        openDialog(`进程 ${pid} · Syscall 时间线`, processTabs('trace') + body);
+        wireProcessTabs(pid);
       } catch (error) {
-        $('traceBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+        openDialog(`进程 ${pid} · Syscall 时间线`, processTabs('trace') + `<div class="empty">${esc(error.message)}</div>`);
+        wireProcessTabs(pid);
+      }
+    }
+
+    async function showMemory(pid) {
+      openDialog(`进程 ${pid} · 记忆`, processTabs('memory') + '<div class="empty">正在读取记忆…</div>');
+      wireProcessTabs(pid);
+      try {
+        const response = await fetch(`/api/memory/${encodeURIComponent(pid)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? '读取失败');
+        const regions = Array.isArray(data.regions) ? data.regions : [];
+        const rows = regions.map((region) => `<tr data-region="${esc(region.region)}"><td>${esc(region.region)}</td><td>${esc(region.kind)}</td><td>${esc(region.backing)}</td><td>${esc(region.access)}</td><td class="mono">${esc(region.entries)}${region.truncated ? '+' : ''}</td><td class="mono">${esc(region.writes)}</td><td class="mono">${esc(region.limit)}</td><td>${esc(region.sharedWith)}</td></tr>`).join('');
+        const body = regions.length
+          ? `<table><thead><tr><th>区域</th><th>类型</th><th>存储</th><th>访问</th><th>条目</th><th>写入</th><th>上限</th><th>共享方</th></tr></thead><tbody>${rows}</tbody></table>`
+          : '<div class="empty">这个进程没有记忆区域。</div>';
+        openDialog(`进程 ${pid} · 记忆`, processTabs('memory') + body);
+        wireProcessTabs(pid);
+        $('traceBody').querySelectorAll('tr[data-region]').forEach((row) => row.addEventListener('click', () => showRegion(pid, row.dataset.region)));
+      } catch (error) {
+        openDialog(`进程 ${pid} · 记忆`, processTabs('memory') + `<div class="empty">${esc(error.message)}</div>`);
+        wireProcessTabs(pid);
+      }
+    }
+
+    async function showRegion(pid, region) {
+      openDialog(`进程 ${pid} · 记忆 · ${region}`, processTabs('memory') + '<div class="empty">正在读取…</div>');
+      wireProcessTabs(pid);
+      try {
+        const response = await fetch(`/api/memory/${encodeURIComponent(pid)}/${encodeURIComponent(region)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? '读取失败');
+        const entries = Array.isArray(data.entries) ? data.entries : [];
+        const rows = entries.map((entry) => `<tr><td class="mono">${esc(entry.key)}</td><td class="mono">${esc(typeof entry.value === 'string' ? entry.value : JSON.stringify(entry.value))}</td><td>${esc(fmtLocal(entry.at))}</td></tr>`).join('');
+        const body = entries.length
+          ? `<div style="margin-bottom:9px;color:#8a93a1;font-size:10px">${esc(data.access ?? '')}</div><table><thead><tr><th>键</th><th>值</th><th>时间</th></tr></thead><tbody>${rows}</tbody></table>`
+          : '<div class="empty">这个区域还没有内容。</div>';
+        openDialog(`进程 ${pid} · 记忆 · ${region}`, processTabs('memory') + body);
+        wireProcessTabs(pid);
+      } catch (error) {
+        openDialog(`进程 ${pid} · 记忆 · ${region}`, processTabs('memory') + `<div class="empty">${esc(error.message)}</div>`);
+        wireProcessTabs(pid);
       }
     }
 

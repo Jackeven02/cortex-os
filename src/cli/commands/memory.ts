@@ -50,6 +50,7 @@ import { parseArgs } from 'node:util';
 
 import { defaultKernelDir } from '../index.js';
 import { probeKernel, KernelCommandError } from '../kernel_client.js';
+import { formatAccess, formatLimit, formatPeers } from '../memory_view.js';
 
 /** What the kernel reports about one region. */
 interface RegionInfo {
@@ -298,59 +299,6 @@ function printRegions(result: MemoryListResult): void {
         formatPeers(region.sharedWith, region.readOnlyPeers),
     );
   }
-}
-
-/**
- * A region's access mode, as it is printed.
- *
- * `read-write` when the process may write to it, `read-only` when its own
- * binding refuses writes, and `?` when the kernel did not report one — an
- * access mode nobody reported is not a writable one, and printing
- * `read-write` there would be a claim about a permission that was never
- * stated.
- */
-export function formatAccess(readOnly: boolean | undefined): string {
-  if (readOnly === undefined) return '?';
-  return readOnly ? 'read-only' : 'read-write';
-}
-
-/**
- * The peers bound to the same physical region, each with the access mode it
- * holds the region under.
- *
- * A peer that may only read the region sees everything in it and cannot add a
- * byte to it — the same `EPERM` a read-only binding traps. The list says who
- * can *see* the region; the marker says which of them may *write* to it, and
- * a peer whose mode nobody reported is marked `?` rather than assumed
- * writable.
- */
-export function formatPeers(
-  sharedWith: readonly number[],
-  readOnlyPeers: readonly number[] | undefined,
-): string {
-  if (sharedWith.length === 0) return '-';
-  const readOnly = readOnlyPeers === undefined ? undefined : new Set(readOnlyPeers);
-  return sharedWith
-    .map((pid) =>
-      readOnly === undefined
-        ? `${pid} (?)`
-        : `${pid} (${readOnly.has(pid) ? 'read-only' : 'read-write'})`,
-    )
-    .join(', ');
-}
-
-/**
- * A region's write-count ceiling, as it is printed.
- *
- * `∞` when the region is unbounded, the number when it is bounded, and `?`
- * when the kernel did not report one — a ceiling nobody reported is not an
- * unbounded region, and printing `∞` there would be a claim about a limit that
- * was never stated.
- */
-function formatLimit(effectiveMaxEntries: number | undefined): string {
-  if (effectiveMaxEntries === undefined) return '?';
-  if (effectiveMaxEntries < 0) return '∞';
-  return String(effectiveMaxEntries);
 }
 
 /**

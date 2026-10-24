@@ -246,7 +246,8 @@ import {
 import { cmdDiff } from '../src/cli/commands/diff.js';
 import { cmdTrace, TRACE_SYSCALL_WIDTH, TRACE_HEADER } from '../src/cli/commands/trace.js';
 import { cmdLogs, alreadyShown } from '../src/cli/commands/logs.js';
-import { cmdMemory, formatAccess, formatPeers } from '../src/cli/commands/memory.js';
+import { cmdMemory } from '../src/cli/commands/memory.js';
+import { formatAccess, formatPeers } from '../src/cli/memory_view.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
@@ -14569,6 +14570,106 @@ async function runMemoryInspectChecks(): Promise<void> {
         readerOut.startsWith(`# memory of pid ${readerPid} (reader) — region 'semantic' (read-only)`),
         `the reader's dump names it, got: ${readerOut}`,
       );
+    });
+
+    await checkAsync('the dashboard says what a process knows', async () => {
+      // The window could show what an agent **did** — the event table, the
+      // syscall timeline — and nothing about what it **knows**. For an agent
+      // the knowledge is the point.
+      const probe = await probeKernel(tmp);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+      const dash = await startDashboard({ dir: tmp, port: 0, kernel: client! });
+      try {
+        const res = await fetch(`${dash.url}/api/memory/${daemonPid}`);
+        assert(res.status === 200, `status ${res.status}`);
+        const body = (await res.json()) as {
+          regions: readonly {
+            region: string;
+            access: string;
+            entries: number;
+            writes: number;
+            limit: string;
+            sharedWith: string;
+          }[];
+        };
+        const semantic = body.regions.find((r) => r.region === 'semantic');
+        assert(semantic !== undefined, `the region is listed, got: ${JSON.stringify(body.regions)}`);
+        assert(semantic!.access === 'read-write', `the writer may write, got ${semantic!.access}`);
+        assert(semantic!.limit === '∞', `the unbounded region says so, got ${semantic!.limit}`);
+        assert(
+          semantic!.sharedWith === `${readerPid} (read-only)`,
+          `the read-only peer is marked, got ${semantic!.sharedWith}`,
+        );
+
+        // And the window says it in the **same words** the CLI does: one
+        // rule, two views.
+        const out = await memoryOutput([String(daemonPid!)]);
+        const row = out.split('\n').find((l) => l.startsWith('semantic'));
+        assert(row !== undefined, `the CLI's row is there, got: ${out}`);
+        assert(row!.includes('read-write'), `the CLI says the same, got: ${row}`);
+        assert(row!.includes('∞'), `the CLI says the same ceiling, got: ${row}`);
+        assert(
+          row!.includes(`${readerPid} (read-only)`),
+          `the CLI marks the peer the same way, got: ${row}`,
+        );
+      } finally {
+        await dash.close();
+        client!.close();
+      }
+    });
+
+    await checkAsync('the dashboard shows what is in a region', async () => {
+      const probe = await probeKernel(tmp);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+      const dash = await startDashboard({ dir: tmp, port: 0, kernel: client! });
+      try {
+        const res = await fetch(`${dash.url}/api/memory/${daemonPid}/semantic`);
+        assert(res.status === 200, `status ${res.status}`);
+        const body = (await res.json()) as {
+          region: string;
+          access: string;
+          entries: readonly { key: string; value: unknown }[];
+        };
+        assert(body.region === 'semantic', `the region is named, got ${body.region}`);
+        assert(body.access === 'read-write', `the access mode is named, got ${body.access}`);
+        assert(body.entries.length === 1, `the note is there, got ${JSON.stringify(body.entries)}`);
+        assert(
+          JSON.stringify(body.entries[0]!.value) === '{"hello":"world"}',
+          `the note is what it wrote, got ${JSON.stringify(body.entries[0]!.value)}`,
+        );
+      } finally {
+        await dash.close();
+        client!.close();
+      }
+    });
+
+    await checkAsync('the page has a memory view of a process', async () => {
+      const probe = await probeKernel(tmp);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+      const dash = await startDashboard({ dir: tmp, port: 0, kernel: client! });
+      try {
+        const html = await (await fetch(`${dash.url}/`)).text();
+        // Which endpoints the page actually fetches — not merely whether the
+        // string `/api/memory/` appears somewhere, because the *region*
+        // endpoint contains it as a prefix. The page must ask for **both**:
+        // the list of regions, and one region's entries.
+        const fetched = [...html.matchAll(/fetch\(`([^`]+)`\)/g)].map((m) => m[1]!);
+        assert(
+          fetched.some((u) => /^\/api\/memory\/\$\{encodeURIComponent\(pid\)\}$/.test(u)),
+          `the page asks the kernel for the regions, got: ${JSON.stringify(fetched)}`,
+        );
+        assert(
+          fetched.some((u) =>
+            /^\/api\/memory\/\$\{encodeURIComponent\(pid\)\}\/\$\{encodeURIComponent\(region\)\}$/.test(u),
+          ),
+          `the page asks the kernel for the entries, got: ${JSON.stringify(fetched)}`,
+        );
+        assert(html.includes('showMemory'), 'the page has a memory view');
+        assert(html.includes('记忆'), 'the memory view has a name');
+      } finally {
+        await dash.close();
+        client!.close();
+      }
     });
 
     await checkAsync('cortex memory says plainly that it needs a live kernel', async () => {

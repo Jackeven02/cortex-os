@@ -338,6 +338,10 @@ The API is available at:
 - `GET /api/events?from=&to=&offset=&limit=` — merged callback + syscall events, newest first. `from`/`to` are millisecond timestamps; results are paginated and the total count is returned in the `x-total-count` header.
 - `GET /api/checkpoints` — checkpoints under `processes/<pid>/checkpoints/`, parsed from file names (`createdAt`/`chainId`) plus on-disk size.
 - `GET /api/ops` — reports which write operations are enabled: `{ allowOps: boolean, ops: string[] }`.
+- `GET /api/memory/:pid` — the memory regions of a process: for each region its `region`, `kind`, `backing`, `access` (`read-write` / `read-only` / `?`), `entries`, `writes`, `limit` (the write-count ceiling: the number, `∞`, or `?`) and `sharedWith` (the peers, each with the access mode it holds the region under — `3 (read-only)`). The words are the ones `cortex memory` prints, because both read them from one module (`src/cli/memory_view.ts`).
+- `GET /api/memory/:pid/:region` — one region's entries: `region`, `access`, and `entries` (`key`, `value`, `at`).
+
+A region's contents live in the memory driver of the kernel that owns the process, so these two endpoints need a **live kernel**. Without one they answer `409` and say so — there is no on-disk copy to read instead. A process the kernel does not have answers `404`; any other failure answers `502`.
 
 By default every write operation is rejected. Opt in from the CLI with `--allow-ops` (enable everything) or `--ops spawn,kill,restore` (enable exactly the listed ops), or pass `startDashboard({ allowOps: true | ['spawn', 'kill'] })` when embedding. Enabled ops are served as `POST /api/ops/<op>` and run the matching CLI command in-process against the dashboard's own state directory, so all CLI validation still applies:
 

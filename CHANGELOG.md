@@ -1546,6 +1546,46 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The window could show what an agent did, and nothing about what it knew.**
+  The operator's dashboard had the event table (every call the agent made) and
+  the syscall timeline (every frame, in order) — and no way to see a single
+  memory region. The kernel held all of it: the regions, their entries, their
+  write counts, their ceilings, their access modes, their peers. For an agent
+  the knowledge is the point, and the window showed only the motion.
+
+  So the process dialog has **two views of one process**. Beside the syscall
+  timeline there is now **记忆**: the regions, with their kind, their backing,
+  their access mode, their entry count, their write count, their ceiling and
+  their peers — and clicking a region shows what is in it (the keys, the values,
+  and when each was written).
+
+  ```console
+  进程 2 · 记忆
+  区域      类型    存储    访问        条目  写入  上限  共享方
+  episodic  cow     inmem   read-write  0     0     100  -
+  semantic  shared  inmem   read-write  3     4     ∞    3 (read-only)
+  ```
+
+  The panel says the same words `cortex memory` says — `read-write`,
+  `read-only`, `∞`, `3 (read-only)` — because the words live in one module
+  (`src/cli/memory_view.ts`) and each view supplies only **how it prints a
+  number**. Two views of one region cannot disagree about who may write to it.
+
+  The memory is asked for **on demand**: the panel fetches it when the operator
+  opens it, not on every process-table refresh — a 250 ms refresh that asked
+  every process for its memory would turn one poll into N round trips to the
+  kernel. Without a live kernel the panel says it needs one rather than
+  showing an empty region: the contents live in the kernel that owns them, and
+  there is no on-disk copy to read instead.
+
+  3 new smoke checks (791 → 794), reverse-verified: with the kernel withholding
+  `readOnlyPeers`, the panel prints `3 (?)` and its check fails; with the
+  dashboard handing the raw region through instead of the described one, its
+  check fails on the access mode; and with the page not asking for the regions,
+  the page check fails. That last one also caught a weak assertion of ours —
+  `/api/memory/` is a prefix of the *entries* endpoint too, so the check now
+  asks which paths the page actually fetches.
+
 - **The views that show what a process spent never said what it was measured
   against.** A budget has two numbers: the **ceiling** — the total the process
   may ever spend — and the **remainder**, which shrinks as it spends.

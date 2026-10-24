@@ -252,7 +252,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 791 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 794 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -378,6 +378,10 @@ Read-only by default. With a live kernel in the directory (`cortex daemon run`),
 **And so does the window's own timeline.** The operator's window has two views of the same frames — the event table and the syscall timeline — and the timeline used to say less than the event table beside it: no cached part (the server was not even reading it), no price (the server sent it and the page dropped it), and `0 out` for a call that never reported how many tokens it wrote. Both now ask one helper for the tokens, and the server reads the frame with the same function the CLI's trace uses — so the terminal, the event table and the timeline all say the same thing about the same call.
 
 **And the timeline reads like the terminal's.** The kernel's own frames are placeholders on disk (`__state`, `__sched`) — the *view* is what distinguishes them: `__state:running->blocked(recv)`, `__sched:sigxcpu(tokens)`. The window prints the same names `cortex trace` does, because both ask the same function.
+
+**And the window shows what the agent knows.** The process dialog had one view of a process — the syscall timeline, which is what it *did*. An agent's memory is what it *knows*, and nothing in the window said a word about it. Now it has two views: click a process, switch to **记忆**, and the window lists its memory regions — name, kind, backing, access mode, entries, writes, ceiling, and the other processes bound to the same region — and clicking a region shows what is inside it: the keys, the values, and when each was written.
+
+It says the same words `cortex memory` says (`read-write`, `read-only`, `∞`, `3 (read-only)`), because the wording lives in one module and each view only chooses how it prints a number. The memory is fetched when you open the panel, not on every refresh of the process table, and without a live kernel the panel says so rather than showing an empty region — a region's contents live in the kernel that owns them, and there is no on-disk copy to read instead.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

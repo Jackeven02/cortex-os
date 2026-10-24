@@ -277,6 +277,12 @@ The kernel knew both, and the transport already carried one of them: the region'
 
 So the table now says both. The region's own right to write is the **`ACCESS`** column (`read-write`, or `read-only` when the binding refuses writes), and each peer in **`SHARED WITH`** carries its own (`3 (read-only)` — it can see this region and cannot write to it). The transport gained one field for the peers (`readOnlyPeers`, a subset of `sharedWith`) and one for the dump's header (`readOnly`); both are additions to a reply, so the transport's version does not move. The region dump names the same mode in its header — the table and the dump are two views of one region, and they say the same thing about it. An access mode nobody reported prints `?`, never `read-write`: a permission nobody stated is not a granted one.
 
+**And the window says it too.** `cortex memory` was the only view of a region's facts, and the operator's window had none of them: the dashboard could show what an agent **did** (the event table, the syscall timeline) and nothing about what it **knows**. The kernel held all of it — the regions, their entries, their write counts, their ceilings, their access modes and their peers — and the window had no way to ask.
+
+So the window asks. The dashboard serves a process's memory over two endpoints (`GET /api/memory/<pid>` for the regions, `GET /api/memory/<pid>/<region>` for one region's entries), and the process dialog has a **second view beside the syscall timeline**: **记忆**. The panel says the same words `cortex memory` says — the access mode, the ceiling, the peers — because those words live in one module (`src/cli/memory_view.ts`), and each view supplies only **how it prints a number**. Click a region and the window shows what is in it: the keys, the values, and when each was written.
+
+The memory is asked for **on demand** — the panel fetches it when the operator opens it, not on every process-table refresh, because a 250 ms refresh that asked every process for its memory would turn one poll into N round trips to the kernel. And without a live kernel the panel says so plainly instead of showing an empty region: a region's contents live in the kernel that owns it, and there is no on-disk copy to read instead (the same limit `cortex memory` has).
+
 **A declared region is not yet a bound one.** The policies live on the process-table entry; turning a logical region into a physical key is the memory engine's job (`attachRegion`, and `syncFromTable` to pull the declarations in). Every birth path has to do that sync, and the three are not the same code: the `spawn` syscall does it in the dispatcher, `restore` does it in the checkpoint manager, and a **daemon registration** does it in init. When the daemon path skipped it, a daemon's agent died on its *first* `memory_read` with `ENOENT` ("no such memory region") while the same agent under `cortex spawn` worked — the regions were declared, just never bound. PROCESS.md §6.1 has always promised "sets up memory regions per policy" for every process; the daemon path was the one that did not keep the promise.
 
 **Performance.** Reads and writes are O(1) plus driver overhead. COW duplication is O(region size) on first write. Acceptable for v0; per-key COW is post-v0.
@@ -1812,6 +1818,32 @@ trace reads it with — and the page asks **one** helper (`callSummary`) for
 the tokens, which both the event row and the timeline row use. Two views of
 one frame inside one window cannot drift apart, and neither of them can drift
 from the terminal.
+
+**And the window says what the agent knows.** The window could show what an
+agent **did** — the event table, the syscall timeline — and nothing about what
+it **knows**. For an agent the knowledge is the point: the event table says
+what it called, and nothing said what it wrote down. The kernel had it all
+along — every region, its entries, its write count, its ceiling, its access
+mode and its peers — and the window had no way to ask for any of it.
+
+So the process dialog has **two views of one process**: the syscall timeline
+(what it did) and the memory panel (what it knows), one click apart. The panel
+shows the regions — name, kind, backing, access, entries, writes, ceiling,
+peers — in the same words `cortex memory` uses, because the words live in one
+module (`src/cli/memory_view.ts`) and each view supplies only **how it prints
+a number**. Click a region and the window shows what is in it: the keys, the
+values, and when each was written.
+
+The memory is fetched **on demand** — when the operator opens the panel, not
+on every process-table refresh. A 250 ms refresh that asked every process for
+its memory would turn one poll into N round trips to the kernel, and the
+answer changes only when the agent writes something.
+
+**A view that cannot ask says so.** Without a live kernel the panel says
+plainly that it needs one, rather than showing an empty region: a region's
+contents live in the kernel that owns it, and there is no on-disk copy to read
+instead. The same limit `cortex memory` has — and the same rule: a view that
+has no answer must not look like a view whose answer is "nothing".
 
 **And a unit has exactly one conversion point.** `budgetsSpent.usdSpent` is in
 **microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4). Three

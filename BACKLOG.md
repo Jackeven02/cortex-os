@@ -1182,6 +1182,52 @@ The user-facing surface. Should feel like a real OS shell.
 
   Docs: STATE §2.4; PROCESS.md §8.3.
 
+- [x] **#100** The operator's window could show what an agent did, and nothing
+  about what it knew → **fixed.** The dashboard had the event table (every call
+  the agent made) and the syscall timeline (every frame, in order) — and no way
+  to see a single memory region. The kernel held all of it: the regions, their
+  entries, their write counts, their ceilings, their access modes, their
+  peers. For an agent the knowledge is the point, and the window showed only
+  the motion.
+
+  **The process dialog now has two views of one process.** Beside the syscall
+  timeline there is **记忆** — the regions, with their kind, their backing,
+  their access mode, their entry count, their write count, their ceiling and
+  their peers — and clicking a region shows what is in it (the keys, the
+  values, and when each was written):
+
+  ```
+  进程 2 · 记忆
+  区域      类型    存储    访问        条目  写入  上限  共享方
+  episodic  cow     inmem   read-write  0     0     100  -
+  semantic  shared  inmem   read-write  3     4     ∞    3 (read-only)
+  ```
+
+  **The window says the same words the CLI says.** The access mode, the ceiling
+  and each peer's mode live in one module (`src/cli/memory_view.ts`), so the
+  panel and `cortex memory` cannot disagree about who may write to a region.
+
+  **The memory is fetched on demand.** The panel asks the kernel when the
+  operator opens it — not on every process-table refresh, which would turn one
+  250 ms poll into N round trips to the kernel. Without a live kernel the panel
+  says it needs one rather than showing an empty region: the contents live in
+  the kernel that owns them, and there is no on-disk copy to read instead.
+
+  **3 new smoke checks** (791 → 794), reverse-verified: with the kernel
+  withholding `readOnlyPeers`, the panel prints `3 (?)` and its check fails;
+  with the dashboard handing the raw region through instead of the described
+  one, its check fails on the access mode; and with the page not asking for
+  the regions, the page check fails. The last one also caught a weak assertion
+  of ours — `/api/memory/` is a prefix of the *entries* endpoint too, so the
+  check now asks which paths the page actually fetches.
+
+  **A bug fixed on the way:** `showModal()` on an open dialog throws, so
+  opening a second process while the first was still open failed. The dialog is
+  now opened once and reused.
+
+  Docs: ARCHITECTURE §4.5 (the window says it too) and the views narrative;
+  STATE §2.3 (the window sees the same memory the CLI sees); CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

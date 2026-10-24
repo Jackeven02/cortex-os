@@ -16,6 +16,7 @@ import { usdToDollars } from '../money.js';
 import { formatTokenUsage, callUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
+import { formatAccess, formatLimit, formatPeers } from '../cli/memory_view.js';
 import {
   ActivityStore,
   safeErrorMessage,
@@ -319,6 +320,78 @@ function withPendingLabel<T extends { pendingSignals?: readonly Signal[] }>(
   row: T,
 ): T & { pendingLabel: string } {
   return { ...row, pendingLabel: describePendingSignals('', row.pendingSignals) };
+}
+
+/**
+ * The transport's `memory` reply for one process: its regions.
+ *
+ * The shape the kernel's memory manager answers with (ABI.md §4.4), read
+ * over the transport rather than out of the log: a region's contents live in
+ * the memory driver, and the `.crec` deliberately keeps only a hash of every
+ * value the process wrote.
+ */
+interface MemoryRegionsReply {
+  readonly pid: number;
+  readonly role: string;
+  readonly regions: readonly {
+    readonly region: string;
+    readonly kind: string;
+    readonly backing: string;
+    readonly readOnly?: boolean;
+    readonly writes: number;
+    readonly entries: number;
+    readonly truncated?: boolean;
+    readonly sharedWith: readonly number[];
+    readonly readOnlyPeers?: readonly number[];
+    readonly effectiveMaxEntries?: number;
+  }[];
+}
+
+/** The transport's `memory` reply for one region: its entries. */
+interface MemoryDumpReply {
+  readonly pid: number;
+  readonly role: string;
+  readonly region: string;
+  readonly readOnly?: boolean;
+  readonly entries: readonly { key: string; value: unknown; at: string }[];
+}
+
+/** One region, in the words the CLI's `cortex memory` prints. */
+interface DescribedRegion {
+  readonly region: string;
+  readonly kind: string;
+  readonly backing: string;
+  /** `read-write`, `read-only`, or `?` when the kernel did not report it. */
+  readonly access: string;
+  readonly entries: number;
+  readonly truncated: boolean;
+  readonly writes: number;
+  /** The write-count ceiling: the number, `∞`, or `?`. */
+  readonly limit: string;
+  /** The peers, each with the access mode it holds the region under. */
+  readonly sharedWith: string;
+}
+
+/**
+ * One region, said the way `cortex memory` says it.
+ *
+ * The words — the access mode, the ceiling, the peers — come from the shared
+ * module (`src/cli/memory_view.ts`), so the window and the CLI cannot
+ * disagree about a region. The page keeps only its own number style: it
+ * spells the counts out (`1,234`) where the CLI shortens them (`1.2k`).
+ */
+function describeRegion(region: MemoryRegionsReply['regions'][number]): DescribedRegion {
+  return {
+    region: region.region,
+    kind: region.kind,
+    backing: region.backing,
+    access: formatAccess(region.readOnly),
+    entries: region.entries,
+    truncated: region.truncated === true,
+    writes: region.writes,
+    limit: formatLimit(region.effectiveMaxEntries),
+    sharedWith: formatPeers(region.sharedWith, region.readOnlyPeers),
+  };
 }
 
 /**
@@ -809,6 +882,49 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         }
         json(response, 200, records.reverse());
         return;
+      }
+      // The memory a process KNOWS: its regions, what is in them, and who
+      // else can see them.
+      //
+      // The window could show what an agent **did** (the event table, the
+      // syscall timeline) and nothing about what it **knows** — and for an
+      // agent, the knowledge is the point. It lives in the kernel's memory
+      // driver, so there is no on-disk copy to fall back on: without a live
+      // kernel this says so rather than showing an empty region.
+      const memoryMatch = /^\/api\/memory\/(\d+)(?:\/([^/]+))?$/.exec(url.pathname);
+      if (memoryMatch !== null) {
+        const pid = Number(memoryMatch[1]);
+        const region = memoryMatch[2] === undefined ? undefined : decodeURIComponent(memoryMatch[2]);
+        if (options.kernel === undefined) {
+          json(response, 409, {
+            error:
+              "no live kernel: a process's memory lives in the kernel that owns it — there is no on-disk copy to read instead",
+          });
+          return;
+        }
+        try {
+          if (region === undefined) {
+            const reply = await options.kernel.request('memory', { pid }) as MemoryRegionsReply;
+            json(response, 200, { pid: reply.pid, role: reply.role, regions: reply.regions.map(describeRegion) });
+            return;
+          }
+          const reply = await options.kernel.request('memory', { pid, region }) as MemoryDumpReply;
+          json(response, 200, {
+            pid: reply.pid,
+            role: reply.role,
+            region: reply.region,
+            // The same word the CLI's dump header uses (`src/cli/memory_view.ts`).
+            access: formatAccess(reply.readOnly),
+            entries: reply.entries,
+          });
+          return;
+        } catch (error) {
+          const errno = (error as { errno?: string }).errno;
+          json(response, errno === 'ESRCH' ? 404 : 502, {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
       }
       if (url.pathname === '/' || url.pathname === '/index.html') {
         response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });

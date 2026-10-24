@@ -243,7 +243,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 791 项断言，0 失败
+npx tsx scripts/smoke.ts                # 794 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -366,6 +366,10 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 **而且大屏自己的时间线也说。** 运维的窗口不止一个视图：它有**事件表**（agent 做出的每一次调用）和 **Syscall 时间线**（每一帧，按顺序），两者读的是同一份 `.crec`。而时间线曾经说得比旁边的事件表还少：没有缓存那部分（服务端压根没读它）、没有价格（服务端发过来了、页面把它丢了），还有给一个从没说过自己写了多少 token 的调用印上 `0 out`。现在两边都问同一个 helper 要 token，服务端也用和 `cortex trace` 同一个函数读帧——所以终端、事件表和时间线对同一次调用说的是同一句话。
 
 **而且时间线读起来和终端里的一样。** 内核自己的帧在盘上是占位名（`__state`、`__sched`）——**区分**它们的是那个视图：`__state:running->blocked(recv)`、`__sched:sigxcpu(tokens)`。大屏印的是和 `cortex trace` 一样的名字，因为两边问的是同一个函数。
+
+**而且大屏看得见 agent 知道什么。** 进程弹窗原本只有一个视图——Syscall 时间线，那是它**做了什么**。agent 的记忆是它**知道什么**，而窗口里对此一个字都没有。现在有两个视图：点一个进程，切到 **记忆**，大屏会列出它的记忆区——名字、类型、存储、访问模式、条目、写入、上限，以及和它绑在同一个区上的其他进程——再点一个区，就能看见里面装了什么：键、值，以及每条是什么时候写的。
+
+它用的词和 `cortex memory` 一样（`read-write`、`read-only`、`∞`、`3 (read-only)`），因为措辞只在一处，每个视图只管自己怎么印数字。记忆是你打开面板时才取的，不是每次刷新进程表都去取一遍；没有活内核时，面板会直接说需要活内核，而不是给你看一个空区——区里的内容住在拥有它的内核里，盘上没有副本可读。
 
 三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
 
