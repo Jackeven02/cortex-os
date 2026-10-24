@@ -50,8 +50,7 @@ import { defaultKernelDir } from '../index.js';
 import { readProcessView, type ProcessRow, type ProcessView } from '../process_view.js';
 import {
   isStalled,
-  readOpenCall,
-  readOpenCallsFromKernel,
+  readOpenCalls,
   describeBlocked,
   formatOpenCall,
   type OpenCall,
@@ -120,14 +119,7 @@ export async function cmdTop(args: string[]): Promise<number> {
     // so the fact is O(processes) to read instead of O(bytes). Without one,
     // the log is all there is — and it is read once, not per poll.
     const now = Date.now();
-    const fromKernel = await readOpenCallsFromKernel(client);
-    const raw = fromKernel ?? (await readOpenCalls(dir, all));
-    // The same filter for both readings: a process the kernel no longer holds
-    // is not inside anything, even though its log keeps the `enter` frame of
-    // the call it was killed in. Two readings of one fact have to make the
-    // same choice, or they are two facts.
-    const live = new Set(all.filter((row) => row.live).map((row) => row.pid));
-    const inside = new Map([...raw].filter(([pid]) => live.has(pid)));
+    const inside = await readOpenCalls(dir, all, client);
 
     return renderTop(dir, view, all, inside, now, stallAfterMs);
   } finally {
@@ -208,32 +200,6 @@ function renderTop(
 
   console.log('trace one:   cortex trace <pid>      follow one:  cortex attach <pid>');
   return 0;
-}
-
-/**
- * Read the open call of every *live* process, in parallel.
- *
- * The logs are read once, not per poll — `top` is a command an operator runs,
- * not a loop. Reading them concurrently keeps the wall time at the slowest
- * log rather than the sum of all of them.
- */
-async function readOpenCalls(
-  dir: string,
-  rows: readonly ProcessRow[],
-): Promise<Map<number, OpenCall>> {
-  const found = await Promise.all(
-    rows
-      .filter((row) => row.live)
-      .map(async (row): Promise<readonly [number, OpenCall | undefined]> => {
-        const call = await readOpenCall(dir, row.pid);
-        return [row.pid, call] as const;
-      }),
-  );
-  const map = new Map<number, OpenCall>();
-  for (const [pid, call] of found) {
-    if (call !== undefined) map.set(pid, call);
-  }
-  return map;
 }
 
 /**
@@ -384,10 +350,15 @@ its own process table is merged in, so running agents appear in the tree too.
 NOTES
   "Waiting" and "stuck" are different, and only one of them is in the process
   table. A process that is blocked on a channel and a process that will never
-  be answered both read as 'waiting on a channel'; the log knows how long the
-  call has been open, and that is what this view shows. A process inside a
-  model call is not blocked at all — the kernel does not park it while the
-  call is in flight — so the log is the only place its stall shows up.
+  be answered both read as 'waiting on a channel'; how long the call has been
+  open is what this view shows. A process inside a model call is not blocked
+  at all -- the kernel does not park it while the call is in flight -- so the
+  process table says only 'running', and the call has to be asked for.
+
+  Where the answer comes from: with a live kernel, from the kernel. It writes
+  every syscall as an 'enter' frame and its partner, and it knows which pairs
+  are still open. Without one, from the process's log. The two readings give
+  the same numbers -- the log is just the slower way to get them.
 
 EXAMPLES
   cortex top

@@ -425,9 +425,10 @@ frame **with the same `callId`**, so a call whose `enter` never got a
 partner is the call the process is sitting inside, and the `enter` frame's
 timestamp is when it started.
 
-The CLI does this in one place (`src/cli/open_call.ts`), and both
-`cortex top` (which shows it) and `cortex supervise` (which acts on it) use
-it — so the view and the command that acts on it cannot disagree. A host
+The CLI does this in one place (`src/cli/open_call.ts`), and `cortex top`
+(which shows it), `cortex ps` (which puts it in a column) and `cortex supervise`
+(which acts on it) use it — so the view and the command that acts on it cannot
+disagree. A host
 wanting the same fact should read it the same way. Two details are worth
 copying: a `sleep` is a **declared wait**, not a stall; and so is a `wait`
 that carries its own deadline (`wait(pid, { timeoutMs })` ends whether or not

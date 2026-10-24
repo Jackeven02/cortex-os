@@ -42,6 +42,50 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex ps` says what each agent is waiting on.** The flat table had the
+  state and nothing else: `blocked`, with no word about *what* the process was
+  blocked on — and `running` for an agent four minutes into a model call,
+  which is a fact about the scheduler and not about the agent. The table now
+  has a **WAITING** column, and it says "a channel", "child 5", "a model
+  call".
+
+  **The column is last, and the cell is a noun.** The existing seven columns
+  keep their positions, so a script that reads `cortex ps` by column number
+  still reads the column it read before. The cell is the *what* ("a
+  channel"); the *how long* stays `cortex top`'s job ("waiting on a channel
+  for 44.4s"), because those are different questions. The age column is
+  coarse on purpose too — "4m" is enough for an age, and "44s" and "4m" are
+  different answers to "should I kill this?".
+
+  **The wording is the wording the other views use.** `describeWait` and
+  `describeBlocked` live in `src/cli/open_call.ts`, next to the reading
+  itself, so a table cell and a tree line cannot drift apart: `ps` says "a
+  channel", `top` says "waiting on a channel for 12.3s", and the dashboard
+  says the same sentence. The *rule for which source answers* is shared the
+  same way — the kernel's blocked reason wins when it has one (it knows
+  *which* child), and the open call is used otherwise, which is how a driver
+  call shows up at all, since the kernel does not park a process while its
+  model call is in flight (BACKLOG #060).
+
+  **A view that cannot ask does not go silent.** A kernel too old to know the
+  `openCalls` command used to leave the table with a row of blanks — and a
+  blank says "nothing is being waited on", which is a claim, and it is false
+  whenever the log knows better. The table now falls back to the log through
+  the *same* function `cortex top` uses, so the two views cannot end up
+  disagreeing about the same agent.
+
+  **4 new smoke checks** (683 → 687), all four reverse-verified: the table
+  stopping to ask the kernel → "cortex ps says what an agent inside a model
+  call is doing" fails; the table phrasing the wait in its own words → "cortex
+  ps and cortex top use the same words for the same wait" fails; the *tree*'s
+  wording changed instead of the table's → the model-call check fails again;
+  and the log fallback removed → "cortex ps still says what a process is
+  waiting on when the kernel is too old" fails.
+
+  No ABI change: this round adds no syscall, no transport command, and no
+  field to `ProcessInfo` — the table asks the kernel a question the kernel
+  could already answer.
+
 - **The dashboard says what each agent is inside.** The page is the operator's
   window, and it was blind to the one fact an operator of an agent OS most
   wants: an agent that is four minutes into a model call read as `running`,

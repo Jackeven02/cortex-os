@@ -14018,6 +14018,17 @@ function topRow(out: string, pid: number): string {
 }
 
 /**
+ * The row a process is on, in `cortex ps`'s output.
+ *
+ * The table is indented by nothing and starts with the pid, so the first
+ * number on the line is the pid.
+ */
+function psRow(out: string, pid: number): string {
+  const re = new RegExp(`^\\s*${pid}\\s`);
+  return out.split('\n').find((line) => re.test(line)) ?? '';
+}
+
+/**
  * Empty a process's log for the duration of one call, and put it back after.
  *
  * The point is to ask the kernel a question the log used to answer. With the
@@ -14068,6 +14079,11 @@ async function runTopChecks(): Promise<void> {
       autoStart: true,
       loadDrivers: (reg) => {
         reg.registerMemory(inmemMemory());
+        // A model call that takes half a minute. The driver is the point: a
+        // process inside one is **not** blocked — the kernel does not park a
+        // process while a driver call is in flight — so the process table
+        // alone can only say `running`.
+        reg.registerLLM(mockLLM({ latencyMs: 30_000 }));
       },
       agentLoader: async () => async (ctx, args) => {
         const mode = typeof args['mode'] === 'string' ? args['mode'] : 'ok';
@@ -14100,6 +14116,13 @@ async function runTopChecks(): Promise<void> {
           // inside one call, with the *other* call's frame already closed —
           // which is the case a one-slot-per-process bookkeeping gets wrong.
           await Promise.all([ctx.sleep(5000), ctx.recv().catch(() => undefined)]);
+          return;
+        }
+        if (mode === 'thinking') {
+          // A model call that takes half a minute. The process is *running*
+          // the whole time — not blocked — so nothing in the process table
+          // says what it is doing. This is the case BACKLOG #060 is about.
+          await ctx.llm_call({ messages: [{ role: 'user', content: 'think' }] });
           return;
         }
         if (mode === 'waiter') {
@@ -14270,6 +14293,143 @@ async function runTopChecks(): Promise<void> {
         result.out.includes(`cortex supervise ${unbrand(wedged)} --kill-after 300`),
         `the command to act on it is handed over, got: ${result.out}`,
       );
+    });
+
+    await checkAsync('cortex ps says what each agent is waiting on', async () => {
+      // The flat table had the state and nothing else: "blocked", with no
+      // word about *what* the process was blocked on. The kernel knows both
+      // the reason and the call, so the table can say both.
+      const result = await capture(() => cmdPs([]));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const line = psRow(result.out, unbrand(wedged));
+      assert(line !== '', `the wedged process is listed, got: ${result.out}`);
+      assert(line.includes('a channel'), `it says what it is waiting on, got: ${line}`);
+    });
+
+    await checkAsync('cortex ps and cortex top use the same words for the same wait', async () => {
+      // One rule, two views. `ps` prints the noun ("a model call"); `top`
+      // prints the sentence ("waiting on a model call for 12.3s"). Phrased
+      // separately they would drift, and the operator would have to work out
+      // whether the table and the tree were talking about the same thing.
+      //
+      // The process is one inside a model call on purpose: it is the one
+      // whose waiting is described by the *call's name* and not by a blocked
+      // reason. A blocked reason comes from the kernel, and both views would
+      // read the same field — which would prove nothing about the shared
+      // wording.
+      const thinker = await kernel.spawn({
+        role: 'thinker-w',
+        agent: { module: 'test:thinking', args: { mode: 'thinking' } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const ps = await capture(() => cmdPs([]));
+      const psLine = psRow(ps.out, unbrand(thinker));
+      assert(psLine !== '', `cortex ps lists the process, got: ${ps.out}`);
+      const waiting = psLine.split(/\s{2,}/).filter(Boolean).at(-1) ?? '';
+      assert(waiting !== '', `ps says what it is waiting on, got: ${psLine}`);
+
+      const top = await capture(() => cmdTop([]));
+      const topLine = topRow(top.out, unbrand(thinker));
+      assert(topLine !== '', `cortex top shows the process, got: ${top.out}`);
+      assert(
+        topLine.includes(waiting),
+        `the two views use the same words, ps="${waiting}" top="${topLine.trim()}"`,
+      );
+    });
+
+    await checkAsync('cortex ps says what an agent inside a model call is doing', async () => {
+      // The hard case, and the one BACKLOG #060 is about: the kernel does not
+      // park a process while its model call is in flight, so the *state* says
+      // `running` — and only the call itself says what the agent is doing.
+      // A table that says `running` and stops there is not wrong, but it is
+      // not what the operator needs.
+      const thinker = await kernel.spawn({
+        role: 'thinker',
+        agent: { module: 'test:thinking', args: { mode: 'thinking' } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const result = await capture(() => cmdPs([]));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const line = psRow(result.out, unbrand(thinker));
+      assert(line !== '', `the process is listed, got: ${result.out}`);
+      assert(
+        line.includes('a model call'),
+        `it says what the agent is inside, got: ${line}`,
+      );
+      assert(
+        line.includes('running'),
+        `and the state still says running — the kernel does not park it, got: ${line}`,
+      );
+
+      // And the tree says the same words about the same call. `ps` prints
+      // the noun, `top` the sentence — but the noun has to be the same noun.
+      const top = await capture(() => cmdTop([]));
+      const topLine = topRow(top.out, unbrand(thinker));
+      assert(topLine !== '', `cortex top shows the process, got: ${top.out}`);
+      assert(
+        topLine.includes('a model call'),
+        `the two views use the same words, got: ${topLine.trim()}`,
+      );
+    });
+
+    await checkAsync('cortex ps still says what a process is waiting on when the kernel is too old', async () => {
+      // A daemon from before the `openCalls` command existed: the method is
+      // simply not there, so the server cannot answer the question.
+      //
+      // The view has to fall back to the log then. A table that goes silent
+      // when the kernel is behind is a table that says "nothing is wrong" —
+      // and the operator has no way to tell that from the truth.
+      //
+      // The process that makes this bite is the one inside a *model call*:
+      // a blocked reason cannot explain it (the kernel does not park a
+      // process while its model call is in flight), so the log is the only
+      // thing that can still say what it is doing.
+      const thinker = await kernel.spawn({
+        role: 'thinker-old',
+        agent: { module: 'test:thinking', args: { mode: 'thinking' } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const oldKernel = Object.create(kernel) as Kernel;
+      (oldKernel as { openCalls?: unknown }).openCalls = undefined;
+      const oldServer = await startKernelServer(oldKernel, { log: () => {} });
+      servers.push(oldServer);
+
+      const real = readEndpoint(tmp);
+      try {
+        writeEndpoint(tmp, oldServer.endpoint);
+        const result = await capture(() => cmdPs([]));
+        assert(result.code === 0, `exit 0, got ${result.code}`);
+
+        const line = psRow(result.out, unbrand(wedged));
+        assert(line !== '', `the wedged process is listed, got: ${result.out}`);
+        assert(
+          line.includes('a channel'),
+          `it still says what it is waiting on, got: ${line}`,
+        );
+
+        const thinkerLine = psRow(result.out, unbrand(thinker));
+        assert(thinkerLine !== '', `the thinker is listed, got: ${result.out}`);
+        assert(
+          thinkerLine.includes('a model call'),
+          `even the call the kernel cannot account for, got: ${thinkerLine}`,
+        );
+
+        // And the tree says the same thing about the same kernel. The two
+        // views read the same fact, so they must not be able to differ on
+        // what to do when the kernel cannot answer.
+        const top = await capture(() => cmdTop([]));
+        const topLine = topRow(top.out, unbrand(thinker));
+        assert(topLine !== '', `cortex top shows the process, got: ${top.out}`);
+        assert(
+          topLine.includes('a model call'),
+          `the tree says it too, got: ${topLine.trim()}`,
+        );
+      } finally {
+        if (real !== undefined) writeEndpoint(tmp, real);
+      }
     });
 
     await checkAsync('cortex top does not call a process that is making progress stuck', async () => {

@@ -1192,6 +1192,39 @@ second with the first would make a view quietly report that nothing is
 stuck. So the reader returns nothing at all when it cannot ask, and the
 caller falls back to the log.
 
+**And `cortex ps` says it too — as a noun, not a sentence.** The flat table had
+the state and nothing else: `blocked`, with no word about *what* the process
+was blocked on; and `running` for an agent four minutes into a model call,
+which is a fact about the scheduler and not about the agent. The table now has
+a **WAITING** column, and it says "a channel", "child 5", "a model call".
+
+Two decisions make it fit rather than crowd the table:
+
+- **The column is last.** The existing seven columns keep their positions, so
+  a script that reads `cortex ps` by column number still reads the column it
+  read before.
+- **The cell is a noun; the duration is `top`'s job.** `ps` says "a channel",
+  `top` says "waiting on a channel for 44.4s". The two are deliberately
+  different in shape because they answer different questions — *what* is it
+  waiting on, and *how long* has it been waiting. (The age column is coarse
+  on purpose too: "4m" is enough for an age, and "44s" and "4m" are
+  different answers to "should I kill this?".)
+
+The wording is the wording `cortex top` and the dashboard use
+(`describeWait` / `describeBlocked`, in `src/cli/open_call.ts`), so a table
+cell and a tree line cannot drift apart. And the *rule for which source
+answers* is shared too: the kernel's blocked reason wins when it has one — it
+knows *which* child — and the open call is used otherwise, which is how a
+driver call shows up at all, since the kernel does not park a process while
+its model call is in flight.
+
+**A view that cannot ask does not go silent.** A kernel too old to know the
+`openCalls` command must not turn the column into a row of blanks: a blank
+says "nothing is being waited on", which is a claim, and it is false
+whenever the log knows better. So the table falls back to the log — through
+the *same* function `cortex top` uses, so the two views cannot end up
+disagreeing about the same agent.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up

@@ -8,8 +8,8 @@
  * The process table says a process is BLOCKED. That is true, and it is not
  * enough: a listener parked on a channel and an agent that will never be
  * answered look identical from the outside — both are `blocked`, both are
- * "waiting on a channel". The difference is *how long*, and the only place
- * that is written down is the log.
+ * "waiting on a channel". The difference is *how long*, and the difference is
+ * not in the process table.
  *
  * Every syscall is written as an `enter` frame and an `exit`/`trap` frame
  * **with the same `callId`**. So the calls that are still open are the ones
@@ -18,23 +18,37 @@
  * `callId`, and whatever is left over is the call the process is sitting
  * inside, and for how long.
  *
+ * ## Where the answer comes from
+ *
+ * **The kernel knows it.** It writes those frames itself, so it knows which
+ * pairs are still open, and it can be asked — `Kernel.openCalls()` on the
+ * host side, `openCalls` on the transport. That costs O(processes), and the
+ * number it reports is the same one the log would give: the `since` is that
+ * `enter` frame's own timestamp.
+ *
+ * **The log is the fallback** — for a kernel too old to know the command, or
+ * for no kernel at all. It is the same reading kept twice, and it is the
+ * slow one: the log of a long-lived agent grows for as long as the agent
+ * runs, so a view that reads it on every invocation gets slower exactly as
+ * the operator needs it most.
+ *
  * ## Why this is not a syscall
  *
- * Because it is a *reading*, not an action, and it is a reading of the log —
- * which is the record. A process that is inside a long driver call is not
- * BLOCKED at all (the kernel does not park a process while its LLM call is
- * in flight), so nothing in the process table can tell you that it is
- * wedged. The log can, because the `enter` frame is there and the `exit`
- * frame is not.
+ * Because it is a *reading*, not an action. A process that is inside a long
+ * driver call is not BLOCKED at all (the kernel does not park a process
+ * while its LLM call is in flight), so nothing in the process table can tell
+ * you that it is wedged. The call can, because the `enter` frame is there
+ * and the `exit` frame is not.
  *
  * ## Why it lives in the CLI, and why it is shared
  *
- * Two commands answer the same question — `cortex supervise` decides whether
- * to kill a process, `cortex top` shows the operator which one to look at.
- * If they read the log differently they will disagree, and a supervisor that
+ * Four views answer the same question — `cortex supervise` decides whether
+ * to kill a process, `cortex top` shows the operator which one to look at,
+ * `cortex ps` puts it in a column, and the dashboard shows it in the page.
+ * If they read it differently they will disagree, and a supervisor that
  * kills a process the operator's view calls healthy is worse than either
- * command not existing. So there is one reading, in one place, and both
- * commands use it.
+ * command not existing. So there is one reading, in one place, and one set
+ * of words, and every view uses both.
  *
  * @module cli/open_call
  */
@@ -162,6 +176,27 @@ export function describeBlocked(blockedOn: BlockedReason | undefined | null): st
 }
 
 /**
+ * What a process is waiting on, as a noun phrase.
+ *
+ * "a channel", "child 5", "a model call". This is what a table cell wants;
+ * `describeCall` is what a line wants. Both come from the same table, so a
+ * table and a line cannot drift apart — and a process blocked on a child says
+ * *which* child, because the kernel knows.
+ *
+ * A call that is not one of the waiting ones keeps its own name ("spawn"),
+ * because "waiting on spawn" would be a sentence about something that is not
+ * waiting at all.
+ */
+export function describeWait(
+  syscall: string,
+  blockedOn?: BlockedReason | null,
+): string {
+  if (blockedOn !== undefined && blockedOn !== null) return describeBlocked(blockedOn);
+  const friendly = FRIENDLY_CALLS[syscall];
+  return friendly !== undefined ? friendly : syscall;
+}
+
+/**
  * What a process is waiting for, in words.
  *
  * The blocked reason wins when the kernel has one; otherwise the call's own
@@ -177,7 +212,12 @@ export function describeCall(syscall: string, blockedOn?: BlockedReason | null):
 }
 
 /**
- * A duration, in the same shape `cortex ps` prints an age in.
+ * A duration, precise to the second.
+ *
+ * How long a *call* has been open. This is not the same shape as the age
+ * `cortex ps` prints, and deliberately so: an age is a coarse fact ("4m" is
+ * enough), while the length of a call is the thing a supervisor decides on,
+ * and "44s" and "4m" are different answers to "should I kill this?".
  */
 export function formatDuration(ms: number): string {
   if (ms < 0) return '0ms';
@@ -213,6 +253,21 @@ export function formatOpenCall(
  */
 export interface OpenCallSource {
   request(cmd: KernelCommand, args?: Record<string, unknown>): Promise<unknown>;
+}
+
+/**
+ * The rows an open-call reading needs: a pid, and whether the kernel still
+ * holds that process.
+ *
+ * The `live` flag is not a detail. A process that is gone is not "inside"
+ * anything: its log keeps the `enter` frame of the call it was killed in, and
+ * reading that as "still inside that call" would be a lie. Every reading here
+ * obeys the same rule, so two views of the same fact cannot make different
+ * choices about it.
+ */
+export interface OpenCallRow {
+  readonly pid: number;
+  readonly live: boolean;
 }
 
 /**
@@ -322,4 +377,61 @@ export async function readOpenCall(dir: string, pid: number): Promise<OpenCall |
     since: info.since,
     ...(info.args !== undefined ? { args: info.args } : {}),
   };
+}
+
+/**
+ * The open call of every **live** process, read from the logs.
+ *
+ * The slow way: one full read of each live process's log, in parallel. It is
+ * the fallback for a kernel that cannot be asked — one too old to know the
+ * `openCalls` command, or one that is not answering.
+ *
+ * Only *live* processes are read. A process the kernel has finished is not
+ * inside anything, whatever its last frame says.
+ */
+export async function readOpenCallsFromLog(
+  dir: string,
+  rows: readonly OpenCallRow[],
+): Promise<Map<number, OpenCall>> {
+  const found = await Promise.all(
+    rows
+      .filter((row) => row.live)
+      .map(async (row): Promise<readonly [number, OpenCall | undefined]> => {
+        const call = await readOpenCall(dir, row.pid);
+        return [row.pid, call] as const;
+      }),
+  );
+  const map = new Map<number, OpenCall>();
+  for (const [pid, call] of found) {
+    if (call !== undefined) map.set(pid, call);
+  }
+  return map;
+}
+
+/**
+ * The call each live process is inside, however it can be found.
+ *
+ * The kernel first, the log second — and the log only when the kernel could
+ * not be asked at all, because "the kernel says there is no open call" and
+ * "the kernel did not answer" are different facts and only the second one
+ * licenses reading the log.
+ *
+ * This is the one entry point every view uses, because two views that read
+ * the same fact differently will disagree, and an operator who sees "waiting
+ * on a channel" in one view and nothing in the other has to work out which
+ * one is lying.
+ */
+export async function readOpenCalls(
+  dir: string,
+  rows: readonly OpenCallRow[],
+  source?: OpenCallSource,
+): Promise<Map<number, OpenCall>> {
+  const fromKernel = await readOpenCallsFromKernel(source);
+  const raw = fromKernel ?? (await readOpenCallsFromLog(dir, rows));
+  // The same filter for both readings: a process the kernel no longer holds
+  // is not inside anything, even though its log keeps the `enter` frame of
+  // the call it was killed in. Two readings of one fact have to make the
+  // same choice, or they are two facts.
+  const live = new Set(rows.filter((row) => row.live).map((row) => row.pid));
+  return new Map([...raw].filter(([pid]) => live.has(pid)));
 }
