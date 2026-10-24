@@ -13,8 +13,7 @@
 
 import { parseArgs } from 'node:util';
 import { defaultKernelDir } from '../index.js';
-import { readProcessView } from '../process_view.js';
-import { CAPABILITIES, type Capability } from '../../kernel/types.js';
+import { formatCaps, readProcessView } from '../process_view.js';
 
 export async function cmdPs(args: string[]): Promise<number> {
   const { values } = parseArgs({
@@ -87,21 +86,6 @@ OPTIONS
   }
 
   return 0;
-}
-
-/**
- * How to print a process's capabilities (docs/ABI.md §4.9).
- *
- * `all` for the full set, the list for a narrowed one, and `-` for a process
- * whose capabilities were never recorded — a `meta.json` from before the
- * kernel persisted them. That `-` is not "everything": it is the absence of
- * an answer, and the view says so instead of guessing.
- */
-function formatCaps(caps: readonly Capability[] | undefined): string {
-  if (caps === undefined) return '-';
-  if (caps.length === 0) return 'none';
-  if (caps.length === CAPABILITIES.length) return 'all';
-  return caps.join(',');
 }
 
 function formatAge(ms: number): string {

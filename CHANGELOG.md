@@ -42,6 +42,82 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex wrap` stopped reporting success for a run that failed.** A
+  process that is **exiting** has not finished: the kernel records its exit
+  code *after* it gets there — two disk writes sit between the two — so there
+  is a real window in which the process table says "dying" and the code is
+  still `null`. The wrapper used to read that window as "no code" and default
+  it to `0`, so `cortex wrap -- <command that failed with 127>` sometimes
+  reported **success**. The full smoke suite caught it twice in a row under
+  load, and the failure looked exactly like the timeout bug that was fixed
+  earlier: `process exited (code 0: completed)`.
+
+  Two halves, because the lie was in two places:
+
+  - the wrapper now **waits** for an ending it can trust — the zombie, which
+    carries the code, or the reap, which leaves the exit record on disk
+    (`attemptFinished`);
+  - and the report never invents a zero for a code it did not see: a missing
+    code is reported as unknown, not as success (`wrapOutcome`).
+
+  Both are exported pure functions, so the rules are pinned on their own
+  rather than left to a race. The end-to-end check now runs the missing
+  command three times, because a race that only shows up under load is
+  exactly the kind that survives a test suite and shows up in somebody's CI.
+
+  **1 smoke check** (675 → 676), reverse-verified twice: putting the missing
+  code back to `0` → the check fails with "an exit code that was never seen
+  must not be reported as success, got 0"; and counting `exiting` as finished
+  again → the check fails with "a process that is exiting has not finished".
+
+- **The dashboard's process table stopped being a snapshot.** The dashboard is
+  the operator's window, and its process list was showing them a picture of
+  the past: the table was re-read only when a process *started* or *ended*, so
+  an agent that worked for a minute was shown as it was when it started — its
+  state frozen, its spend frozen — while the page said "live connection" in
+  the corner.
+
+  The kernel says what happens (every syscall, every state transition, and
+  when it happened), so **the table is re-read when the kernel says
+  something**. The re-read is **throttled**, not debounced: a busy kernel
+  says something every few milliseconds, and a re-read that waited for the
+  silence would never happen — the table would sit frozen through exactly the
+  busy period it exists for. This was not a theory. A real run against a real
+  daemon measured **two tables in fifteen seconds** before the throttle and
+  about **four a second** after it, and the smoke suite now pins the
+  difference (a table that is pushed once and then stops is a failure).
+
+- **The dashboard says what each agent was allowed to do.** `cortex ps` grew a
+  CAPS column two rounds ago, because the question "what was this agent
+  allowed to do?" used to have no answer in the CLI at all. The dashboard —
+  the operator's *window* — still had none. It has one now.
+
+  The label travels with the row (`capsLabel`), produced by the same rule
+  `cortex ps` prints (`formatCaps`, which moved from the command into
+  `src/cli/process_view.ts` so the two views share it): an agent restricted to
+  `spawn` says `spawn`, an agent holding everything says `all`, an agent
+  holding nothing says `none`, and a process whose capabilities were never
+  recorded says `-` — which is *not* "everything", it is the absence of an
+  answer. The page prints the label it is given and does not re-implement the
+  rule, because a second rule is a rule that drifts.
+
+- **The footer says which way the page is being refreshed.** It used to claim
+  "auto-refresh · every 3 seconds" whatever it was doing — and with a live
+  kernel it was not polling every 3 seconds at all. It now names the mode:
+  "live push (SSE), reconciled every 30 seconds" while the kernel is pushing,
+  "polling every 3 seconds (the live connection is unavailable)" when it is
+  not.
+
+  **3 smoke checks** (672 → 675), all three reverse-verified: removing the
+  re-read trigger → the table is never pushed again; giving the dashboard its
+  own capability rule → the two views disagree (`pid 6 holds "none", got `
+  — the empty string a naive join produces); and putting the throttle back to
+  a plain debounce → the table stops at two tables in four seconds.
+
+  No ABI change: `KERNEL_ABI_VERSION` stays 1.0.0, and `ProcessInfo` is
+  untouched — the dashboard reads the same view `cortex ps` reads and renders
+  one more column of it.
+
 - **The supervisor stopped waking up for nothing.** `cortex supervise` was
   built on the event stream, but its *decisions* were still made on a timer: it
   woke every 250 ms to ask itself whether anything had changed. So a process

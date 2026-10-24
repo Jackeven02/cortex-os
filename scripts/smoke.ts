@@ -248,6 +248,8 @@ import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
+import { cmdPs } from '../src/cli/commands/ps.js';
+import { formatCaps } from '../src/cli/process_view.js';
 import { cmdTop } from '../src/cli/commands/top.js';
 import {
   listDaemons,
@@ -9218,7 +9220,7 @@ async function runWrapChecks(): Promise<void> {
   const { existsSync, readdirSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
-  const { cmdWrap } = await import('../src/cli/commands/wrap.js');
+  const { cmdWrap, attemptFinished, wrapOutcome } = await import('../src/cli/commands/wrap.js');
   const { readMeta } = await import('../src/cli/process_store.js');
   const { defaultKernelDir } = await import('../src/index.js');
   const { asProcessId: asPid } = await import('../src/kernel/types.js');
@@ -9619,23 +9621,66 @@ async function runWrapChecks(): Promise<void> {
     });
 
     await checkAsync('wrap reports 127 and says so when the command does not exist', async () => {
-      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
-      process.env['CORTEX_HOME'] = home;
-      const realErr = console.error;
-      const lines: string[] = [];
-      console.error = (...a: unknown[]) => void lines.push(a.map(String).join(' '));
-      let code = 0;
-      try {
-        code = await cmdWrap(['--role', 'missing', '--', 'cortex-no-such-binary-xyz']);
-      } finally {
-        console.error = realErr;
+      // Run it a few times: the failure this pins was a race, and a race
+      // that only shows up under load is exactly the kind that survives a
+      // test suite and shows up in somebody's CI.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-wrap-'));
+        process.env['CORTEX_HOME'] = home;
+        const realErr = console.error;
+        const lines: string[] = [];
+        console.error = (...a: unknown[]) => void lines.push(a.map(String).join(' '));
+        let code = 0;
+        try {
+          code = await cmdWrap(['--role', 'missing', '--', 'cortex-no-such-binary-xyz']);
+        } finally {
+          console.error = realErr;
+        }
+        assert(
+          code === 127,
+          `expected 127, got ${code}; the wrapper said: ${lines.join(' | ') || '(nothing)'}`,
+        );
+        assert(
+          lines.join('\n').includes('command not found'),
+          `the user is told why, got: ${lines.join(' | ')}`,
+        );
+        await rm(home, { recursive: true, force: true });
       }
-      assert(code === 127, `expected 127, got ${code}`);
+    });
+
+    await checkAsync('the wrapper waits for an ending it can trust', async () => {
+      // EXITING is not an ending. The kernel records the exit code *after*
+      // the process gets there — two disk writes sit between the two — and
+      // the wrapper used to read that window as "no code" and default it to
+      // zero. So a command that failed with 127 was sometimes reported as a
+      // successful run, which is the one thing a wrapper must never do.
+      assert(attemptFinished('exiting') === false, 'a process that is exiting has not finished');
+      assert(attemptFinished('zombie') === true, 'a zombie has finished');
+      assert(attemptFinished('suspended') === true, 'a suspended attempt has finished');
+      assert(attemptFinished(undefined) === true, 'a reaped attempt has finished');
+      assert(attemptFinished('running') === false, 'a running attempt has not finished');
+
+      // And the outcome never invents a success.
+      const exiting = wrapOutcome({ state: 'exiting', exitCode: null, exitReason: null }, undefined);
       assert(
-        lines.join('\n').includes('command not found'),
-        `the user is told why, got: ${lines.join(' | ')}`,
+        exiting.exitCode !== 0,
+        `an exit code that was never seen must not be reported as success, got ${exiting.exitCode}`,
       );
-      await rm(home, { recursive: true, force: true });
+      assert(
+        exiting.exitCode === null,
+        `an exit code that was never seen stays unknown, got ${exiting.exitCode}`,
+      );
+      const reapedUnknown = wrapOutcome(undefined, undefined);
+      assert(
+        reapedUnknown.exitCode !== 0,
+        `an unknown ending must not be reported as success, got ${reapedUnknown.exitCode}`,
+      );
+
+      // A code that *was* seen is reported as it is.
+      const zombie = wrapOutcome({ state: 'zombie', exitCode: 127, exitReason: 'x' }, undefined);
+      assert(zombie.exitCode === 127, `a known exit code is reported as it is, got ${zombie.exitCode}`);
+      const reaped = wrapOutcome(undefined, { code: 5, reason: 'y' });
+      assert(reaped.exitCode === 5, `a reaped process reports its exit record, got ${reaped.exitCode}`);
     });
 
     await checkAsync('wrap stops a long-running command at the timeout instead of leaking it', async () => {
@@ -14179,6 +14224,46 @@ async function runTopChecks(): Promise<void> {
  * With one, the dashboard reads the kernel's own process table and takes
  * the event stream by push.
  */
+/**
+ * The `lastTransitionAt` the dashboard's pushed tables reported for a pid.
+ *
+ * The tables arrive as SSE frames (`event: processes` and a JSON row array).
+ * The question the table has to answer is not "does it have a row" but "does
+ * the row move": a table that reports the same transition time forever is a
+ * snapshot, whatever the page calls it.
+ */
+function transitionsOf(sse: string, pid: number): string[] {
+  const out: string[] = [];
+  for (const frame of sse.split('\n\n')) {
+    const lines = frame.split('\n');
+    if (!lines.some((line) => line === 'event: processes')) continue;
+    const data = lines
+      .filter((line) => line.startsWith('data: '))
+      .map((line) => line.slice(6))
+      .join('');
+    if (data.length === 0) continue;
+    let rows: Array<Record<string, unknown>>;
+    try {
+      rows = JSON.parse(data) as Array<Record<string, unknown>>;
+    } catch {
+      continue;
+    }
+    const row = rows.find((r) => r['pid'] === pid);
+    const at = row?.['lastTransitionAt'];
+    if (typeof at === 'string') out.push(at);
+  }
+  return out;
+}
+
+function firstTransitionOf(sse: string, pid: number): string | undefined {
+  return transitionsOf(sse, pid)[0];
+}
+
+function lastTransitionOf(sse: string, pid: number): string | undefined {
+  const all = transitionsOf(sse, pid);
+  return all[all.length - 1];
+}
+
 async function runDashboardLiveChecks(): Promise<void> {
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { join } = await import('node:path');
@@ -14206,6 +14291,18 @@ async function runDashboardLiveChecks(): Promise<void> {
           // it stays alive, because a process that has exited is reaped and
           // (in this harness) leaves no record behind.
           await ctx.memory_write('semantic', 'live-key', 'live-value');
+          await ctx.recv();
+          return;
+        }
+        if (mode === 'busy') {
+          // Keeps changing state: a sleep parks the process on its timer
+          // and waking it puts it back in the run queue, so the kernel
+          // keeps saying what state it is in. A table that only refreshes
+          // when a process starts or ends would show one snapshot of all
+          // of that.
+          for (let i = 0; i < 40; i += 1) {
+            await ctx.sleep(50);
+          }
           await ctx.recv();
           return;
         }
@@ -14317,6 +14414,142 @@ async function runDashboardLiveChecks(): Promise<void> {
           if (!seen) await new Promise((resolve) => setTimeout(resolve, 100));
         }
         assert(seen, "the running process's memory_write is in the event feed");
+      });
+
+      // --- the operator's window has to say what is true ------------------
+      await checkAsync('the dashboard says what each agent was allowed to do', async () => {
+        // Three agents, three authorities. The cases are chosen so that a
+        // *second* rule cannot pass them: an empty set and the full set are
+        // exactly where "join the list" and "say what it means" disagree.
+        const cases = [
+          { role: 'capped', capabilities: ['spawn'] as Capability[], label: 'spawn' },
+          { role: 'powerless', capabilities: [] as Capability[], label: 'none' },
+          { role: 'omnipotent', capabilities: [...CAPABILITIES], label: 'all' },
+        ];
+        const spawned: Array<{ pid: number; label: string }> = [];
+        for (const c of cases) {
+          const pid = await kernel.spawn({
+            role: c.role,
+            agent: { module: 'test:live', args: { mode: 'alive' } },
+            capabilities: c.capabilities,
+          });
+          spawned.push({ pid: unbrand(pid), label: c.label });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        const res = await fetch(`${dash.url}/api/processes`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        for (const c of spawned) {
+          const row = rows.find((r) => r['pid'] === c.pid);
+          assert(row !== undefined, `the agent is in the list, got: ${JSON.stringify(rows.map((r) => r['pid']))}`);
+          assert(
+            row!['capsLabel'] === c.label,
+            `pid ${c.pid} holds "${c.label}", got ${String(row!['capsLabel'])}`,
+          );
+          // One rule, two views: the label is the one the shared rule prints.
+          assert(
+            row!['capsLabel'] === formatCaps(row!['capabilities'] as Capability[]),
+            `pid ${c.pid} follows the shared rule, got ${String(row!['capsLabel'])}`,
+          );
+        }
+
+        // And the CLI says the same thing about the same agent.
+        const prevLog = console.log;
+        let psOut = '';
+        console.log = (...parts: unknown[]): void => {
+          psOut += `${parts.map((p) => String(p)).join(' ')}\n`;
+        };
+        try {
+          await cmdPs([]);
+        } finally {
+          console.log = prevLog;
+        }
+        const psLine = psOut.split('\n').find((line) => line.trim().startsWith(`${spawned[0]!.pid} `));
+        assert(psLine !== undefined, `cortex ps lists the agent, got: ${psOut}`);
+        assert(
+          psLine!.includes('spawn'),
+          `cortex ps prints the same authority, got: ${psLine}`,
+        );
+      });
+
+      await checkAsync('the process table follows what the kernel says happened', async () => {
+        // The table used to be re-read only when a process started or ended.
+        // An agent that works for a minute was shown as it was when it
+        // started — its state frozen, its spend frozen — while the page
+        // said "live connection".
+        const pid = await kernel.spawn({
+          role: 'mover',
+          agent: { module: 'test:live', args: { mode: 'busy' } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        const res = await fetch(`${dash.url}/api/stream?limit=50`);
+        assert(res.status === 200, `status ${res.status}`);
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        try {
+          let text = '';
+          const countOf = (needle: string): number => text.split(needle).length - 1;
+          const readProcesses = async (want: number, ms: number): Promise<boolean> => {
+            const deadline = Date.now() + ms;
+            for (;;) {
+              if (countOf('event: processes') >= want) return true;
+              const left = deadline - Date.now();
+              if (left <= 0) return false;
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              const expiry = new Promise<null>((resolve) => {
+                timer = setTimeout(() => resolve(null), left);
+              });
+              const chunk = await Promise.race([reader.read(), expiry]);
+              if (timer !== undefined) clearTimeout(timer);
+              if (chunk === null) return false;
+              if (chunk.done) return false;
+              text += decoder.decode(chunk.value, { stream: true });
+            }
+          };
+
+          assert(await readProcesses(1, 3000), `the stream opened, got: ${text.slice(0, 300)}`);
+          const firstAt = firstTransitionOf(text, unbrand(pid));
+
+          // The agent keeps moving; nothing starts and nothing ends. The
+          // table has to keep up — not once, but *continuously*. A throttle
+          // that waited for the silence would freeze the table through
+          // exactly the busy period it exists for, which is what a real
+          // run caught: two tables in fifteen seconds.
+          assert(
+            await readProcesses(4, 4000),
+            `the table kept coming, got ${countOf('event: processes')} tables`,
+          );
+          const secondAt = lastTransitionOf(text, unbrand(pid));
+
+          assert(firstAt !== undefined, `the first table carries the agent, got: ${text.slice(0, 600)}`);
+          assert(secondAt !== undefined, `the second table carries the agent, got: ${text.slice(0, 600)}`);
+          assert(
+            secondAt! > firstAt!,
+            `the table is not a frozen snapshot — it showed ${firstAt} and then ${secondAt}`,
+          );
+        } finally {
+          await reader.cancel().catch(() => undefined);
+        }
+      });
+
+      await checkAsync('the page does not re-implement what it is shown', async () => {
+        const html = await (await fetch(`${dash.url}/`)).text();
+        // The capability column comes from the server, which uses the same
+        // rule `cortex ps` prints. A page that re-implemented the rule
+        // would be a second rule — and the two would drift.
+        assert(html.includes('capsLabel'), 'the page prints the label it is given');
+        assert(
+          !html.includes('capabilities.join'),
+          'the page does not format capabilities itself',
+        );
+        // The footer says which way the page is being refreshed.
+        assert(html.includes('实时推送'), 'the footer names the live mode');
+        assert(html.includes('每 3 秒轮询'), 'the footer names the polling fallback');
+        assert(
+          !html.includes('自动刷新 · 每 3 秒'),
+          'the page does not claim a 3-second refresh it is not doing',
+        );
       });
 
       // Last, because it closes the dashboard: an open event stream is a

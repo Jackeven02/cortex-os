@@ -71,6 +71,87 @@ const DEFAULT_TIMEOUT_MS = 120_000;
  */
 const TIMEOUT_EXIT_CODE = 137;
 
+/**
+ * What the CLI reports about a run that has ended.
+ *
+ * The rule this exists to keep: **the wrapper must never report success for
+ * a run whose exit code it did not see.** A missing exit code is not a zero
+ * — it is the absence of an answer, and turning it into zero tells CI that a
+ * failed run passed.
+ *
+ * The case that bit: a process is EXITING while the kernel is still writing
+ * its exit record, and the exit code only lands once that write is done. The
+ * wrapper used to read that window as "no code" and default it to zero — so
+ * `cortex wrap -- <command that failed with 127>` sometimes reported
+ * success. The window is real: two disk writes sit between the process
+ * becoming EXITING and the code being recorded.
+ *
+ * Exported so the rule can be pinned on its own, the way `nextDeadline` and
+ * `decideAuthority` are.
+ */
+export function wrapOutcome(
+  entry:
+    | {
+        readonly state: ProcessState;
+        readonly exitCode: number | null;
+        readonly exitReason: string | null;
+      }
+    | undefined,
+  exitRecord: { readonly code: number; readonly reason: string } | undefined,
+): { state: ProcessState; exitCode: number | null; exitReason: string | null } {
+  if (entry === undefined) {
+    // Reaped: recover the REAL status from the .crec exit record rather than
+    // assuming success, or a killed run would print "code 0: completed".
+    return {
+      state: 'zombie',
+      exitCode: exitRecord?.code ?? 1,
+      exitReason:
+        exitRecord?.reason ?? 'reaped with no exit record (crashed or killed before recording)',
+    };
+  }
+  if (entry.state === 'exiting') {
+    // The code is not known yet. Whatever is available is used; what is
+    // not available stays **unknown** — a null code is reported as "the
+    // run never finished", never as success.
+    return {
+      state: 'exiting',
+      exitCode: exitRecord?.code ?? entry.exitCode,
+      exitReason: exitRecord?.reason ?? entry.exitReason,
+    };
+  }
+  if (entry.state === 'zombie') {
+    return {
+      state: 'zombie',
+      exitCode: entry.exitCode ?? exitRecord?.code ?? 1,
+      exitReason: entry.exitReason ?? exitRecord?.reason ?? 'completed',
+    };
+  }
+  if (entry.state === 'suspended') {
+    return { state: 'suspended', exitCode: 0, exitReason: 'checkpointed (suspended)' };
+  }
+  return { state: entry.state, exitCode: null, exitReason: null };
+}
+
+/**
+ * Whether an attempt has finished, as far as the wrapper is concerned.
+ *
+ * The one state this exists to get right is **EXITING**: the process is
+ * dying, and the kernel records its exit code *after* it gets there (two
+ * disk writes sit between the two). An attempt that is exiting has not
+ * finished — its ending is not knowable yet, and treating it as finished is
+ * how a failed run gets reported as a successful one.
+ *
+ * `undefined` means the entry is gone: the kernel reaped it, and the exit
+ * record on disk is what is left to read.
+ *
+ * Exported for the same reason as `wrapOutcome`: the rule is worth pinning
+ * on its own.
+ */
+export function attemptFinished(state: ProcessState | undefined): boolean {
+  if (state === undefined) return true;
+  return state === 'zombie' || state === 'suspended';
+}
+
 export async function cmdWrap(args: string[]): Promise<number> {
   // Everything after `--` is the command to run. parseArgs would try to read
   // its own flags out of that, so the split is done first and by hand.
@@ -301,12 +382,7 @@ export async function cmdWrap(args: string[]): Promise<number> {
         }
       }
       const entry = kernel.table.get(current);
-      if (
-        entry === undefined ||
-        entry.state === 'zombie' ||
-        entry.state === 'exiting' ||
-        entry.state === 'suspended'
-      ) {
+      if (attemptFinished(entry?.state)) {
         // A finished attempt is not a finished run. Init restarts on a
         // *deferred* backoff timer (1s by default), so at this instant the
         // replacement may not exist yet and `currentPidOf` still names the dead
@@ -336,23 +412,18 @@ export async function cmdWrap(args: string[]): Promise<number> {
     let exitReason: string | null;
 
     if (entry === undefined) {
-      // Reaped: recover the REAL status from the .crec exit record rather than
-      // assuming success, or a killed run would print "code 0: completed".
       const exitRec = await readExitRecord(dir, current);
-      state = 'zombie';
-      exitCode = exitRec?.code ?? 1;
-      exitReason =
-        exitRec?.reason ?? 'reaped with no exit record (crashed or killed before recording)';
+      ({ state, exitCode, exitReason } = wrapOutcome(undefined, exitRec));
       done = true;
     } else if (entry.state === 'zombie' || entry.state === 'exiting') {
-      state = 'zombie';
-      exitCode = entry.exitCode ?? 0;
-      exitReason = entry.exitReason ?? 'completed';
+      // The exit record is the fallback for what the table cannot answer:
+      // an EXITING entry whose code has not been written yet, and a zombie
+      // that somehow carries none.
+      const exitRec = entry.exitCode === null ? await readExitRecord(dir, current) : undefined;
+      ({ state, exitCode, exitReason } = wrapOutcome(entry, exitRec));
       done = true;
     } else if (entry.state === 'suspended') {
-      state = 'suspended';
-      exitCode = 0;
-      exitReason = 'checkpointed (suspended)';
+      ({ state, exitCode, exitReason } = wrapOutcome(entry, undefined));
       done = true;
     } else {
       // Timed out. Stop it explicitly: the CLI is about to exit and take the

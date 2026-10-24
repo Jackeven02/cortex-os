@@ -1065,6 +1065,34 @@ module (`src/cli/process_view.ts`) answers for both, and it takes the
 connection it is given rather than opening its own — the dashboard holds one
 connection for its whole life and hands it over.
 
+**And the process table stopped being a snapshot.** It was re-read only when
+a process *started* or *ended*, so an agent that worked for a minute was
+shown as it was when it started — its state frozen, its spend frozen — while
+the page said "live connection". The kernel says what happens (every syscall,
+every state transition, and when it happened), so the table is re-read when
+the kernel says something, **throttled** at a quarter of a second: a busy
+kernel says something every few milliseconds, and a re-read that waited for
+the silence would never happen — the table would sit frozen through exactly
+the busy period it exists for. That was not a theory: a real run measured
+**two tables in fifteen seconds** before the throttle and about **four a
+second** after it.
+
+And the table now says **what each agent was allowed to do** — the question
+`cortex ps` answers and the dashboard did not. The label travels with the row
+(`capsLabel`), produced by the same rule `cortex ps` prints (`formatCaps`),
+because two views of the same fact must not be able to disagree: an agent
+restricted to `spawn` says `spawn`, an agent holding everything says `all`,
+an agent holding nothing says `none`, and a process whose capabilities were
+never recorded says `-` — which is *not* "everything", it is the absence of
+an answer. The page prints the label it is given; it does not re-implement
+the rule, because a second rule is a rule that drifts.
+
+And the **footer says which way the page is being refreshed**: "live push
+(SSE), reconciled every 30 seconds" while the kernel is pushing, "polling
+every 3 seconds (the live connection is unavailable)" when it is not. The
+page used to claim "auto-refresh · every 3 seconds" whatever it was doing —
+and in the live case it was not polling every 3 seconds at all.
+
 **And the dashboard learned to stop.** An open event stream is a connection
 that never ends by itself, and `server.close()` waits for it. The dashboard's
 own UI holds one open from the moment it loads, so Ctrl+C would hang the

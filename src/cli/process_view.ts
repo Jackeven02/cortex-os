@@ -32,12 +32,33 @@ import { probeKernel } from './kernel_client.js';
 import type { KernelCommand } from './kernel_protocol.js';
 import {
   unbrand,
+  CAPABILITIES,
   type BlockedReason,
   type BudgetCounters,
   type BudgetLimits,
   type Capability,
   type ProcessState,
 } from '../kernel/types.js';
+
+/**
+ * How to print a process's capabilities (docs/ABI.md §4.9).
+ *
+ * `all` for the full set, the list for a narrowed one, `none` for a process
+ * that holds nothing, and `-` for a process whose capabilities were never
+ * recorded — a `meta.json` from before the kernel persisted them. That `-` is
+ * not "everything": it is the absence of an answer, and the view says so
+ * instead of guessing.
+ *
+ * It lives here, and not in one command, because two views answer the same
+ * question — `cortex ps` prints it, and the dashboard shows it — and they
+ * must not be able to disagree about what an agent was allowed to do.
+ */
+export function formatCaps(caps: readonly Capability[] | undefined): string {
+  if (caps === undefined) return '-';
+  if (caps.length === 0) return 'none';
+  if (caps.length === CAPABILITIES.length) return 'all';
+  return caps.join(',');
+}
 
 /**
  * The bit of a live kernel the read-only views need.

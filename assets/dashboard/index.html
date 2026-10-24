@@ -103,6 +103,7 @@
     tbody tr { cursor: pointer; transition: background .12s; }
     tbody tr:hover { background: #f8f9fc; }
     .pid-cell { color: #53627a; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
+    .caps-cell { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; color: #667181; }
     .role-cell { color: #273244; font-size: 11px; font-weight: 570; }
     .role-wrap { display: flex; align-items: center; gap: 8px; }
     .role-avatar { display: grid; width: 23px; height: 23px; place-items: center; border: 1px solid #e1e6f3; border-radius: 6px; background: #f1f4ff; color: #4b5fb6; font-size: 9px; font-weight: 700; }
@@ -219,7 +220,7 @@
           <section class="panel" id="processes">
             <div class="panel-head"><div><div class="panel-title">Agent 进程 <span class="nav-count" id="processCountLabel"></span></div><div class="panel-note">进程状态与最近资源使用</div></div><div class="table-tools"><div class="view-toggle"><button id="viewTable" class="active" type="button">表格</button><button id="viewTree" type="button">监督树</button></div><input class="search" id="processSearch" type="search" placeholder="筛选进程…" aria-label="筛选进程"><button class="icon-button" id="processRefresh" title="刷新进程">↻</button></div></div>
             <div class="spawn-bar" id="spawnBar" hidden><input type="text" id="spawnRole" placeholder="角色（必填，如 coder）" aria-label="角色"><input type="text" id="spawnModule" placeholder="模块路径（可选，如 ./examples/hello.js）" aria-label="模块路径"><input type="text" id="spawnTask" placeholder="任务（可选）" aria-label="任务"><button class="button" id="spawnGo" type="button">启动机器人</button></div>
-            <div id="processTableWrap" class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th>PID</th><th>PPID</th><th>Token</th><th>启动时间</th><th></th></tr></thead><tbody id="processRows"><tr><td colspan="7" class="empty">正在读取进程…</td></tr></tbody></table></div>
+            <div id="processTableWrap" class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th>PID</th><th>PPID</th><th>Token</th><th>权限</th><th>启动时间</th><th></th></tr></thead><tbody id="processRows"><tr><td colspan="8" class="empty">正在读取进程…</td></tr></tbody></table></div>
             <div id="processTreeWrap" class="tree-wrap" hidden><div id="processTree"></div></div>
           </section>
 
@@ -251,7 +252,7 @@
           <div class="event-filters"><span>时间范围</span><input type="datetime-local" id="eventFrom" aria-label="开始时间"><span>→</span><input type="datetime-local" id="eventTo" aria-label="结束时间"><button class="button" id="eventFilter" type="button">筛选</button><button class="text-button" id="eventClear" type="button">清除</button></div>
           <div class="table-scroll"><table class="event-table"><thead><tr><th>类型</th><th>名称 / 关联记录</th><th>PID</th><th>耗时</th><th>Token / 模型</th><th>时间</th><th>错误</th></tr></thead><tbody id="eventRows"><tr><td colspan="7" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr></tbody></table></div>
         </section>
-        <footer class="page-footer"><span>Cortex Agent OS</span><span id="footerUpdated">自动刷新 · 每 3 秒</span></footer>
+        <footer class="page-footer"><span>Cortex Agent OS</span><span id="footerUpdated">连接中</span></footer>
       </div>
     </main>
   </div>
@@ -271,19 +272,22 @@
     }
 
     const processTokens = (process) => Number(process.budgetsSpent ? (process.budgetsSpent.tokensIn ?? 0) + (process.budgetsSpent.tokensOut ?? 0) : process.tokens ?? 0) || 0;
+    // What this agent was allowed to do. The label comes from the server,
+    // which uses the same rule `cortex ps` prints — one rule, two views.
+    const processCaps = (process) => String(process.capsLabel ?? '—');
     let processData = [];
     let eventData = [];
 
     function renderProcesses() {
       const query = $('processSearch').value.trim().toLowerCase();
-      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state}`.toLowerCase().includes(query));
+      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)}`.toLowerCase().includes(query));
       $('processRows').innerHTML = visible.length ? visible.map((process) => {
         const initial = String(process.role ?? '?').slice(0, 1).toUpperCase();
         const time = fmtLocal(process.startedAt);
         const canKill = opsList.includes('kill') && process.state !== 'zombie' && process.state !== 'exiting';
         const opsCell = canKill ? `<td><button class="text-button" data-kill="${esc(process.pid)}">停止</button></td>` : '<td></td>';
-        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td><td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td>${esc(time)}</td>${opsCell}</tr>`;
-      }).join('') : `<tr><td colspan="7" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
+        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td><td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td>${opsCell}</tr>`;
+      }).join('') : `<tr><td colspan="8" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
       $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
       $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
     }
@@ -347,7 +351,7 @@
       const renderNode = (process, depth) => {
         const tokens = processTokens(process);
         const children = (kids.get(process.pid) ?? []).map((child) => renderNode(child, depth + 1)).join('');
-        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${tokens.toLocaleString()} tok</span></span></div>${children}`;
+        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${tokens.toLocaleString()} tok</span></span></div>${children}`;
       };
       const visible = roots.filter(keep);
       $('processTree').innerHTML = visible.length ? visible.map((process) => renderNode(process, 0)).join('') : `<div class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，监督树会显示在这里。'}</div>`;
@@ -491,6 +495,21 @@
       eventData = append ? eventData.concat(page) : page;
     }
 
+    // What the footer says about how fresh the page is.
+    //
+    // The page used to claim "auto-refresh · every 3 seconds" whatever it
+    // was doing. With a live kernel it is not polling every 3 seconds at
+    // all — the kernel pushes — and when the push is gone it *is* polling
+    // every 3 seconds. A page that cannot say which one it is doing is a
+    // page the operator cannot trust.
+    let lastUpdated = '';
+    let refreshMode = '连接中';
+    function renderFooter() {
+      $('footerUpdated').textContent = lastUpdated
+        ? `最近更新 ${lastUpdated} · ${refreshMode}`
+        : refreshMode;
+    }
+
     function applyData() {
       const active = processData.filter((process) => ['running', 'ready', 'blocked'].includes(process.state));
       const tokens = processData.reduce((sum, process) => sum + processTokens(process), 0);
@@ -503,7 +522,8 @@
       $('processCountLabel').textContent = processData.length ? `(${processData.length})` : '';
       $('runtimeTotal').textContent = processData.length.toLocaleString();
       $('updated').textContent = `已同步 ${new Date().toLocaleTimeString()}`;
-      $('footerUpdated').textContent = `最近更新 ${new Date().toLocaleTimeString()}`;
+      lastUpdated = new Date().toLocaleTimeString();
+      renderFooter();
       renderProcesses();
       renderStates();
       renderEvents();
@@ -539,6 +559,8 @@
 
     function startPolling() {
       if (pollTimer === null) pollTimer = setInterval(pollOnce, 3000);
+      refreshMode = '每 3 秒轮询（实时连接不可用）';
+      renderFooter();
     }
 
     function startStream() {
@@ -546,7 +568,12 @@
       const source = new EventSource('/api/stream?limit=100');
       source.addEventListener('processes', (event) => { processData = JSON.parse(event.data); applyData(); });
       source.addEventListener('events', (event) => { eventData = JSON.parse(event.data); eventsTotal = Math.max(eventsTotal, eventData.length); applyData(); });
-      source.onopen = () => { $('updated').textContent = '实时连接（SSE）'; document.querySelector('.connection .live-dot').style.background = '#25a879'; };
+      source.onopen = () => {
+        $('updated').textContent = '实时连接（SSE）';
+        document.querySelector('.connection .live-dot').style.background = '#25a879';
+        refreshMode = '实时推送（SSE）· 每 30 秒校准';
+        renderFooter();
+      };
       source.onerror = () => { source.close(); $('updated').textContent = 'SSE 不可用，已回退到轮询'; startPolling(); };
       setInterval(pollOnce, 30000);
       return true;

@@ -9,8 +9,9 @@ import { asProcessId } from '../kernel/types.js';
 import type { ProcessInfo, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
-import { readProcessView } from '../cli/process_view.js';
+import { formatCaps, readProcessView } from '../cli/process_view.js';
 import type { KernelCommand } from '../cli/kernel_protocol.js';
+import type { Capability } from '../kernel/types.js';
 
 /**
  * The live kernel the dashboard watches, if there is one.
@@ -71,6 +72,20 @@ const inRange = (atMs: number, range: TimeRange): boolean =>
   (range.from === undefined || atMs >= range.from) && (range.to === undefined || atMs <= range.to);
 
 const MAX_SCAN = 5000;
+
+/**
+ * How long the live path waits before it re-reads the process table.
+ *
+ * The kernel says what happens; a burst of frames says it all at once, and
+ * the table does not need a re-read per frame. A quarter of a second is
+ * short enough that the table is never more than a quarter of a second
+ * behind, and long enough that a busy kernel does not turn into a busy
+ * dashboard.
+ *
+ * It is a **throttle**, not a debounce: the wait starts with the first
+ * thing that happens and is not pushed back by the things that follow.
+ */
+const PROCESS_REFRESH_DEBOUNCE_MS = 250;
 
 function safeErrorMessage(message: string): string {
   return message
@@ -215,9 +230,23 @@ const byNewest = (a: unknown, b: unknown): number =>
  * agent that is actually working.
  */
 async function listProcesses(dir: string, options: DashboardOptions): Promise<unknown[]> {
-  if (options.processes !== undefined) return [...options.processes()];
+  if (options.processes !== undefined) return [...options.processes()].map(withCapsLabel);
   const view = await readProcessView(dir, options.kernel);
-  return [...view.rows];
+  return [...view.rows].map(withCapsLabel);
+}
+
+/**
+ * Put the capability column on the row, in the same words `cortex ps` uses.
+ *
+ * The label travels with the row so the page never has to re-implement the
+ * rule. Two views of the same fact must not be able to disagree: `cortex ps`
+ * prints `all` / `none` / `-` / the list, and so does the dashboard, because
+ * both call the same function.
+ */
+function withCapsLabel<T extends { capabilities?: readonly Capability[] }>(
+  row: T,
+): T & { capsLabel: string } {
+  return { ...row, capsLabel: formatCaps(row.capabilities) };
 }
 
 /** Every write operation the dashboard knows how to perform. */
@@ -458,9 +487,63 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           let recent: unknown[] = [];
           const seeded = new Set<string>();
 
+          // --- the process table has to hear what happened ------------------
+          //
+          // The table used to be re-read only when a process *started* or
+          // *ended*, which meant a working agent was shown as it was when it
+          // started: its state frozen, its spend frozen, for as long as it
+          // stayed alive. The page said "live connection" while showing a
+          // snapshot. The kernel says what happens (every syscall, every
+          // state transition), so the table is re-read when the kernel says
+          // something.
+          //
+          // The re-read is **throttled, not debounced**: a busy kernel says
+          // something every few milliseconds, and a debounce that waits for
+          // the silence would never see any — the table would sit frozen
+          // through exactly the busy period it exists for. So the first
+          // thing that happens schedules a re-read a quarter of a second
+          // later, and everything that happens in the meantime rides along
+          // with it.
+          let processRefresh: ReturnType<typeof setTimeout> | undefined;
+          let refreshSeq = 0;
+          const refreshProcesses = (immediate: boolean): void => {
+            const run = (): void => {
+              const seq = ++refreshSeq;
+              void listProcesses(dir, options)
+                .then((rows) => {
+                  // Only the newest read may speak: an older one that
+                  // arrives late would put an older table back on the screen.
+                  if (seq !== refreshSeq) return;
+                  send('processes', rows);
+                })
+                .catch(() => undefined);
+            };
+            if (immediate) {
+              if (processRefresh !== undefined) {
+                clearTimeout(processRefresh);
+                processRefresh = undefined;
+              }
+              run();
+              return;
+            }
+            // Already scheduled: let it fire. Resetting the timer on every
+            // event would starve it.
+            if (processRefresh !== undefined) return;
+            processRefresh = setTimeout(() => {
+              processRefresh = undefined;
+              run();
+            }, PROCESS_REFRESH_DEBOUNCE_MS);
+          };
+
           const handle = (raw: unknown): void => {
             const event = raw as { kind?: string; pid?: number; record?: unknown };
             if (event.kind === 'record') {
+              // Something happened to a process: its state may have
+              // changed, its spend may have moved. The table has to hear
+              // it — including for the frames the activity panel does not
+              // show, because `__state` is how the kernel says a process
+              // changed state.
+              refreshProcesses(false);
               const converted = toDashboardEvent(event.record as SyscallRecord, event.pid ?? 0);
               if (converted === undefined) return;
               // A frame that was already in the history is not new.
@@ -470,9 +553,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
               return;
             }
             if (event.kind === 'process-start' || event.kind === 'process-exit') {
-              void listProcesses(dir, options).then((rows) => {
-                send('processes', rows);
-              });
+              refreshProcesses(true);
             }
           };
 
@@ -510,6 +591,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             request.on('close', () => {
               closed = true;
               if (heartbeat !== undefined) clearInterval(heartbeat);
+              if (processRefresh !== undefined) clearTimeout(processRefresh);
               unsubscribe?.();
             });
             return;
