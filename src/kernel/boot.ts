@@ -180,6 +180,7 @@ import {
 } from './syscall_dispatcher.js';
 import { DriverRegistry } from './driver_registry.js';
 import { ReplayEngine, type ReplayMode, type ReplayRecordings } from './replay.js';
+import { resolveModule } from '../module_spec.js';
 
 // =============================================================================
 // §1. Agent surface
@@ -400,6 +401,22 @@ export interface KernelOptions {
    * store are both flat) — a documented simplification, not a behaviour change.
    */
   readonly dir: string;
+
+  /**
+   * The working directory a **relative** agent module path is resolved
+   * against — `agent: { module: './child.js' }` means
+   * `<cwd>/child.js`. Defaults to the host's current directory, captured when
+   * the kernel is constructed.
+   *
+   * This is a host-side option, not part of the syscall ABI: it says where
+   * the *host* put its files, not what a syscall means. It exists because
+   * "relative to the kernel's own source directory" is not a rule anybody
+   * can act on — an installed package has no agent modules next to its
+   * internals.
+   *
+   * See `src/module_spec.ts` for the full rule.
+   */
+  readonly cwd?: string;
 
   /** Override the per-process `.crec` directory. Defaults to `<dir>/processes`. */
   readonly processesDir?: string;
@@ -660,6 +677,13 @@ export class Kernel {
   #now: () => Timestamp;
   #random: (opts?: RandomOptions) => number;
   #importModule: (specifier: string) => Promise<unknown>;
+  /**
+   * The working directory relative agent module paths resolve against
+   * (`KernelOptions.cwd`). Captured at construction: a kernel that resolved
+   * paths against a directory that moved underneath it would load child
+   * agents from somewhere nobody asked for.
+   */
+  #cwd: string;
   #loadAgent: AgentLoader;
   /**
    * The replay engine, when this kernel is replaying a recording.
@@ -745,7 +769,14 @@ export class Kernel {
 
     this.#now = opts.now ?? (() => new Date().toISOString());
     this.#random = opts.random ?? (() => Math.random());
-    this.#importModule = opts.importModule ?? ((s: string) => import(s));
+    this.#cwd = opts.cwd ?? process.cwd();
+    // The default importer resolves the spec first: `AgentSpec.module` is a
+    // path *or* an import specifier (docs/ABI.md §4.1), and `import()` only
+    // understands the second. A path becomes a `file://` URL here, so the
+    // same module loads on Windows as on POSIX. An injected importer gets
+    // the raw spec — it replaces the dynamic import, not the rule.
+    this.#importModule =
+      opts.importModule ?? ((s: string) => import(resolveModule(s, this.#cwd).specifier));
     this.#loadAgent = opts.agentLoader ?? ((spec) => this.#defaultLoadAgent(spec));
 
     // --- replay engine (§5.5: a run can be replayed deterministically) ------

@@ -2158,6 +2158,42 @@ How does an agent get loaded? `import('./agents/foo.js')` and call its default e
 
 **v0 answer:** yes. Agent modules are ES modules with a default-exported async function `(ctx) => Promise<void> | void`. The kernel imports them at `spawn` time.
 
+**And the spec is resolved, not passed through.** `AgentSpec.module` is a
+*path or an import specifier* (ABI §4.1), but the loader used to hand the
+string straight to `import()`, which only understands import specifiers. On
+POSIX a relative path happened to survive — Node resolves `./x.js` against
+the importing module — and on Windows an absolute path did not:
+
+```
+Only URLs with a scheme in: file, data, and node are supported by the default
+ESM loader. On Windows, absolute paths must be valid file:// URLs.
+Received protocol 'f:'
+```
+
+So the CLI and the kernel disagreed, and the loser was the one the ABI
+documents: `ctx.spawn({ role: 'child', agent: { module: './child.js' } })` —
+the exact form in ABI §4.1 — gave a child that died with "agent load
+failed", and on Windows a child it could not even name. The CLI took a path
+(`cortex spawn --module ./x.js`); the kernel took a URL.
+
+The rule now lives in one module (`src/module_spec.ts`), and every entry
+point uses it — the kernel's default loader, the CLI's `--module` flag, and
+the daemon registry that persists one:
+
+1. **A URL is used as it is** — `file:`, `node:`, `data:`, `https:`.
+2. **A path is resolved against the working directory** and becomes a
+   `file://` URL. Something is a path when it *looks* like one (`./x`,
+   `../x`, `/x`, `C:\x`) or when it names a file that is really there.
+3. **Anything else is an import specifier** — a package name — and goes to
+   `import()` untouched.
+
+The working directory is the host's current directory when the kernel booted
+(`KernelOptions.cwd` overrides it), so `./child.js` means the file next to
+the caller rather than one next to the kernel's internals — an installed
+package has no agent modules beside its own source. A rule only the CLI can
+reach is a rule the kernel reinvents, and it did: in the shape of "hand the
+string to `import()` and hope".
+
 Open: should we support manifest files (`agent.json` with metadata + entry point)? v0 says no. v1 may.
 
 ### 12.4 Driver loading and ESM/CJS interop

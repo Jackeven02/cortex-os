@@ -22,7 +22,7 @@ hanging. This is Erlang's "let it crash", written as ordinary `async`/`await`.
 export default async function planner(ctx: CortexContext): Promise<void> {
   const { pid } = await ctx.spawn({
     role: 'coder:billing',
-    agent: { module: import.meta.url, args: { kind: 'coder' } }, // absolute!
+    agent: { module: import.meta.url, args: { kind: 'coder' } }, // this file, by URL
     memory: { semantic: { kind: 'shared', backing: 'inmem' } }, // re-declare for children
   });
 
@@ -50,9 +50,14 @@ export default async function planner(ctx: CortexContext): Promise<void> {
 - Full version (three coders, one hangs, README assembled from shared memory):
   [`examples/supervision-tree.ts`](../examples/supervision-tree.ts).
 
-> **Gotcha.** A parent spawning a child must pass an **absolute** module path
-> (`import.meta.url`). A bare relative path resolves against the kernel, not your
-> file, and the child exits `127 agent load failed`.
+> **Gotcha.** `agent.module` is a **path or an import specifier** (ABI §4.1),
+> and a path may be relative — but it is resolved against the **kernel's
+> working directory** (the host's current directory at boot), *not* against the
+> directory the parent agent lives in. So "the child next to me" is
+> `import.meta.url`, and "the child in the working directory" is
+> `./child.js`. A path relative to the agent's *own* source directory never
+> worked: the loader used to resolve a relative path against the kernel's
+> internals, and the child exited `127 agent load failed`.
 
 ---
 

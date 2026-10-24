@@ -571,6 +571,16 @@ export interface WaitOptions {
  *     that loops `llm_call` until the model says stop. Useful for tests
  *     and trivial daemons.
  *
+ * **`module` is resolved by one rule**, in `src/module_spec.ts`:
+ *
+ *   1. A URL (`file:`, `node:`, `data:`, `https:`) is used as it is.
+ *   2. A path is resolved against the kernel's working directory
+ *      (`KernelOptions.cwd`; the host's current directory by default) and
+ *      becomes a `file://` URL — so `./child.js` means the file next to the
+ *      caller, and an absolute path works the same on Windows as on POSIX.
+ *   3. Anything else is an import specifier — a package name — and goes to
+ *      `import()` untouched.
+ *
  * v1 may add `{ inline: (ctx) => Promise<void> }` for in-process agents,
  * but that breaks checkpointability across kernel restarts, so v0 keeps
  * agents in their own modules.

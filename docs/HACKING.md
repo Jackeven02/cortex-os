@@ -253,12 +253,16 @@ syscalls.
 
 **Four gotchas that will bite you** (all real, all learned the hard way):
 
-1. **A parent spawning a child must pass an absolute `module`.** A bare
-   relative specifier resolves against the *importing* module
-   (`src/kernel/boot.ts`), not the cwd, so `'./examples/x.ts'` looks for
-   `src/kernel/examples/x.ts` and the child exits `127 agent load failed`. Use
-   `import.meta.url` (see `examples/supervision-tree.ts`'s `SELF`). The CLI's
-   `--module` does this conversion for you — only *parent-spawns-child* hits it.
+1. **A parent's `module` for a child says *where the file is*, not *where the
+   child is*.** `agent.module` may be a path **or** an import specifier
+   (ABI §4.1). A **relative** path is resolved against the **kernel's working
+   directory** — the host's current directory when the kernel booted — not
+   against the directory your agent file lives in. So "the child next to me"
+   is `import.meta.url` (see `examples/supervision-tree.ts`'s `SELF`), and "the
+   child in the working directory" is `./child.js`. A path relative to your
+   own source directory never worked: the loader used to resolve it against
+   the kernel's internals (`src/kernel/boot.ts`), and the child exited
+   `127 agent load failed`.
 2. **Memory regions are declared per process, not inherited.** A child spawned
    without a `memory` map has no regions and its first `memory_write` traps
    `ENOENT`. `cortex spawn` declares the three standard regions for the process

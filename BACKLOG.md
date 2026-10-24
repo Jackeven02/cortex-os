@@ -722,6 +722,48 @@ The user-facing surface. Should feel like a real OS shell.
   (the operator's window says the same thing, and a rule only one command can
   reach is a rule every other view reinvents); CHANGELOG.
 
+- [x] **#088** An agent could not spawn a child from a file path → **fixed.**
+  `AgentSpec.module` is documented as a path **or** an import specifier
+  (ABI §4.1), and ABI §4.1's own example is
+  `agent: { module: './agents/researcher.js' }` — but the kernel handed the
+  string straight to `import()`, which only understands import specifiers. The
+  CLI took a path (`cortex spawn --module ./x.js` always worked); the kernel
+  took a URL. On POSIX a relative path survived by accident (Node resolved it
+  against the *importing* module — the kernel's own source); on Windows an
+  absolute path could not even be named:
+
+  ```
+  Only URLs with a scheme in: file, data, and node are supported by the default
+  ESM loader. On Windows, absolute paths must be valid file:// URLs.
+  Received protocol 'f:'
+  ```
+
+  So the exact form the ABI documents gave a child that exited
+  `127 agent load failed` — and the cookbook and the hacking guide had the bug
+  written down as a rule ("a parent spawning a child must pass an absolute
+  module path").
+
+  **One rule now, in one module** (`src/module_spec.ts`), used by the kernel's
+  default loader, the CLI's `--module` flag and the daemon registry: a URL is
+  used as it is; a path is resolved against the working directory
+  (`KernelOptions.cwd`, default: the host's at boot) and becomes a `file://`
+  URL; anything else is an import specifier and goes to `import()` untouched.
+
+  **Six new smoke checks** (750 → 756), all reverse-verified — with the
+  loader's resolution reverted, the absolute-path and the relative-path checks
+  fail; with the rule disabled, six fail. They use the **real** loader and
+  **real files on disk**: the bug is about the filesystem, and a mocked
+  importer would have missed it.
+
+  **One limit, stated rather than hidden:** a path is resolved when the module
+  is *loaded*, against the working directory the kernel booted with — so a
+  process restored in a *different* working directory resolves a relative path
+  differently. Spawn with an absolute path or a `file://` URL when the process
+  has to survive a move.
+
+  Docs: ABI §4.1 (the rule, as a table); ARCHITECTURE §12.3; COOKBOOK and
+  HACKING (both had the bug written down as a rule); CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

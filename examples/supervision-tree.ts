@@ -62,13 +62,12 @@ import type { CortexContext, MemoryRegionPolicy } from 'cortex-agent-os';
 /**
  * How the planner points its children back at this file.
  *
- * It must be **absolute**: a bare `import()` resolves a relative specifier
- * against the *importing* module (the kernel, `src/kernel/boot.ts`), not
- * against the cwd — so `'./examples/supervision-tree.ts'` would look for
- * `src/kernel/examples/...` and the coders would exit 127 "agent load failed".
- * `import.meta.url` is this module's own URL, which is what the CLI passes for
- * `--module` too (it converts the path with `pathToFileURL`), so parent and
- * children end up loading the identical module identity.
+ * `import.meta.url` is this module's own URL, and a URL is used exactly as it
+ * is (ABI §4.1) — so the parent and its children load the *identical* module
+ * identity, whatever the working directory is. A relative path would work
+ * too, but it means "the file in the kernel's working directory": the
+ * directory `cortex` was started in, not the directory this file lives in
+ * (a daemon started by systemd has a working directory of `/`).
  */
 const SELF = import.meta.url;
 /** `semantic` is `shared` by default — see docs/STATE.md §2.3. */

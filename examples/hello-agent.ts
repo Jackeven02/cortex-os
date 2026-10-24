@@ -19,7 +19,7 @@
  *   });
  *   const pid = await kernel.spawn({
  *     role: 'hello',
- *     agent: { module: import.meta.resolve('./hello-agent.ts') },
+ *     agent: { module: import.meta.resolve('./hello-agent.ts') }, // a URL is used as it is
  *   });
  *
  * The agent receives a `CortexContext` (the `ctx` object) which is the entire

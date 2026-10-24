@@ -10,9 +10,8 @@
  */
 
 import { parseArgs } from 'node:util';
-import { pathToFileURL } from 'node:url';
 
-import { resolveModulePath } from '../module_path.js';
+import { resolveModule } from '../../module_spec.js';
 
 import {
   bootCliKernel,
@@ -185,7 +184,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
   const agentSpec: AgentSpec =
     values.module !== undefined
       ? {
-          module: pathToFileURL(resolveModulePath(values.module)).href,
+          module: resolveModule(values.module, process.cwd()).specifier,
           ...(agentArgs !== undefined ? { args: agentArgs } : {}),
         }
       : {
@@ -432,10 +431,12 @@ OPTIONS
   --role <string>      Agent role name (required)
   --task <string>       Task description (becomes the system prompt)
   --system <string>     Full system prompt (overrides --task)
-  --module <path>       Run a user agent module (default-exported function)
+  --module <path|package>  Run a user agent module (default-exported function)
                         instead of the built-in prompt agent. A bundled example
                         may be named as ./examples/<name>.ts and resolves
-                        inside the package, not the cwd.
+                        inside the package, not the cwd. A relative path is
+                        resolved against the current directory; anything that
+                        is not a path is imported as a package name.
   --driver <string>     LLM driver name (prompt agent only; default: auto from env)
   --model <string>      Model name to pass to the driver (prompt agent only)
   --max-tokens <n>      Max output tokens per LLM call (prompt agent only)

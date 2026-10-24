@@ -1546,6 +1546,64 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **An agent could not spawn a child from a file path.** `AgentSpec.module` is
+  documented as a **path or an import specifier** (ABI §4.1), and the ABI's own
+  example is `agent: { module: './agents/researcher.js' }`. The CLI took that
+  literally — `cortex spawn --module ./x.js` has always worked. The kernel did
+  not: it handed the string straight to `import()`, which only understands
+  import specifiers.
+
+  On POSIX a relative path happened to survive (Node resolves `./x.js` against
+  the *importing* module); on Windows an absolute path did not:
+
+  ```
+  Only URLs with a scheme in: file, data, and node are supported by the default
+  ESM loader. On Windows, absolute paths must be valid file:// URLs.
+  Received protocol 'f:'
+  ```
+
+  So `ctx.spawn({ role: 'child', agent: { module: './child.js' } })` — the exact
+  form the ABI documents — gave a child that died with `127 agent load
+  failed`, and on Windows a child it could not even name. One entry point took
+  a path, the other took a URL, and the one the ABI documents was the one that
+  failed.
+
+  The rule now lives in one module (`src/module_spec.ts`), and every entry
+  point uses it — the kernel's default loader, the CLI's `--module` flag, and
+  the daemon registry that persists one:
+
+  1. **A URL is used as it is** — `file:`, `node:`, `data:`, `https:`.
+  2. **A path is resolved against the working directory** and becomes a
+     `file://` URL. Something is a path when it *looks* like one (`./x`,
+     `../x`, `/x`, `C:\x`) or when it names a file that is really there.
+  3. **Anything else is an import specifier** — a package name — and goes to
+     `import()` untouched.
+
+  The working directory is the host's current directory when the kernel booted
+  (`KernelOptions.cwd` overrides it), so `./child.js` means the file in the
+  working directory rather than one next to the kernel's internals — an
+  installed package has no agent modules beside its own source. A rule only
+  the CLI can reach is a rule the kernel reinvents, and it did: in the shape
+  of "hand the string to `import()` and hope".
+
+  **Six new smoke checks** (750 → 756), all reverse-verified: with the
+  loader's resolution reverted, "ctx.spawn loads a child agent module named
+  by an absolute path" and "a relative module path resolves against the
+  working directory" both fail; with the whole rule disabled, six fail. The
+  checks use the **real** loader and **real files on disk** — the bug is about
+  the filesystem, so a mocked importer would have missed it.
+
+  No ABI change: `KERNEL_ABI_VERSION` stays `1.0.0`. The ABI already said
+  "path or import specifier" — this is the implementation catching up with the
+  contract, not the contract changing. `KernelOptions` gained one optional
+  host-side field (`cwd`), which is not an ABI change.
+
+  Two documents had the bug written down as a rule — the cookbook's "a parent
+  spawning a child must pass an absolute module path" and the hacking guide's
+  first gotcha. Both now say what is true: a relative path is resolved against
+  the kernel's working directory, which is not the directory the parent agent
+  lives in.
+
 - **The operator's window called a kernel frame `__state`.** `cortex trace`
   prints the kernel's own bookkeeping frames under the name that distinguishes
   them — `__state:running->blocked(recv)`, `__sched:sigxcpu(tokens)` — and the

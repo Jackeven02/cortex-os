@@ -43,9 +43,8 @@ import { parseArgs } from 'node:util';
 import { existsSync, mkdirSync, writeFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { platform as osPlatform } from 'node:os';
-import { pathToFileURL } from 'node:url';
 
-import { resolveModulePath } from '../module_path.js';
+import { resolveModule } from '../../module_spec.js';
 
 import {
   bootCliKernel,
@@ -168,26 +167,29 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
 
   const system = values.system ?? `You are a ${values.role}. Your task: ${values.task ?? '(no task specified)'}`;
 
-  // A daemon spec persists the module's path, and the daemon runs it later —
-  // possibly after a reboot, possibly by a different user account. A path
-  // that does not exist now will not exist then either, so refuse it here
-  // rather than registering a daemon that can only ever fail.
-  let modulePath: string | undefined;
+  // A daemon spec persists the module's specifier, and the daemon runs it
+  // later — possibly after a reboot, possibly by a different user account. A
+  // *path* that does not exist now will not exist then either, so refuse it
+  // here rather than registering a daemon that can only ever fail. A package
+  // name is not a path: `import()` resolves it when the daemon runs, and it
+  // may well be installed by then.
+  let moduleSpecifier: string | undefined;
   if (values.module !== undefined) {
-    modulePath = resolveModulePath(values.module);
-    if (!existsSync(modulePath)) {
+    const resolved = resolveModule(values.module, process.cwd());
+    if (resolved.isPath && resolved.path !== null && !existsSync(resolved.path)) {
       console.error(`cortex daemon install: --module '${values.module}' does not exist`);
-      console.error(`(looked for ${modulePath})`);
+      console.error(`(looked for ${resolved.path})`);
       console.error(
         `if you meant one of the bundled examples, use its name -- e.g. ./examples/checkpoint-agent.ts`,
       );
       return 1;
     }
+    moduleSpecifier = resolved.specifier;
   }
 
   const agentSpec: AgentSpec =
-    modulePath !== undefined
-      ? { module: pathToFileURL(modulePath).href }
+    moduleSpecifier !== undefined
+      ? { module: moduleSpecifier }
       : {
           system,
           ...(values.driver !== undefined ? { driver: values.driver } : {}),
@@ -702,9 +704,12 @@ OPTIONS
   --role <string>       Agent role (required)
   --task <string>       Task (becomes the system prompt)
   --system <string>     Full system prompt (overrides --task)
-  --module <path>       Run a user agent module instead of the prompt agent.
+  --module <path|package>  Run a user agent module instead of the prompt agent.
                         A bundled example may be named as ./examples/<name>.ts
-                        and resolves inside the package, not the cwd.
+                        and resolves inside the package, not the cwd. A relative
+                        path is resolved against the current directory;
+                        anything that is not a path is imported as a package
+                        name.
   --driver/--model/--max-tokens   Prompt-agent LLM options
   --token-budget <n>    Total token budget
   --restart <kind>      always | on-failure | never (default: never)

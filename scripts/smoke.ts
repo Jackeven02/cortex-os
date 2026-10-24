@@ -322,7 +322,7 @@ import type { CortexContext, LLMResponse, Timestamp } from '../src/kernel/types.
 import { OutputCapture } from '../src/cli/output_capture.js';
 import { bootCliKernel } from '../src/cli/index.js';
 import { pathToFileURL } from 'node:url';
-import { resolveModulePath } from '../src/cli/module_path.js';
+import { resolveModule } from '../src/module_spec.js';
 import { DEFAULT_MEMORY_REGIONS } from '../src/cli/index.js';
 import {
   writeEndpoint,
@@ -7611,7 +7611,8 @@ async function runMockLLMChecks(): Promise<void> {
 }
 
 async function runBootChecks(): Promise<void> {
-  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { mkdtemp, rm, mkdir, writeFile, readFile } = await import('node:fs/promises');
+  const { existsSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
 
@@ -7923,6 +7924,131 @@ async function runBootChecks(): Promise<void> {
     const ex = await readExit(procDir as string, pid);
     assert(ex !== undefined && ex.code === 127, `expected 127, got ${ex?.code}`);
     assert(ex!.reason.includes('agent load failed'), `reason explains the load failure, got "${ex!.reason}"`);
+  });
+
+  // --- §4.5 the default loader, on real files -------------------------------
+  //
+  // The kernel's default loader used to hand `spec.module` straight to
+  // `import()`, which only understands *import specifiers*. On Windows an
+  // absolute path died with "Only URLs with a scheme in: file, data, and
+  // node are supported…", and a relative path was resolved against the
+  // kernel's own source directory instead of the caller's working directory.
+  // The ABI documents `module` as "path or import specifier" and shows
+  // `agent: { module: './agents/researcher.js' }` — so the loader has to
+  // mean it.
+  //
+  // These checks use the REAL loader (no injected importer) and real files
+  // on disk, because the bug is about the filesystem.
+
+  /** A kernel with the real module loader — no injected importer. */
+  async function makeRealKernel(sub: string, cwd: string): Promise<Kernel> {
+    const k = new Kernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: join(sub, 'kernel'),
+      cwd,
+      now: clock,
+      random: detRandom,
+      recorderFactory: nullRecorderFactory,
+      autoStart: false,
+      loadDrivers: (reg) => {
+        reg.registerLLM(mockLLM());
+      },
+    });
+    await k.boot();
+    kernels.push(k);
+    return k;
+  }
+
+  /**
+   * A child agent module that writes a marker file and exits with code 7.
+   * The marker is the proof that the module was *loaded and run*, not merely
+   * resolved.
+   */
+  const childModuleSource = (marker: string): string => `
+import { writeFileSync } from 'node:fs';
+export default async (ctx) => {
+  writeFileSync(${JSON.stringify(marker)}, 'ran');
+  ctx.exit(7, 'child ran');
+};
+`;
+
+  /**
+   * A parent agent module that spawns a child by `childSpec` and writes the
+   * child's exit code to `codeFile`. The code file is the proof that the
+   * parent saw the child's *real* outcome.
+   */
+  const parentModuleSource = (childSpec: string, codeFile: string): string => `
+import { writeFileSync } from 'node:fs';
+export default async (ctx) => {
+  const { pid } = await ctx.spawn({ role: 'child', agent: { module: ${JSON.stringify(childSpec)} } });
+  const res = await ctx.wait(pid);
+  writeFileSync(${JSON.stringify(codeFile)}, String(res.exitCode));
+  ctx.exit(0, 'parent done');
+};
+`;
+
+  await checkAsync('ctx.spawn loads a child agent module named by an absolute path', async () => {
+    const sub = join(tmp, 'mod-abs');
+    await mkdir(sub, { recursive: true });
+    const marker = join(sub, 'child-ran.txt');
+    const codeFile = join(sub, 'child-code.txt');
+    const child = join(sub, 'child.mjs');
+    const parent = join(sub, 'parent.mjs');
+    await writeFile(child, childModuleSource(marker), 'utf8');
+    await writeFile(parent, parentModuleSource(child, codeFile), 'utf8');
+
+    const k = await makeRealKernel(sub, sub);
+    await k.spawn({ role: 'parent', agent: { module: parent } });
+    await k.settle();
+
+    assert(existsSync(marker), 'the child module was loaded and run');
+    assert(
+      (await readFile(codeFile, 'utf8')) === '7',
+      'the parent saw the child\'s real exit code',
+    );
+  });
+
+  await checkAsync('a relative module path resolves against the working directory', async () => {
+    const sub = join(tmp, 'mod-rel');
+    await mkdir(sub, { recursive: true });
+    const marker = join(sub, 'child-ran.txt');
+    const codeFile = join(sub, 'child-code.txt');
+    await writeFile(join(sub, 'child.mjs'), childModuleSource(marker), 'utf8');
+    await writeFile(join(sub, 'parent.mjs'), parentModuleSource('./child.mjs', codeFile), 'utf8');
+
+    // Both the parent and the child are named relatively. Neither may be
+    // resolved against the kernel's own source directory — an installed
+    // package has no agent modules next to its internals.
+    const k = await makeRealKernel(sub, sub);
+    await k.spawn({ role: 'parent', agent: { module: './parent.mjs' } });
+    await k.settle();
+
+    assert(existsSync(marker), 'the child module was loaded and run');
+    assert(
+      (await readFile(codeFile, 'utf8')) === '7',
+      'the parent saw the child\'s real exit code',
+    );
+  });
+
+  await checkAsync('a file:// module URL is used exactly as it is', async () => {
+    const sub = join(tmp, 'mod-url');
+    await mkdir(sub, { recursive: true });
+    const marker = join(sub, 'child-ran.txt');
+    const codeFile = join(sub, 'child-code.txt');
+    const child = join(sub, 'child.mjs');
+    await writeFile(child, childModuleSource(marker), 'utf8');
+    const childUrl = pathToFileURL(child).href;
+    await writeFile(join(sub, 'parent.mjs'), parentModuleSource(childUrl, codeFile), 'utf8');
+
+    const k = await makeRealKernel(sub, sub);
+    await k.spawn({ role: 'parent', agent: { module: pathToFileURL(join(sub, 'parent.mjs')).href } });
+    await k.settle();
+
+    assert(existsSync(marker), 'the child module was loaded and run');
+    assert(
+      (await readFile(codeFile, 'utf8')) === '7',
+      'the parent saw the child\'s real exit code',
+    );
   });
 
   // --- §3 the built-in prompt-only agent ------------------------------------
@@ -12759,18 +12885,19 @@ async function runCliChecks(): Promise<void> {
       const elsewhere = mkdtempSync(join(tmpdir(), 'cortex-elsewhere-'));
       try {
         process.chdir(elsewhere);
-        const resolved = resolveModulePath('./examples/checkpoint-agent.ts');
+        const resolved = resolveModule('./examples/checkpoint-agent.ts', elsewhere);
+        assert(resolved.path !== null, 'the bundled example should name a file');
         assert(
-          existsSync(resolved),
-          `the bundled example should resolve to a real file, got ${resolved}`,
+          existsSync(resolved.path),
+          `the bundled example should resolve to a real file, got ${resolved.path}`,
         );
         assert(
-          !resolved.startsWith(elsewhere),
-          `it should not resolve inside the cwd, got ${resolved}`,
+          !resolved.path.startsWith(elsewhere),
+          `it should not resolve inside the cwd, got ${resolved.path}`,
         );
         assert(
-          resolved.includes('checkpoint-agent'),
-          `it should be the checkpoint agent, got ${resolved}`,
+          resolved.path.includes('checkpoint-agent'),
+          `it should be the checkpoint agent, got ${resolved.path}`,
         );
       } finally {
         process.chdir(here);
@@ -12779,20 +12906,54 @@ async function runCliChecks(): Promise<void> {
     });
 
     check('a path that exists in the cwd wins over the package', () => {
-      const resolved = resolveModulePath('./examples/checkpoint-agent.ts');
+      const resolved = resolveModule('./examples/checkpoint-agent.ts', process.cwd());
+      assert(resolved.path !== null, 'it names a file');
       assert(
-        resolved.endsWith('checkpoint-agent.ts'),
-        `expected the .ts source from the cwd, got ${resolved}`,
+        resolved.path.endsWith('checkpoint-agent.ts'),
+        `expected the .ts source from the cwd, got ${resolved.path}`,
       );
     });
 
     check('an unresolvable path falls back to the cwd-relative resolution', () => {
-      const resolved = resolveModulePath('./definitely-not-here.ts');
+      const resolved = resolveModule('./definitely-not-here.ts', process.cwd());
+      assert(resolved.path !== null, 'a missing path is still a path');
       assert(
-        resolved.endsWith('definitely-not-here.ts'),
-        `expected the cwd-relative path, got ${resolved}`,
+        resolved.path.endsWith('definitely-not-here.ts'),
+        `expected the cwd-relative path, got ${resolved.path}`,
       );
-      assert(!existsSync(resolved), 'and it should not exist');
+      assert(!existsSync(resolved.path), 'and it should not exist');
+    });
+
+    check('a bare name that is not a file stays an import specifier', () => {
+      const resolved = resolveModule('some-agent-package', process.cwd());
+      assert(
+        resolved.specifier === 'some-agent-package',
+        `expected the package name untouched, got ${resolved.specifier}`,
+      );
+      assert(resolved.isPath === false, 'a package is not a path');
+      assert(resolved.path === null, 'and there is no file to look for');
+    });
+
+    check('a file URL is used exactly as it is', () => {
+      const url = 'file:///F:/agents/child.js';
+      const resolved = resolveModule(url, process.cwd());
+      assert(resolved.specifier === url, `expected the URL unchanged, got ${resolved.specifier}`);
+      assert(resolved.isPath === false, 'a URL is not looked up on disk');
+    });
+
+    check('a Windows drive path is a path, not a URL scheme', () => {
+      // `C:` is a drive letter. Read as a scheme it asks Node for a protocol
+      // it has never heard of — which is how `import('C:\\x.js')` used to die.
+      const resolved = resolveModule('C:\\agents\\child.js', process.cwd());
+      assert(resolved.isPath === true, 'a drive letter is a path');
+      assert(
+        resolved.path !== null && resolved.path.endsWith('child.js'),
+        `expected the file path, got ${resolved.path}`,
+      );
+      assert(
+        resolved.specifier.startsWith('file:///'),
+        `expected a file URL, got ${resolved.specifier}`,
+      );
     });
 
     // Create processes dir.

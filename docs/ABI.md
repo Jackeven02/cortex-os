@@ -201,6 +201,28 @@ const child = await ctx.spawn({
 });
 ```
 
+**What `module` names.** `agent.module` is a **path or an import specifier**, and
+one rule resolves it (`src/module_spec.ts`):
+
+| the spec is | the kernel does |
+| --- | --- |
+| a URL — `file:`, `node:`, `data:`, `https:` | imports it exactly as it is |
+| a path — `./x`, `../x`, `/x`, `C:\x`, or a file that is really there | resolves it against the kernel's working directory and imports the resulting `file://` URL |
+| anything else | treats it as an import specifier (a package name) and imports it as it is |
+
+The working directory is the host's current directory when the kernel booted
+(`KernelOptions.cwd` overrides it). A **relative** path therefore means "the
+file in that working directory" — not the file next to the kernel's internals,
+and the same thing on Windows as on POSIX.
+
+The CLI's `--module` flag uses the same rule, so `cortex spawn --module
+./x.js` and `ctx.spawn({ agent: { module: './x.js' } })` name the same file.
+
+> A path is resolved **when the module is loaded**, against the working
+> directory the kernel booted with. A process restored in a *different*
+> working directory resolves a relative path differently — spawn with an
+> absolute path or a `file://` URL when the process has to survive a move.
+
 #### `wait(pid?: ProcessId, opts?: WaitOptions): Promise<WaitResult>`
 
 Block until a child exits. If `pid` is omitted, wait for any child.
