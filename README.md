@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 798 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 801 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -390,6 +390,8 @@ Read-only by default. With a live kernel in the directory (`cortex daemon run`),
 It says the same words `cortex memory` says (`read-write`, `read-only`, `∞`, `3 (read-only)`), because the wording lives in one module and each view only chooses how it prints a number. The memory is fetched when you open the panel, not on every refresh of the process table, and without a live kernel the panel says so rather than showing an empty region — a region's contents live in the kernel that owns them, and there is no on-disk copy to read instead.
 
 **And the window says how long each process lived.** Its process table showed the *start time* and nothing else — and a start time is not a duration: for a process that died an hour ago it says nothing at all about how long it lived. There is a **存活时长** column beside it now, and the number is the same one `cortex ps` and `cortex top` print, because the rule lives in one place. A running process is aging, so its number keeps counting up; a finished one is not, so it shows the lifetime the kernel recorded and stops there.
+
+**And the window says what each process spent, in money as well as tokens.** The money used to live only in the budget panel, and that panel rolls it up **by role** — three agents called `coder` became one line with one number on it, so you could see which agent spent the tokens and not which one spent the money. The process table carries a **USD** cell beside the tokens now, in the same words `cortex top` prints (`$0.000250 of $1.000000`), so a cost can be matched to the process that paid it.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

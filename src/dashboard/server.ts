@@ -11,7 +11,7 @@ import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView, formatAge, processAge, type AgeFacts } from '../cli/process_view.js';
 import { describeOutcome } from '../cli/process_outcome.js';
-import { describeBudget, formatTokenBudget } from '../cli/process_budget.js';
+import { describeBudget, formatTokenBudget, formatUsdBudget, type BudgetFacts } from '../cli/process_budget.js';
 import { usdToDollars } from '../money.js';
 import { formatTokenUsage, callUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
@@ -219,7 +219,7 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
   if (options.processes !== undefined) {
     return [...options.processes()].map((row) =>
       withAgeLabel(
-        withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withTokenLabel(withInside(withPendingLabel(row))))))),
+        withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withUsdLabel(withTokenLabel(withInside(withPendingLabel(row)))))))),
         now,
       ),
     );
@@ -227,7 +227,7 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
   const view = await readProcessView(dir, options.kernel);
   return [...view.rows].map((row) =>
     withAgeLabel(
-      withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withTokenLabel(withInside(withPendingLabel(row))))))),
+      withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withUsdLabel(withTokenLabel(withInside(withPendingLabel(row)))))))),
       now,
     ),
   );
@@ -284,29 +284,82 @@ function withTokenLabel<
     budgetsRemaining?: { tokens?: number; usd?: number; wallTimeMs?: number };
   },
 >(row: T): T & { tokenLabel: string } {
+  return {
+    ...row,
+    tokenLabel: formatTokenBudget(budgetFactsOf(row), (n) => n.toLocaleString()),
+  };
+}
+
+/**
+ * The budget facts of one row, as the budget rule wants them.
+ *
+ * A row that came from the kernel carries both records; a row from a test
+ * double may not, and a counter nobody reported is zero — the kernel counts
+ * from zero, and a cell that said "no" about a spend nobody made would be a
+ * claim.
+ */
+function budgetFactsOf(row: {
+  budgetsSpent?: {
+    tokensIn?: number;
+    tokensOut?: number;
+    tokensCached?: number;
+    usdSpent?: number;
+    wallTimeMs?: number;
+    syscallCount?: number;
+  };
+  budgetsRemaining?: { tokens?: number; usd?: number; wallTimeMs?: number };
+}): BudgetFacts {
   const spent = row.budgetsSpent;
   const remaining = row.budgetsRemaining;
   return {
-    ...row,
-    tokenLabel: formatTokenBudget(
-      {
-        spent: {
-          tokensIn: spent?.tokensIn ?? 0,
-          tokensOut: spent?.tokensOut ?? 0,
-          tokensCached: spent?.tokensCached ?? 0,
-          usdSpent: spent?.usdSpent ?? 0,
-          wallTimeMs: spent?.wallTimeMs ?? 0,
-          syscallCount: spent?.syscallCount ?? 0,
-        },
-        remaining: {
-          tokens: remaining?.tokens ?? -1,
-          usd: remaining?.usd ?? -1,
-          wallTimeMs: remaining?.wallTimeMs ?? -1,
-        },
-      },
-      (n) => n.toLocaleString(),
-    ),
+    spent: {
+      tokensIn: spent?.tokensIn ?? 0,
+      tokensOut: spent?.tokensOut ?? 0,
+      tokensCached: spent?.tokensCached ?? 0,
+      usdSpent: spent?.usdSpent ?? 0,
+      wallTimeMs: spent?.wallTimeMs ?? 0,
+      syscallCount: spent?.syscallCount ?? 0,
+    },
+    remaining: {
+      tokens: remaining?.tokens ?? -1,
+      usd: remaining?.usd ?? -1,
+      wallTimeMs: remaining?.wallTimeMs ?? -1,
+    },
   };
+}
+
+/**
+ * Put the **money** on the row, in the same words `cortex top` prints.
+ *
+ * The window showed a process's tokens and a process's money — but not in the
+ * same row. The money was in the budget panel, which rolls it up **by role**:
+ * three agents called `coder` became one line with one number on it. So the
+ * operator could see which agent spent the tokens and could **not** see which
+ * one spent the money, and could not see either one's money ceiling.
+ *
+ * The cell carries the spend and the ceiling it is measured against, for the
+ * same reason every other spend does: a spend on its own is 12% of one budget
+ * and 99% of another.
+ *
+ * The money's precision is not the page's to choose — six decimals is what a
+ * microdollar count can say exactly (`src/money.ts`) — so this cell is built
+ * by the same function `cortex top` uses, and the two cannot disagree about
+ * what a process cost.
+ */
+function withUsdLabel<
+  T extends {
+    budgetsSpent?: {
+      tokensIn?: number;
+      tokensOut?: number;
+      tokensCached?: number;
+      usdSpent?: number;
+      wallTimeMs?: number;
+      syscallCount?: number;
+    };
+    budgetsRemaining?: { tokens?: number; usd?: number; wallTimeMs?: number };
+  },
+>(row: T): T & { usdLabel: string } {
+  return { ...row, usdLabel: formatUsdBudget(budgetFactsOf(row)) };
 }
 
 /**

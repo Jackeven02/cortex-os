@@ -223,7 +223,7 @@
           <section class="panel" id="processes">
             <div class="panel-head"><div><div class="panel-title">Agent 进程 <span class="nav-count" id="processCountLabel"></span></div><div class="panel-note">进程状态、最近资源使用 · 停在哪个调用、怎么结束的</div></div><div class="table-tools"><div class="view-toggle"><button id="viewTable" class="active" type="button">表格</button><button id="viewTree" type="button">监督树</button></div><input class="search" id="processSearch" type="search" placeholder="筛选进程…" aria-label="筛选进程"><button class="icon-button" id="processRefresh" title="刷新进程">↻</button></div></div>
             <div class="spawn-bar" id="spawnBar" hidden><input type="text" id="spawnRole" placeholder="角色（必填，如 coder）" aria-label="角色"><input type="text" id="spawnModule" placeholder="模块路径（可选，如 ./examples/hello.js）" aria-label="模块路径"><input type="text" id="spawnTask" placeholder="任务（可选）" aria-label="任务"><button class="button" id="spawnGo" type="button">启动机器人</button></div>
-            <div id="processTableWrap" class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th id="insideHead" hidden>备注</th><th>PID</th><th>PPID</th><th>Token</th><th>权限</th><th>启动时间</th><th>存活时长</th><th></th></tr></thead><tbody id="processRows"><tr><td colspan="9" class="empty">正在读取进程…</td></tr></tbody></table></div>
+            <div id="processTableWrap" class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th id="insideHead" hidden>备注</th><th>PID</th><th>PPID</th><th>Token</th><th>USD</th><th>权限</th><th>启动时间</th><th>存活时长</th><th></th></tr></thead><tbody id="processRows"><tr><td colspan="10" class="empty">正在读取进程…</td></tr></tbody></table></div>
             <div id="processTreeWrap" class="tree-wrap" hidden><div id="processTree"></div></div>
           </section>
 
@@ -293,6 +293,16 @@
     // the server, which uses the same rule `cortex ps` prints — one rule,
     // three views.
     const processTokenLabel = (process) => String(process.tokenLabel ?? processTokens(process).toLocaleString());
+    // **What this process cost in money.** The label comes from the server,
+    // which asks the same function `cortex top` prints its USD column with —
+    // one rule, two views.
+    //
+    // The money used to live only in the budget panel, which rolls it up **by
+    // role**: three agents called `coder` became one line with one number on
+    // it. So the window could say which agent spent the tokens and could not
+    // say which one spent the money. The number's precision is not the page's
+    // to choose — six decimals is what a microdollar count can say exactly.
+    const processUsdLabel = (process) => String(process.usdLabel ?? '—');
     // **How long the process lived.** The label comes from the server, which
     // asks the same function `cortex ps` prints its AGE column with — one rule,
     // three views.
@@ -388,8 +398,8 @@
         // ended, then the budget, then what it is waiting on.
         const detail = [outcome, budget, inside, pending].filter(Boolean).join(' — ');
         const insideCell = (insideKnown || pendingKnown || outcomeKnown || budgetKnown) ? `<td class="inside-cell" title="${esc(detail)}">${esc(detail || '—')}</td>` : '';
-        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td>${insideCell}<td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${esc(processTokenLabel(process))}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td><td class="mono">${esc(processAgeLabel(process))}</td>${opsCell}</tr>`;
-      }).join('') : `<tr><td colspan="${insideKnown || pendingKnown || outcomeKnown || budgetKnown ? 10 : 9}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
+        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td>${insideCell}<td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${esc(processTokenLabel(process))}</td><td>${esc(processUsdLabel(process))}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td><td class="mono">${esc(processAgeLabel(process))}</td>${opsCell}</tr>`;
+      }).join('') : `<tr><td colspan="${insideKnown || pendingKnown || outcomeKnown || budgetKnown ? 11 : 10}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
       $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
       $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
     }
@@ -472,7 +482,7 @@
         const budget = processBudget(process);
         const detail = [outcome, budget, inside, pending].filter(Boolean).join(' — ');
         const insideSpan = detail ? `<span class="tree-inside">${esc(detail)}</span>` : '';
-        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${esc(processTokenLabel(process))} tok</span><span>${esc(processAgeLabel(process))}</span>${insideSpan}</span></div>${children}`;
+        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${esc(processTokenLabel(process))} tok</span><span>${esc(processUsdLabel(process))}</span><span>${esc(processAgeLabel(process))}</span>${insideSpan}</span></div>${children}`;
       };
       const visible = roots.filter(keep);
       $('processTree').innerHTML = visible.length ? visible.map((process) => renderNode(process, 0)).join('') : `<div class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，监督树会显示在这里。'}</div>`;

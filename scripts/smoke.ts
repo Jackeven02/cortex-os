@@ -10617,6 +10617,75 @@ async function runDashboardChecks(): Promise<void> {
         assert(!html.includes('spent.usdSpent'), 'the page never adds up the raw microdollars');
       });
 
+      await checkAsync('the dashboard says what each process spent, in money', async () => {
+        // The window showed a process's **tokens** per process, but its
+        // **money** only in the budget panel — and that panel rolls the money
+        // up **by role**. Three agents called `coder` became one line with one
+        // number on it, so the operator could see which agent spent the tokens
+        // and could not see which one spent the money.
+        const res = await fetch(`${dash.url}/api/processes`);
+        assert(res.status === 200, `status ${res.status}`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const row = rows.find((r) => r['pid'] === 2);
+        assert(row !== undefined, 'the process is in the list');
+        // The spend, and the ceiling it is measured against. A money budget
+        // with no ceiling says so, rather than leaving the denominator out.
+        assert(
+          row!['usdLabel'] === '$0.003400 of ∞',
+          `the row says the money, got ${String(row!['usdLabel'])}`,
+        );
+      });
+
+      await checkAsync('the dashboard and cortex top say the same money', async () => {
+        // One rule, two views: the window's cell and the tree's column are
+        // built by the same function, so a process cannot cost one thing in the
+        // operator's window and another in the terminal.
+        const prevHome = process.env['CORTEX_HOME'];
+        process.env['CORTEX_HOME'] = tmp;
+        try {
+          const res = await fetch(`${dash.url}/api/processes`);
+          const rows = (await res.json()) as Array<Record<string, unknown>>;
+          const row = rows.find((r) => r['pid'] === 2);
+          assert(row !== undefined, 'the process is in the list');
+
+          let out = '';
+          const prevLog = console.log;
+          console.log = (...parts: unknown[]): void => {
+            out += parts.map((p) => String(p)).join(' ') + '\n';
+          };
+          try {
+            await cmdTop([]);
+          } finally {
+            console.log = prevLog;
+          }
+          assert(
+            out.includes('$0.003400 of ∞'),
+            `cortex top prints the same money, got: ${out}`,
+          );
+          assert(
+            String(row!['usdLabel']) === '$0.003400 of ∞',
+            `the window says the same, got ${String(row!['usdLabel'])}`,
+          );
+        } finally {
+          if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+          else process.env['CORTEX_HOME'] = prevHome;
+        }
+      });
+
+      await checkAsync('the page shows what each process spent', async () => {
+        // The money is in the process **table** now, not only in the budget
+        // panel — so it is a number the operator can match to the process that
+        // spent it. The tree puts the same label in a span, so only the cell
+        // says that the *table* has it.
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        assert(html.includes('<th>USD</th>'), 'the page names the column');
+        assert(
+          /<td[^>]*>\$\{esc\(processUsdLabel\(process\)\)\}<\/td>/.test(html),
+          'the process table renders the money',
+        );
+      });
+
       await checkAsync('the event row keeps the shape of the table', async () => {
         // The row template built the "Token / 模型" cell's tooltip with a
         // nested template literal — `title="${event.usd === undefined ? '' :

@@ -1285,6 +1285,33 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE (the other two views say it too); STATE §2.4 (how long
   a process lived is a fact the operator can see); CHANGELOG.
 
+- [x] **#102** The window could say what a process spent in tokens, but not in
+  money → **fixed.** The dashboard's process table showed each process's
+  token spend and its ceiling. The money was in the **budget panel** — and
+  that panel rolls it up **by role**.
+
+  **Three agents called `coder` became one line with one number on it.** The
+  `coder` row said `2` processes and `$0.002300`, so the operator could see
+  which agent spent the tokens and could **not** see which one spent the
+  money — and could not see either one's money ceiling at all. Two numbers
+  about the same question, each answering a different part of it.
+
+  **The money is in the process table now**, beside the tokens, in the words
+  `cortex top` prints: `$0.000250 of $1.000000` — the spend and the ceiling
+  it is measured against, built by the same function (`formatUsdBudget`, in
+  `src/cli/process_budget.ts`). The budget panel keeps its roll-up, because
+  "where did the money go" is a different question from "how much did *this*
+  process cost", and the roll-up is the right answer to the first one.
+
+  **3 new smoke checks** (798 → 801), reverse-verified: with the server
+  withholding `usdLabel`, both dashboard checks fail ("got undefined"); with
+  the page not rendering the cell, the page check fails; and with the money
+  cell dropping the ceiling it is measured against, both dashboard checks
+  fail on the exact string — `$0.003400` where it should be `$0.003400 of ∞`.
+
+  Docs: ARCHITECTURE (the window says a process's money, not a role's);
+  STATE §2.4 (a process's two spends travel together); CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

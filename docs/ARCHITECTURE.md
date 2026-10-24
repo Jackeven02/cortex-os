@@ -1803,6 +1803,25 @@ dashboard's process rows — and the rule lives in one place
 (`src/cli/process_budget.ts`), so two views of one process cannot disagree
 about what its budget was.
 
+**And the window says a process's money, not a role's.** The dashboard showed
+a process's **tokens** per process, and its **money** only in the budget
+panel — and that panel rolls the money up **by role**. Three agents called
+`coder` became one line with one number on it, so the operator could see
+which agent spent the tokens and could **not** see which one spent the money.
+The two numbers were about the same question and each answered a different
+part of it.
+
+So the money is in the process table now, beside the tokens, in the words
+`cortex top` prints — `$0.000250 of $1.000000`, the spend and the ceiling it
+is measured against — built by the same function (`formatUsdBudget`, in
+`src/cli/process_budget.ts`). The budget panel keeps its roll-up, because
+"where did the money go" is a different question from "how much did *this*
+process cost", and the roll-up is the right answer to the first one.
+
+The money's precision is not the page's to choose: six decimals is what a
+microdollar count can say exactly (`src/money.ts`), so a cost printed at
+another resolution would not add up to the spend beside it.
+
 **And a call says what it spent, not just a process.** A process's spend is one
 total; a **call's** is a pair — what the model read and what it wrote, and the
 part of the input that came out of the provider's cache — and the price. The
