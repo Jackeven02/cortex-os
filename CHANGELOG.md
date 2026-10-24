@@ -1546,6 +1546,55 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The cached tokens were in the kernel and in no view.** The kernel records
+  three token counters (STATE.md §2.4): the input, the output, and the part of
+  the input the provider served out of its cache. The cached part is **inside**
+  the input — the provider reports the whole prompt (`prompt_tokens`) and says
+  how much of it it did not have to read again (`cached_tokens`) — and it is
+  billed at the cache price rather than the fresh one. So a process could spend
+  1,000 tokens for a fraction of the usual money, and **no view said so**.
+
+  `cortex ps` and `cortex top` printed `tokensIn + tokensOut`, `cortex limit`
+  printed the same total, the dashboard's budget panel had a column of totals
+  and no column of cache, and the per-call trace said "1,234 in / 56 out" for a
+  call that was served entirely out of the cache. The operator had the tokens
+  and the dollars and no way to make them add up.
+
+  **Every view that shows tokens now says which part of them was cached**:
+
+  ```console
+  $ cortex ps
+  PID  PPID  ROLE   STATE    TOKENS            CAPS  AGE      NOTE
+  ---------------------------------------------------------------
+  2    1     coder  running  1.2k (300 cached) all   12.4s
+  ```
+
+  `cortex top` prints the same cell and names the cached total in its summary
+  line; `cortex limit` prints `spent 1200 (300 cached) / limit ∞`; the
+  dashboard prints the same cell, adds a **缓存** column to the budget table
+  and a **缓存命中** tile, and says which part of a *call* was cached.
+
+  **The cached part is a part of the total, never an extra one.** The provider
+  reports the whole prompt, so the total a process spent is
+  `tokensIn + tokensOut` — with the cached tokens counted once, which is also
+  what the token ceiling is charged with. The arithmetic and the wording live
+  in one module (`src/token_usage.ts`); each view supplies only how it prints
+  a number (the CLI shortens, `1.2k`; the dashboard spells it out, `1,234`).
+
+  10 new smoke checks (765 → 775), all reverse-verified: with the table's cell
+  back to the bare total the `cortex ps` check fails; with the tree's cell back
+  to the bare total the `cortex top` check fails; with the budget line back to
+  the bare total the `cortex limit` check fails; with the server's label out of
+  the row the dashboard check fails; with the page's cached column removed the
+  page check fails; and with the total counting the cached part twice, four of
+  the rule checks fail.
+
+  **One limit, stated rather than hidden:** whether a cached token *should* be
+  charged in full against the token ceiling is still open — it is today, and
+  the money is charged at the cache price while the tokens are charged at the
+  full count. That is a policy question (BACKLOG #092); this change makes it
+  visible rather than deciding it.
+
 - **A wall-clock budget was not a ceiling, and every agent reported that it had
   lived for zero milliseconds.** `budgetsSpent.wallTimeMs` is the time a
   process has been alive (PROCESS.md §8.3), and it was charged in exactly one

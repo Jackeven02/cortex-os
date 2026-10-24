@@ -569,6 +569,30 @@ Budgets decrement on every relevant syscall. When exhausted:
 - Default disposition: STOPPED
 - Supervisor may: increase budget, terminate, fork a fresh attempt
 
+**And a token count has three parts.** The kernel records the input, the
+output, and the part of the input the provider served out of its cache
+(STATE.md §2.4). The cached part is **inside** the input — the provider
+reports the whole prompt and says how much of it it did not have to read
+again — so the total a process spent is `tokensIn + tokensOut`, and the cached
+tokens are counted **once**. A total that added them on top would drain the
+token ceiling twice as fast as the work actually did.
+
+They are worth saying out loud, because they are billed at the cache price
+rather than the fresh one: a process that spent 1,000 tokens for a fifth of
+the usual money was reading from the cache, and no view used to say so. So
+every view that shows tokens says which part of them was cached — `cortex ps`
+and `cortex top` print `1.2k (300 cached)`, `cortex limit` prints
+`spent 1200 (300 cached)`, and the dashboard prints the same cell plus a
+column of its own. The arithmetic and the wording live in one place
+(`src/token_usage.ts`), so the three views cannot drift apart.
+
+**Whether a cached token should be charged in full against the token ceiling
+is still open.** It is today — the money is charged at the cache price while
+the tokens are charged at the full count — and an agent that re-reads a
+cached prompt a thousand times drains its token ceiling while its dollar bill
+barely moves. That is a policy question, not an implementation detail, and it
+is tracked in BACKLOG.md (#092).
+
 **And the wall clock is a clock.** `wall_time_ms` is a ceiling on how long a
 process may **live**, so it is charged by time passing — not by the process
 doing something. It used to be charged only at an `llm_call`, and only when

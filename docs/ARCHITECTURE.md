@@ -1716,8 +1716,36 @@ own token rule and `cortex top` had another: anything under a thousand
 rounded up to `1.0k` in the table and was printed exactly in the tree. So 999
 tokens read as `1.0k` in one view and `999` in the other — two views of one
 process, and no way for the operator to tell which one was the truth. The
-rule now lives in one place (`formatTokens`, in `src/cli/process_view.ts`),
-next to the capability wording, so both views say `999`.
+rule now lives in one place (`formatTokens`, in `src/token_usage.ts`), so both
+views say `999`. (It used to sit in `src/cli/process_view.ts`, next to the
+capability wording — until the dashboard needed the same rule, and a rule
+the dashboard cannot import is a rule the dashboard will re-implement.)
+
+**And a token count says which part of it was cached.** The kernel records
+three token counters (STATE.md §2.4): the input, the output, and the part of
+the input the provider served out of its cache. The cached part is **inside**
+the input — the provider reports the whole prompt and says how much of it it
+did not have to read again — so the total a process spent is
+`tokensIn + tokensOut`, with the cached tokens counted **once**. And they are
+worth saying out loud, because they are billed at the cache price rather than
+the fresh one: a process that spent 1,000 tokens for a fifth of the usual
+money was reading from the cache, and no view said so. The operator saw the
+tokens and the dollars and could not make them add up.
+
+So every view that shows tokens now says which part of them was cached —
+`cortex ps` and `cortex top` print `1.2k (300 cached)`, `cortex limit` prints
+`spent 1200 (300 cached)`, the dashboard prints the same cell plus a column of
+its own — and the arithmetic and the wording live in one module
+(`src/token_usage.ts`): the total, the cached part, the fresh part, and the
+cell that puts them together. Each view supplies only **how it prints a
+number** — the CLI shortens (`1.2k`), the dashboard spells it out (`1,234`) —
+because the shape of the cell has to be the same in both, and the number
+style is the view's to choose.
+
+The same module is what the kernel charges the token ceiling with: the
+ceiling is charged for the input and the output, with the cached part inside
+the input and counted once. (Whether a cached token *should* be charged in
+full is still open — BACKLOG #092.)
 
 **And a unit has exactly one conversion point.** `budgetsSpent.usdSpent` is in
 **microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4). Three

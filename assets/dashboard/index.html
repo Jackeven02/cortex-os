@@ -143,7 +143,7 @@
     .tree-meta { margin-left: auto; display: flex; align-items: center; gap: 10px; color: #77808e; font-size: 9px; }
     .tree-inside { color: #5b6577; font-size: 9px; }
     .budgets-panel { margin-bottom: 14px; }
-    .budget-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 14px 16px 10px; }
+    .budget-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; padding: 14px 16px 10px; }
     .budget-stat { padding: 10px 12px; border: 1px solid #eef0f3; border-radius: 8px; background: var(--surface-soft); }
     .budget-stat .label { color: #8a93a1; font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }
     .budget-stat .value { margin-top: 4px; font-size: 17px; font-weight: 640; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
@@ -244,10 +244,11 @@
           <div class="budget-summary">
             <div class="budget-stat"><div class="label">Token 总量</div><div class="value" id="budgetTokens">—</div></div>
             <div class="budget-stat"><div class="label">输入 / 输出</div><div class="value" id="budgetSplit">—</div></div>
+            <div class="budget-stat"><div class="label">缓存命中</div><div class="value" id="budgetCached">—</div></div>
             <div class="budget-stat"><div class="label">USD 成本</div><div class="value" id="budgetUsd">—</div></div>
             <div class="budget-stat"><div class="label">墙钟 · Syscalls</div><div class="value" id="budgetTime">—</div></div>
           </div>
-          <div class="table-scroll"><table><thead><tr><th>角色</th><th>进程</th><th>Token in</th><th>Token out</th><th>USD</th><th>墙钟</th><th>Syscalls</th><th>Token 占比</th></tr></thead><tbody id="budgetRows"><tr><td colspan="8" class="empty">正在读取进程…</td></tr></tbody></table></div>
+          <div class="table-scroll"><table><thead><tr><th>角色</th><th>进程</th><th>Token in</th><th>Token out</th><th>缓存</th><th>USD</th><th>墙钟</th><th>Syscalls</th><th>Token 占比</th></tr></thead><tbody id="budgetRows"><tr><td colspan="9" class="empty">正在读取进程…</td></tr></tbody></table></div>
         </section>
 
         <section class="panel events-panel" id="events">
@@ -282,6 +283,14 @@
     }
 
     const processTokens = (process) => Number(process.budgetsSpent ? (process.budgetsSpent.tokensIn ?? 0) + (process.budgetsSpent.tokensOut ?? 0) : process.tokens ?? 0) || 0;
+    // What the process spent, in tokens — and which part of it the provider
+    // served out of its cache. The cached tokens are a *part* of the input,
+    // not extra ones, and they are billed at the cache price: a process that
+    // spent 1,000 tokens for a fifth of the usual money was reading from the
+    // cache, and the window used to say nothing about it. The label comes
+    // from the server, which uses the same rule `cortex ps` prints — one
+    // rule, three views.
+    const processTokenLabel = (process) => String(process.tokenLabel ?? processTokens(process).toLocaleString());
     // What this agent was allowed to do. The label comes from the server,
     // which uses the same rule `cortex ps` prints — one rule, two views.
     const processCaps = (process) => String(process.capsLabel ?? '—');
@@ -345,7 +354,7 @@
         // ended, then the budget, then what it is waiting on.
         const detail = [outcome, budget, inside, pending].filter(Boolean).join(' — ');
         const insideCell = (insideKnown || pendingKnown || outcomeKnown || budgetKnown) ? `<td class="inside-cell" title="${esc(detail)}">${esc(detail || '—')}</td>` : '';
-        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td>${insideCell}<td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td>${opsCell}</tr>`;
+        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td>${insideCell}<td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${esc(processTokenLabel(process))}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td>${opsCell}</tr>`;
       }).join('') : `<tr><td colspan="${insideKnown || pendingKnown || outcomeKnown || budgetKnown ? 9 : 8}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
       $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
       $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
@@ -380,7 +389,14 @@
         const audit = (event.audit && typeof event.audit === 'object') ? event.audit : null;
         const auditText = audit ? Object.entries(audit).slice(0, 3).map(([k, v]) => `${k}=${String(v).slice(0, 12)}`).join(' · ') : '';
         const auditTitle = audit ? JSON.stringify(audit) : '';
-        const tokenSummary = event.tokensIn === undefined && event.tokensOut === undefined ? (event.model ?? '—') : `${Number(event.tokensIn ?? 0).toLocaleString()} in / ${Number(event.tokensOut ?? 0).toLocaleString()} out${event.model ? ` · ${event.model}` : ''}`;
+        // The cached tokens are a **part** of the input above, not extra ones:
+        // the provider reports the whole prompt and says how much of it came
+        // out of its cache. They are billed at the cache price, so a call that
+        // read 1,000 tokens out of the cache is not a call that cost 1,000
+        // tokens — and the row has to say so.
+        const cachedTokens = Number(event.tokensCached ?? 0);
+        const cachedSummary = cachedTokens > 0 ? ` (${cachedTokens.toLocaleString()} cached)` : '';
+        const tokenSummary = event.tokensIn === undefined && event.tokensOut === undefined ? (event.model ?? '—') : `${Number(event.tokensIn ?? 0).toLocaleString()} in / ${Number(event.tokensOut ?? 0).toLocaleString()} out${cachedSummary}${event.model ? ` · ${event.model}` : ''}`;
         const errorSummary = event.errorMessage ? `${event.error ?? '错误'}: ${event.errorMessage}` : (event.error ?? '—');
         // The cost, as a string, computed **here** — not as a template literal
         // dropped into an HTML attribute. A nested template inside `title="…"`
@@ -415,7 +431,6 @@
       roots.sort(byPid);
       kids.forEach((list) => list.sort(byPid));
       const renderNode = (process, depth) => {
-        const tokens = processTokens(process);
         const children = (kids.get(process.pid) ?? []).map((child) => renderNode(child, depth + 1)).join('');
         const inside = processInside(process);
         const pending = processPending(process);
@@ -423,7 +438,7 @@
         const budget = processBudget(process);
         const detail = [outcome, budget, inside, pending].filter(Boolean).join(' — ');
         const insideSpan = detail ? `<span class="tree-inside">${esc(detail)}</span>` : '';
-        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${tokens.toLocaleString()} tok</span>${insideSpan}</span></div>${children}`;
+        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${esc(processTokenLabel(process))} tok</span>${insideSpan}</span></div>${children}`;
       };
       const visible = roots.filter(keep);
       $('processTree').innerHTML = visible.length ? visible.map((process) => renderNode(process, 0)).join('') : `<div class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，监督树会显示在这里。'}</div>`;
@@ -440,25 +455,32 @@
         const spent = process.budgetsSpent ?? {};
         acc.tokensIn += spent.tokensIn ?? 0;
         acc.tokensOut += spent.tokensOut ?? 0;
+        acc.tokensCached += spent.tokensCached ?? 0;
         acc.usd += processUsd(process);
         acc.wall += spent.wallTimeMs ?? 0;
         acc.syscalls += spent.syscallCount ?? 0;
         return acc;
-      }, { tokensIn: 0, tokensOut: 0, usd: 0, wall: 0, syscalls: 0 });
+      }, { tokensIn: 0, tokensOut: 0, tokensCached: 0, usd: 0, wall: 0, syscalls: 0 });
       const fmtWall = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`);
       $('budgetTokens').textContent = (totals.tokensIn + totals.tokensOut).toLocaleString();
       $('budgetSplit').textContent = `${totals.tokensIn.toLocaleString()} / ${totals.tokensOut.toLocaleString()}`;
+      // The cached tokens are a **part** of the input above, not extra ones —
+      // they were read out of the provider's cache, and they are billed at the
+      // cache price. They are counted here so the operator can see why the
+      // money and the tokens do not add up.
+      $('budgetCached').textContent = totals.tokensCached.toLocaleString();
       $('budgetUsd').textContent = fmtUsd(totals.usd);
       $('budgetTime').textContent = `${fmtWall(totals.wall)} · ${totals.syscalls}`;
       const byRole = new Map();
       for (const process of processData) {
         const role = process.role ?? '—';
-        if (!byRole.has(role)) byRole.set(role, { count: 0, tokensIn: 0, tokensOut: 0, usd: 0, wall: 0, syscalls: 0 });
+        if (!byRole.has(role)) byRole.set(role, { count: 0, tokensIn: 0, tokensOut: 0, tokensCached: 0, usd: 0, wall: 0, syscalls: 0 });
         const row = byRole.get(role);
         const spent = process.budgetsSpent ?? {};
         row.count += 1;
         row.tokensIn += spent.tokensIn ?? 0;
         row.tokensOut += spent.tokensOut ?? 0;
+        row.tokensCached += spent.tokensCached ?? 0;
         row.usd += processUsd(process);
         row.wall += spent.wallTimeMs ?? 0;
         row.syscalls += spent.syscallCount ?? 0;
@@ -469,8 +491,8 @@
         const tokens = r.tokensIn + r.tokensOut;
         const share = Math.round((tokens / grand) * 100);
         const shareCell = tokens > 0 ? `<span class="budget-share" style="width:${Math.max(2, Math.min(100, share))}px"></span> ${share}%` : '—';
-        return `<tr><td class="role-cell">${esc(role)}</td><td>${r.count}</td><td>${r.tokensIn.toLocaleString()}</td><td>${r.tokensOut.toLocaleString()}</td><td>${fmtUsd(r.usd)}</td><td>${fmtWall(r.wall)}</td><td>${r.syscalls}</td><td>${shareCell}</td></tr>`;
-      }).join('') : '<tr><td colspan="8" class="empty">暂无进程数据。</td></tr>';
+        return `<tr><td class="role-cell">${esc(role)}</td><td>${r.count}</td><td>${r.tokensIn.toLocaleString()}</td><td>${r.tokensOut.toLocaleString()}</td><td>${r.tokensCached.toLocaleString()}</td><td>${fmtUsd(r.usd)}</td><td>${fmtWall(r.wall)}</td><td>${r.syscalls}</td><td>${shareCell}</td></tr>`;
+      }).join('') : '<tr><td colspan="9" class="empty">暂无进程数据。</td></tr>';
     }
 
     function setProcessView(view) {

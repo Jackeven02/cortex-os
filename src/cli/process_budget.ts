@@ -38,6 +38,7 @@
 
 import type { BudgetCounters, BudgetLimits } from '../kernel/types.js';
 import { formatDollars, usdToDollars } from '../money.js';
+import { formatTokenUsage, tokenUsage } from '../token_usage.js';
 
 /**
  * What the CLI knows about a process's budget.
@@ -128,15 +129,20 @@ export function describeBudget(remaining: BudgetLimits): string {
  * number that is not a limit is never printed as one.
  */
 export function formatBudgetLines(facts: BudgetFacts): readonly string[] {
-  const spentTokens = facts.spent.tokensIn + facts.spent.tokensOut;
-  const tokenCeiling = budgetCeiling(spentTokens, facts.remaining.tokens);
+  // The token line counts exactly — no `k`, no rounding — because it is a
+  // budget: the operator has to be able to add the numbers up. And it says
+  // which part of the spend the provider served out of its cache, because
+  // those tokens were billed at the cache price while the ceiling was charged
+  // the full count for them.
+  const spentTokens = formatTokenUsage(facts.spent, (n) => String(n));
+  const tokenCeiling = budgetCeiling(tokenUsage(facts.spent).total, facts.remaining.tokens);
   const usdCeiling = budgetCeiling(facts.spent.usdSpent, facts.remaining.usd);
   const wallCeiling = budgetCeiling(facts.spent.wallTimeMs, facts.remaining.wallTimeMs);
 
   return [
     budgetLine(
       'tokens:    ',
-      String(spentTokens),
+      spentTokens,
       tokenCeiling === null ? null : String(tokenCeiling),
       String(facts.remaining.tokens),
     ),

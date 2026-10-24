@@ -61,6 +61,7 @@ Every piece of state an agent has falls into one of these:
 ### 2.4 Resource budgets
 
 - Tokens spent (input / output / cached).
+- **The cached part is inside the input, and it is counted once.** The provider reports the whole prompt (`prompt_tokens`) and says how much of it it did not have to read again (`cached_tokens`), so `tokensCached` is a **subset of** `tokensIn` — not a third column of spend. The total a process spent is `tokensIn + tokensOut`, and a total that added the cached part on top would drain the token ceiling twice as fast as the work did. The cached tokens are worth naming anyway, because they are billed at the cache price rather than the fresh one — so every view that shows tokens says which part of them was cached, and the arithmetic and the wording live in one module (`src/token_usage.ts`).
 - Money spent (microdollars per provider).
 - Wall-clock time alive.
 - Syscall count.

@@ -56,6 +56,7 @@ import type { ProcessMeta } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
 import { processOutcome } from '../process_outcome.js';
 import { dollarsToMicrodollars, formatDollars } from '../../money.js';
+import { formatTokenUsage } from '../../token_usage.js';
 import type { AgentSpec, MemoryRegionPolicy, ProcessState, RestartPolicy } from '../../kernel/types.js';
 import { PID_INIT } from '../../kernel/process_table.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
@@ -500,7 +501,9 @@ export async function cmdWrap(args: string[]): Promise<number> {
           : command.join(' '),
       );
     }
-    console.log(`tokens: ${spent.tokensIn + spent.tokensOut} (in ${spent.tokensIn}, out ${spent.tokensOut})`);
+    console.log(
+      `tokens: ${formatTokenUsage(spent, (n) => String(n))} — in ${spent.tokensIn}, out ${spent.tokensOut}`,
+    );
     // Only worth a line when the tap actually saw something. A wrapped command
     // that made no LLM calls should not get a misleading "0 calls" summary.
     if (tapCalls > 0) {

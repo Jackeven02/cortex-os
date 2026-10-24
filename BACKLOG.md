@@ -864,6 +864,68 @@ The user-facing surface. Should feel like a real OS shell.
   parked process); ARCHITECTURE §4.2 and §4.8 (the table, the scheduler's
   heartbeat, the ps table's age column and note order); CHANGELOG.
 
+- [x] **#091** The cached tokens were in the kernel and in no view → **fixed.**
+  The kernel has recorded three token counters since the beginning (STATE.md
+  §2.4): the input, the output, and the part of the input the provider served
+  out of its cache. The cached part is **inside** the input — the provider
+  reports the whole prompt and says how much of it it did not have to read
+  again — and it is billed at the cache price rather than the fresh one. So a
+  process could spend 1,000 tokens for a fraction of the usual money, and
+  **nothing said so**: `cortex ps` and `cortex top` printed
+  `tokensIn + tokensOut`, `cortex limit` printed the same total, the
+  dashboard's budget panel had a column of totals and no column of cache, and
+  its per-call trace said "1,234 in / 56 out" for a call that was served
+  entirely out of the cache. The operator had the tokens and the dollars and no
+  way to make them add up.
+
+  **Every view that shows tokens now says which part of them was cached** —
+  `1.2k (300 cached)` in the table and the tree, `spent 1200 (300 cached)` in
+  the budget line, and the dashboard gets the same cell plus a **缓存** column
+  and a **缓存命中** tile of its own. The cached part is a *part* of the total,
+  so it never adds to it: the total is `tokensIn + tokensOut`, counted once
+  (`src/token_usage.ts`, which is also what the kernel charges the ceiling
+  with).
+
+  **The rule and the wording are one module, not one per view.** The total, the
+  cached part, the fresh part, and the cell that puts them together live in
+  `src/token_usage.ts`; each view supplies only **how it prints a number** —
+  the CLI shortens (`1.2k`), the dashboard spells it out (`1,234`) — because
+  the shape of the cell has to be the same in both. The dashboard's
+  per-process cell is computed on the server (`tokenLabel`), exactly like the
+  capability, ending and budget labels, so the page prints what it is given.
+
+  **10 new smoke checks** (765 → 775), all reverse-verified: with the table's
+  cell back to the bare total the `cortex ps` check fails; with the tree's cell
+  back to the bare total the `cortex top` check fails; with the budget line
+  back to the bare total the `cortex limit` check fails; with the server's
+  label out of the row the dashboard check fails; with the page's cached column
+  removed the page check fails; and with the total counting the cached part
+  twice, four of the rule checks fail.
+
+  Docs: PROCESS §8.3 (the three parts, and what is still open about the
+  ceiling), STATE §2.4 (the cached part is inside the input), ARCHITECTURE (the
+  module, and the views); CHANGELOG.
+
+- [ ] **#092** A cached token is charged in full against the token ceiling →
+  **open, and it wants a decision.** The token ceiling is charged for
+  `tokensIn + tokensOut`, and the cached tokens are inside the input — so a
+  process that re-reads a cached prompt a thousand times drains its token
+  ceiling at full price while its dollar bill barely moves (the cache price is
+  a fraction of the fresh one). The two ceilings then disagree about the same
+  work: the token ceiling says "out of budget", the money says "you have
+  barely spent anything". **The options are a policy question, so they need a
+  decision before code:** (a) keep it — the token ceiling bounds *work* and the
+  money ceiling bounds *cost*, and an agent that reads the same prompt a
+  thousand times really did do a thousand reads; (b) charge the cached part at
+  the cache price, in tokens, the way the money does — the ceiling then means
+  "tokens at the price you actually paid", which needs the provider's price
+  table in the kernel's budget path; (c) do not charge cached tokens against
+  the ceiling at all — the ceiling then bounds only the fresh reading, and a
+  cache-only agent can run forever inside a token budget. **What this round
+  did is make it visible**: every view now says how much of a process's spend
+  was cached, so the operator can see *why* a token ceiling drained. The
+  charging rule itself is unchanged.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

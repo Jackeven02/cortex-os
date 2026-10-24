@@ -50,10 +50,10 @@ import { defaultKernelDir } from '../index.js';
 import {
   readProcessView,
   describePendingSignals,
-  formatTokens,
   type ProcessRow,
   type ProcessView,
 } from '../process_view.js';
+import { cachedSuffix, formatTokenUsage, formatTokens } from '../../token_usage.js';
 import {
   isStalled,
   readOpenCalls,
@@ -81,6 +81,21 @@ function longest(values: readonly string[]): number {
 }
 
 /**
+ * The widest a token cell may be.
+ *
+ * Derived from the rule instead of guessed at: a cell is the total a process
+ * spent and — when the provider served part of the input out of its cache —
+ * the cached count in brackets, and both are printed by one formatter. So the
+ * widest cell is the one that formatter can produce, and it is produced here,
+ * once, by asking the formatter itself.
+ */
+const TOKENS_MAX = formatTokenUsage({
+  tokensIn: 9_999_999_999,
+  tokensOut: 0,
+  tokensCached: 9_999_999_999,
+}).length;
+
+/**
  * The columns of the tree, and the widest each one may be.
  *
  * Every maximum is derived from the value domain it holds, except the **role**
@@ -93,7 +108,7 @@ const TOP_COLUMNS: readonly ColumnSpec[] = [
   { header: 'PID', max: 8, gap: 2 },
   { header: 'ROLE', max: 24, gap: 2 },
   { header: 'STATE', max: longest(PROCESS_STATES), gap: 2 },
-  { header: 'TOKENS', max: longest(['0', '999', '999.9k', '999.9M']), gap: 2 },
+  { header: 'TOKENS', max: TOKENS_MAX, gap: 2 },
   // Money is printed at the resolution the kernel counts it — six decimals
   // (`$0.000027`). Nine characters is not enough for that: the widest a
   // dollar amount gets here is "$1234.567890", and a cost that is cut with
@@ -177,6 +192,7 @@ function renderTop(
     .map(([state, n]) => `${n} ${state}`)
     .join(' · ');
   const tokens = all.reduce((n, m) => n + m.budgetsSpent.tokensIn + m.budgetsSpent.tokensOut, 0);
+  const cached = all.reduce((n, m) => n + m.budgetsSpent.tokensCached, 0);
   const usd = usdToDollars(all.reduce((n, m) => n + m.budgetsSpent.usdSpent, 0));
 
   const stalled = [...inside.entries()].filter(([, call]) =>
@@ -188,7 +204,9 @@ function renderTop(
       `${stalled.length > 0 ? ` · ${stalled.length} stuck` : ''}` +
       `${view.live ? ' · live kernel' : ''}`,
   );
-  console.log(`${formatTokens(tokens)} tokens · ${formatDollars(usd)} spent · home ${dir}`);
+  console.log(
+    `${formatTokens(tokens)} tokens${cachedSuffix(cached, formatTokens)} · ${formatDollars(usd)} spent · home ${dir}`,
+  );
   console.log('');
 
   if (all.length === 1) {
@@ -373,7 +391,7 @@ function cellsFor(
     String(m.pid),
     m.role,
     m.state,
-    formatTokens(m.budgetsSpent.tokensIn + m.budgetsSpent.tokensOut),
+    formatTokenUsage(m.budgetsSpent),
     formatDollars(usdToDollars(m.budgetsSpent.usdSpent)),
     note,
   ];
@@ -401,7 +419,8 @@ its own process table is merged in, so running agents appear in the tree too.
   STATE     running, ready, blocked, stopped, suspended, zombie
   WAITING   a channel (recv), a timer (sleep), a child (wait),
             a model call (llm_call), a tool call (tool_call)
-  SPEND     tokens in+out, then USD
+  SPEND     tokens in+out, then USD. A token cell also says how much of it
+            the provider served out of its cache: '1.2k (300 cached)'.
   NOTE      also says what is waiting for the process: a signal the kernel has
             queued for it ('SIGTERM queued') is not delivered until the
             process runs again

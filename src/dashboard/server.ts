@@ -13,6 +13,7 @@ import { formatCaps, describePendingSignals, readProcessView } from '../cli/proc
 import { describeOutcome } from '../cli/process_outcome.js';
 import { describeBudget } from '../cli/process_budget.js';
 import { usdToDollars } from '../money.js';
+import { formatTokenUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
 import {
@@ -216,12 +217,12 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
 
   if (options.processes !== undefined) {
     return [...options.processes()].map((row) =>
-      withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withInside(withPendingLabel(row)))))),
+      withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withTokenLabel(withInside(withPendingLabel(row))))))),
     );
   }
   const view = await readProcessView(dir, options.kernel);
   return [...view.rows].map((row) =>
-    withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withInside(withPendingLabel(row)))))),
+    withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withTokenLabel(withInside(withPendingLabel(row))))))),
   );
 }
 
@@ -241,6 +242,44 @@ function withUsdDollars<T extends { budgetsSpent?: { usdSpent?: number } }>(
   row: T,
 ): T & { usdSpentDollars: number } {
   return { ...row, usdSpentDollars: usdToDollars(row.budgetsSpent?.usdSpent ?? 0) };
+}
+
+/**
+ * Put the token count on the row, in the same words `cortex ps` and `cortex top`
+ * print.
+ *
+ * A token count has three parts, and the cached one is a *part* of the input:
+ * the provider reports the whole prompt and says how much of it came out of
+ * its cache. The page used to print the total alone, so a process that spent
+ * 1,000 tokens for a fifth of the usual money looked like any other — and the
+ * operator could not make the tokens and the dollars add up.
+ *
+ * The label travels with the row so the page never re-implements the rule: one
+ * function, three views. The page's own number style is the only thing the
+ * server does not decide here — it spells the numbers out (`1,234`) where the
+ * CLI shortens them (`1.2k`), and that difference is the view's to make.
+ */
+function withTokenLabel<
+  T extends {
+    budgetsSpent?: {
+      tokensIn?: number;
+      tokensOut?: number;
+      tokensCached?: number;
+    };
+  },
+>(row: T): T & { tokenLabel: string } {
+  const spent = row.budgetsSpent;
+  return {
+    ...row,
+    tokenLabel: formatTokenUsage(
+      {
+        tokensIn: spent?.tokensIn ?? 0,
+        tokensOut: spent?.tokensOut ?? 0,
+        tokensCached: spent?.tokensCached ?? 0,
+      },
+      (n) => n.toLocaleString(),
+    ),
+  };
 }
 
 /**

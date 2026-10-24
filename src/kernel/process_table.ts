@@ -71,6 +71,7 @@ import {
 } from './types.js';
 import { CortexError, isCortexError, trap } from './errors.js';
 import { type Recorder, type SyscallRecordInput } from './recorder.js';
+import { tokenUsage } from '../token_usage.js';
 
 // =============================================================================
 // §1. Reserved PIDs
@@ -1134,7 +1135,12 @@ export class ProcessTable {
       syscallCount: spent.syscallCount + syscallCount,
     };
 
-    const totalTokens = tokensIn + tokensOut;
+    // The token ceiling is charged for the **input and the output** — and the
+    // cached part of the input is inside the input, so it is charged once, not
+    // twice (`src/token_usage.ts` is where that is written down). A cached
+    // token is a token the provider did not have to read again; it is cheaper
+    // in money and the same in work.
+    const totalTokens = tokenUsage({ tokensIn, tokensOut, tokensCached: 0 }).total;
     entry.budgetsRemaining = {
       tokens: remaining.tokens < 0 ? -1 : Math.max(0, remaining.tokens - totalTokens),
       usd: remaining.usd < 0 ? -1 : Math.max(0, remaining.usd - usdSpent),

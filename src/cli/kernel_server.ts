@@ -76,6 +76,7 @@ import {
 } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
 import { ALL_SIGNALS } from '../kernel/signals.js';
+import { tokenUsage } from '../token_usage.js';
 import type { Kernel } from '../kernel/boot.js';
 import { type KernelEndpoint } from './kernel_endpoint.js';
 import {
@@ -680,7 +681,11 @@ async function dispatch(
       // read at this very moment, which is what makes it exact. (A client
       // that read the spend and then converted it would be racing the very
       // spending it is trying to cap.)
-      const spentTokens = entry.budgetsSpent.tokensIn + entry.budgetsSpent.tokensOut;
+      //
+      // The tokens spent are the ones the token ceiling is charged for:
+      // `tokensIn + tokensOut`, with the cached part inside the input and
+      // counted once (see `src/token_usage.ts`).
+      const spentTokens = tokenUsage(entry.budgetsSpent).total;
       const remaining = {
         tokens:
           tokens === undefined

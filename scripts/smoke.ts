@@ -319,6 +319,7 @@ import {
   type ComparedCall,
 } from '../src/cli/replay_core.js';
 import { processOutcome, formatOutcomeCode, describeOutcome } from '../src/cli/process_outcome.js';
+import { formatTokenUsage, formatTokens, tokenUsage } from '../src/token_usage.js';
 import type { CortexContext, LLMResponse, Timestamp } from '../src/kernel/types.js';
 import { OutputCapture } from '../src/cli/output_capture.js';
 import { bootCliKernel } from '../src/cli/index.js';
@@ -17344,6 +17345,254 @@ async function runAttachPushChecks(): Promise<void> {
   }
 }
 
+/**
+ * The cached tokens reach the operator.
+ *
+ * The kernel records three token counters (docs/STATE.md §2.4): the tokens a
+ * model read, the tokens it wrote, and the part of the input the provider
+ * served out of its cache. The cached part is **inside** the input — the
+ * provider reports the whole prompt and says how much of it it did not have
+ * to read again — and it is billed at the cache price.
+ *
+ * So an operator could see 1,000 tokens and a dollar bill that did not match
+ * them, with nothing in any view to explain it: `cortex ps` and `cortex top`
+ * printed the total alone, `cortex limit` printed the total alone, and the
+ * dashboard had a column of totals and no column of cache.
+ *
+ * This group runs a real kernel with a real driver, makes a real cache hit,
+ * and checks that the cached part reaches every view that shows tokens.
+ */
+async function runTokenUsageChecks(): Promise<void> {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-tokens-'));
+  const kernels: Kernel[] = [];
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevLog = console.log;
+  const prevErr = console.error;
+
+  // --- §1 the rule, on its own -------------------------------------------
+
+  check('a token count is the input and the output, with the cached part inside the input', () => {
+    const usage = tokenUsage({ tokensIn: 1000, tokensOut: 200, tokensCached: 400 });
+    assert(usage.total === 1200, `the total is the input and the output, got ${usage.total}`);
+    assert(usage.cached === 400, `the cached part is counted, got ${usage.cached}`);
+    assert(usage.fresh === 600, `the fresh part is the input minus the cached, got ${usage.fresh}`);
+  });
+
+  check('the cached part is counted once, not twice', () => {
+    // A total that added the cached part on top of the input would drain the
+    // token ceiling twice as fast as the work actually did.
+    const spent = { tokensIn: 1000, tokensOut: 200, tokensCached: 400 };
+    const total = tokenUsage(spent).total;
+    assert(total === 1200, `the cached tokens are inside the input, got ${total}`);
+    assert(
+      total !== spent.tokensIn + spent.tokensOut + spent.tokensCached,
+      'the cached part is not added on top of the input',
+    );
+  });
+
+  check('a token cell says which part was cached — and only when there is one', () => {
+    const withCache = formatTokenUsage({ tokensIn: 1000, tokensOut: 200, tokensCached: 400 });
+    const withoutCache = formatTokenUsage({ tokensIn: 1000, tokensOut: 200, tokensCached: 0 });
+    assert(withCache === '1.2k (400 cached)', `the cell names the cached part, got ${withCache}`);
+    assert(withoutCache === '1.2k', `a process with no cached tokens says nothing about it, got ${withoutCache}`);
+  });
+
+  try {
+    // --- §2 a real kernel, a real driver, a real cache hit ----------------
+
+    const kernel = await bootKernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir: tmp,
+      autoStart: true,
+      loadDrivers: (reg) => {
+        reg.registerMemory(inmemMemory());
+        // A driver that serves a repeated prompt out of its cache — the way
+        // a real provider does, and the only way the kernel ever learns that
+        // a prompt was cached at all.
+        reg.registerLLM(mockLLM({ cacheRepeated: true }));
+      },
+      agentLoader: async () => async (ctx) => {
+        // The same prompt, twice: the second call is served out of the cache.
+        const messages = [{ role: 'user' as const, content: CACHED_PROMPT }];
+        await ctx.llm_call({ messages });
+        await ctx.llm_call({ messages });
+        // Stay alive. A process that has exited leaves no record behind in
+        // this harness, and the views have to be able to show a live one.
+        await ctx.recv();
+      },
+    });
+    kernels.push(kernel);
+
+    const server = await startKernelServer(kernel, { log: () => {} });
+    servers.push(server);
+    writeEndpoint(tmp, server.endpoint);
+    process.env['CORTEX_HOME'] = tmp;
+
+    const pid = await kernel.spawn({ role: 'cached', agent: { module: 'test:cached' } });
+
+    // Wait for the second call to land: the cached count is only there once
+    // the driver has answered twice.
+    let inTokens = 0;
+    let outTokens = 0;
+    let cached = 0;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const entry = kernel.table.get(pid);
+      if (entry !== undefined && entry.budgetsSpent.tokensCached > 0) {
+        inTokens = entry.budgetsSpent.tokensIn;
+        outTokens = entry.budgetsSpent.tokensOut;
+        cached = entry.budgetsSpent.tokensCached;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+
+    const capture = async (
+      run: () => Promise<number>,
+    ): Promise<{ code: number; out: string; err: string }> => {
+      let out = '';
+      let err = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      console.error = (...parts: unknown[]): void => {
+        err += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      try {
+        const code = await run();
+        return { code, out, err };
+      } finally {
+        process.stdout.write = prevWrite;
+        console.error = prevErr;
+      }
+    };
+
+    await checkAsync('the kernel records the cached tokens the driver reported', async () => {
+      assert(cached > 0, 'the driver served the second prompt out of its cache');
+      assert(
+        inTokens >= cached,
+        `the cached part is inside the input, got in=${inTokens} cached=${cached}`,
+      );
+    });
+
+    await checkAsync('the total a process spent counts the cached tokens once', async () => {
+      const usage = tokenUsage({ tokensIn: inTokens, tokensOut: outTokens, tokensCached: cached });
+      assert(
+        usage.total === inTokens + outTokens,
+        `the total is the input and the output, got ${usage.total}`,
+      );
+      assert(
+        usage.fresh + usage.cached === inTokens,
+        'the input splits into the fresh part and the cached part',
+      );
+    });
+
+    await checkAsync('cortex ps says which part of a process\'s tokens was cached', async () => {
+      const result = await capture(() => cmdPs([]));
+      assert(result.code === 0, `exit 0, got ${result.code}: ${result.err}`);
+      const row = psRow(result.out, unbrand(pid));
+      assert(row !== '', `the process is in the table, got: ${result.out}`);
+      assert(
+        row.includes(`(${formatTokens(cached)} cached)`),
+        `the row names the cached part, got: ${row}`,
+      );
+    });
+
+    await checkAsync('cortex top says which part of a process\'s tokens was cached', async () => {
+      const result = await capture(() => cmdTop([]));
+      assert(result.code === 0, `exit 0, got ${result.code}: ${result.err}`);
+      const row = topRow(result.out, unbrand(pid));
+      assert(row !== '', `the process is in the tree, got: ${result.out}`);
+      assert(
+        row.includes(`(${formatTokens(cached)} cached)`),
+        `the row names the cached part, got: ${row}`,
+      );
+      assert(
+        result.out.includes(`tokens (${formatTokens(cached)} cached)`),
+        `the summary names it too, got: ${result.out}`,
+      );
+    });
+
+    await checkAsync('cortex limit says which part of the spend was cached', async () => {
+      const result = await capture(() => cmdLimit([String(unbrand(pid))]));
+      assert(result.code === 0, `exit 0, got ${result.code}: ${result.err}`);
+      assert(
+        result.out.includes(`(${cached} cached)`),
+        `the tokens line names the cached part, got: ${result.out}`,
+      );
+    });
+
+    const probe = await probeKernel(tmp);
+    assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+    const client = probe.kind === 'live' ? probe.client : undefined;
+    const dash = await startDashboard({ dir: tmp, port: 0, kernel: client! });
+    try {
+      await checkAsync('the dashboard says which part of a process\'s tokens was cached', async () => {
+        const res = await fetch(`${dash.url}/api/processes`);
+        assert(res.status === 200, `status ${res.status}`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const row = rows.find((r) => r['pid'] === unbrand(pid));
+        assert(
+          row !== undefined,
+          `the process is in the list, got: ${JSON.stringify(rows.map((r) => r['pid']))}`,
+        );
+        const label = String(row!['tokenLabel'] ?? '');
+        assert(
+          label.includes(`(${cached.toLocaleString()} cached)`),
+          `the row names the cached part, got: ${label}`,
+        );
+      });
+
+      await checkAsync('the dashboard page prints the token label it is given', async () => {
+        const html = await (await fetch(`${dash.url}/`)).text();
+        assert(html.includes('tokenLabel'), 'the page prints the label it is given');
+        assert(html.includes('budgetCached'), 'the budget panel has a place for the cached total');
+        assert(html.includes('<th>缓存</th>'), 'the budget table has a column for the cached part');
+      });
+    } finally {
+      await dash.close();
+    }
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A prompt long enough that the cached part is worth reading.
+ *
+ * A cache hit of two tokens is not something an operator would ever notice,
+ * and a view that only showed the number would not be worth reading either.
+ */
+const CACHED_PROMPT =
+  'The same prompt, sent twice, so that the second one is served out of the cache. ' +
+  'It is deliberately long: a cache hit of two tokens is not something an operator would ' +
+  'ever notice, and a view that only showed the number would not be worth reading either.';
+
 
 /**
  * A promise that must finish before a deadline.
@@ -19787,6 +20036,7 @@ await runEventStreamChecks();
 await runSuperviseChecks();
 await runCapabilityInheritanceChecks();
 await runTopChecks();
+await runTokenUsageChecks();
 await runKernelGoneChecks();
 await runDaemonChecks();
 await runKernelHardeningChecks();

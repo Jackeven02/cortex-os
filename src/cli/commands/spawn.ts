@@ -31,6 +31,7 @@ import { KernelCommandError, probeKernel } from '../kernel_client.js';
 import type { AgentSpec, Capability, ProcessState, MemoryRegionPolicy } from '../../kernel/types.js';
 import { parseCapabilities } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
+import { formatTokenUsage } from '../../token_usage.js';
 
 /** Default time to let an agent run before giving up (ms). */
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -308,7 +309,9 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       wallTimeMs: elapsed, syscallCount: 0,
     };
     const remaining = entry?.budgetsRemaining ?? persistedMeta?.budgetsRemaining ?? { tokens: -1, usd: -1, wallTimeMs: -1 };
-    console.log(`tokens: ${spent.tokensIn + spent.tokensOut} (in ${spent.tokensIn}, out ${spent.tokensOut})`);
+    console.log(
+      `tokens: ${formatTokenUsage(spent, (n) => String(n))} — in ${spent.tokensIn}, out ${spent.tokensOut}`,
+    );
 
     // Write the record so ps/trace can see this process later.
     //

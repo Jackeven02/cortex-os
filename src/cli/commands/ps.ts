@@ -16,11 +16,11 @@ import { defaultKernelDir } from '../index.js';
 import {
   formatCaps,
   describePendingSignals,
-  formatTokens,
   processAge,
   readProcessView,
   type ProcessRow,
 } from '../process_view.js';
+import { formatTokenUsage } from '../../token_usage.js';
 import { describeWait, readOpenCalls, type OpenCall } from '../open_call.js';
 import { describeOutcome } from '../process_outcome.js';
 import { describeBudget } from '../process_budget.js';
@@ -52,6 +52,21 @@ const CAPS_MAX = (() => {
 })();
 
 /**
+ * The widest a token cell may be.
+ *
+ * Derived from the rule instead of guessed at: a cell is the total a process
+ * spent and — when the provider served part of the input out of its cache —
+ * the cached count in brackets, and both are printed by one formatter. So the
+ * widest cell is the one that formatter can produce, and it is produced here,
+ * once, by asking the formatter itself.
+ */
+const TOKENS_MAX = formatTokenUsage({
+  tokensIn: 9_999_999_999,
+  tokensOut: 0,
+  tokensCached: 9_999_999_999,
+}).length;
+
+/**
  * The columns of the process table, and the widest each one may be.
  *
  * Every maximum is derived from the value domain it holds, except the two
@@ -66,7 +81,7 @@ const PS_COLUMNS: readonly ColumnSpec[] = [
   { header: 'PPID', max: 8, gap: 2 },
   { header: 'ROLE', max: 24, gap: 2 },
   { header: 'STATE', max: longest(PROCESS_STATES), gap: 2 },
-  { header: 'TOKENS', max: longest(['0', '999', '999.9k', '999.9M']), gap: 2 },
+  { header: 'TOKENS', max: TOKENS_MAX, gap: 2 },
   { header: 'CAPS', max: CAPS_MAX, gap: 2 },
   { header: 'AGE', max: 10, gap: 2 },
   { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 0 },
@@ -96,6 +111,11 @@ OPTIONS
 
 COLUMNS
   PID PPID ROLE STATE TOKENS CAPS AGE NOTE
+
+  TOKENS is what the process spent, and says which part of it the provider
+  served out of its cache: '1.2k (300 cached)'. The cached tokens are part of
+  that total, not extra ones — they were read from the cache, and they are
+  billed at the cache price.
 
   NOTE says what the process is doing. For a process that is still alive, it
   says what it is waiting on — a channel, a child, a timer, a model call. It
@@ -211,7 +231,7 @@ COLUMNS
       p.ppid !== null ? String(p.ppid) : '-',
       p.role,
       p.state,
-      formatTokens(p.budgetsSpent.tokensIn + p.budgetsSpent.tokensOut),
+      formatTokenUsage(p.budgetsSpent),
       formatCaps(p.capabilities),
       formatAge(ageMs),
       note(p),

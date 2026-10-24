@@ -75,6 +75,15 @@ export interface ActivityEvent {
   model?: string;
   tokensIn?: number;
   tokensOut?: number;
+  /**
+   * The input tokens the provider served out of its cache.
+   *
+   * A **part** of `tokensIn`, not extra ones: the provider reports the whole
+   * prompt and says how much of it it did not have to read again. They are
+   * billed at the cache price, so a call that reads 1,000 tokens out of the
+   * cache is not a call that cost 1,000 tokens.
+   */
+  tokensCached?: number;
   usd?: number;
   audit?: Record<string, unknown>;
 }
@@ -121,7 +130,15 @@ export function toActivityEvent(record: SyscallRecord, pid: number): ActivityEve
   const llmResult =
     record.syscall === 'llm_call'
       ? (record.result as
-          | { model?: string; usage?: { inputTokens?: number; outputTokens?: number; usd?: number } }
+          | {
+              model?: string;
+              usage?: {
+                inputTokens?: number;
+                outputTokens?: number;
+                cachedTokens?: number;
+                usd?: number;
+              };
+            }
           | undefined)
       : undefined;
   return {
@@ -136,6 +153,7 @@ export function toActivityEvent(record: SyscallRecord, pid: number): ActivityEve
     ...(llmResult?.model !== undefined ? { model: llmResult.model } : {}),
     ...(llmResult?.usage?.inputTokens !== undefined ? { tokensIn: llmResult.usage.inputTokens } : {}),
     ...(llmResult?.usage?.outputTokens !== undefined ? { tokensOut: llmResult.usage.outputTokens } : {}),
+    ...(llmResult?.usage?.cachedTokens !== undefined ? { tokensCached: llmResult.usage.cachedTokens } : {}),
     ...(llmResult?.usage?.usd !== undefined ? { usd: llmResult.usage.usd } : {}),
     ...(audit !== undefined ? { audit } : {}),
   };
