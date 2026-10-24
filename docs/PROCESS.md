@@ -593,6 +593,29 @@ cached prompt a thousand times drains its token ceiling while its dollar bill
 barely moves. That is a policy question, not an implementation detail, and it
 is tracked in BACKLOG.md (#092).
 
+**And a call's spend is a pair, where a process's is a total.** The counters
+above are what a *process* accumulated; one `llm_call` spent its own share of
+them, and the kernel records that share in the frame's result, in the ABI's
+`usage` shape (ABI.md §4.3) — the input it read, the output it wrote, the part
+of the input the provider served out of its cache, and the price.
+
+So the trace says it. A model call is the one syscall that costs something,
+and the trace used to print everything about it *except* that: the syscall, the
+phase, the duration, the reversibility — and not one number of what it spent.
+The dashboard's event table said it; the CLI's deepest view did not. Now the
+trace has a last column, `spend`, that says the price first and the tokens
+after it — `$0.000161 · 1.2k in / 80 out (900 cached)` — and a frame that spent
+nothing says nothing, because an empty cell is honest and `$0.000000` would be
+a claim about a number nobody spent.
+
+What the frame did **not** report is not printed as a zero. A call that says
+how many tokens it read and nothing about how many it wrote says `1.2k in`,
+not `1.2k in / 0 out`: the kernel charges an unreported counter as nothing,
+but what the frame said and what the budget moved by are two different
+questions, and the trace answers the first one. The trace and the dashboard
+read the same frame with the same function (`callUsage`, in
+`src/token_usage.ts`), so the two views cannot disagree about it.
+
 **And the wall clock is a clock.** `wall_time_ms` is a ceiling on how long a
 process may **live**, so it is charged by time passing — not by the process
 doing something. It used to be charged only at an `llm_call`, and only when

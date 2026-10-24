@@ -43,6 +43,7 @@ import { join } from 'node:path';
 import { existingCrecPath, LogTail } from '../kernel/recorder.js';
 import { asProcessId, type SyscallRecord } from '../kernel/types.js';
 import { listProcDirs, readAllMetas } from '../cli/process_store.js';
+import { callUsage } from '../token_usage.js';
 
 /**
  * How many events of each kind the store keeps.
@@ -127,20 +128,10 @@ export function toActivityEvent(record: SyscallRecord, pid: number): ActivityEve
     | { output?: { structured?: { audit?: Record<string, unknown> } } }
     | undefined;
   const audit = record.syscall === 'tool_call' ? toolResult?.output?.structured?.audit : undefined;
-  const llmResult =
-    record.syscall === 'llm_call'
-      ? (record.result as
-          | {
-              model?: string;
-              usage?: {
-                inputTokens?: number;
-                outputTokens?: number;
-                cachedTokens?: number;
-                usd?: number;
-              };
-            }
-          | undefined)
-      : undefined;
+  // What the call spent, read by the same function the CLI's trace reads it
+  // with: the counters are the ABI's (docs/ABI.md §4.3), and a counter the
+  // frame did not report stays absent rather than becoming a zero.
+  const usage = callUsage(record.syscall, record.result);
   return {
     type,
     at: record.timestamp,
@@ -150,11 +141,11 @@ export function toActivityEvent(record: SyscallRecord, pid: number): ActivityEve
     ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
     ...(record.error !== undefined ? { error: record.error.errno } : {}),
     ...(record.error !== undefined ? { errorMessage: safeErrorMessage(record.error.message) } : {}),
-    ...(llmResult?.model !== undefined ? { model: llmResult.model } : {}),
-    ...(llmResult?.usage?.inputTokens !== undefined ? { tokensIn: llmResult.usage.inputTokens } : {}),
-    ...(llmResult?.usage?.outputTokens !== undefined ? { tokensOut: llmResult.usage.outputTokens } : {}),
-    ...(llmResult?.usage?.cachedTokens !== undefined ? { tokensCached: llmResult.usage.cachedTokens } : {}),
-    ...(llmResult?.usage?.usd !== undefined ? { usd: llmResult.usage.usd } : {}),
+    ...(usage?.model !== undefined ? { model: usage.model } : {}),
+    ...(usage?.inputTokens !== undefined ? { tokensIn: usage.inputTokens } : {}),
+    ...(usage?.outputTokens !== undefined ? { tokensOut: usage.outputTokens } : {}),
+    ...(usage?.cachedTokens !== undefined ? { tokensCached: usage.cachedTokens } : {}),
+    ...(usage?.usd !== undefined ? { usd: usage.usd } : {}),
     ...(audit !== undefined ? { audit } : {}),
   };
 }

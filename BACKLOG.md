@@ -926,6 +926,72 @@ The user-facing surface. Should feel like a real OS shell.
   was cached, so the operator can see *why* a token ceiling drained. The
   charging rule itself is unchanged.
 
+- [x] **#093** `cortex trace` did not say what a model call cost → **fixed.**
+  The kernel records the usage of a model call in the frame's result (ABI.md
+  §4.3): the tokens it read and wrote, the part of the input the provider
+  served out of its cache, and the price. The dashboard's event table read it
+  and said so — and `cortex trace`, the CLI's deepest view, printed the
+  syscall, the phase, the duration and the reversibility, and not one number of
+  what the call spent. To learn what an agent's calls had cost, the operator
+  had to leave the trace for a view that sums a *process* rather than names a
+  *call*.
+
+  **The trace has a last column now, `spend`**, and it says the price first
+  and the tokens after it: `$0.000161 · 1.2k in / 80 out (900 cached)`. The
+  order is a rule, not a preference: a cell too wide for its column is cut
+  from the end, the tail is the cached count, and the price is not the thing
+  to lose.
+
+  **A frame says only what it reported.** A counter the frame did not report
+  is not a counter of zero — a call that says how many tokens it read and
+  nothing about how many it wrote says `1.2k in`, not `1.2k in / 0 out`. The
+  kernel charges an unreported counter as nothing, but what the frame said and
+  what the budget moved by are two different questions. A frame that spent
+  nothing says nothing at all: the cell is empty, because `$0.000000` would be
+  a claim about a number nobody spent.
+
+  **One reader, two views.** The trace and the dashboard's event table read a
+  frame with the same function (`callUsage`, in `src/token_usage.ts`), so they
+  cannot disagree about what one call cost. The column's width is derived the
+  way the syscall column's is — from the widest cell the formatter can
+  produce — so a call that spent a lot is never cut short.
+
+  **`cortex trace --help` names the columns the table prints** — including the
+  new one — and a smoke check holds it to them: every column label in the
+  help must be a column the header really has, and every column the header has
+  must be in the help. The list is read out of the header itself, so a new
+  column that nobody documents fails the check.
+
+  **3 new smoke checks** (775 → 778), all reverse-verified: with the spend
+  cell switched off the trace check fails ("the row says what it cost"); with
+  an unreported counter printed as zero it fails again ("an unreported
+  counter is not a zero"); with a frame that names a model and reports no
+  usage dropped, the dashboard check fails ("a frame that names a model says
+  something"); with the `spend` line out of the help, the help check fails
+  ("the help does not describe the spend column"); and with a phantom column
+  in the help, it fails the other way ("the help describes a column the table
+  does not have").
+
+  Docs: PROCESS §8.3 (a call's spend is a pair), STATE §2.4 (the counters the
+  frame reports, and the ones it does not), ARCHITECTURE (the views); CHANGELOG.
+
+- [x] **#094** `cortex top --help` described two columns the table does not
+  have → **fixed.** The help still called them `WAITING` and `SPEND` — the
+  names the columns had before they were renamed to `NOTE` and `TOKENS` — and
+  never mentioned the two the table prints. An operator reading the help went
+  looking for a column that was not there and for one that was.
+
+  The help now names the columns the table prints, and a smoke check holds it
+  to them: every column label in the help must be a column `cortex top`
+  actually has. The check reads the labels out of the help text itself, so a
+  new column that nobody documents fails it.
+
+  **1 new smoke check** (778 → 779), reverse-verified: with a phantom column
+  back in the help, the check fails ("the help describes a column the table
+  does not have: SPEND").
+
+  Docs: CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

@@ -32,6 +32,20 @@
  * The shape of the cell — the total, and the cached part in brackets — is the
  * same in both, because it is decided once, here.
  *
+ * ## Two levels: a process and a call
+ *
+ * A **process** spends one total; a **call** spends a pair. So the two are
+ * printed in two shapes, from two functions, and never mixed:
+ *
+ * - a process: `1.2k (300 cached)` — one number, and the part of it that was
+ *   cached;
+ * - a call: `1.2k in / 80 out (900 cached)` — what it read, what it wrote, and
+ *   the part of the input that came out of the cache.
+ *
+ * The second shape is what `cortex trace` prints for a model call, and it is
+ * the same shape the dashboard's event row prints — read by the same function,
+ * from the same frame.
+ *
  * @module token_usage
  */
 
@@ -137,4 +151,114 @@ export function formatTokenUsage(
 ): string {
   const usage = tokenUsage(spent);
   return `${format(usage.total)}${cachedSuffix(usage.cached, format)}`;
+}
+
+/**
+ * What one model call spent.
+ *
+ * The shape the ABI gives a driver's usage (docs/ABI.md §4.3): the tokens the
+ * model read, the tokens it wrote, the part of the input the provider served
+ * out of its cache, and the price.
+ *
+ * Every counter is optional because a frame can report **less** than the ABI
+ * says: a recording written by an older driver, or a host that only priced
+ * the call. A counter that was not reported is **not** a counter of zero, and
+ * a view that printed zero for it would be claiming something nobody said.
+ */
+export interface CallUsage {
+  /** The model that answered, when the frame says so. */
+  readonly model?: string;
+  /** The tokens the model read. */
+  readonly inputTokens?: number;
+  /** The tokens the model wrote. */
+  readonly outputTokens?: number;
+  /** The input tokens the provider served out of its cache. */
+  readonly cachedTokens?: number;
+  /** The price, in dollars. */
+  readonly usd?: number;
+}
+
+/**
+ * Read a recorded frame's result as what a model call spent.
+ *
+ * `undefined` when the frame is not a model call, or when it carries nothing
+ * at all to say: no model and no counter. None of those spent anything an
+ * operator can be told about.
+ *
+ * Everything that *is* there is read, and what is not there stays absent — the
+ * counters come back `undefined` rather than `0`, so a view that prints them
+ * cannot invent a number nobody reported. That is the whole difference
+ * between "this call cost nothing" and "this frame does not say what it cost".
+ *
+ * It lives here because two views read the same frame — the CLI's trace and
+ * the dashboard's event table — and a rule one of them cannot import is a
+ * rule it will re-implement.
+ *
+ * @param syscall The frame's syscall name.
+ * @param result The frame's recorded result.
+ */
+export function callUsage(syscall: string, result: unknown): CallUsage | undefined {
+  if (syscall !== 'llm_call') return undefined;
+  if (typeof result !== 'object' || result === null) return undefined;
+  const frame = result as Record<string, unknown>;
+  const model = typeof frame['model'] === 'string' ? frame['model'] : undefined;
+  // The usage is where the ABI puts the counters (docs/ABI.md §4.3). A frame
+  // that carries none of them still may name the model that answered.
+  const raw = frame['usage'];
+  const counters =
+    typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {};
+  const inputTokens = count(counters['inputTokens']);
+  const outputTokens = count(counters['outputTokens']);
+  const cachedTokens = count(counters['cachedTokens']);
+  const usd = count(counters['usd']);
+  if (
+    model === undefined &&
+    inputTokens === undefined &&
+    outputTokens === undefined &&
+    cachedTokens === undefined &&
+    usd === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    ...(model !== undefined ? { model } : {}),
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    ...(usd !== undefined ? { usd } : {}),
+  };
+}
+
+/** A number in a recorded frame, or `undefined` when it is not one. */
+function count(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * One model call's tokens, in words: the input it read, the output it wrote,
+ * and the cached part of that input.
+ *
+ * A **call** is not a **process**: a process's spend is one total, while a
+ * call's is a pair — and the input is the interesting half, because it is
+ * most of what the price is made of.
+ *
+ * **Only the counters the frame reported are printed.** A frame that says how
+ * many tokens it read and nothing about how many it wrote says "1.2k in", and
+ * not "1.2k in / 0 out" — because a counter nobody reported is not a counter
+ * of zero, and printing zero would be a claim about a number that was never
+ * made. The kernel charges an unreported counter as zero (`spend()` reads the
+ * same fields), but what the kernel charged and what the frame said are two
+ * different questions, and this cell answers the second one.
+ *
+ * @param usage What the call spent.
+ * @param format How this view prints a number.
+ */
+export function formatCallUsage(usage: CallUsage, format: (n: number) => string): string {
+  const parts: string[] = [];
+  if (usage.inputTokens !== undefined) parts.push(`${format(usage.inputTokens)} in`);
+  if (usage.outputTokens !== undefined) parts.push(`${format(usage.outputTokens)} out`);
+  const text = parts.join(' / ');
+  const cached = cachedSuffix(usage.cachedTokens ?? 0, format);
+  if (cached === '') return text;
+  return text === '' ? cached.trim() : `${text}${cached}`;
 }

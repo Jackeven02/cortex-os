@@ -244,7 +244,7 @@ import {
 } from '../src/cli/diff_core.js';
 
 import { cmdDiff } from '../src/cli/commands/diff.js';
-import { cmdTrace, TRACE_SYSCALL_WIDTH } from '../src/cli/commands/trace.js';
+import { cmdTrace, TRACE_SYSCALL_WIDTH, TRACE_HEADER } from '../src/cli/commands/trace.js';
 import { cmdLogs, alreadyShown } from '../src/cli/commands/logs.js';
 import { cmdMemory } from '../src/cli/commands/memory.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
@@ -319,7 +319,7 @@ import {
   type ComparedCall,
 } from '../src/cli/replay_core.js';
 import { processOutcome, formatOutcomeCode, describeOutcome } from '../src/cli/process_outcome.js';
-import { formatTokenUsage, formatTokens, tokenUsage } from '../src/token_usage.js';
+import { formatTokenUsage, formatTokens, tokenUsage, callUsage } from '../src/token_usage.js';
 import type { CortexContext, LLMResponse, Timestamp } from '../src/kernel/types.js';
 import { OutputCapture } from '../src/cli/output_capture.js';
 import { bootCliKernel } from '../src/cli/index.js';
@@ -12437,6 +12437,244 @@ async function runDiffChecks(): Promise<void> {
     }
   });
 
+  await checkAsync('the trace says what a model call spent', async () => {
+    // The kernel records the usage of a model call in the frame's result — the
+    // tokens it read and wrote, the part of the input the provider served out
+    // of its cache, and the price. The dashboard's event table said so; the
+    // CLI's deepest view said nothing at all, so the operator had to leave the
+    // trace to find out what an agent's calls had cost.
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-trace-cost-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
+      // A frame that spent nothing.
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(2), syscall: '__state',
+        callId: 's1', phase: 'exit',
+        args: { from: 'new', to: 'ready', trigger: 'spawn' },
+        stateBefore: 'new', stateAfter: 'ready', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      // A frame that spent something.
+      await rec.append({
+        timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(2), syscall: 'llm_call',
+        callId: 'c1', phase: 'exit',
+        result: {
+          text: 'an answer',
+          model: 'gpt-4o-mini',
+          usage: { inputTokens: 1200, outputTokens: 80, cachedTokens: 900, usd: 0.000161 },
+        },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+        durationMs: 18,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      // A frame that reported only part of its usage: the input it read, and
+      // nothing else. No price, no output count.
+      await rec.append({
+        timestamp: '2026-01-01T00:00:02.000Z', pid: asProcessId(2), syscall: 'llm_call',
+        callId: 'c2', phase: 'exit',
+        result: { text: 'a partial answer', model: 'gpt-4o-mini', usage: { inputTokens: 500 } },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+        durationMs: 7,
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      // A frame that names the model and says nothing about what it cost.
+      await rec.append({
+        timestamp: '2026-01-01T00:00:03.000Z', pid: asProcessId(2), syscall: 'llm_call',
+        callId: 'c3', phase: 'exit',
+        result: { text: 'an answer', model: 'gpt-4o-mini' },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      console.error = (): void => {};
+      try {
+        const code = await cmdTrace(['2']);
+        assert(code === 0, `trace exit 0, got ${code}`);
+      } finally {
+        console.log = prevLog;
+        console.error = prevErr;
+      }
+
+      const rows = recordLines(out);
+      assert(rows.length === 4, `expected 4 record rows, got ${rows.length}: ${out}`);
+      const calls = rows.filter((r) => r.includes('llm_call'));
+      assert(calls.length === 3, `expected 3 model calls, got ${calls.length}: ${out}`);
+      const [call, partial, bare] = calls as [string, string, string];
+
+      assert(call.includes('$0.000161'), `the row says what it cost, got: ${call}`);
+      assert(call.includes('1.2k in / 80 out'), `the row says what it spent, got: ${call}`);
+      assert(call.includes('(900 cached)'), `the row says what was cached, got: ${call}`);
+
+      // The spend column is a column like any other: the heading and the row
+      // have to line up, or the reader cannot tell which column they are
+      // looking at. Position, not word-search.
+      const header = out.split('\n').find((l) => l.startsWith('time'));
+      assert(header !== undefined, `no header row: ${out}`);
+      assert(
+        header!.indexOf('spend') === call.indexOf('$0.000161'),
+        `the spend column is off: header ${header!.indexOf('spend')}, row ${call.indexOf('$0.000161')}`,
+      );
+
+      // A frame that reported part of its usage says that part — and says
+      // nothing about the rest. "500 in" is what the frame said; "500 in / 0
+      // out" would be a claim about a number nobody reported.
+      assert(partial.includes('500 in'), `the partial call says what it reported, got: ${partial}`);
+      assert(!partial.includes('out'), `an unreported counter is not a zero: ${partial}`);
+      assert(!partial.includes('$'), `an unreported price is not a zero: ${partial}`);
+
+      // A frame that names the model and reports no usage at all spent
+      // nothing that can be told about — so the cell is empty, and the row
+      // ends where its own content ends.
+      assert(
+        bare.trimEnd().endsWith('reversible'),
+        `...and it ends where its own content ends, got: ${bare}`,
+      );
+
+      // And a frame that spent nothing says nothing about a cost. A state
+      // transition costs nothing, and "$0.000000" would be a claim about a
+      // number nobody spent.
+      const state = rows.find((r) => r.includes('__state'));
+      assert(state !== undefined, `the transition is in the trace: ${out}`);
+      assert(!state!.includes('$'), `a frame that spent nothing has no cost, got: ${state}`);
+      assert(
+        state!.trimEnd().endsWith('idempotent'),
+        `...and it ends where its own content ends, got: ${state}`,
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('cortex trace --help names the columns it prints', async () => {
+    // A help text that names a column nobody can see is a help text that
+    // lies about the command — and one that fails to name a column the
+    // operator needs is a help text that leaves them guessing. The list of
+    // columns is taken from the header the table really prints, so a new
+    // column that nobody documents fails this check.
+    const prevLog = console.log;
+    let out = '';
+    try {
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      const code = await cmdTrace(['--help']);
+      assert(code === 0, `exit 0, got ${code}`);
+    } finally {
+      console.log = prevLog;
+    }
+    const printed = TRACE_HEADER.trim().split(/\s+/);
+    const section = out.slice(out.indexOf('COLUMNS'), out.indexOf('EXAMPLES'));
+    const named = [...section.matchAll(/^ {2}(\S+)\s{2,}/gm)].map((m) => m[1]!);
+    assert(named.length > 0, `the help has a columns section: ${out}`);
+    for (const name of named) {
+      assert(
+        printed.includes(name),
+        `the help describes a column the table does not have: ${name}`,
+      );
+    }
+    for (const name of printed) {
+      assert(
+        named.includes(name),
+        `the help does not describe the ${name} column, got: ${out}`,
+      );
+    }
+  });
+
+  await checkAsync('the trace and the dashboard read a call the same way', async () => {
+    // One frame, two views: the CLI's trace and the dashboard's event table.
+    // They must not be able to disagree about what a call spent — so they read
+    // it with the same function, and this holds them to it.
+    const frame = {
+      timestamp: '2026-01-01T00:00:01.000Z',
+      pid: asProcessId(2),
+      syscall: 'llm_call',
+      callId: 'c1',
+      phase: 'exit',
+      result: {
+        text: 'an answer',
+        model: 'gpt-4o-mini',
+        usage: { inputTokens: 1200, outputTokens: 80, cachedTokens: 900, usd: 0.000161 },
+      },
+      stateBefore: 'running',
+      stateAfter: 'running',
+      reversibility: 'reversible',
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+    } as unknown as SyscallRecord;
+
+    const usage = callUsage(frame.syscall, frame.result);
+    assert(usage !== undefined, 'the frame carries a usage');
+    assert(usage!.inputTokens === 1200 && usage!.outputTokens === 80, 'the tokens are read');
+    assert(usage!.cachedTokens === 900, 'the cached part is read');
+    assert(usage!.usd === 0.000161, 'the price is read');
+    assert(usage!.model === 'gpt-4o-mini', 'the model is read');
+
+    const event = toActivityEvent(frame, 2);
+    assert(event !== undefined, 'the dashboard makes an event of the frame');
+    assert(event!.tokensIn === usage!.inputTokens, 'the dashboard and the trace read the same input');
+    assert(event!.tokensOut === usage!.outputTokens, '...the same output');
+    assert(event!.tokensCached === usage!.cachedTokens, '...the same cached part');
+    assert(event!.usd === usage!.usd, '...and the same price');
+
+    // A frame that is not a model call spent nothing, and a frame that
+    // carries no usage did not report one — neither is a cost of zero.
+    assert(callUsage('memory_read', { count: 1 }) === undefined, 'a non-model call spent nothing');
+    assert(callUsage('llm_call', { text: 'no usage here' }) === undefined, 'a frame with no usage is not a cost');
+
+    // A frame that reports part of its usage reports *that* part. The
+    // dashboard must not fill in the rest either: an absent counter is
+    // absent, and the two views must not disagree about what was said.
+    const partial = callUsage('llm_call', { model: 'gpt-4o-mini', usage: { inputTokens: 500 } });
+    assert(partial !== undefined, 'a partial usage is still a usage');
+    assert(partial!.inputTokens === 500, 'the reported counter is read');
+    assert(partial!.outputTokens === undefined, 'an unreported counter stays unreported');
+    assert(partial!.usd === undefined, '...and so does an unreported price');
+
+    const partialEvent = toActivityEvent(
+      {
+        ...frame,
+        result: { text: 'an answer', model: 'gpt-4o-mini', usage: { inputTokens: 500 } },
+      } as unknown as SyscallRecord,
+      2,
+    );
+    assert(partialEvent !== undefined, 'the dashboard makes an event of the partial frame');
+    assert(partialEvent!.tokensIn === 500, 'the dashboard keeps the reported counter');
+    assert(partialEvent!.tokensOut === undefined, '...and invents none');
+    assert(partialEvent!.usd === undefined, '...and no price either');
+
+    // A frame that names the model and says nothing about what it cost still
+    // says which model answered — that is a fact, and the dashboard has
+    // always shown it.
+    const bare = callUsage('llm_call', { model: 'gpt-4o-mini', text: 'an answer' });
+    assert(bare !== undefined, 'a frame that names a model says something');
+    assert(bare!.model === 'gpt-4o-mini', 'the model is read');
+    assert(bare!.inputTokens === undefined, 'and nothing else is invented');
+
+    const bareEvent = toActivityEvent(
+      { ...frame, result: { text: 'an answer', model: 'gpt-4o-mini' } } as unknown as SyscallRecord,
+      2,
+    );
+    assert(bareEvent !== undefined, 'the dashboard makes an event of the bare frame');
+    assert(bareEvent!.model === 'gpt-4o-mini', 'the dashboard still shows the model');
+    assert(bareEvent!.tokensIn === undefined, '...and no tokens that were never reported');
+  });
+
   await checkAsync('cortex diff with one argument prints help and fails', async () => {
     const prevLog = console.log;
     try {
@@ -16529,6 +16767,31 @@ async function runTopChecks(): Promise<void> {
         if (prevHome === undefined) delete process.env['CORTEX_HOME'];
         else process.env['CORTEX_HOME'] = prevHome;
         rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    await checkAsync('cortex top --help names the columns it prints', async () => {
+      // The help used to describe two columns the table does not have — it
+      // still called them `WAITING` and `SPEND` — and never mentioned the two
+      // it does have. A help text that names a column nobody can see is a
+      // help text that lies about the command, and the operator who reads it
+      // goes looking for a column that is not there.
+      const result = await capture(() => cmdTop(['--help']));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      // The labels the help describes, taken from the text itself.
+      const named = [...result.out.matchAll(/^ {2}([A-Z][A-Z]+)\s{2,}/gm)].map((m) => m[1]!);
+      const real = ['PID', 'ROLE', 'STATE', 'TOKENS', 'USD', 'NOTE'];
+      for (const name of named) {
+        assert(
+          real.includes(name),
+          `the help describes a column the table does not have: ${name}`,
+        );
+      }
+      for (const name of ['STATE', 'TOKENS', 'USD', 'NOTE']) {
+        assert(
+          named.includes(name),
+          `the help does not describe the ${name} column, got: ${result.out}`,
+        );
       }
     });
 

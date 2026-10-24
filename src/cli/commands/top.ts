@@ -417,13 +417,14 @@ call — what it is waiting for and for how long. When a live kernel is running,
 its own process table is merged in, so running agents appear in the tree too.
 
   STATE     running, ready, blocked, stopped, suspended, zombie
-  WAITING   a channel (recv), a timer (sleep), a child (wait),
-            a model call (llm_call), a tool call (tool_call)
-  SPEND     tokens in+out, then USD. A token cell also says how much of it
-            the provider served out of its cache: '1.2k (300 cached)'.
-  NOTE      also says what is waiting for the process: a signal the kernel has
-            queued for it ('SIGTERM queued') is not delivered until the
-            process runs again
+  TOKENS    what the process spent -- tokens in+out -- and how much of the
+            input the provider served out of its cache: '1.2k (300 cached)'
+  USD       what that spend cost in money, at six decimals
+  NOTE      what the process is waiting for: a channel (recv), a timer
+            (sleep), a child (wait), a model call (llm_call), a tool call
+            (tool_call). It also says what is queued for it: a signal the
+            kernel has queued for it ('SIGTERM queued') is not delivered
+            until the process runs again
 
 NOTES
   "Waiting" and "stuck" are different, and only one of them is in the process

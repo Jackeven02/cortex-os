@@ -1747,6 +1747,29 @@ ceiling is charged for the input and the output, with the cached part inside
 the input and counted once. (Whether a cached token *should* be charged in
 full is still open — BACKLOG #092.)
 
+**And a call says what it spent, not just a process.** A process's spend is one
+total; a **call's** is a pair — what the model read and what it wrote, and the
+part of the input that came out of the provider's cache — and the price. The
+kernel records all of it in the `llm_call` frame's result, in the ABI's `usage`
+shape (ABI.md §4.3). The frame was there the whole time: the dashboard's event
+table read it and said so, while `cortex trace` — the CLI's deepest view —
+printed the syscall, the phase, the duration and the reversibility, and nothing
+at all about what the call cost. The operator had to leave the trace to find
+out what an agent's calls had cost.
+
+So the trace has a last column now, `spend`, and it says the price first and
+the tokens after it: `$0.000161 · 1.2k in / 80 out (900 cached)`. The order is
+a rule, not a preference — a cell too wide for its column is cut from the end,
+the tail is the cached count, and the price is not the thing to lose.
+
+Two views of one frame cannot disagree about it, so both read it with the same
+function (`callUsage`, in `src/token_usage.ts`) — and both say only what the
+frame reported. A counter the frame did not report is **not** a counter of
+zero: a frame that says how many tokens it read and nothing about how many it
+wrote says `1.2k in`, not `1.2k in / 0 out`. And a frame that spent nothing at
+all says nothing — an empty cell is honest, and `$0.000000` would be a claim
+about a number nobody spent.
+
 **And a unit has exactly one conversion point.** `budgetsSpent.usdSpent` is in
 **microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4). Three
 places disagreed about that, and two of them were wrong by a factor of a

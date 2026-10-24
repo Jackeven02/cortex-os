@@ -112,9 +112,9 @@ $ cortex replay 1234
 # Trace every syscall
 $ cortex trace 1234
 # tracing .cortex/processes/1234/log.crec
-time          pid     syscall                                                    phase  duration   reversibility
-----------------------------------------------------------------------------------------------------------------
-14:23:01.402  1234    llm_call                                                   exit   2523ms     reversible
+time          pid     syscall                                                    phase  duration   reversibility spend
+----------------------------------------------------------------------------------------------------------------------
+14:23:01.402  1234    llm_call                                                   exit   2523ms     reversible    $0.000161 · 1.2k in / 80 out (900 cached)
 14:23:04.115  1234    tool_call                                                  exit   -          irreversible
 14:23:06.221  1234    __state:running->exiting(exit)                             exit   -          idempotent
 # 3 record(s)
@@ -122,6 +122,10 @@ time          pid     syscall                                                   
 #  __state:running->blocked(recv), __state:new->ready(spawn),
 #  __init:restart-gave-up, __sched:parked(recv), __signal:SIGTERM(queued) — so a log
 #  reads as the story it is, not a row of anonymous placeholders)
+# (and a call that spent something says what it spent — the price first, then the
+#  tokens it read and wrote, and the part of the input that came out of the
+#  cache. A frame that spent nothing says nothing: an empty cell is honest,
+#  "$0.000000" would be a claim)
 
 # Read back what a process printed (kept per process, not mixed into the
 # daemon's stdout — stdout and stderr are tagged separately)
@@ -154,8 +158,8 @@ pid 1234 exited with code 0 (finished the task)
 # These are the same frames `cortex trace` reads, pushed instead of polled.
 $ cortex watch --pid 1234
 # watching the kernel event stream (Ctrl-C to stop)
-time          pid     syscall                                                    phase  duration   reversibility
-----------------------------------------------------------------------------------------------------------------
+time          pid     syscall                                                    phase  duration   reversibility spend
+----------------------------------------------------------------------------------------------------------------------
 19:50:09.072  1234    sleep                                                      exit   64ms       idempotent
 19:50:09.077  1234    __state:running->blocked(sleep)                            exit   -          idempotent
 19:50:09.138  1234    __state:blocked->ready(wait-return)                        exit   -          idempotent
@@ -240,7 +244,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 775 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 779 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -360,6 +364,8 @@ Read-only by default. With a live kernel in the directory (`cortex daemon run`),
 **And the tokens say what was cached.** The provider reports the whole prompt and says how much of it it did not have to read again — and those tokens are billed at the cache price rather than the fresh one. The window says so: the process table prints `1,234 (300 cached)`, the budget panel has a **缓存** column and a **缓存命中** total beside it, and the event table says which part of a single call was cached.
 
 **And the event table shows what a call cost.** `cortex wrap --tap` records the model's own HTTP calls into the same log a driver call goes into, so those calls show up in the event table too — with their tokens and their price, written in the ABI's `usage` shape, the same shape every other reader of an `llm_call` frame looks in.
+
+**And `cortex trace` says it too.** The window was not the only view that could say what a call spent — the CLI's deepest view could not, and it was the view an operator opens to find out what an agent has been doing. Its last column now says what each call spent (`$0.000161 · 1.2k in / 80 out (900 cached)`), and it reads the frame with the same function the event table does, so the two cannot disagree. A frame that spent nothing says nothing: an empty cell is honest, and `$0.000000` would be a claim about a number nobody spent.
 
 **And the timeline reads like the terminal's.** The kernel's own frames are placeholders on disk (`__state`, `__sched`) — the *view* is what distinguishes them: `__state:running->blocked(recv)`, `__sched:sigxcpu(tokens)`. The window prints the same names `cortex trace` does, because both ask the same function.
 

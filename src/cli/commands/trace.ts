@@ -23,6 +23,8 @@ import { INIT_ACTIONS } from '../../kernel/init.js';
 import { DISPATCH_ACTIONS, DISPATCH_EXITS } from '../../kernel/scheduler.js';
 import { renderHeader, renderRow, ruleUnder, type Column } from '../table.js';
 import { frameName } from '../frame_name.js';
+import { callUsage, formatCallUsage, formatTokens } from '../../token_usage.js';
+import { formatDollars } from '../../money.js';
 
 /** The length of the longest string in a list. */
 function longest(values: readonly string[]): number {
@@ -73,6 +75,36 @@ export const TRACE_SYSCALL_WIDTH = Math.max(
 );
 
 /**
+ * How wide the spend column has to be.
+ *
+ * Derived from the rule, the same way the syscall column is: the widest cell
+ * is the one the formatter can produce, and it is produced here, once, by
+ * asking the formatter itself.
+ *
+ * The width only reserves space — a row that spent nothing ends where its own
+ * content ends, and the heading is trimmed with it — so the reservation is
+ * the **worst case** rather than a typical one. That way a call that spent a
+ * lot is never cut short, which is the one thing a spend column must not do.
+ *
+ * The ceiling is the one the rest of the project uses for tokens
+ * (`cortex ps`, `cortex top`): ten digits. The money is the ceiling
+ * `cortex top`'s USD column uses — four digits and six decimals, because six
+ * decimals is the resolution the kernel counts at (docs/STATE.md §2.4).
+ */
+export const TRACE_SPEND_WIDTH =
+  formatCallUsage(
+    {
+      inputTokens: 9_999_999_999,
+      outputTokens: 9_999_999_999,
+      cachedTokens: 9_999_999_999,
+      usd: 0,
+    },
+    formatTokens,
+  ).length +
+  ' · '.length +
+  formatDollars(1234.567890).length;
+
+/**
  * The columns of the trace table, in order: the header, the width of the
  * cell, and the gap that follows it.
  *
@@ -90,8 +122,41 @@ const TRACE_COLUMNS: readonly Column[] = [
   { header: 'duration', width: 10, gap: 1 },
   // `reversibility` is 13 characters — the longest value is `irreversible`,
   // and the heading itself is longer still.
-  { header: 'reversibility', width: 13, gap: 0 },
+  { header: 'reversibility', width: 13, gap: 1 },
+  // What a frame that spent something spent. Empty for every frame that spent
+  // nothing, which is most of them — and empty is honest: a state transition
+  // costs nothing, and a cell that said "$0.000000" would be a claim.
+  { header: 'spend', width: TRACE_SPEND_WIDTH, gap: 0 },
 ];
+
+/**
+ * What a frame that spent something spent.
+ *
+ * The rule: **a syscall that spent something says what it spent.** The
+ * kernel records the usage of a model call in the frame's result — the
+ * tokens it read and wrote, the part of the input that came out of the
+ * provider's cache, and the price — and the trace used to print none of it.
+ * The dashboard's event table said it; the CLI's deepest view did not.
+ *
+ * Two things decide the shape:
+ *
+ * - **The money comes first**, because it is what the column is about, and
+ *   because a cell that is too wide is cut from the end — the tail is the
+ *   cached count, and the price is not the thing to lose.
+ * - **Only what the frame reported is printed.** A frame that reported a
+ *   price and no tokens says the price; a frame that reported tokens and no
+ *   price says the tokens. A frame that reported neither says nothing, and a
+ *   cell that said "$0.000000" would be a claim about a number nobody spent.
+ */
+function spendCell(rec: SyscallRecord): string {
+  const usage = callUsage(rec.syscall, rec.result);
+  if (usage === undefined) return '';
+  const parts: string[] = [];
+  if (usage.usd !== undefined) parts.push(formatDollars(usage.usd));
+  const tokens = formatCallUsage(usage, formatTokens);
+  if (tokens !== '') parts.push(tokens);
+  return parts.join(' · ');
+}
 
 /**
  * Render one syscall record as a fixed-width `trace`/`attach` line.
@@ -108,6 +173,7 @@ export function formatRecordLine(rec: SyscallRecord): string {
     rec.phase,
     rec.durationMs !== undefined ? `${rec.durationMs}ms` : '-',
     rec.reversibility,
+    spendCell(rec),
   ]);
 }
 
@@ -135,6 +201,18 @@ USAGE
 
 OPTIONS
   -h, --help   Show this help
+
+COLUMNS
+  time           when the frame was recorded
+  pid            the process the frame belongs to
+  syscall        what was called — and the kernel's own frames, named after
+                 what distinguishes them (__state:running->blocked(recv))
+  phase          enter (the call started) or exit (it finished)
+  duration       how long it took
+  reversibility  whether it can be undone
+  spend          what the call spent: the price first, then the tokens it read
+                 and wrote, and the part of the input the provider served out
+                 of its cache. A frame that spent nothing says nothing
 
 EXAMPLES
   cortex trace 2

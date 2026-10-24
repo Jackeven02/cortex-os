@@ -1546,6 +1546,77 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **`cortex trace` did not say what a model call cost.** The kernel records the
+  usage of a model call in the frame's result — the tokens it read and wrote,
+  the part of the input the provider served out of its cache, and the price
+  (ABI.md §4.3). The dashboard's event table read it and said so. `cortex trace`
+  — the CLI's deepest view, the one an operator opens to find out what an
+  agent has been doing — printed the syscall, the phase, the duration and the
+  reversibility, and **not one number of what the call spent**. To learn what
+  an agent's calls had cost, the operator had to leave the trace for a view
+  that sums a process rather than names a call.
+
+  The trace has a last column now, `spend`, and it says the price first and
+  the tokens after it:
+
+  ```console
+  $ cortex trace 2
+  # tracing .cortex/processes/2/log.crec
+  time          pid     syscall                                                    phase  duration   reversibility spend
+  ----------------------------------------------------------------------------------------------------------------------
+  19:33:22.033  2       __state:new->ready(spawn)                                  exit   -          idempotent
+  19:33:22.058  2       llm_call                                                   enter  -          reversible
+  19:33:22.078  2       llm_call                                                   exit   20ms       reversible    $0.000161 · 1.2k in / 80 out (900 cached)
+  19:33:22.080  2       __state:running->exiting(exit)                             exit   -          idempotent
+  # 9 record(s)
+  ```
+
+  **The order inside the cell is a rule.** A cell too wide for its column is
+  cut from the end, the tail is the cached count, and the price is not the
+  thing to lose — so the money comes first.
+
+  **And a frame says only what it reported.** A counter the frame did not
+  report is not a counter of zero: a call that says how many tokens it read
+  and nothing about how many it wrote says `1.2k in`, not `1.2k in / 0 out`.
+  The kernel charges an unreported counter as nothing, but what the frame said
+  and what the budget moved by are two different questions, and the trace
+  answers the first one. A frame that spent nothing says nothing at all — the
+  cell is empty, because `$0.000000` would be a claim about a number nobody
+  spent.
+
+  **The trace and the dashboard read a frame with the same function**
+  (`callUsage`, in `src/token_usage.ts`), so two views of one frame cannot
+  disagree about what it cost. The column's width is derived the way the
+  syscall column's is — from the widest cell the formatter can produce — so a
+  call that spent a lot is never cut short.
+
+  **`cortex trace --help` names the columns the table prints** — including the
+  new one — and a smoke check holds it to them: every column label in the help
+  must be a column the header really has, and every column the header has must
+  be in the help. The list is read out of the header itself, so a new column
+  that nobody documents fails the check.
+
+  3 new smoke checks (775 → 778), all reverse-verified: with the spend cell
+  switched off, the trace check fails ("the row says what it cost"); with an
+  unreported counter printed as zero, it fails again ("an unreported counter
+  is not a zero"); with a frame that names a model and reports no usage
+  dropped, the dashboard check fails ("a frame that names a model says
+  something"); with the `spend` line out of the help, the help check fails
+  ("the help does not describe the spend column"); and with a phantom column
+  in the help, it fails the other way ("the help describes a column the table
+  does not have").
+
+- **`cortex top --help` described two columns the table does not have.** The
+  help still called them `WAITING` and `SPEND`, and never mentioned the two it
+  does have — `TOKENS` and `USD`. An operator reading the help went looking
+  for a column that was not there, and for one that was. The help now names
+  the columns the table prints, and a smoke check holds it to them: every
+  column label in the help must be a column `cortex top` actually has.
+
+  1 new smoke check (778 → 779), reverse-verified: with a phantom column back
+  in the help, the check fails ("the help describes a column the table does
+  not have: SPEND").
+
 - **The cached tokens were in the kernel and in no view.** The kernel records
   three token counters (STATE.md §2.4): the input, the output, and the part of
   the input the provider served out of its cache. The cached part is **inside**
