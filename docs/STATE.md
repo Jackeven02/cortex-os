@@ -220,6 +220,8 @@ Every tool declares its side-effect class:
 
 Tagging is per-tool, declared by the driver author. The kernel records the tag in the syscall log.
 
+**The tag is a fact the operator can see.** The kernel records it on every frame (ABI.md §4.1) and `cortex trace` prints it in a column of its own — but the operator's window dropped it: the dashboard's event table said what was called, how long it took and what it spent, and nothing about whether the call could be taken back. A tool call that charged a credit card read exactly like a read, and the one distinction an operator watching the window most needs was the one the window threw away. The event table has a **可逆性** column now — between the duration and the cost, the order `cortex trace` uses — and the syscall timeline says it too, so the window's two views of one frame cannot disagree about it. The word is the **recorded** one, and a frame that carries no tag is *not reported*, not "reversible".
+
 ### 5.2 Forkable regions
 
 An agent can declare a span of execution as a **forkable region**:

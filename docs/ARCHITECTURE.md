@@ -1861,6 +1861,43 @@ the tokens, which both the event row and the timeline row use. Two views of
 one frame inside one window cannot drift apart, and neither of them can drift
 from the terminal.
 
+**And the window says which calls can be undone.** The kernel tags every frame
+with what it would take to undo it — `reversible`, `idempotent`,
+`irreversible` (ABI.md §4.1) — and the tag is not decoration. It traps an
+irreversible call inside a `forkable` region with `EREVERSIBLE`, it decides
+how verbosely the frame is recorded, and it is what `cortex audit` reads to
+surface the tools that never declared one. `cortex trace` prints it in a
+column of its own.
+
+The window dropped it. The event table said what was called, how long it took
+and what it spent, and nothing about whether it could be taken back — so a
+tool call that charged a credit card read exactly like a read, and the one
+distinction an operator watching the window most needs was the one the window
+threw away. The tag was in the frame the whole time; the view discarded it.
+
+So the event table has a **可逆性** column now, between the duration and the
+cost — the order `cortex trace` uses: how long it took, whether it can be
+undone, what it spent. The word is the **recorded** one, because the recorded
+one is the word the terminal prints and the word the kernel acts on. A frame
+that carries no tag is *not reported*, not "reversible", and says so with the
+same em dash every other cell in that table uses. The syscall timeline says it
+too — the window's two views of one frame cannot disagree about what a frame
+means.
+
+The two sinks of the LangChain integration now answer the same question the
+same way. The `.crec` frame carried the tag and the jsonl line did not — and
+the dashboard's event table merges the two, so half of its rows could not say
+whether they could be undone. The tag is decided **once**, where the event is
+born (`reversibilityForEvent`, in `src/integrations/langchain.ts`), and
+travels with it: the jsonl line, the `.crec` frame and the host's `onEvent`
+callback all get the same word.
+
+That rule is deliberately conservative. A callback knows only **that a tool
+ran**, not what the tool did — so a tool call is `irreversible`. A read-only
+tool would be `idempotent`, and the friendlier guess is the one tag nobody can
+act on. A retrieval is a read, so it is `reversible`; everything else is
+`idempotent`.
+
 **And the window says what the agent knows.** The window could show what an
 agent **did** — the event table, the syscall timeline — and nothing about what
 it **knows**. For an agent the knowledge is the point: the event table says

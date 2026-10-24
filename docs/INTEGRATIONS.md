@@ -29,6 +29,8 @@ time                  pid    syscall           phase   duration  reversibility
 
 Both sinks are written when `crec` is active: the jsonl file is the integration's own audit trail and survives a `.cortex` reset, so removing it would be a silent regression for anyone already parsing it.
 
+Both sinks carry the same **reversibility** tag for the same call, so a reader that merges them — the dashboard's event table does — cannot be told two different things about one action. The tag is decided once, where the event is born: a tool call is `irreversible` (a callback knows only that a tool ran, and the friendlier guess is the one tag nobody can act on), a retrieval is `reversible` (it is a read), and everything else is `idempotent`. The jsonl line carries it as `reversibility`; the `.crec` frame carries it in the field the ABI defines (ABI.md §4.1).
+
 ```ts
 import { CortexLangChainCallbackHandler } from 'cortex-agent-os/integrations/langchain';
 
@@ -335,7 +337,7 @@ The API is available at:
 
 - `GET /api/processes` — process table (live or persisted). Each row carries the kernel's own `budgetsSpent` **in microdollars** (STATE.md §2.4) *and* `usdSpentDollars`, the same spend already converted to dollars — the page is handed dollars so it cannot print a microdollar counter next to a dollar sign. Each row also carries `tokenLabel` and `usdLabel`, the two spends beside the ceilings they are measured against, in the same words `cortex ps` and `cortex top` print them: `1,234 (300 cached) of 10,000` and `$0.000250 of $1.000000` (`of ∞` for a budget with no ceiling). And `ageLabel`, how long that process lived: a **running** process is aging, so the number is the time since it started, and a **finished** one shows the lifetime the kernel recorded for it and stops there.
 - `GET /api/trace/:pid` — redacted syscall timeline. Each row carries `syscall` — the **recorded** syscall name, unchanged, for a reader that matches on it — and `frame`, the name a human reads: `__state:running->blocked(recv)`, `__sched:sigxcpu(tokens)`. The two are the same frame; `frame` is what `cortex trace` prints, so the window and the terminal say the same thing.
-- `GET /api/events?from=&to=&offset=&limit=` — merged callback + syscall events, newest first. `from`/`to` are millisecond timestamps; results are paginated and the total count is returned in the `x-total-count` header.
+- `GET /api/events?from=&to=&offset=&limit=` — merged callback + syscall events, newest first. `from`/`to` are millisecond timestamps; results are paginated and the total count is returned in the `x-total-count` header. Each event carries `reversibility` — the **recorded** tag (`reversible` / `idempotent` / `irreversible`), the same word `cortex trace` prints. It is absent for an event whose source did not report one, and absent means *not reported*, not "reversible".
 - `GET /api/checkpoints` — checkpoints under `processes/<pid>/checkpoints/`, parsed from file names (`createdAt`/`chainId`) plus on-disk size.
 - `GET /api/ops` — reports which write operations are enabled: `{ allowOps: boolean, ops: string[] }`.
 - `GET /api/memory/:pid` — the memory regions of a process: for each region its `region`, `kind`, `backing`, `access` (`read-write` / `read-only` / `?`), `entries`, `writes`, `limit` (the write-count ceiling: the number, `∞`, or `?`) and `sharedWith` (the peers, each with the access mode it holds the region under — `3 (read-only)`). The words are the ones `cortex memory` prints, because both read them from one module (`src/cli/memory_view.ts`).

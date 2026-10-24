@@ -1312,6 +1312,76 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE (the window says a process's money, not a role's);
   STATE §2.4 (a process's two spends travel together); CHANGELOG.
 
+- [x] **#103** The window could not say which calls could be undone →
+  **fixed.** The kernel tags every frame with what it would take to undo it —
+  `reversible`, `idempotent`, `irreversible` (ABI.md §4.1) — and the tag is
+  not decoration: it traps an irreversible call inside a `forkable` region
+  with `EREVERSIBLE`, it decides how verbosely the frame is recorded, and it
+  is what `cortex audit` reads to surface the tools that never declared one.
+  `cortex trace` prints it in a column of its own.
+
+  **The dashboard's event table dropped it.** The table said what was called,
+  how long it took and what it spent — and nothing about whether the call
+  could be taken back, so a tool call that charged a credit card read exactly
+  like a read. The tag was in the frame the whole time; the view threw it
+  away.
+
+  **The event table has a 可逆性 column now**, between the duration and the
+  cost — the order `cortex trace` uses: how long it took, whether it can be
+  undone, what it spent. The word is the **recorded** one, the word the
+  terminal prints; a frame that carries no tag is *not reported*, not
+  "reversible", and says so with the em dash every other cell in that table
+  uses. The syscall timeline says it too, so the window's two views of one
+  frame cannot disagree about what a frame means.
+
+  **The LangChain integration's two sinks now agree.** The `.crec` frame
+  carried the tag and the jsonl line did not — and the event table merges the
+  two, so half of its rows could not say whether they could be undone. The
+  tag is decided once, where the event is born (`reversibilityForEvent`), and
+  travels with it: the jsonl line, the `.crec` frame and the host's `onEvent`
+  callback all get the same word. The rule is deliberately conservative — a
+  callback knows only *that a tool ran*, so a tool call is `irreversible`, a
+  retrieval is `reversible`, and everything else is `idempotent`.
+
+  **4 new smoke checks** (801 → 805), reverse-verified: with the server
+  withholding the tag, the dashboard check fails ("got undefined"); with
+  `#emit` not deciding it, the two-sinks check fails on the jsonl side alone
+  (the `.crec` side still has its own fallback); with the page not rendering
+  the column, the page check fails; with the column moved after the cost, the
+  order check fails; and with the timeline dropping the tag, the timeline
+  check fails.
+
+  Docs: ARCHITECTURE (the window says which calls can be undone); STATE §5.1
+  (the tag is a fact the operator can see); INTEGRATIONS (both sinks, and
+  `/api/events`); CHANGELOG.
+
+- [ ] **#104** The event table shows no tokens for a LangChain call →
+  **open.** The dashboard's event table merges two sources: the kernel's own
+  `.crec` frames and the LangChain callback log. The kernel's frames carry
+  the counters under the dashboard's names (`tokensIn` / `tokensOut` /
+  `tokensCached`), so the page's one helper (`callSummary`) reads them and
+  prints `1,200 in / 80 out (900 cached)`. The **LangChain events arrive
+  raw** — the server hands the parsed jsonl line through untouched — and that
+  sink writes its own names (`inputTokens` / `outputTokens`, in
+  `src/integrations/langchain.ts`). So a model call made through the LangChain
+  callback shows `—` in the **TOKEN / 模型** column, while the kernel's own
+  `llm_call` right beside it shows the tokens. Seen in a real browser run of
+  #103's seed: `模型 · end` (`ChatOpenAI`) printed `—` and `模型 · call`
+  (`llm_call`) printed `1,200 in / 80 out (900 cached) · gpt-4o-mini`.
+
+  **It is a shape mismatch, not a missing fact.** The numbers are on disk —
+  the jsonl line says `inputTokens: 900, outputTokens: 40`. The fix has to
+  decide *where* the two shapes become one: the **server** normalizes the
+  callback events into the dashboard's shape before handing them over (one
+  conversion point, the way `toActivityEvent` does it for the syscall
+  frames), or the **page** reads both names (two rules in the one place the
+  project keeps rules out of). The server is the better answer — the rule
+  that says "a call's tokens are read with `callUsage`" should also say which
+  *name* they arrive under — but it changes the shape `/api/events` hands
+  out, and a consumer reading `inputTokens` today would notice. **And the
+  price stays absent either way**: a callback reports tokens, not dollars, so
+  that cell keeps saying `—` unless the integration starts carrying a price.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

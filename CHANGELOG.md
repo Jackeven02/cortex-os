@@ -1546,6 +1546,45 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The window could not say which calls could be undone.** The kernel tags
+  every frame with what it would take to undo it — `reversible`, `idempotent`,
+  `irreversible` (ABI.md §4.1) — and the tag is not decoration: it traps an
+  irreversible call inside a `forkable` region with `EREVERSIBLE`, it decides
+  how verbosely the frame is recorded, and it is what `cortex audit` reads to
+  surface the tools that never declared one. `cortex trace` prints it in a
+  column of its own.
+
+  The dashboard's event table dropped it. The table said what was called, how
+  long it took and what it spent — and nothing about whether the call could
+  be taken back, so a tool call that charged a credit card read exactly like
+  a read. The tag was in the frame the whole time; the view threw it away.
+
+  The event table has a **可逆性** column now, between the duration and the
+  cost — the order `cortex trace` uses: how long it took, whether it can be
+  undone, what it spent. The word is the **recorded** one, the word the
+  terminal prints; a frame that carries no tag is *not reported*, not
+  "reversible", and says so with the em dash every other cell in that table
+  uses. The syscall timeline says it too, so the window's two views of one
+  frame cannot disagree about what a frame means.
+
+  The LangChain integration's two sinks now answer the same question the same
+  way: the `.crec` frame carried the tag and the jsonl line did not, and the
+  event table merges the two — so half of its rows could not say whether they
+  could be undone. The tag is decided once, where the event is born
+  (`reversibilityForEvent`), and travels with it: the jsonl line, the `.crec`
+  frame and the host's `onEvent` callback all get the same word. The rule is
+  deliberately conservative — a callback knows only *that a tool ran*, so a
+  tool call is `irreversible`, a retrieval is `reversible`, and everything else
+  is `idempotent`.
+
+  4 new smoke checks (801 → 805), reverse-verified: with the server
+  withholding the tag, the dashboard check fails ("got undefined"); with
+  `#emit` not deciding it, the two-sinks check fails on the jsonl side alone
+  (the `.crec` side still has its own fallback); with the page not rendering
+  the column, the page check fails; with the column moved after the cost, the
+  order check fails; and with the timeline dropping the tag, the timeline
+  check fails.
+
 - **The window could say what a process spent in tokens, but not in money.**
   The dashboard's process table showed each process's token spend and its
   ceiling. The money was in the **budget panel** — and that panel rolls it up

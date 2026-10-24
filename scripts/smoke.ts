@@ -9100,6 +9100,40 @@ async function runLangchainChecks(): Promise<void> {
       assert(!JSON.stringify(toolFrames).includes('secret-output'), 'tool output never recorded');
     });
 
+    await checkAsync('the two sinks say the same thing about one call', async () => {
+      // The jsonl line and the `.crec` frame are two records of the same
+      // call. The frame carried the tag and the line did not — so a reader
+      // that merges them (the dashboard's event table does) had no way to
+      // tell a tool call from a read for half of its rows, and the two
+      // files could be read as saying different things about one action.
+      await handler.handleToolStart({ name: 'charge_card' }, 'secret-arg', 'run-x');
+      await handler.handleToolEnd('secret-output', 'run-x');
+      await handler.flush();
+
+      const lines = (await readFile(join(crecTmp, 'integrations', 'langchain', 'events.jsonl'), 'utf8')).trim().split('\n');
+      const jsonl = lines
+        .map((line) => JSON.parse(line) as Record<string, unknown>)
+        .filter((event) => event['runId'] === 'run-x');
+      assert(jsonl.length === 2, `expected 2 jsonl events, got ${jsonl.length}`);
+      for (const event of jsonl) {
+        assert(
+          event['reversibility'] === 'irreversible',
+          `the jsonl event carries the tag, got ${String(event['reversibility'])}`,
+        );
+      }
+
+      const records = [];
+      for await (const rec of readRecords(existingCrecPath(crecTmp, asProcessId(4242)))) records.push(rec);
+      const frames = records.filter((r) => r.callId === 'run-x');
+      assert(frames.length === 2, `expected 2 frames, got ${frames.length}`);
+      for (const frame of frames) {
+        assert(
+          frame.reversibility === 'irreversible',
+          `the crec frame says the same, got ${frame.reversibility}`,
+        );
+      }
+    });
+
     await checkAsync('an error becomes an exit-trap pair, not a silent success', async () => {
       await handler.handleLLMError(new Error('secret failure detail'), 'run-e');
       await handler.flush();
@@ -10181,7 +10215,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -10241,15 +10275,17 @@ function renderDashboardEventRow(html: string, event: Record<string, unknown>): 
   assert(close > open, "the page's event row template never closes");
   const body = html.slice(open + 1, close);
   const callSummary = pageFunction(html, 'callSummary');
-  const fn = new Function('event', 'esc', 'fmtUsd', 'eventLabel', 'fmtLocal', 'callSummary', body) as (
+  const reversibilityLabel = pageFunction(html, 'reversibilityLabel');
+  const fn = new Function('event', 'esc', 'fmtUsd', 'eventLabel', 'fmtLocal', 'callSummary', 'reversibilityLabel', body) as (
     e: Record<string, unknown>,
     escFn: PageFn,
     usdFn: PageFn,
     labelFn: PageFn,
     timeFn: PageFn,
     summaryFn: PageFn,
+    revFn: PageFn,
   ) => string;
-  return fn(event, esc, fmtUsd, eventLabel, fmtLocal, callSummary);
+  return fn(event, esc, fmtUsd, eventLabel, fmtLocal, callSummary, reversibilityLabel);
 }
 
 /** Render one row of the dashboard's syscall timeline, the way the page does. */
@@ -10261,7 +10297,7 @@ function renderDashboardTraceRow(html: string, record: Record<string, unknown>):
   // exercises the page's own code rather than a copy of it. It asks the
   // page's own `callSummary` for the tokens, so the two views of a frame
   // cannot drift apart in the check either.
-  const traceItem = pageFunction(html, 'traceItem', { esc, fmtUsd, callSummary });
+  const traceItem = pageFunction(html, 'traceItem', { esc, fmtUsd, callSummary, reversibilityLabel: pageFunction(html, 'reversibilityLabel') });
   return String(traceItem(record));
 }
 
@@ -10278,7 +10314,8 @@ async function runDashboardChecks(): Promise<void> {
       pid: asProcessId(2),
       stateBefore: 'running' as const,
       stateAfter: 'running' as const,
-      reversibility: 'reversible' as const,
+      // A model call is safe to repeat — that is what `idempotent` means.
+      reversibility: 'idempotent' as const,
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
     await rec.append({ ...base, timestamp: '2026-09-28T00:00:01.000Z', syscall: 'llm_call', callId: 'c1', phase: 'enter', args: {} });
@@ -10310,6 +10347,9 @@ async function runDashboardChecks(): Promise<void> {
       syscall: 'tool_call',
       callId: 'c2',
       phase: 'exit',
+      // The tool declared it cannot be undone — it charged a card. This is
+      // the tag the window used to drop.
+      reversibility: 'irreversible',
       result: { output: { structured: { audit: { correlation_id: 'abc', product_count: 3 } } } },
     });
     await rec.close();
@@ -10328,7 +10368,9 @@ async function runDashboardChecks(): Promise<void> {
     await mkdir(join(tmp, 'integrations', 'langchain'), { recursive: true });
     await writeFile(
       join(tmp, 'integrations', 'langchain', 'events.jsonl'),
-      `${JSON.stringify({ type: 'llm.end', at: '2026-09-28T00:00:04.000Z', runId: 'lc-1', name: 'ChatOpenAI', pid: 2, durationMs: 50 })}\n`,
+      // The tag the LangChain handler now writes on every event it emits —
+      // the same word the `.crec` frame of the same call carries.
+      `${JSON.stringify({ type: 'llm.end', at: '2026-09-28T00:00:04.000Z', runId: 'lc-1', name: 'ChatOpenAI', pid: 2, durationMs: 50, reversibility: 'idempotent' })}\n`,
       'utf8',
     );
     // Seed one checkpoint file named like the kernel writes them:
@@ -10359,6 +10401,93 @@ async function runDashboardChecks(): Promise<void> {
         assert(trapped !== undefined && trapped['error'] === 'EHTTP', 'trap errno surfaced');
         assert(trapped['errorMessage'] === 'auth failed for key [REDACTED]', `sanitized errorMessage, got ${String(trapped['errorMessage'])}`);
         assert(!raw.includes('sk-livekey123456789'), 'raw secret never leaves the API');
+      });
+
+      await checkAsync('the dashboard says which calls can be undone', async () => {
+        // The kernel tags every frame with what it would take to undo it
+        // (ABI.md §4.1), and `cortex trace` prints the tag in a column of its
+        // own. The window's event table dropped it — so a tool call that
+        // charged a credit card looked exactly like a read, and the one
+        // distinction an operator watching the window most needs was gone.
+        const res = await fetch(`${dash.url}/api/events?limit=50`);
+        assert(res.status === 200, `status ${res.status}`);
+        const events = (await res.json()) as Array<Record<string, unknown>>;
+        const tool = events.find((e) => e['type'] === 'tool.call');
+        assert(tool !== undefined, 'the tool call is in the feed');
+        assert(
+          tool!['reversibility'] === 'irreversible',
+          `the tool call says it cannot be undone, got ${String(tool!['reversibility'])}`,
+        );
+        // A model call is safe to repeat — that is what `idempotent` means.
+        const llm = events.find((e) => e['type'] === 'llm.call' && e['durationMs'] !== undefined);
+        assert(llm !== undefined, 'the model call is in the feed');
+        assert(
+          llm!['reversibility'] === 'idempotent',
+          `the model call says it is safe to repeat, got ${String(llm!['reversibility'])}`,
+        );
+        // The LangChain half of the feed carries the same tag, so the two
+        // halves cannot answer the same question differently.
+        const callback = events.find((e) => e['type'] === 'llm.end');
+        assert(callback !== undefined, 'the LangChain event is in the feed');
+        assert(
+          callback!['reversibility'] === 'idempotent',
+          `the callback says the same, got ${String(callback!['reversibility'])}`,
+        );
+      });
+
+      await checkAsync('the page shows which calls can be undone', async () => {
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        assert(html.includes('<th>可逆性</th>'), 'the page names the column');
+        // The cell carries the **recorded** word — the same word
+        // `cortex trace` prints — and it sits between the duration and the
+        // cost, the order the trace table uses.
+        const row = renderDashboardEventRow(html, {
+          type: 'tool.call', name: 'tool_call', pid: 2, durationMs: 34,
+          reversibility: 'irreversible',
+        });
+        assert(
+          /<td class="rev-cell rev-irreversible"[^>]*>irreversible<\/td>/.test(row),
+          `the row says the tag, got: ${row}`,
+        );
+        assert(row.indexOf('rev-cell') > row.indexOf('class="duration"'), 'the tag sits after the duration');
+        assert(row.indexOf('rev-cell') < row.indexOf('class="cost-cell"'), 'and before the cost');
+        // A call nobody tagged is *not reported* — not "reversible". It says
+        // so the way every other cell here says it.
+        const quiet = renderDashboardEventRow(html, { type: 'llm.call', name: 'llm_call', pid: 2 });
+        assert(
+          /<td class="rev-cell"[^>]*>—<\/td>/.test(quiet),
+          `an untagged call says nothing, got: ${quiet}`,
+        );
+      });
+
+      await checkAsync('the timeline says which frames can be undone', async () => {
+        // The process dialog's timeline is the window's second view of the
+        // same frames `cortex trace` prints, and it has to say the same
+        // things — including whether the frame can be undone.
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        const row = renderDashboardTraceRow(html, {
+          timestamp: '2026-09-28T00:00:05.000Z',
+          syscall: 'tool_call',
+          frame: 'tool_call',
+          phase: 'exit',
+          durationMs: 12,
+          reversibility: 'irreversible',
+          tokensIn: 100,
+          tokensOut: 20,
+        });
+        assert(row.includes('irreversible'), `the timeline says the tag, got: ${row}`);
+        // And before what it spent — the order `cortex trace` uses: how long
+        // it took, whether it can be undone, what it spent.
+        const spent = String(pageFunction(html, 'callSummary')({
+          tokensIn: 100, tokensOut: 20,
+        }));
+        assert(spent !== '', 'the record spent something');
+        assert(
+          row.indexOf('irreversible') < row.indexOf(spent),
+          `the tag comes before the spend, got: ${row}`,
+        );
       });
 
       await checkAsync('dashboard /api/trace/:pid returns the syscall timeline', async () => {
@@ -10702,7 +10831,13 @@ async function runDashboardChecks(): Promise<void> {
         assert(tableAt >= 0, 'the event table is still there');
         const headRow = html.slice(tableAt, html.indexOf('</tr>', tableAt));
         const columns = (headRow.match(/<th\b/g) ?? []).length;
-        assert(columns === 7, `the event table has seven columns, got ${columns}`);
+        assert(columns === 8, `the event table has eight columns, got ${columns}`);
+        // And the empty row spans every one of them — a colspan that is one
+        // short leaves the last column of the header unclaimed.
+        assert(
+          html.includes(`<td colspan="${columns}" class="empty">`),
+          `the empty row spans all ${columns} columns`,
+        );
 
         // Render one row with the page's own code.
         const row = renderDashboardEventRow(html, {

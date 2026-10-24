@@ -162,6 +162,12 @@
     .event-kind.error { background: #fff0f0; color: var(--red); }
     .event-time { color: #929aa6; font-size: 9px; }
     .duration { color: #536071; font-variant-numeric: tabular-nums; }
+    /* The reversibility tag: the recorded word, in the recorded colour.
+       A call that cannot be undone is the one an operator has to see. */
+    .rev-cell { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; color: #6d7684; letter-spacing: .1px; }
+    .rev-cell.rev-irreversible { color: var(--red); }
+    .rev-cell.rev-reversible { color: var(--green); }
+    .rev-cell.rev-idempotent { color: #929aa7; }
     .page-footer { display: flex; align-items: center; justify-content: space-between; padding: 8px 2px; color: #9aa1ac; font-size: 9px; }
     dialog { width: min(620px, calc(100vw - 28px)); max-height: 78vh; padding: 0; overflow: hidden; border: 1px solid #dfe3e9; border-radius: 11px; background: #fff; color: var(--ink); box-shadow: 0 20px 80px #0e172533; }
     dialog::backdrop { background: #18212f55; backdrop-filter: blur(2px); }
@@ -254,7 +260,7 @@
         <section class="panel events-panel" id="events">
           <div class="panel-head"><div><div class="panel-title">最近执行事件</div><div class="panel-note">Cortex 模型 / 工具 / syscall 与 LangChain 回调 · 不含 prompt 内容</div></div><span class="nav-count" id="eventTotal"></span><button class="text-button" id="eventMore">加载更多</button></div>
           <div class="event-filters"><span>时间范围</span><input type="datetime-local" id="eventFrom" aria-label="开始时间"><span>→</span><input type="datetime-local" id="eventTo" aria-label="结束时间"><button class="button" id="eventFilter" type="button">筛选</button><button class="text-button" id="eventClear" type="button">清除</button></div>
-          <div class="table-scroll"><table class="event-table"><thead><tr><th>类型</th><th>名称 / 关联记录</th><th>PID</th><th>耗时</th><th>Token / 模型</th><th>时间</th><th>错误</th></tr></thead><tbody id="eventRows"><tr><td colspan="7" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr></tbody></table></div>
+          <div class="table-scroll"><table class="event-table"><thead><tr><th>类型</th><th>名称 / 关联记录</th><th>PID</th><th>耗时</th><th>可逆性</th><th>Token / 模型</th><th>时间</th><th>错误</th></tr></thead><tbody id="eventRows"><tr><td colspan="8" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr></tbody></table></div>
         </section>
         <footer class="page-footer"><span>Cortex Agent OS</span><span id="footerUpdated">连接中</span></footer>
       </div>
@@ -422,6 +428,21 @@
       return 'Agent';
     }
 
+    // Whether a call can be undone.
+    //
+    // The kernel tags every frame with it (ABI.md §4.1) and `cortex trace`
+    // prints the tag in a column of its own — so the word here is the
+    // **recorded** one, the same word the terminal prints: `reversible`,
+    // `idempotent`, `irreversible`.
+    //
+    // A tag nobody reported is *not reported*, not "reversible" — and this
+    // table marks that the way every other cell here marks a value it does
+    // not have: an em dash.
+    function reversibilityLabel(value) {
+      if (value === undefined || value === null || value === '') return '—';
+      return String(value);
+    }
+
     function renderEvents() {
       const rows = eventData;
       $('eventTotal').textContent = eventsTotal ? `共 ${eventsTotal.toLocaleString()} 条` : '';
@@ -449,8 +470,15 @@
         // column showed the *time*, every cell after it shifted one column
         // left, and the tokens and the cost never reached the screen at all.
         const costLabel = event.usd === undefined ? '' : fmtUsd(event.usd);
-        return `<tr><td><span class="event-kind ${kind}">${label} · ${esc(String(event.type ?? '').split('.').at(-1))}</span></td><td class="event-name" title="${esc(auditTitle)}">${esc(event.name ?? event.runId ?? '—')}${auditText ? ` · ${esc(auditText)}` : ''}</td><td class="pid-cell">${esc(event.pid ?? '—')}</td><td class="duration">${event.durationMs === undefined ? '—' : `${esc(event.durationMs)} ms`}</td><td class="cost-cell" title="${esc(costLabel)}">${esc(tokenSummary)}</td><td class="event-time">${esc(time)}</td><td title="${esc(errorSummary)}">${esc(errorSummary)}</td></tr>`;
-      }).join('') : '<tr><td colspan="7" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr>';
+        // Whether this call can be undone. The word is the **recorded** one
+        // — the same word `cortex trace` prints in its reversibility column
+        // — and it sits between the duration and the cost, the order the
+        // trace table uses: how long it took, whether it can be undone, what
+        // it spent.
+        const rev = reversibilityLabel(event.reversibility);
+        const revClass = ['reversible', 'idempotent', 'irreversible'].includes(rev) ? ` rev-${rev}` : '';
+        return `<tr><td><span class="event-kind ${kind}">${label} · ${esc(String(event.type ?? '').split('.').at(-1))}</span></td><td class="event-name" title="${esc(auditTitle)}">${esc(event.name ?? event.runId ?? '—')}${auditText ? ` · ${esc(auditText)}` : ''}</td><td class="pid-cell">${esc(event.pid ?? '—')}</td><td class="duration">${event.durationMs === undefined ? '—' : `${esc(event.durationMs)} ms`}</td><td class="rev-cell${revClass}" title="${esc('能否撤销：reversible 可由另一次调用撤销 · idempotent 调用两次等于一次 · irreversible 无法撤销')}">${esc(rev)}</td><td class="cost-cell" title="${esc(costLabel)}">${esc(tokenSummary)}</td><td class="event-time">${esc(time)}</td><td title="${esc(errorSummary)}">${esc(errorSummary)}</td></tr>`;
+      }).join('') : '<tr><td colspan="8" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr>';
     }
 
     let processView = 'table';
@@ -735,7 +763,13 @@
     // `callSummary` the event table asks.
     function traceItem(record) {
       const parts = [String(record.frame ?? record.syscall)];
+      // Whether the frame can be undone, in the recorded word — and before
+      // what it spent, the order `cortex trace` uses. A frame that carries no
+      // tag says nothing here, the way the rest of this line stays quiet
+      // about what it does not know.
+      const rev = reversibilityLabel(record.reversibility);
       const spent = callSummary(record);
+      if (rev !== '—') parts.push(rev);
       if (spent !== '') parts.push(spent);
       if (record.model) parts.push(String(record.model));
       if (record.usd !== undefined) parts.push(fmtUsd(Number(record.usd)));

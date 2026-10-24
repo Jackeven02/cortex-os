@@ -20,6 +20,18 @@ export interface LangChainEvent {
   readonly inputTokens?: number;
   readonly outputTokens?: number;
   readonly error?: string;
+  /**
+   * What it would take to undo this event.
+   *
+   * The same tag the `.crec` frame carries (ABI.md §4.1), so the two sinks
+   * cannot disagree about one call — and so the operator's window can say
+   * that a tool call is not a read.
+   *
+   * The handler fills this on every event it emits ({@link
+   * reversibilityForEvent}); it is optional only because a host may hand the
+   * handler an event of its own.
+   */
+  readonly reversibility?: Reversibility;
 }
 
 /**
@@ -91,6 +103,27 @@ const REVERSIBILITY_FOR_TYPE: Readonly<Record<string, Reversibility>> = {
 const REVERSIBILITY_FOR_SYSCALL: Readonly<Record<string, Reversibility>> = {
   tool_call: 'irreversible',
 };
+
+/**
+ * What it would take to undo the call behind a callback event.
+ *
+ * The rule is deliberately conservative: a callback only knows **that a tool
+ * ran**, not what the tool did — so a tool call is tagged `irreversible`. A
+ * read-only tool would be `idempotent`, and guessing the friendlier word
+ * would be the one tag nobody can act on. A retrieval is a read, so it is
+ * `reversible`; everything else (a model call, a chain step) is `idempotent`.
+ *
+ * It is decided **once**, where the event is born, so the jsonl line and the
+ * `.crec` frame of the same call carry the same tag — two sinks that answer
+ * the same question must not answer it differently.
+ */
+export function reversibilityForEvent(type: string, syscallName?: string): Reversibility {
+  return (
+    REVERSIBILITY_FOR_TYPE[type] ??
+    (syscallName !== undefined ? REVERSIBILITY_FOR_SYSCALL[syscallName] : undefined) ??
+    'idempotent'
+  );
+}
 
 const usageFrom = (value: unknown): { inputTokens?: number; outputTokens?: number } => {
   if (typeof value !== 'object' || value === null) return {};
@@ -252,14 +285,24 @@ export class CortexLangChainCallbackHandler {
    * already parsing it.
    */
   async #emit(event: LangChainEvent): Promise<void> {
-    await this.#onEvent?.(event);
+    // The tag is decided **here**, where the event is born, and then travels
+    // with it: the jsonl line, the `.crec` frame and the host's `onEvent`
+    // callback all get the same word. The jsonl sink used to carry no tag at
+    // all, so the dashboard's event table — which merges the jsonl events
+    // with the syscall frames — had no way to tell a tool call from a read
+    // for half of its rows.
+    const tagged: LangChainEvent = {
+      ...event,
+      reversibility: event.reversibility ?? reversibilityForEvent(event.type, SYSCALL_FOR_TYPE[event.type]),
+    };
+    await this.#onEvent?.(tagged);
     const path = defaultEventPath(this.#dir);
     this.#writes = this.#writes.then(async () => {
       await mkdir(dirname(path), { recursive: true });
-      await appendFile(path, `${JSON.stringify(event)}\n`, 'utf8');
+      await appendFile(path, `${JSON.stringify(tagged)}\n`, 'utf8');
     });
     if (this.#sink === 'crec') {
-      const crecWrite = this.#writeCrec(event);
+      const crecWrite = this.#writeCrec(tagged);
       this.#writes = this.#writes.then(() => crecWrite);
     }
     await this.#writes;
@@ -318,7 +361,7 @@ export class CortexLangChainCallbackHandler {
       ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
       stateBefore: 'running',
       stateAfter: 'running',
-      reversibility: REVERSIBILITY_FOR_TYPE[event.type] ?? REVERSIBILITY_FOR_SYSCALL[name] ?? 'idempotent',
+      reversibility: event.reversibility ?? REVERSIBILITY_FOR_TYPE[event.type] ?? REVERSIBILITY_FOR_SYSCALL[name] ?? 'idempotent',
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
     await recorder.append(record);

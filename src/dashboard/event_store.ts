@@ -41,7 +41,7 @@ import { open } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { existingCrecPath, LogTail } from '../kernel/recorder.js';
-import { asProcessId, type SyscallRecord } from '../kernel/types.js';
+import { asProcessId, type Reversibility, type SyscallRecord } from '../kernel/types.js';
 import { listProcDirs, readAllMetas } from '../cli/process_store.js';
 import { callUsage } from '../token_usage.js';
 
@@ -86,6 +86,23 @@ export interface ActivityEvent {
    */
   tokensCached?: number;
   usd?: number;
+  /**
+   * Whether the call can be undone: `reversible`, `idempotent` or
+   * `irreversible`.
+   *
+   * **Every syscall frame carries one** (ABI.md §4.1), and it is not
+   * decoration — it drives three kernel behaviours: the `forkable` region's
+   * `EREVERSIBLE` trap, how verbosely the frame is recorded, and what
+   * `cortex audit` surfaces. `cortex trace` prints it in a column of its own.
+   *
+   * The window used to drop it, so a tool call that paid a credit card looked
+   * exactly like a read — which is the one distinction an operator watching
+   * the window most needs.
+   *
+   * Absent means *not reported*: an event from a source that does not carry
+   * the tag. It does not mean "reversible".
+   */
+  reversibility?: Reversibility;
   audit?: Record<string, unknown>;
 }
 
@@ -146,6 +163,9 @@ export function toActivityEvent(record: SyscallRecord, pid: number): ActivityEve
     ...(usage?.outputTokens !== undefined ? { tokensOut: usage.outputTokens } : {}),
     ...(usage?.cachedTokens !== undefined ? { tokensCached: usage.cachedTokens } : {}),
     ...(usage?.usd !== undefined ? { usd: usage.usd } : {}),
+    // What it would take to undo this call. The frame always carries the tag
+    // (ABI.md §4.1), and the trace prints it — so the window prints it too.
+    ...(record.reversibility !== undefined ? { reversibility: record.reversibility } : {}),
     ...(audit !== undefined ? { audit } : {}),
   };
 }
