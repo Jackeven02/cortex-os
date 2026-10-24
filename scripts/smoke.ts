@@ -11350,7 +11350,7 @@ async function runDiffChecks(): Promise<void> {
       });
       await rec.append({
         timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(2), syscall: '__state',
-        callId: 's1', phase: 'exit', args: { from: 'new', to: 'ready', trigger: 'test' },
+        callId: 's1', phase: 'exit', args: { from: 'new', to: 'ready', trigger: 'spawn' },
         stateBefore: 'new', stateAfter: 'ready', reversibility: 'idempotent',
         kernelAbiVersion: KERNEL_ABI_VERSION,
       });
@@ -11385,6 +11385,69 @@ async function runDiffChecks(): Promise<void> {
       assert(
         out.includes('__signal:SIGTERM(queued)'),
         `the signal lost its outcome: ${out}`,
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('the trace says why a process changed state', async () => {
+    // A transition without a cause is a fact without an explanation. The log
+    // said the process went from `running` to `blocked`, and not whether it
+    // was waiting on a channel, on a timer, on a child, or on a signal — so
+    // the reader had to guess from the transition pair. The cause was in the
+    // frame the whole time (ABI.md §6.1); the view dropped it.
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-trace-cause-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(2), syscall: '__state',
+        callId: 's1', phase: 'exit',
+        args: { from: 'running', to: 'blocked', trigger: 'recv' },
+        stateBefore: 'running', stateAfter: 'blocked', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(2), syscall: '__state',
+        callId: 's2', phase: 'exit',
+        args: { from: 'running', to: 'exiting', trigger: 'signal', signal: 'SIGTERM' },
+        stateBefore: 'running', stateAfter: 'exiting', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      console.error = (): void => {};
+      try {
+        const code = await cmdTrace(['2']);
+        assert(code === 0, `trace exit 0, got ${code}`);
+      } finally {
+        console.log = prevLog;
+        console.error = prevErr;
+      }
+
+      assert(
+        out.includes('__state:running->blocked(recv)'),
+        `the transition lost its cause: ${out}`,
+      );
+      assert(
+        out.includes('__state:running->exiting(SIGTERM)'),
+        `a signal is named by the signal, not by the word "signal": ${out}`,
       );
     } finally {
       if (prevHome === undefined) delete process.env['CORTEX_HOME'];
@@ -11460,10 +11523,12 @@ async function runDiffChecks(): Promise<void> {
 
   await checkAsync('the trace table holds its widest frame', async () => {
     // A column width that is a guess is a width that is wrong eventually. The
-    // widest name the kernel can produce is `__state:checkpointing->checkpointing`
-    // (36 characters); one character more and every column after it slides
-    // right, so the row stops lining up with the heading above it and the
-    // reader cannot tell which column they are looking at.
+    // widest name the kernel can produce is
+    // `__state:checkpointing->checkpointing(init-register-daemon)` — the two
+    // longest states and the longest cause, which is 58 characters; one
+    // character more and every column after it slides right, so the row stops
+    // lining up with the heading above it and the reader cannot tell which
+    // column they are looking at.
     //
     // The width is derived from the kernel's own value domains, so this check
     // is really checking that the derivation is still true — and that a name
@@ -11483,7 +11548,7 @@ async function runDiffChecks(): Promise<void> {
       await rec.append({
         timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(2), syscall: '__state',
         callId: 'w1', phase: 'exit',
-        args: { from: 'checkpointing', to: 'checkpointing', trigger: 'test' },
+        args: { from: 'checkpointing', to: 'checkpointing', trigger: 'checkpoint' },
         stateBefore: 'checkpointing', stateAfter: 'checkpointing', reversibility: 'idempotent',
         kernelAbiVersion: KERNEL_ABI_VERSION,
       });
@@ -11495,7 +11560,7 @@ async function runDiffChecks(): Promise<void> {
       });
       await rec.append({
         timestamp: '2026-01-01T00:00:02.000Z', pid: asProcessId(2),
-        syscall: 'acme_extremely_long_driver_syscall_name',
+        syscall: 'acme_extremely_long_driver_syscall_name_that_cannot_possibly_fit',
         callId: 'w3', phase: 'exit', result: 1,
         stateBefore: 'running', stateAfter: 'running', reversibility: 'idempotent',
         kernelAbiVersion: KERNEL_ABI_VERSION,
@@ -11524,10 +11589,11 @@ async function runDiffChecks(): Promise<void> {
       assert(rows.length === 3, `expected 3 record rows, got ${rows.length}: ${out}`);
 
       // The widest name the kernel can produce still fits.
+      const widestFrame = '__state:checkpointing->checkpointing(init-register-daemon)';
       assert(
-        TRACE_SYSCALL_WIDTH >= '__state:checkpointing->checkpointing'.length,
+        TRACE_SYSCALL_WIDTH >= widestFrame.length,
         `the syscall column is ${TRACE_SYSCALL_WIDTH} wide and the widest frame name is ` +
-          `${'__state:checkpointing->checkpointing'.length}`,
+          `${widestFrame.length}`,
       );
 
       // Every row lines up with the header — including the widest frame, and
@@ -11543,15 +11609,15 @@ async function runDiffChecks(): Promise<void> {
         );
       }
 
-      // The widest frame is shown whole.
+      // The widest frame is shown whole — cause and all.
       assert(
-        out.includes('__state:checkpointing->checkpointing'),
+        out.includes('__state:checkpointing->checkpointing(checkpoint)'),
         `the widest frame was cut: ${out}`,
       );
 
       // A name that cannot fit is cut *and marked* — a fact that does not fit
       // must not lose its tail silently.
-      const longName = 'acme_extremely_long_driver_syscall_name';
+      const longName = 'acme_extremely_long_driver_syscall_name_that_cannot_possibly_fit';
       const expectedCut = `${longName.slice(0, TRACE_SYSCALL_WIDTH - 1)}…`;
       assert(
         out.includes(expectedCut),
@@ -16633,6 +16699,54 @@ async function runKernelHardeningChecks(): Promise<void> {
       assert(meta.pid === unbrand(pid), `the meta names the right pid, got ${meta.pid}`);
       assert(meta.exitReason === 'signal:SIGKILL', `exit reason, got ${meta.exitReason}`);
       assert(meta.exitCode === 137, `exit code, got ${meta.exitCode}`);
+    });
+
+    await checkAsync('a state frame records the state it came from, not the sender', async () => {
+      // ABI.md §6.1 says the `__state` frame carries `from`, `to` and the
+      // trigger that caused the transition. The signal path passed the
+      // *sender's* pid in the transition's own metadata, and that metadata
+      // used to be spread over the transition — so the frame recorded a pid
+      // (or null) where the state belonged. The log said a process came
+      // "from null", which is not a state at all.
+      const k = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir: tmp,
+        autoStart: true,
+        loadDrivers: (reg) => reg.registerLLM(mockLLM()),
+        agentLoader: async () => async (ctx) => {
+          try {
+            await ctx.recv(undefined, { timeoutMs: 60_000 });
+          } catch {
+            /* the process is going away */
+          }
+        },
+      });
+      kernels.push(k);
+
+      const pid = await k.spawn({ role: 'signalled', agent: { module: 'test:signalled' } });
+      assert(await waitFor(() => k.table.get(pid)?.state === 'blocked'), 'the agent parked');
+      await k.signals.send(pid, 'SIGKILL');
+      assert(
+        await waitFor(() => k.table.get(pid)?.state === 'zombie' || k.table.get(pid) === undefined),
+        'the agent died of the signal',
+      );
+
+      const frames: { args?: unknown }[] = [];
+      for await (const rec of readRecords(existingCrecPath(tmp, pid))) {
+        if (rec.syscall === '__state') frames.push(rec);
+      }
+      assert(frames.length > 0, 'the transitions were recorded');
+      for (const frame of frames) {
+        const args = (frame.args ?? {}) as Record<string, unknown>;
+        assert(
+          typeof args['from'] === 'string',
+          `the frame records the state it came from, got ${JSON.stringify(args['from'])}`,
+        );
+        assert(
+          typeof args['to'] === 'string',
+          `the frame records the state it went to, got ${JSON.stringify(args['to'])}`,
+        );
+      }
     });
 
     await checkAsync('a second kernel in the same directory does not reuse a PID', async () => {

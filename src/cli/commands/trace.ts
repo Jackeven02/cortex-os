@@ -17,7 +17,7 @@ import { existsSync } from 'node:fs';
 import { defaultKernelDir, existingCrecPath } from '../index.js';
 import { readRecords } from '../../kernel/recorder.js';
 import { unbrand, asProcessId, type SyscallRecord } from '../../kernel/types.js';
-import { PROCESS_STATES } from '../../kernel/process_table.js';
+import { PROCESS_STATES, STATE_TRIGGERS } from '../../kernel/process_table.js';
 import { ALL_SIGNALS, DELIVERY_OUTCOMES } from '../../kernel/signals.js';
 import { INIT_ACTIONS } from '../../kernel/init.js';
 import { DISPATCH_ACTIONS } from '../../kernel/scheduler.js';
@@ -40,18 +40,25 @@ function longest(values: readonly string[]): number {
  *
  * So the width is **derived** from the kernel's own value domains:
  *
- * - `__state:` + *state* + `->` + *state* — the longest state is
- *   `checkpointing` (13), so `__state:checkpointing->checkpointing` is 36;
+ * - `__state:` + *state* + `->` + *state* + `(` + *cause* + `)` — the
+ *   longest state is `checkpointing` (13) and the longest cause is
+ *   `init-register-daemon` (20), so 58;
  * - `__signal:` + *signal* + `(` + *outcome* + `)` — 27;
  * - `__init:` + *action* — 23 (`restart-gave-up`);
  * - `__sched:` + *action* — 15.
  *
  * The lists come from the kernel modules themselves, so a new state, a new
- * signal or a new supervision action widens the column automatically. There
- * is nothing here to remember to update.
+ * signal, a new supervision action or a new transition cause widens the
+ * column automatically. There is nothing here to remember to update.
  */
 export const TRACE_SYSCALL_WIDTH = Math.max(
-  '__state:'.length + longest(PROCESS_STATES) + '->'.length + longest(PROCESS_STATES),
+  '__state:'.length +
+    longest(PROCESS_STATES) +
+    '->'.length +
+    longest(PROCESS_STATES) +
+    '('.length +
+    longest(STATE_TRIGGERS) +
+    ')'.length,
   '__signal:'.length + longest(ALL_SIGNALS) + '('.length + longest(DELIVERY_OUTCOMES) + ')'.length,
   '__init:'.length + longest(INIT_ACTIONS),
   '__sched:'.length + longest(DISPATCH_ACTIONS),
@@ -111,9 +118,17 @@ export function frameName(rec: SyscallRecord): string {
     case '__state': {
       const from = typeof args?.['from'] === 'string' ? args['from'] : rec.stateBefore;
       const to = typeof args?.['to'] === 'string' ? args['to'] : rec.stateAfter;
-      return from !== undefined && to !== undefined
-        ? `__state:${from}->${to}`
-        : rec.syscall;
+      if (from === undefined || to === undefined) return rec.syscall;
+      // The cause: **why** the process moved. Without it the log says a
+      // process went from `running` to `blocked` and not whether it was
+      // waiting on a channel, on a timer, on a child, or on a signal — a
+      // fact without an explanation. The trigger was in the frame all along
+      // (ABI.md §6.1); the view just dropped it.
+      //
+      // A signal is named by the signal itself, because "SIGTERM" says more
+      // than "signal"; every other cause is the trigger.
+      const cause = stateCause(args);
+      return cause === '' ? `__state:${from}->${to}` : `__state:${from}->${to}(${cause})`;
     }
     case '__signal': {
       const signal = typeof args?.['signal'] === 'string' ? args['signal'] : undefined;
@@ -124,6 +139,25 @@ export function frameName(rec: SyscallRecord): string {
     default:
       return rec.syscall;
   }
+}
+
+/**
+ * What caused a state transition.
+ *
+ * A signal is named by the signal — "SIGTERM" says more than "signal" — and
+ * everything else is the trigger the kernel recorded (`recv`, `sleep`,
+ * `wait`, `scheduler-dispatch`, …).
+ *
+ * Empty when the frame carries no cause at all: an older kernel recorded the
+ * transition without one, and a frame that says nothing is better than one
+ * that guesses.
+ */
+function stateCause(args: Record<string, unknown> | undefined): string {
+  if (args === undefined) return '';
+  const signal = args['signal'];
+  if (typeof signal === 'string' && signal !== '') return signal;
+  const trigger = args['trigger'];
+  return typeof trigger === 'string' ? trigger : '';
 }
 
 /**

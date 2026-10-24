@@ -2358,6 +2358,72 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   No syscall, `.crec`, or `.csnap` format change — the ABI frozen at `1.0.0`
   is untouched. This is the CLI's own rendering.
 
+- **A transition without a cause.** A `__state` frame said what a process
+  *did* — `running->blocked` — and not **why**: not whether it was waiting on
+  a channel, on a timer, on a child, or on a signal. The cause was in the
+  frame the whole time (ABI.md §6.1 — "`from`, `to`, and the trigger that
+  caused the transition"), and the view dropped it.
+
+  So a log read like this:
+
+  ```
+  __state:new->ready
+  __state:ready->running
+  __state:running->blocked
+  __state:blocked->ready
+  ```
+
+  — and the reader had to guess from the transition pair what the agent was
+  doing and why it moved. Now:
+
+  ```
+  __state:new->ready(spawn)
+  __state:ready->running(scheduler-dispatch)
+  __state:running->blocked(recv)
+  __state:blocked->ready(recv-wake)
+  ```
+
+  A signal is named by the **signal**, not by the word "signal": `SIGTERM`
+  says more than `signal`.
+
+  **And the causes are a vocabulary, not free text.** `STATE_TRIGGERS` is
+  exported from the process table and `setState` takes a `StateTrigger`, so a
+  cause that is not on the list cannot be recorded — a typo is a compile
+  error (`Type '"revc"' is not assignable to type '"recv" | …'`) and not a
+  frame nobody can explain. The list also widens the trace table's syscall
+  column by itself: the widest frame name the kernel can produce is
+  `__state:checkpointing->checkpointing(init-register-daemon)`, 58 characters.
+
+  **And the frame's own fields are the frame's.** Found by running it: the
+  signal path passed the pid that sent the signal in the transition's
+  metadata, and that metadata was spread *over* the transition — so the
+  `__state` frame recorded a pid (or null) where the **state** belonged. The
+  raw log said:
+
+  ```json
+  {"syscall":"__state","args":{"to":"exiting","from":null,"signal":"SIGTERM","trigger":"signal"}}
+  ```
+
+  — a process that came "from null", which is not a state at all. The
+  transition's own `from` and `to` now always win, and the sender is recorded
+  under `sender`.
+
+  **Two new smoke checks** (735 → 737), each one reverse-verified: the cause
+  dropped from the view → "the trace says why a process changed state" fails
+  ("the transition lost its cause"); a signal named by the word "signal"
+  instead of by the signal → the same check fails ("a signal is named by the
+  signal, not by the word 'signal'"); the sender put back under `from` →
+  "a state frame records the state it came from, not the sender" fails
+  ("the frame records the state it came from, got null") — the exact frame
+  the real kernel wrote; and a mistyped trigger → the build fails.
+
+  The README's trace, attach and watch examples are now real output again,
+  at the new column width.
+
+  No syscall, `.crec`, or `.csnap` format change — the ABI frozen at `1.0.0`
+  is untouched. What the `__state` frame *carries* is fixed to match what
+  ABI.md §6.1 already promised.
+
 ### Documentation
 
 - **The kernel-size claim was off by more than half.** MANIFESTO §II.3

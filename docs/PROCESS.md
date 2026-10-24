@@ -296,6 +296,24 @@ Every legal transition is listed here. Anything not in this table is illegal and
 
 **Forking** does not appear in this table because fork does not transition the parent. Fork creates a **new** process in NEW state, with a snapshot copied from the parent's current state (whatever it is — RUNNING, BLOCKED, even STOPPED). The parent continues unchanged. See STATE.md §3.
 
+**Every transition records why.** The `Trigger` column above says what *kind* of
+event moved the process; the kernel records it as a **cause** — the trigger
+(`recv`, `sleep`, `wait`, `spawn`, `scheduler-dispatch`, `signal`, …) — and
+that cause is in the `__state` frame in the `.crec` log, where `cortex trace`
+shows it:
+
+```
+__state:running->blocked(recv)
+__state:running->exiting(SIGTERM)
+```
+
+A transition without a cause is a fact without an explanation, and the reader
+had to guess from the transition pair alone. The causes are a **vocabulary**,
+not free text: `STATE_TRIGGERS` is exported from the process table and
+`setState` takes a `StateTrigger`, so a cause that is not on the list cannot
+be recorded — a typo is a compile error, not a frame nobody can explain
+(ABI.md §6.1).
+
 ---
 
 ## 6. Lifecycle of a process

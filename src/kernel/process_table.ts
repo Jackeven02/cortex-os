@@ -112,6 +112,53 @@ export const PROCESS_STATES = [
 ] as const satisfies readonly ProcessState[];
 
 /**
+ * Why a process changed state — the **trigger** recorded with every
+ * transition.
+ *
+ * A transition without a cause is a fact without an explanation: the log says
+ * the process went from `running` to `blocked`, and not whether it was
+ * waiting on a channel, on a timer, on a child, or on a signal. The trigger
+ * is that answer, and it was in the `__state` frame all along — the views
+ * just dropped it.
+ *
+ * The list is exported so that:
+ *
+ * - a view can size its column to the widest cause the kernel can produce
+ *   rather than guess at one (ABI.md §6.1);
+ * - a cause that is not on the list cannot be recorded — `setState` takes a
+ *   {@link StateTrigger}, so a typo is a compile error and not a frame
+ *   nobody can explain.
+ *
+ * The list is exhaustive by construction: every `setState` call site names
+ * one of these.
+ */
+export const STATE_TRIGGERS = [
+  'init-boot',
+  'init-register-daemon',
+  'spawn',
+  'fork',
+  'fork-abort',
+  'restore',
+  'checkpoint',
+  'checkpoint-abort',
+  'recv',
+  'recv-wake',
+  'recv-cancel',
+  'wait',
+  'wait-return',
+  'sleep',
+  'exit',
+  'signal',
+  'kill',
+  'cleanup-done',
+  'scheduler-dispatch',
+  'scheduler-yield',
+] as const;
+
+/** One cause of a state transition. */
+export type StateTrigger = (typeof STATE_TRIGGERS)[number];
+
+/**
  * Legal state transitions, encoded as a set of `"from->to"` keys.
  *
  * Source: docs/PROCESS.md §5 (the normative table). Note that §2 prose says
@@ -745,7 +792,8 @@ export class ProcessTable {
    * @param pid     Target process.
    * @param next    New state.
    * @param meta    Optional context recorded with the transition (trigger,
-   *                signal, syscall name, etc.).
+   *                signal, syscall name, etc.). The trigger is typed: only a
+   *                cause on {@link STATE_TRIGGERS} can be recorded.
    *
    * @throws CortexError ESRCH if the PID is absent, EINVAL if the transition
    *         is not in the legal table, ERECORD if recording fails.
@@ -753,7 +801,7 @@ export class ProcessTable {
   async setState(
     pid: ProcessId,
     next: ProcessState,
-    meta: { readonly trigger?: string; readonly [key: string]: unknown } = {},
+    meta: { readonly trigger?: StateTrigger; readonly [key: string]: unknown } = {},
   ): Promise<void> {
     const entry = this.mustGet(pid, 'setState');
     const prev = entry.state;
@@ -1207,7 +1255,14 @@ export class ProcessTable {
       syscall: '__state',
       callId: `state-${unbrand(entry.pid)}-${entry.lastTransitionAt}`,
       phase: 'exit',
-      args: { from: prev, to: next, ...meta },
+      // The transition's own `from` and `to` are spread **last**, on purpose:
+      // they are what the frame means (ABI.md §6.1 — "`from`, `to`, and the
+      // trigger that caused the transition"), and a caller must not be able
+      // to shadow them with something else. The signal path used to pass the
+      // *sender's* pid under `from`, and the frame recorded that instead of
+      // the state the process came from — so the log said a process went
+      // "from null", which is not a state at all.
+      args: { ...meta, from: prev, to: next },
       stateBefore: prev,
       stateAfter: next,
       reversibility: 'idempotent',

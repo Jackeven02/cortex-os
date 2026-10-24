@@ -751,22 +751,36 @@ opening the file:
 
 ```
 __init:restart-gave-up
-__state:new->ready
+__state:new->ready(spawn)
 __sched:dispatch
 __signal:SIGTERM(delivered)
 ```
+
+A `__state` frame names **why** the process moved, because a transition
+without a cause is a fact without an explanation: `running->blocked` says the
+process blocked, and not whether it was waiting on a channel, on a timer, on a
+child, or on a signal. A signal is named by the signal itself — "SIGTERM" says
+more than "signal" — and every other cause is the trigger the kernel recorded.
 
 Rendering a record under a longer name is not a change to the record
 (§11) — the same `.crec` file is byte-for-byte identical either way.
 
 The **vocabularies** those names are built from are exported at runtime, so
 there is exactly one home for each of them and a view can size itself against
-them rather than guess: `PROCESS_STATES` (the process table),
-`ALL_SIGNALS` and `DELIVERY_OUTCOMES` (the signal manager),
+them rather than guess: `PROCESS_STATES` and `STATE_TRIGGERS` (the process
+table), `ALL_SIGNALS` and `DELIVERY_OUTCOMES` (the signal manager),
 `INIT_ACTIONS` (init) and `DISPATCH_ACTIONS` (the scheduler). A new state,
-signal, delivery outcome or supervision action widens whatever depends on it
-by itself — including the syscall column of the trace table, whose width is
-computed from these lists rather than typed by hand.
+signal, delivery outcome, transition cause or supervision action widens
+whatever depends on it by itself — including the syscall column of the trace
+table, whose width is computed from these lists rather than typed by hand.
+
+The trigger vocabulary is also **enforced**: `setState` takes a
+`StateTrigger`, so a cause that is not on the list cannot be recorded — a
+typo is a compile error rather than a frame nobody can explain. (The recorded
+`from` and `to` are the *states* the process came from and went to, and the
+transition's own values always win: a caller cannot shadow them. The signal
+path records the pid that sent the signal under `sender`, for the same
+reason.)
 
 ---
 

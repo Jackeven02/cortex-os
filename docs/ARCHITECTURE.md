@@ -1209,13 +1209,41 @@ So the *view* now carries the distinguishing part:
 |---|---|---|
 | `__init` | `__init:restart-gave-up` | which supervision action was taken |
 | `__sched` | `__sched:dispatch` | which scheduling action was taken |
-| `__state` | `__state:new->ready` | the transition, not just "a transition" |
+| `__state` | `__state:running->blocked(recv)` | the transition, **and what caused it** |
 | `__signal` | `__signal:SIGTERM(delivered)` | which signal, and what became of it |
+
+The `__state` frame is the one that gained a cause. A transition without one
+is a fact without an explanation: `running->blocked` says the process
+blocked, and not whether it was waiting on a channel, on a timer, on a child,
+or on a signal — so the reader had to guess from the transition pair. The
+cause was in the frame all along (ABI.md §6.1 — "`from`, `to`, and the
+trigger that caused the transition"); the view dropped it.
+
+A signal is named by the **signal**, not by the word "signal": `SIGTERM` says
+more than `signal`. Every other cause is the trigger the kernel recorded —
+`recv`, `sleep`, `wait`, `scheduler-dispatch`, `init-register-daemon`, and so
+on.
+
+**And the causes are a vocabulary, not free text.** `STATE_TRIGGERS` is
+exported from the process table, `setState` takes a `StateTrigger`, and so a
+cause that is not on the list **cannot be recorded** — a typo is a compile
+error (`Type '"revc"' is not assignable to type '"recv" | …'`) and not a frame
+nobody can explain. The list also widens the trace table's syscall column by
+itself: the widest frame name the kernel can produce is
+`__state:checkpointing->checkpointing(init-register-daemon)`, 58 characters.
 
 The **recorded** syscall name is untouched — the `.crec` format is frozen
 (ABI.md §6), and this is a view of a log, not a change to the log. A
 `__init` record on disk still says `__init`; `cortex trace`, `cortex
 attach` and `cortex watch` render it as `__init:restart`.
+
+**And the frame's own fields are the frame's.** The signal path used to pass
+the pid that sent the signal in the transition's metadata, and that metadata
+was spread *over* the transition — so the `__state` frame recorded a pid (or
+null) where the **state** belonged, and the log said a process came "from
+null", which is not a state at all. ABI.md §6.1 says the frame carries
+`from`, `to` and the trigger, and now it does: the transition's own values
+always win, and the sender is recorded under `sender`.
 
 The same fix removed a second failure that had been hiding in plain sight:
 the table's **header** was a hand-typed string. It had drifted — its

@@ -582,7 +582,7 @@ export class SignalManager {
     await this.#table.setState(pid, 'stopped', {
       trigger: 'signal',
       signal,
-      from: from !== undefined ? unbrand(from) : null,
+      sender: from !== undefined ? unbrand(from) : null,
     });
     await this.#record(pid, signal, from, 'delivered', {
       disposition: { kind: 'default' },
@@ -613,7 +613,7 @@ export class SignalManager {
     await this.#table.setState(pid, 'ready', {
       trigger: 'signal',
       signal,
-      from: from !== undefined ? unbrand(from) : null,
+      sender: from !== undefined ? unbrand(from) : null,
     });
     await this.#record(pid, signal, from, 'delivered', {
       disposition: { kind: 'default' },
@@ -728,7 +728,7 @@ export class SignalManager {
       trigger: 'signal',
       signal,
       graceful,
-      from: from !== undefined ? unbrand(from) : null,
+      sender: from !== undefined ? unbrand(from) : null,
     });
     await this.#table.setState(pid, 'zombie', {
       trigger: graceful ? 'cleanup-done' : 'kill',
@@ -804,7 +804,7 @@ export class SignalManager {
         trigger: 'signal',
         signal,
         kill: true,
-        from: from !== undefined ? unbrand(from) : null,
+        sender: from !== undefined ? unbrand(from) : null,
       });
     }
 
@@ -899,7 +899,7 @@ export class SignalManager {
         signal,
         signalNumber: SIGNAL_NUMBERS[signal],
         outcome,
-        from: from !== undefined ? unbrand(from) : null,
+        sender: from !== undefined ? unbrand(from) : null,
         ...details,
       },
       stateBefore: stateNow,

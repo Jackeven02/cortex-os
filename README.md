@@ -69,9 +69,11 @@ set the budget for 1234 (coder):
 # Follow a running agent's syscall stream (push, when a kernel is running)
 $ cortex attach 1234
 # attach .cortex/processes/1234/log.crec (live — frames by push from the kernel)
-14:23:01 1234  __state     exit  idempotent
-14:23:01 1234  memory_read  exit  idempotent
-14:23:04 1234  llm_call     exit  reversible
+time          pid     syscall                                                    phase  duration   reversibility
+----------------------------------------------------------------------------------------------------------------
+14:23:01.402  1234    memory_read                                                 exit   -          idempotent
+14:23:04.115  1234    llm_call                                                   exit   2523ms     reversible
+14:23:06.221  1234    __state:running->exiting(exit)                             exit   -          idempotent
 # pid 1234 exited with code 0 (completed)
 # detached
 # (with a live kernel running: cortex attach 1234 --interactive
@@ -110,15 +112,16 @@ $ cortex replay 1234
 # Trace every syscall
 $ cortex trace 1234
 # tracing .cortex/processes/1234/log.crec
-time          pid     syscall                              phase  duration   reversibility
-------------------------------------------------------------------------------------------
-14:23:01.402  1234   llm_call                             exit   2523ms     reversible
-14:23:04.115  1234   tool_call                            exit   -          irreversible
-14:23:06.221  1234   __state:running->exiting             exit   -          idempotent
+time          pid     syscall                                                    phase  duration   reversibility
+----------------------------------------------------------------------------------------------------------------
+14:23:01.402  1234    llm_call                                                   exit   2523ms     reversible
+14:23:04.115  1234    tool_call                                                  exit   -          irreversible
+14:23:06.221  1234    __state:running->exiting(exit)                             exit   -          idempotent
 # 3 record(s)
-# (the kernel's own frames are named too: __init:restart, __state:new->ready,
-#  __sched:parked, __signal:SIGTERM(queued) — so init's log reads as the
-#  supervision journal it is)
+# (the kernel's own frames are named too — and they say *why*:
+#  __state:running->blocked(recv), __state:new->ready(spawn),
+#  __init:restart-gave-up, __sched:parked, __signal:SIGTERM(queued) — so a log
+#  reads as the story it is, not a row of anonymous placeholders)
 
 # Read back what a process printed (kept per process, not mixed into the
 # daemon's stdout — stdout and stderr are tagged separately)
@@ -150,8 +153,12 @@ pid 1234 exited with code 0 (finished the task)
 # Watch the kernel live — every syscall frame, as it happens.
 # These are the same frames `cortex trace` reads, pushed instead of polled.
 $ cortex watch --pid 1234
-19:50:09.072  1234    sleep            exit    2523ms    idempotent
-19:50:09.077  1234    exit             enter   -         irreversible
+# watching the kernel event stream (Ctrl-C to stop)
+time          pid     syscall                                                    phase  duration   reversibility
+----------------------------------------------------------------------------------------------------------------
+19:50:09.072  1234    sleep                                                      exit   64ms       idempotent
+19:50:09.077  1234    __state:running->blocked(sleep)                            exit   -          idempotent
+19:50:09.138  1234    __state:blocked->ready(wait-return)                        exit   -          idempotent
 # pid 1234 exited with code 3 (probe finished on purpose)
 
 # Supervise a live agent: kill it if it stops making progress, and put
@@ -200,7 +207,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `replay`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` follows one agent's syscall stream — by push when a live kernel holds the process (median lag 1 ms, and the follow ends by itself when the agent does, with its real exit code), and by tailing the log file when there is no kernel; with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. `cortex top` reads each live process's log the same way `cortex supervise` does, so the view and the command that acts on it cannot disagree — with `--stall-after <ms>` it marks what is over *your* threshold and hands you the command to run. It also says **which signals are queued** for a process: a `kill` aimed at a wedged agent is not delivered but queued, waiting for a wake-up that may never come, and the view says so instead of leaving it to the command that sent it. And `cortex limit` reaches a running agent's budget — a budget is a thing the *kernel* holds, so the command asks the kernel that holds the process rather than a kernel of its own that holds nothing but init — and it names the **ceiling** (what the process may spend in total) apart from what is left of it, because a remainder that shrinks under your feet is not a limit. `--tokens N` sets that ceiling; a finished process refuses to have its budget rewritten, because what it spent is the kernel's record. The tables keep their shape, too: a column is as wide as the widest value in it, a value that does not fit is cut **and marked** (`…`), and `cortex ps` and `cortex top` say the same number for the same spend. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `replay`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` follows one agent's syscall stream — by push when a live kernel holds the process (median lag 1 ms, and the follow ends by itself when the agent does, with its real exit code), and by tailing the log file when there is no kernel; with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. `cortex top` reads each live process's log the same way `cortex supervise` does, so the view and the command that acts on it cannot disagree — with `--stall-after <ms>` it marks what is over *your* threshold and hands you the command to run. It also says **which signals are queued** for a process: a `kill` aimed at a wedged agent is not delivered but queued, waiting for a wake-up that may never come, and the view says so instead of leaving it to the command that sent it. And `cortex limit` reaches a running agent's budget — a budget is a thing the *kernel* holds, so the command asks the kernel that holds the process rather than a kernel of its own that holds nothing but init — and it names the **ceiling** (what the process may spend in total) apart from what is left of it, because a remainder that shrinks under your feet is not a limit. `--tokens N` sets that ceiling; a finished process refuses to have its budget rewritten, because what it spent is the kernel's record. The tables keep their shape, too: a column is as wide as the widest value in it, a value that does not fit is cut **and marked** (`…`), and `cortex ps` and `cortex top` say the same number for the same spend. And the kernel's own frames say **why** — `__state:running->blocked(recv)` is not just a transition, it is a transition with a cause, and `__state:running->exiting(SIGTERM)` names the signal that did it. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 
@@ -233,7 +240,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 735 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 737 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
