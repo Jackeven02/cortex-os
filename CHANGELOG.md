@@ -1654,6 +1654,60 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   The end-to-end check runs a real agent that throws a `TypeError`, through
   the real `cortex spawn`, and reads the record off the disk.
 
+- **A daemon's supervisor could act without saying a word.** `cortex daemon
+  run` is how a long-running agent is deployed, and for a daemon **stdout is
+  the log** — systemd's journal and launchd's log collect it. The kernel's
+  supervisor made its decisions, recorded them in init's own log, and told
+  nobody.
+
+  The result, from a real run of a daemon that crashes on every attempt:
+
+  ```console
+  $ cortex daemon run crasher
+  [kernel] serving on 127.0.0.1:56046 (pid 11080)
+    endpoint published at /home/you/.cortex/kernel.json
+  [daemon crasher pid 2] running (restart=on-failure)
+  # daemon stop requested
+  # shutting down kernel
+  ```
+
+  Three attempts, three crashes, a give-up — and not one word about any of
+  it. The terminal said the daemon was *running* while the agent was dead and
+  never coming back, and the only way to learn what had happened was to go
+  and read the process list or the log afterwards. A supervisor that restarts
+  silently is a supervisor nobody can trust.
+
+  **Init now reports its decisions to the host** — a restart (with the new
+  attempt's pid, and how the old one ended) or the decision *not* to restart
+  (the policy said so, or the cap was reached) — through
+  `KernelOptions.onDaemonDecision`, and the CLI prints them:
+
+  ```console
+  $ cortex daemon run crasher
+  [daemon crasher pid 2] running (restart=on-failure)
+  [daemon crasher] attempt 1 exited (code 1: boom) — restarting as pid 3 (attempt 2)
+  [daemon crasher] attempt 2 exited (code 1: boom) — restarting as pid 4 (attempt 3)
+  [daemon crasher] attempt 3 exited (code 1: boom) — not restarting: gave up after 2 restart(s) (max-restarts: 2)
+  ```
+
+  **Every** decision is reported, including the one that says nothing will
+  happen: a daemon that exits cleanly under a `never` policy is gone for good,
+  and that is exactly what the operator has to be told. The exit code is
+  printed with the same rule the rest of the CLI uses — an unknown code prints
+  as `?`, never as `0` (see `src/cli/process_outcome.ts`).
+
+  Nothing about the agent-facing contract changed: no syscall, no argument, no
+  errno, no `ProcessInfo` field. This is the host's side of the kernel, which
+  ABI.md §11 says is not part of the frozen contract.
+
+  **Three new smoke checks** (721 → 724), each one reverse-verified: the
+  restart decision not reported → "the supervisor tells the host what it
+  decided" fails ("the restart was not reported"); the "not restarting"
+  decision not reported → "a daemon that is not restarted says so" fails
+  ("the decision not to restart was not reported"); the CLI not printing the
+  decisions → "the daemon says what its supervisor did" fails (and shows the
+  old output: a registration line and nothing else).
+
 - **The output capture could be switched off without a word.** The tap that
   copies an agent's printed lines into `output.log` was installed by
   replacing `process.stdout.write`. That worked — until anything else

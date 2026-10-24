@@ -356,6 +356,16 @@ interface InitProcess {
 }
 ```
 
+**And it reports what it decided.** The restart decisions were always made,
+and always recorded in init's own log (`__init` records: `restart`,
+`restart-gave-up`) — but they reached nobody who was watching. A daemon that
+crashed three times and was then given up on printed nothing at all, and for
+a daemon stdout *is* the log. Init now tells the host through
+`KernelOptions.onDaemonDecision`: a restart (with the new attempt's pid, and
+how the old one ended) or the decision *not* to restart (the policy said so,
+or the cap was reached). The CLI prints it; see PROCESS.md §9.1. A host that
+embeds the kernel gets the same hook.
+
 **Internals.** Init is itself an agent function — it uses the same syscall surface as any other process. The only difference: it has no parent, it cannot exit (would crash the kernel), and it has special privileges to reparent orphans.
 
 ### 4.10 `syscall_dispatcher.ts`

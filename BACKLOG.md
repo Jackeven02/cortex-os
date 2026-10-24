@@ -235,6 +235,31 @@ The user-facing surface. Should feel like a real OS shell.
   The end-to-end check runs a real agent that throws a `TypeError`, through
   the real `cortex spawn`, and reads the record off the disk.
 
+- [x] **#076** A daemon's supervisor could act without saying a word →
+  **fixed.** `cortex daemon run` is how a long-running agent is deployed, and
+  for a daemon **stdout is the log** — systemd's journal and launchd's log
+  collect it. The kernel's supervisor made its decisions, recorded them in
+  init's own log, and told nobody. A real run of a daemon that crashes on
+  every attempt printed its registration line and nothing else: three
+  attempts, three crashes, a give-up — and the terminal said the daemon was
+  *running* while the agent was dead and never coming back. **Init now
+  reports its decisions to the host** — a restart (with the new attempt's
+  pid, and how the old one ended) or the decision *not* to restart (the
+  policy said so, or the cap was reached) — through
+  `KernelOptions.onDaemonDecision`, and the CLI prints them:
+  `[daemon crasher] attempt 1 exited (code 1: boom) — restarting as pid 3
+  (attempt 2)`. **Every** decision is reported, including the one that says
+  nothing will happen: a daemon that exits cleanly under a `never` policy is
+  gone for good, and that is exactly what the operator has to be told.
+  **Three new smoke checks** (721 → 724), all three reverse-verified: the
+  restart decision not reported → "the supervisor tells the host what it
+  decided" fails; the "not restarting" decision not reported → "a daemon that
+  is not restarted says so" fails; the CLI not printing them → "the daemon
+  says what its supervisor did" fails (and shows the old output: a
+  registration line and nothing else). Nothing about the agent-facing
+  contract changed — this is the host's side of the kernel, which ABI.md §11
+  says is not part of the frozen contract.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

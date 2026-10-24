@@ -43,6 +43,7 @@ import { fsTool } from '../drivers/tool/fs.js';
 import { mcpTool, parseMcpDefaultReversibility, parseMcpReversibilityMap } from '../drivers/tool/mcp.js';
 import { inmemMemory } from '../drivers/memory/inmem.js';
 import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type MemoryRegionPolicy } from '../kernel/types.js';
+import type { DaemonDecision } from '../kernel/init.js';
 import { isCortexError } from '../kernel/errors.js';
 import { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir } from '../kernel/recorder.js';
 import { type ReplayMode, type ReplayRecordings } from '../kernel/replay.js';
@@ -400,6 +401,12 @@ export async function bootCliKernel(
       readonly recordings: ReplayRecordings;
       readonly mode?: ReplayMode;
     };
+    /**
+     * Called when the kernel's supervisor decides something about a
+     * supervised daemon — a restart, or the decision not to restart
+     * (docs/PROCESS.md §9).
+     */
+    readonly onDaemonDecision?: (decision: DaemonDecision) => void;
   } = {},
 ): Promise<Kernel> {
   ensureKernelDirs(dir);
@@ -446,6 +453,7 @@ export async function bootCliKernel(
     defaultMemoryBacking: DEFAULT_MEMORY_BACKING,
     ...(opts.maxRegionEntries !== undefined ? { maxRegionEntries: opts.maxRegionEntries } : {}),
     ...(opts.replay !== undefined ? { replay: opts.replay } : {}),
+    ...(opts.onDaemonDecision !== undefined ? { onDaemonDecision: opts.onDaemonDecision } : {}),
     autoStart: true,
     // The kernel's default restoreContext reads an in-memory per-PID map that
     // is empty in a fresh CLI invocation, so cross-invocation `cortex restore`

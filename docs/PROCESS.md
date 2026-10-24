@@ -547,6 +547,29 @@ cortex daemon install --role inbox-watcher \
                       --wake-on email_arrived
 ```
 
+**And the supervisor says what it did.** A daemon's stdout is its log —
+systemd's journal and launchd's log collect it — so the decisions init makes
+about a daemon have to be *there*. They used to be nowhere: the decisions were
+made and recorded in init's own log, but nothing told the operator. A daemon
+that crashed three times and was then given up on printed its registration
+line and nothing else, and the terminal said "running" while the agent was
+dead and never coming back.
+
+Init now reports each decision to the host
+(`KernelOptions.onDaemonDecision`), and the CLI prints it:
+
+```console
+$ cortex daemon run crasher
+[daemon crasher pid 2] running (restart=on-failure)
+[daemon crasher] attempt 1 exited (code 1: boom) — restarting as pid 3 (attempt 2)
+[daemon crasher] attempt 2 exited (code 1: boom) — restarting as pid 4 (attempt 3)
+[daemon crasher] attempt 3 exited (code 1: boom) — not restarting: gave up after 2 restart(s) (max-restarts: 2)
+```
+
+Every decision is reported, including the one that says nothing will happen:
+a daemon that exits cleanly under a `never` policy is gone for good, and that
+is exactly what the operator has to be told.
+
 ### 9.2 Supervision
 
 Cortex does not bake supervision into the kernel. Supervision is a **user-space pattern** built from kernel primitives:

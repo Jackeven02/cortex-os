@@ -372,6 +372,7 @@ different stories about the same run.
 | snapshot a running process | `kernel.dispatcher.invoke(pid, 'checkpoint', { tag })` |
 | be told when a process is created | `KernelOptions.onProcessStart` |
 | be told when a process ends | `KernelOptions.onProcessExit` |
+| be told what the supervisor decided about a daemon | `KernelOptions.onDaemonDecision` |
 | **watch everything, as it happens** | **`kernel.subscribe(listener)`** |
 | see whether a process is *stuck* | **`kernel.openCalls()`** — the call each process is inside, and since when |
 | ...and if you want the frames themselves | read its `.crec` and pair the `enter`/`exit` frames |
@@ -382,6 +383,14 @@ different stories about the same run.
 your own metadata, and it fires at the same instant as `awaitExit` resolves.
 But it is a *notification*, not a *join*: it tells you a process ended, it
 does not wait for one.
+
+**`KernelOptions.onDaemonDecision` is how a supervisor talks to its
+operator.** When init restarts a daemon — or decides not to — it says so
+through this hook: which attempt ended, how it ended, and what replaced it
+(or why nothing did). The decisions were always made and always recorded in
+init's own log, but a host that did not read that log had no way to learn
+them, and for a daemon stdout *is* the log. A supervisor that restarts
+silently is a supervisor nobody can trust.
 
 **`kernel.openCalls()` answers "what is this process doing?" without the log.**
 It returns, for every process that is inside a syscall, the syscall's name,

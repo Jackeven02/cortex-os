@@ -103,6 +103,7 @@ import {
   DEFAULT_RESTART_STORM_THRESHOLD,
   shouldRestartFromCode,
   type DaemonSpec,
+  type DaemonDecision,
   type InitAlarm,
   type OnAlarmHook,
   type ShutdownReport,
@@ -4737,6 +4738,7 @@ async function runInitChecks(): Promise<void> {
     setTimeoutFn?: (cb: () => void, ms: number) => unknown;
     clearTimeoutFn?: (handle: unknown) => void;
     onAlarm?: OnAlarmHook;
+    onDecision?: (decision: DaemonDecision) => void;
     restartStormThreshold?: number;
   }
 
@@ -5006,6 +5008,76 @@ async function runInitChecks(): Promise<void> {
     assert(!table.has(d), 'daemon reaped');
     assert(table.children(PID_INIT).length === 0, 'no restart under policy "never"');
     assert(init.daemonCount === 1, 'logical daemon record persists');
+  });
+
+  await checkAsync('the supervisor tells the host what it decided', async () => {
+    // The decisions were always made, and always recorded in init's own log.
+    // What was missing was a way for the *operator* to hear them: a daemon
+    // that crashed three times and was given up on printed nothing at all,
+    // and for a daemon stdout is the log.
+    const table = await makeTable();
+    const decisions: DaemonDecision[] = [];
+    const { init, signals } = makeKernel(table, { onDecision: (d) => decisions.push(d) });
+    await init.boot();
+    const first = await init.registerDaemon({
+      role: 'd',
+      agent,
+      restart: { kind: 'on-failure', backoffMs: 0, maxRestarts: 1 },
+    });
+
+    // It fails: a new attempt starts, and the host is told about it.
+    await exitWithCode(init, table, first, 3, 'boom');
+    const restart = decisions.find((d) => d.kind === 'restart');
+    assert(restart !== undefined, 'the restart was not reported');
+    assert(restart!.kind === 'restart', 'the decision was not a restart');
+    assert(
+      restart!.kind === 'restart' && restart!.attempt === 1,
+      `the decision named the wrong attempt: ${restart!.kind === 'restart' ? restart!.attempt : '?'}`,
+    );
+    assert(
+      restart!.kind === 'restart' && restart!.previousExitCode === 3,
+      `the decision lost the exit code: ${restart!.kind === 'restart' ? String(restart!.previousExitCode) : '?'}`,
+    );
+    assert(
+      restart!.kind === 'restart' && restart!.previousExitReason === 'boom',
+      `the decision lost the reason: ${restart!.kind === 'restart' ? restart!.previousExitReason : '?'}`,
+    );
+    const second = onlyChild(table);
+    assert(second !== undefined, 'the replacement did not start');
+    assert(
+      restart!.kind === 'restart' && restart!.pid === unbrand(second!),
+      'the decision named a different pid than the one that started',
+    );
+
+    // It fails again: the cap is reached, and the host is told that too.
+    await exitWithCode(init, table, second!, 3, 'boom again');
+    const stop = decisions.find((d) => d.kind === 'no-restart');
+    assert(stop !== undefined, 'the give-up was not reported');
+    assert(
+      stop!.kind === 'no-restart' && stop!.detail.includes('max-restarts'),
+      `the give-up did not say why: ${stop!.kind === 'no-restart' ? stop!.detail : '?'}`,
+    );
+    assert(
+      stop!.kind === 'no-restart' && stop!.previousExitReason === 'boom again',
+      `the give-up lost the reason: ${stop!.kind === 'no-restart' ? stop!.previousExitReason : '?'}`,
+    );
+  });
+
+  await checkAsync('a daemon that is not restarted says so', async () => {
+    // The policy said "never". That is a decision like any other, and the
+    // operator has to hear it: the agent is gone for good.
+    const table = await makeTable();
+    const decisions: DaemonDecision[] = [];
+    const { init, signals } = makeKernel(table, { onDecision: (d) => decisions.push(d) });
+    await init.boot();
+    const d = await init.registerDaemon({ role: 'd', agent, restart: { kind: 'never' } });
+    await signals.send(d, 'SIGKILL', PID_KERNEL);
+    const stop = decisions.find((x) => x.kind === 'no-restart');
+    assert(stop !== undefined, 'the decision not to restart was not reported');
+    assert(
+      stop!.kind === 'no-restart' && stop!.detail.includes('never'),
+      `the decision did not say the policy: ${stop!.kind === 'no-restart' ? stop!.detail : '?'}`,
+    );
   });
 
   await checkAsync('maxRestarts caps total restarts and alarms', async () => {
@@ -15862,6 +15934,59 @@ async function runDaemonChecks(): Promise<void> {
           )
         : [];
       assert(crecs.length >= 2, `restart produced >= 2 process logs (got ${crecs.length})`);
+    });
+
+    await checkAsync('the daemon says what its supervisor did', async () => {
+      // A daemon's stdout is its log — systemd's journal and launchd's log
+      // collect it. So the supervisor's decisions have to be *there*: a daemon
+      // that crashed three times and was given up on printed "running" and
+      // nothing else, and the terminal said so while the agent was dead and
+      // never coming back.
+      const home = mkdtempSync(join(tmpdir(), 'cortex-smoke-daemonsay-'));
+      const prevHomeDaemon = process.env['CORTEX_HOME'];
+      process.env['CORTEX_HOME'] = home;
+      const modulePath = join(home, 'crash-agent.ts');
+      writeFileSync(
+        modulePath,
+        `export default async function crashAgent(ctx: any): Promise<void> { ctx.exit(1, 'boom'); }\n`,
+      );
+      writeDaemon(home, {
+        name: 'crasher',
+        spec: {
+          role: 'crasher',
+          agent: { module: `file://${modulePath}` },
+          restart: { kind: 'on-failure', maxRestarts: 1, backoffMs: 10 },
+          memory: undefined,
+        },
+        installedAt: new Date().toISOString(),
+      });
+
+      const lines: string[] = [];
+      const realLog = console.log;
+      console.log = (...parts: unknown[]) => {
+        lines.push(parts.map((p) => String(p)).join(' '));
+      };
+      try {
+        await cmdDaemon(['run', 'crasher', '--max-runtime-ms', '400']);
+      } finally {
+        console.log = realLog;
+        if (prevHomeDaemon === undefined) delete process.env['CORTEX_HOME'];
+        else process.env['CORTEX_HOME'] = prevHomeDaemon;
+      }
+      const said = lines.join('\n');
+      assert(
+        said.includes('attempt 1 exited (code 1: boom)'),
+        `the daemon did not say how its first attempt ended: ${said}`,
+      );
+      assert(
+        said.includes('restarting as pid'),
+        `the daemon did not say that it restarted: ${said}`,
+      );
+      assert(
+        said.includes('not restarting: gave up after 1 restart(s)'),
+        `the daemon did not say that it gave up: ${said}`,
+      );
+      await rmSync(home, { recursive: true, force: true });
     });
 
     await checkAsync('cortex daemon run with an unknown name fails', async () => {

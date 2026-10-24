@@ -116,6 +116,14 @@ Things that look like syscalls but aren't:
   offset it occupies there. The kernel does not interpret the line (it does
   not interpret the syscall frame either), the `.crec` is unchanged, and a
   replay still does not reproduce printed output — it never did (§2).
+- **Being told what the supervisor decided is not a syscall either.** When
+  init restarts a daemon — or decides not to — it reports the decision to the
+  host through `KernelOptions.onDaemonDecision`: which attempt ended, how it
+  ended, and what replaced it (or why nothing did). An agent cannot observe
+  this (it is not in the tree, and the decision is about a *daemon*), and the
+  decision itself is recorded in init's own log — the hook is how it reaches
+  the operator. For a daemon, stdout is the log, so a supervisor that acted
+  silently was a supervisor nobody could trust.
 
 This last point is important. Cortex cannot record what it does not see. If your agent does `fetch(...)` directly, the recording has a hole in it and replay will diverge.
 

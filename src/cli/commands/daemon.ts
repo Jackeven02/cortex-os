@@ -55,6 +55,7 @@ import {
   DEFAULT_MEMORY_REGIONS,
 } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
+import { formatOutcomeCode } from '../process_outcome.js';
 import { type DaemonSpec } from '../../kernel/init.js';
 import { type AgentSpec, type RestartPolicy, type MemoryRegionPolicy } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
@@ -383,10 +384,31 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
     return 0;
   }
 
-  const kernel = await bootCliKernel(
-    dir,
-    maxRegionEntries !== undefined ? { maxRegionEntries } : {},
-  );
+  // The supervisor's decisions, printed as they are made.
+  //
+  // A daemon's stdout is its log — systemd's journal and launchd's log
+  // collect it — so whatever the supervisor does has to be *there*. It used
+  // to be nowhere: a daemon that crashed three times and was given up on
+  // printed "running" and nothing else, and the terminal said so while the
+  // agent was dead and never coming back.
+  //
+  // The daemon's name is known only after it is registered, so the map is
+  // filled in below; the decisions themselves come later.
+  const daemonNames = new Map<number, string>();
+  const kernel = await bootCliKernel(dir, {
+    ...(maxRegionEntries !== undefined ? { maxRegionEntries } : {}),
+    onDaemonDecision: (decision) => {
+      const name = daemonNames.get(decision.daemonId) ?? decision.role;
+      const ended = `attempt ${decision.attempt} exited (code ${formatOutcomeCode(decision.previousExitCode)}: ${decision.previousExitReason})`;
+      if (decision.kind === 'restart') {
+        console.log(
+          `[daemon ${name}] ${ended} — restarting as pid ${decision.pid} (attempt ${decision.attempt + 1})`,
+        );
+      } else {
+        console.log(`[daemon ${name}] ${ended} — not restarting: ${decision.detail}`);
+      }
+    },
+  });
 
   // The kernel is the only thing in the process that lives long enough to be
   // worth reaching into, so this is where the transport is published: the
@@ -409,6 +431,7 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
     for (const d of targets) {
       if (d === undefined) continue;
       const pid = await kernel.registerDaemon(d.spec);
+      daemonNames.set(unbrand(pid), d.name);
       console.log(`[daemon ${d.name} pid ${unbrand(pid)}] running (restart=${d.spec.restart?.kind ?? 'never'})`);
     }
 

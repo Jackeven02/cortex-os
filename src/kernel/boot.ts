@@ -165,6 +165,7 @@ import { WakeGate } from './wake_gate.js';
 import {
   InitProcess,
   type DaemonSpec,
+  type DaemonDecision,
   type InitAlarm,
   type OnAlarmHook,
   type ShutdownReport,
@@ -493,6 +494,17 @@ export interface KernelOptions {
 
   /** Supervisor hooks. */
   readonly onAlarm?: OnAlarmHook;
+  /**
+   * Called when init decides what to do about a supervised daemon whose
+   * attempt just ended — a restart, or the decision not to restart
+   * (docs/PROCESS.md §9).
+   *
+   * The decisions were always made and always recorded in init's own log;
+   * this is how they reach whoever is watching. A daemon that crashed three
+   * times and was given up on used to print nothing at all, and for a daemon
+   * stdout *is* the log.
+   */
+  readonly onDaemonDecision?: (decision: DaemonDecision) => void;
   readonly onBudgetExhausted?: (pid: ProcessId, kind: 'tokens' | 'usd' | 'wallTime') => void | Promise<void>;
 
   /**
@@ -866,6 +878,7 @@ export class Kernel {
       ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
       ...(opts.clearTimeoutFn !== undefined ? { clearTimeoutFn: opts.clearTimeoutFn } : {}),
       ...(opts.onAlarm !== undefined ? { onAlarm: opts.onAlarm } : {}),
+      ...(opts.onDaemonDecision !== undefined ? { onDecision: opts.onDaemonDecision } : {}),
       onReaped: (pid) => {
         // Per-PID teardown the supervisor cannot own: cancel a dead receiver's
         // parked recv waiters (so a later send can never hand a message to a

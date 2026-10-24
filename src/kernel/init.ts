@@ -169,6 +169,47 @@ export type InitAlarm =
       readonly maxRestarts: number;
     };
 
+/**
+ * What init decided about a supervised daemon whose attempt just ended.
+ *
+ * The decisions were always made — and always recorded in init's own log
+ * (`__init` records: `restart`, `restart-gave-up`) — but they reached nobody
+ * who was watching. A daemon that crashed three times and was then given up
+ * on printed nothing at all: the terminal said "running", and the agent was
+ * dead and never coming back. For a daemon, stdout *is* the log — it is what
+ * systemd's journal and launchd's log collect — so a supervisor that acts
+ * silently is a supervisor nobody can trust.
+ *
+ * The host gets this through `KernelOptions.onDaemonDecision` and decides
+ * what to do with it; the CLI prints it.
+ */
+export type DaemonDecision =
+  | {
+      /** A new attempt is starting. */
+      readonly kind: 'restart';
+      /** The daemon's stable identity — the pid of its *first* attempt. */
+      readonly daemonId: number;
+      readonly role: string;
+      /** Which attempt just ended (1 is the first try). */
+      readonly attempt: number;
+      /** How that attempt ended. */
+      readonly previousExitCode: number | null;
+      readonly previousExitReason: string;
+      /** The new attempt's pid. */
+      readonly pid: number;
+    }
+  | {
+      /** No new attempt is starting. */
+      readonly kind: 'no-restart';
+      readonly daemonId: number;
+      readonly role: string;
+      readonly attempt: number;
+      readonly previousExitCode: number | null;
+      readonly previousExitReason: string;
+      /** Why not — the policy said so, or the cap was reached. */
+      readonly detail: string;
+    };
+
 export type OnAlarmHook = (alarm: InitAlarm) => void;
 
 /**
@@ -208,6 +249,11 @@ export interface InitProcessOptions {
   readonly clearTimeoutFn?: (handle: unknown) => void;
   /** Hook for unusual-termination notices (storm / max-restarts). */
   readonly onAlarm?: OnAlarmHook;
+  /**
+   * Hook for the supervisor's decisions about a daemon whose attempt ended —
+   * a restart, or the decision not to restart (docs/PROCESS.md §9).
+   */
+  readonly onDecision?: (decision: DaemonDecision) => void;
   /**
    * Per-PID teardown hook, called from `handleZombie` once a process has
    * reached its terminal disposition. The host kernel uses it to cancel a dead
@@ -249,6 +295,12 @@ interface DaemonRecord {
   readonly spec: DaemonSpec;
   currentPid: ProcessId;
   restartCount: number;
+  /**
+   * The exit code of the attempt that just ended. Kept because the restart
+   * may be deferred by a backoff timer, and by the time the new attempt
+   * starts the code is no longer in scope anywhere else.
+   */
+  lastExitCode: number | null;
   /** Epoch-ms of each restart, pruned to the sliding window. */
   restartTimestamps: number[];
   /** Pending backoff timer, if a restart is scheduled but not yet fired. */
@@ -277,6 +329,7 @@ export class InitProcess {
   #setTimeoutFn: (cb: () => void, ms: number) => unknown;
   #clearTimeoutFn: (handle: unknown) => void;
   #onAlarm: OnAlarmHook | null;
+  #onDecision: ((decision: DaemonDecision) => void) | null;
   #onReaped: ((pid: ProcessId) => void | Promise<void>) | null;
   #memory: MemoryManager | null;
   #stormThreshold: number;
@@ -302,6 +355,7 @@ export class InitProcess {
     this.#clearTimeoutFn =
       opts.clearTimeoutFn ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
     this.#onAlarm = opts.onAlarm ?? null;
+    this.#onDecision = opts.onDecision ?? null;
     this.#onReaped = opts.onReaped ?? null;
     this.#memory = opts.memory ?? null;
     this.#stormThreshold = opts.restartStormThreshold ?? DEFAULT_RESTART_STORM_THRESHOLD;
@@ -410,6 +464,7 @@ export class InitProcess {
       spec,
       currentPid: pid,
       restartCount: 0,
+      lastExitCode: null,
       restartTimestamps: [],
       restartTimer: null,
     };
@@ -666,7 +721,26 @@ export class InitProcess {
     if (this.#shuttingDown) return null;
 
     const policy: RestartPolicy = rec.spec.restart ?? { kind: 'never' };
+    // Remember how this attempt ended: the restart may be deferred by a
+    // backoff timer, and the code has to survive until the new attempt
+    // starts (so the operator can be told what it replaced).
+    rec.lastExitCode = exitCode;
     if (!shouldRestartFromCode(policy.kind, exitCode)) {
+      // The policy says no. That is a decision like any other, and the
+      // operator has to hear it: a daemon that died and was not restarted
+      // because the policy says `never` is a daemon that is now gone for good.
+      this.#decide({
+        kind: 'no-restart',
+        daemonId: daemonIdNum,
+        role: rec.spec.role,
+        attempt: rec.restartCount + 1,
+        previousExitCode: exitCode,
+        previousExitReason: prevExitReason,
+        detail:
+          policy.kind === 'never'
+            ? 'the restart policy is "never"'
+            : `the restart policy is "${policy.kind}" and this run did not fail`,
+      });
       return null;
     }
 
@@ -686,6 +760,15 @@ export class InitProcess {
         reason: 'max-restarts',
         restartCount: rec.restartCount,
         maxRestarts,
+      });
+      this.#decide({
+        kind: 'no-restart',
+        daemonId: daemonIdNum,
+        role: rec.spec.role,
+        attempt: rec.restartCount + 1,
+        previousExitCode: exitCode,
+        previousExitReason: prevExitReason,
+        detail: `gave up after ${rec.restartCount} restart(s) (max-restarts: ${maxRestarts})`,
       });
       return null;
     }
@@ -709,6 +792,15 @@ export class InitProcess {
         reason: 'restart-storm',
         count: rec.restartTimestamps.length,
         windowMs,
+      });
+      this.#decide({
+        kind: 'no-restart',
+        daemonId: daemonIdNum,
+        role: rec.spec.role,
+        attempt: rec.restartCount + 1,
+        previousExitCode: exitCode,
+        previousExitReason: prevExitReason,
+        detail: `gave up after ${rec.restartTimestamps.length} restarts in ${windowMs}ms (restart storm)`,
       });
       return null;
     }
@@ -765,6 +857,17 @@ export class InitProcess {
       role: rec.spec.role,
       restartCount: rec.restartCount,
       prevExitReason,
+    });
+    // The new attempt exists now, so this is the moment the operator can be
+    // told about it: the old attempt's ending, and what replaced it.
+    this.#decide({
+      kind: 'restart',
+      daemonId: unbrand(rec.daemonId),
+      role: rec.spec.role,
+      attempt: rec.restartCount,
+      previousExitCode: rec.lastExitCode,
+      previousExitReason: prevExitReason,
+      pid: unbrand(newPid),
     });
     return newPid;
   }
@@ -823,6 +926,20 @@ export class InitProcess {
       this.#onAlarm(alarm);
     } catch {
       // A misbehaving alarm hook must not break supervision.
+    }
+  }
+
+  /**
+   * Tell the host what was decided about a daemon. Never throws into the
+   * caller: a hook that misbehaves must not break the supervision it is
+   * only watching.
+   */
+  #decide(decision: DaemonDecision): void {
+    if (this.#onDecision === null) return;
+    try {
+      this.#onDecision(decision);
+    } catch {
+      // Reporting a decision must not change it.
     }
   }
 
