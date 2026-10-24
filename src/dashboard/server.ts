@@ -10,7 +10,7 @@ import type { BlockedReason, ProcessInfo, Signal, SyscallRecord } from '../kerne
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView } from '../cli/process_view.js';
-import { usdToDollars } from '../cli/process_budget.js';
+import { usdToDollars } from '../money.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
 import {
   ActivityStore,

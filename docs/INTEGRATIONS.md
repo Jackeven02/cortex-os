@@ -245,9 +245,16 @@ The fold used to skip the conversion, so `meta.json` ended up holding
 count — where it meant `53`. Every other view then read a run that had spent
 money as a run that had spent nothing: `cortex limit` printed
 `usd: spent $0.000000`. The conversion now happens at that boundary, in one
-place (`dollarsToMicrodollars`, in `src/cli/process_budget.ts`), and the
+place (`dollarsToMicrodollars`, in `src/money.ts`), and the
 summary line prints the tap's own dollars — the same money, in the unit the
 operator reads.
+
+**The tap's money is printed like every other money.** One model call costs
+about **$0.000027**, so the format is six decimals — the resolution a
+microdollar count can say exactly. Four decimals would print `$0.0000`, and a
+run that spent real money would read as a run that spent nothing. The tap's
+budget-exceeded error says the same number in the same format as `cortex top`
+and `cortex limit`, because all of them ask `formatDollars` in `src/money.ts`.
 
 ### The frame is an `llm_call` frame, so it is shaped like one
 

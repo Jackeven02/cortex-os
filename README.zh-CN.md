@@ -38,16 +38,16 @@ PID  PPID  ROLE            STATE    TOKENS  CAPS  AGE  WAITING
 # 并标出各自在等什么、已经等了多久
 $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
-0 tokens · $0.0000 spent · home .cortex
+0 tokens · $0.000000 spent · home .cortex
 
-      PID  ROLE            STATE    TOKENS  USD      NOTE
----------------------------------------------------------
-      1    init            running  0       $0.0000  1 syscall
-├─    2    holder          blocked  0       $0.0000  waiting on a channel for 18.7s — SIGTERM queued
-└─    3    planner         blocked  0       $0.0000  waiting on child 6 for 18.7s — SIGCHLD queued
-   ├─ 4    coder:overview  zombie   0       $0.0000  exit 0 (coder overview complete)
-   ├─ 5    coder:install   zombie   0       $0.0000  exit 0 (coder install complete)
-   └─ 6    coder:api       blocked  0       $0.0000  waiting on a timer for 18.6s
+      PID  ROLE            STATE    TOKENS  USD        NOTE
+-----------------------------------------------------------
+      1    init            running  0       $0.000000  1 syscall
+├─    2    holder          blocked  0       $0.000000  waiting on a channel for 18.7s — SIGTERM queued
+└─    3    planner         blocked  0       $0.000000  waiting on child 6 for 18.7s — SIGCHLD queued
+   ├─ 4    coder:overview  zombie   0       $0.000000  exit 0 (coder overview complete)
+   ├─ 5    coder:install   zombie   0       $0.000000  exit 0 (coder install complete)
+   └─ 6    coder:api       blocked  0       $0.000000  waiting on a timer for 18.6s
 
 # ...以及卡住的那一个，顺带把该跑的命令给你
 $ cortex top --stall-after 30000
@@ -232,7 +232,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 744 项断言，0 失败
+npx tsx scripts/smoke.ts                # 746 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -344,7 +344,7 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 
 **默认只读。** 状态目录里有活内核时（`cortex daemon run`），大屏**盯着那个内核**：**正在运行**的进程会出现在列表里——活进程还没有 `meta.json`，只看磁盘的话看到的是一堆尸体——事件流也由内核推送，边写边到。没有活内核时，大屏能做的就是任何"看文件系统的人"能做的事：读 `.cortex/processes/<pid>/meta.json`、解码 `.crec` syscall 日志（**包括还在跑的进程的日志**）、列出检查点、渲染进程树。`restore` 是纯写盘操作，所以它在 v0 的无守护进程模型下也能工作。
 
-**而且大屏里的钱，和 CLI 里印的钱是同一笔钱。** 成本面板读的是内核的微美元计数器，在服务端换算一次，显示成美元——所以一个花了 `$0.0034` 的进程，在这里和 `cortex top` 里都读作 `$0.0034`，而不是一个视图说 `$3400`、另一个说 `$0.0034`。
+**而且大屏里的钱，和 CLI 里印的钱是同一笔钱。** 成本面板读的是内核的微美元计数器，在服务端换算一次，显示成美元——所以一个花了 `$0.003400` 的进程，在这里和 `cortex top` 里都读作 `$0.003400`，而不是一个视图说 `$3400`、另一个说 `$0.0034`。而且它按内核计数的精度打印：一次模型调用大约 `$0.000027`，这里就显示 `$0.000027`——而不是 `$0.0000`，一个花了真钱的运行就那样看起来像没花过钱。
 
 **而且事件表里看得见这次调用花了多少钱。** `cortex wrap --tap` 把模型自己发出的 HTTP 调用记进和驱动调用同一份日志，所以这些调用同样出现在事件表里——带着它们的 token 和价格，写成 ABI 规定的 `usage` 形状，也就是所有读 `llm_call` 帧的人都在找的那个形状。
 

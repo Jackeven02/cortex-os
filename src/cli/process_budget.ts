@@ -37,6 +37,7 @@
  */
 
 import type { BudgetCounters, BudgetLimits } from '../kernel/types.js';
+import { formatDollars, usdToDollars } from '../money.js';
 
 /**
  * What the CLI knows about a process's budget.
@@ -63,38 +64,14 @@ export function budgetCeiling(spent: number, remaining: number): number | null {
 }
 
 /**
- * Microdollars → dollars.
- *
- * `budgetsSpent.usdSpent` is in **microdollars** — an integer count, 1 USD =
- * 1_000_000 (docs/STATE.md §2.4). Every place that puts that number in front
- * of a human converts here, and only here: a second copy of this division is
- * a second chance to be wrong by a million.
- *
- * It was worth getting wrong. `cortex top` divided and the dashboard did not,
- * so the operator's window said a process that spent **$0.0034** had spent
- * **$3400.0000** — a thousand times the money, which is the kind of number
- * that gets a budget cut.
+ * Microdollars → dollars, and the format money is printed in, live in
+ * [`src/money.ts`](../money.ts) — one place, so the CLI, the fetch tap and
+ * the dashboard cannot each invent their own version of "how much is this".
  */
-export function usdToDollars(microdollars: number): number {
-  return microdollars / 1_000_000;
-}
-
-/**
- * Dollars → microdollars, the unit `budgetsSpent.usdSpent` is in.
- *
- * Used where a number from outside the kernel — a tap's price, a driver's
- * usage — is folded into the budget. Rounded because the field is an integer
- * count of microdollars, and clamped at zero because a spend is never
- * negative.
- */
-export function dollarsToMicrodollars(dollars: number): number {
-  if (!Number.isFinite(dollars) || dollars <= 0) return 0;
-  return Math.round(dollars * 1_000_000);
-}
 
 /** Format microdollars as dollars. */
 function dollars(microdollars: number): string {
-  return `$${usdToDollars(microdollars).toFixed(6)}`;
+  return formatDollars(usdToDollars(microdollars));
 }
 
 /**

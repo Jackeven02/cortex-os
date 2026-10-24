@@ -1546,6 +1546,64 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A run that spent $0.000027 was shown as having spent $0.0000.** The unit
+  was fixed in the last release; the *precision* was not, and it cost the same
+  thing.
+
+  The kernel counts money in microdollars, so six decimals is what a cost can
+  be said to exactly. Four decimals is not a rounding preference — one model
+  call costs about **$0.000027**, and printed to four decimals that is
+  `$0.0000`.
+
+  `cortex top` printed four decimals:
+
+  ```
+  $ cortex top
+  cortex top — 2 processes · 1 running · 1 zombie
+  120 tokens · $0.0000 spent · home /tmp/cortex
+
+     PID  ROLE    STATE    TOKENS  USD        NOTE
+  ------------------------------------------------
+     1    init    running  0       $0.0000  0 syscalls
+  └─ 2    tapped  zombie   120     $0.0000  exit 0
+  ```
+
+  and so did the dashboard's budget panel, in the operator's window:
+
+  ```
+  资源预算
+  USD 成本          $0.0000
+  角色     进程    TOKEN IN  TOKEN OUT  USD        墙钟    SYSCALLS  TOKEN 占比
+  tapped   1       100       20         $0.0000   250 ms  1         100%
+  ```
+
+  Meanwhile `cortex limit`, reading the same record, said `$0.000027` — and so
+  did the dashboard's own event row. Two views of one process's cost, one of
+  them rounding the cost away. And a budget that reads as untouched is a
+  budget nobody is watching.
+
+  **Money is now printed at six decimals, everywhere**, and the rule lives
+  beside the conversion:
+
+  - `src/money.ts` is the one module that knows about money: the conversion
+    (`usdToDollars` / `dollarsToMicrodollars`, moved there from
+    `src/cli/process_budget.ts`) **and** the format (`formatDollars`). It is
+    its own module rather than a CLI one because three layers print money —
+    the CLI, the fetch tap (its budget-exceeded error), and the dashboard —
+    and a rule only the CLI layer can reach is a rule the other two reinvent.
+  - `cortex top` prints it in the summary line and in the table, and the USD
+    column is now wide enough to say `$1234.567890` instead of cutting it.
+  - `cortex wrap --tap` and the tap's own error ask the same function.
+  - The dashboard page keeps its own copy of the rule — it is a static file
+    served over HTTP and cannot import one — and a smoke check holds the two
+    to the same string.
+
+  **Two new smoke checks** (744 → 746), both reverse-verified: `cortex top`
+  back to four decimals → "the cost was not rounded away" (the output says
+  `$0.0000 spent`); the page's `fmtUsd` back to four → "the page and the CLI
+  say the same money: $0 vs $0.000000", and the event row's cost tooltip
+  reads `$0.0000`.
+
 - **A tapped model call showed its model and nothing else.** The fetch tap
   writes `llm_call` frames into the same `.crec` a driver call goes into,
   under the same syscall name — but it wrote the result **flat**:

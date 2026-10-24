@@ -38,16 +38,16 @@ PID  PPID  ROLE            STATE    TOKENS  CAPS  AGE  WAITING
 # on, and for how long
 $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
-0 tokens · $0.0000 spent · home .cortex
+0 tokens · $0.000000 spent · home .cortex
 
-      PID  ROLE            STATE    TOKENS  USD      NOTE
----------------------------------------------------------
-      1    init            running  0       $0.0000  1 syscall
-├─    2    holder          blocked  0       $0.0000  waiting on a channel for 18.7s — SIGTERM queued
-└─    3    planner         blocked  0       $0.0000  waiting on child 6 for 18.7s — SIGCHLD queued
-   ├─ 4    coder:overview  zombie   0       $0.0000  exit 0 (coder overview complete)
-   ├─ 5    coder:install   zombie   0       $0.0000  exit 0 (coder install complete)
-   └─ 6    coder:api       blocked  0       $0.0000  waiting on a timer for 18.6s
+      PID  ROLE            STATE    TOKENS  USD        NOTE
+-----------------------------------------------------------
+      1    init            running  0       $0.000000  1 syscall
+├─    2    holder          blocked  0       $0.000000  waiting on a channel for 18.7s — SIGTERM queued
+└─    3    planner         blocked  0       $0.000000  waiting on child 6 for 18.7s — SIGCHLD queued
+   ├─ 4    coder:overview  zombie   0       $0.000000  exit 0 (coder overview complete)
+   ├─ 5    coder:install   zombie   0       $0.000000  exit 0 (coder install complete)
+   └─ 6    coder:api       blocked  0       $0.000000  waiting on a timer for 18.6s
 
 # ...and the one that is stuck, with the command to act on it
 $ cortex top --stall-after 30000
@@ -240,7 +240,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 744 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 746 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -355,7 +355,7 @@ $ cortex dashboard --ops spawn,kill,restore   # allow those three from the UI
 
 Read-only by default. With a live kernel in the directory (`cortex daemon run`), the dashboard **watches that kernel**: the processes that are *running* appear in the list — a running process has no `meta.json` yet, so a disk-only view would show a directory of corpses — and the event stream arrives by push, as the kernel writes it. Without one it does what any viewer of a filesystem can do: it reads `.cortex/processes/<pid>/meta.json`, decodes the `.crec` syscall logs (including the logs of processes that are still running), lists checkpoints, and renders the tree. `restore` is a pure disk write, which is why it works even in v0's no-daemon model.
 
-**And the money in it is the money the CLI prints.** The cost panel reads the kernel's microdollar counter, converts it once on the server, and shows dollars — so a process that spent `$0.0034` reads as `$0.0034` here *and* in `cortex top`, instead of one view saying `$3400` and the other saying `$0.0034`.
+**And the money in it is the money the CLI prints.** The cost panel reads the kernel's microdollar counter, converts it once on the server, and shows dollars — so a process that spent `$0.003400` reads as `$0.003400` here *and* in `cortex top`, instead of one view saying `$3400` and the other saying `$0.0034`. And it is printed at the resolution the kernel counts: one model call costs about `$0.000027`, and that reads as `$0.000027` — not `$0.0000`, which is how a run that spent real money comes to look like a run that spent nothing.
 
 **And the event table shows what a call cost.** `cortex wrap --tap` records the model's own HTTP calls into the same log a driver call goes into, so those calls show up in the event table too — with their tokens and their price, written in the ABI's `usage` shape, the same shape every other reader of an `llm_call` frame looks in.
 

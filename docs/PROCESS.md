@@ -473,12 +473,12 @@ PID  PPID  ROLE     STATE    TOKENS  CAPS  AGE  WAITING
 
 $ cortex top
 cortex top — 2 processes · 1 running · 1 blocked · live kernel
-0 tokens · $0.0000 spent · home .cortex
+0 tokens · $0.000000 spent · home .cortex
 
-   PID  ROLE     STATE    TOKENS  USD      NOTE
------------------------------------------------
-   1    init     running  0       $0.0000  1 syscall
-└─ 2    blocker  blocked  0       $0.0000  waiting on a channel for 40.3s — SIGTERM queued
+   PID  ROLE     STATE    TOKENS  USD        NOTE
+-------------------------------------------------
+   1    init     running  0       $0.000000  1 syscall
+└─ 2    blocker  blocked  0       $0.000000  waiting on a channel for 40.3s — SIGTERM queued
 ```
 
 `cortex ps` puts it in the WAITING column, `cortex top` in its NOTE, and the

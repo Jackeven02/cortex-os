@@ -55,7 +55,7 @@ import {
 import type { ProcessMeta } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
 import { processOutcome } from '../process_outcome.js';
-import { dollarsToMicrodollars } from '../process_budget.js';
+import { dollarsToMicrodollars, formatDollars } from '../../money.js';
 import type { AgentSpec, MemoryRegionPolicy, ProcessState, RestartPolicy } from '../../kernel/types.js';
 import { PID_INIT } from '../../kernel/process_table.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
@@ -506,7 +506,7 @@ export async function cmdWrap(args: string[]): Promise<number> {
     if (tapCalls > 0) {
       const plural = tapCalls === 1 ? '' : 's';
       const failed = tapFailedCalls > 0 ? `, ${tapFailedCalls} failed` : '';
-      console.log(`tap: ${tapCalls} llm call${plural} ($${tapUsd.toFixed(6)}${failed})`);
+      console.log(`tap: ${tapCalls} llm call${plural} (${formatDollars(tapUsd)}${failed})`);
     }
 
     // Persist so `cortex ps` / `trace` / the dashboard see this run after the

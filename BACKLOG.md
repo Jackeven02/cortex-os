@@ -611,6 +611,36 @@ The user-facing surface. Should feel like a real OS shell.
   The rule it writes down: **an HTML attribute never holds a template
   literal.** A value is computed in JS, escaped once, and dropped in.
 
+- [x] **#085** `cortex top` and the dashboard's budget panel round a real cost
+  away → **fixed.** #082 fixed the *unit* (microdollars → dollars) and left the
+  *precision* alone, which cost the same thing. One model call costs about
+  **$0.000027**; printed to four decimals that is `$0.0000`. So `cortex top`
+  said **$0.0000 spent** for a run that had spent real money, and the
+  dashboard's budget panel said `$0.0000` in the operator's window — while
+  `cortex limit` and the dashboard's own event row both said `$0.000027`, from
+  the same record.
+
+  Money is now printed at **six decimals**, the resolution a microdollar
+  count can say exactly, and the rule lives beside the conversion in one
+  module (`src/money.ts`: `usdToDollars` / `dollarsToMicrodollars` /
+  `formatDollars`). It is its own module rather than a CLI one because three
+  layers print money — the CLI, the fetch tap (its budget-exceeded error) and
+  the dashboard — and a rule only the CLI layer can reach is a rule the other
+  two reinvent. The page itself cannot import it (a static file served over
+  HTTP), so it keeps its own copy and a smoke check holds the two to the same
+  string.
+
+  **Two new smoke checks** (744 → 746), both reverse-verified: `cortex top`
+  back to four decimals → "the cost was not rounded away" (`$0.0000 spent`);
+  the page's `fmtUsd` back to four → "the page and the CLI say the same
+  money: $0 vs $0.000000", and the event row's tooltip reads `$0.0000`.
+
+  Docs: STATE.md §2.4 (and its Chinese mirror) — the counter is an integer
+  count of microdollars, converted in one place, and printed at the kernel's
+  resolution; ARCHITECTURE — a unit has exactly one conversion point *and* one
+  format; INTEGRATIONS — the tap's money is printed like every other money;
+  both READMEs; CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

@@ -51,6 +51,7 @@ import { KERNEL_ABI_VERSION } from '../index.js';
 import { OPENAI_PRICING, type FetchFn, type FetchResponseLike } from '../drivers/llm/openai.js';
 import { Recorder, readRecords, existingCrecPath, type SyscallRecordInput } from '../kernel/recorder.js';
 import { asProcessId, type SyscallRecord, type Timestamp } from '../kernel/types.js';
+import { formatDollars } from '../money.js';
 
 // =============================================================================
 // §1. Public options
@@ -493,7 +494,7 @@ export async function tapFetch(options: LLMTapOptions): Promise<() => Promise<vo
     // `throw` fires after the record is written, so the overrun is auditable
     // even though the caller sees an exception.
     if (budget === 'throw') {
-      throw new Error(`cortex llm_tap: budget exceeded for pid ${options.pid} (${tokensIn + tokensOut} tokens, $${usdSpent.toFixed(4)})`);
+      throw new Error(`cortex llm_tap: budget exceeded for pid ${options.pid} (${tokensIn + tokensOut} tokens, ${formatDollars(usdSpent)})`);
     }
     return response as unknown as FetchResponseLike;
   };

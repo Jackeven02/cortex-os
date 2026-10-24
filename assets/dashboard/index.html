@@ -264,6 +264,13 @@
   <script>
     const $ = (id) => document.getElementById(id);
     const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+    // **Money, in the only format this project prints it.** The kernel counts
+    // money in microdollars, so six decimals is what it can say exactly — and
+    // one model call costs about $0.000027, which four decimals rounds away
+    // to nothing. The CLI prints the same string (`formatDollars` in
+    // src/money.ts); the page cannot import it, so a smoke check holds the
+    // two to the same answer.
+    const fmtUsd = (usd) => `$${Number(usd).toFixed(6)}`;
     // Disk stores UTC ISO strings; checkpoint file names encode UTC with the
     // colons replaced by dashes (2026-09-28T10-21-26-246Z). Render both as
     // the viewer's local time instead of raw UTC.
@@ -361,7 +368,7 @@
         // the rest of the row as the attribute's value: the "Token / 模型"
         // column showed the *time*, every cell after it shifted one column
         // left, and the tokens and the cost never reached the screen at all.
-        const costLabel = event.usd === undefined ? '' : `$${Number(event.usd).toFixed(6)}`;
+        const costLabel = event.usd === undefined ? '' : fmtUsd(event.usd);
         return `<tr><td><span class="event-kind ${kind}">${label} · ${esc(String(event.type ?? '').split('.').at(-1))}</span></td><td class="event-name" title="${esc(auditTitle)}">${esc(event.name ?? event.runId ?? '—')}${auditText ? ` · ${esc(auditText)}` : ''}</td><td class="pid-cell">${esc(event.pid ?? '—')}</td><td class="duration">${event.durationMs === undefined ? '—' : `${esc(event.durationMs)} ms`}</td><td class="cost-cell" title="${esc(costLabel)}">${esc(tokenSummary)}</td><td class="event-time">${esc(time)}</td><td title="${esc(errorSummary)}">${esc(errorSummary)}</td></tr>`;
       }).join('') : '<tr><td colspan="7" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr>';
     }
@@ -417,7 +424,6 @@
         return acc;
       }, { tokensIn: 0, tokensOut: 0, usd: 0, wall: 0, syscalls: 0 });
       const fmtWall = (ms) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`);
-      const fmtUsd = (usd) => (usd > 0 ? `$${usd.toFixed(4)}` : '$0');
       $('budgetTokens').textContent = (totals.tokensIn + totals.tokensOut).toLocaleString();
       $('budgetSplit').textContent = `${totals.tokensIn.toLocaleString()} / ${totals.tokensOut.toLocaleString()}`;
       $('budgetUsd').textContent = fmtUsd(totals.usd);

@@ -203,6 +203,7 @@ import {
 import { startDashboard } from '../src/dashboard/server.js';
 import { ActivityStore, toActivityEvent } from '../src/dashboard/event_store.js';
 import { writeMeta, readMeta, writeExitRecord, writeProcessView, type ProcessMeta } from '../src/cli/process_store.js';
+import { formatDollars, usdToDollars } from '../src/money.js';
 
 import {
   FsToolDriver,
@@ -9993,15 +9994,16 @@ type PageFn = (...args: unknown[]) => unknown;
  * to exercise *it* has to take the code from the page, not from a copy
  * that can drift away from what ships.
  */
-function pageFunction(html: string, name: 'esc' | 'eventLabel' | 'fmtLocal'): PageFn {
-  const header = name === 'esc' ? 'const esc = (value) =>' : `function ${name}(`;
+function pageFunction(html: string, name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal'): PageFn {
+  const isConst = name === 'esc' || name === 'fmtUsd';
+  const header = isConst ? `const ${name} = ` : `function ${name}(`;
   const at = html.indexOf(header);
   assert(at >= 0, `the page still defines ${name}`);
   let src: string;
-  if (name === 'esc') {
-    const end = html.indexOf(';\n', at);
-    assert(end > at, 'the page still defines esc');
-    src = html.slice(at, end + 1);
+  if (isConst) {
+    const tail = /;\s*\n/.exec(html.slice(at));
+    assert(tail !== null, `the page still defines ${name}`);
+    src = html.slice(at, at + tail.index + 1);
   } else {
     const open = html.indexOf('{', at);
     let depth = 0;
@@ -10025,6 +10027,7 @@ function pageFunction(html: string, name: 'esc' | 'eventLabel' | 'fmtLocal'): Pa
 /** Render one event row the way the dashboard page renders it. */
 function renderDashboardEventRow(html: string, event: Record<string, unknown>): string {
   const esc = pageFunction(html, 'esc');
+  const fmtUsd = pageFunction(html, 'fmtUsd');
   const eventLabel = pageFunction(html, 'eventLabel');
   const fmtLocal = pageFunction(html, 'fmtLocal');
   const at = html.indexOf('rows.map((event) => {');
@@ -10044,13 +10047,14 @@ function renderDashboardEventRow(html: string, event: Record<string, unknown>): 
   }
   assert(close > open, "the page's event row template never closes");
   const body = html.slice(open + 1, close);
-  const fn = new Function('event', 'esc', 'eventLabel', 'fmtLocal', body) as (
+  const fn = new Function('event', 'esc', 'fmtUsd', 'eventLabel', 'fmtLocal', body) as (
     e: Record<string, unknown>,
     escFn: PageFn,
+    usdFn: PageFn,
     labelFn: PageFn,
     timeFn: PageFn,
   ) => string;
-  return fn(event, esc, eventLabel, fmtLocal);
+  return fn(event, esc, fmtUsd, eventLabel, fmtLocal);
 }
 
 async function runDashboardChecks(): Promise<void> {
@@ -10214,7 +10218,7 @@ async function runDashboardChecks(): Promise<void> {
           } finally {
             console.log = prevLog;
           }
-          assert(out.includes('$0.0034'), `cortex top reports the same cost, got: ${out}`);
+          assert(out.includes('$0.003400'), `cortex top reports the same cost, got: ${out}`);
         } finally {
           if (prevHome === undefined) delete process.env['CORTEX_HOME'];
           else process.env['CORTEX_HOME'] = prevHome;
@@ -10279,6 +10283,34 @@ async function runDashboardChecks(): Promise<void> {
         assert(row.includes('100 in / 20 out'), `the row shows its tokens, got: ${row}`);
         assert(row.includes('gpt-4o-mini'), `the row shows its model, got: ${row}`);
         assert(row.includes('$0.000027'), `the row shows its cost, got: ${row}`);
+      });
+
+      await checkAsync('the dashboard and the CLI print money the same way', async () => {
+        // The page is a static file served over HTTP, so it cannot import
+        // `formatDollars` — it keeps its own copy of the rule. Two copies of a
+        // rule about money is one copy too many, so this check holds the two
+        // to the same string.
+        //
+        // The rule is six decimals, because the kernel counts in microdollars
+        // and one model call costs about $0.000027. The panel used to print
+        // four: a run that had spent real money read as a run that had spent
+        // nothing, while `cortex limit` and the event row said $0.000027.
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        const fmtUsd = pageFunction(html, 'fmtUsd') as (usd: number) => string;
+        for (const usd of [0, 0.000027, 0.0034, 12.345678]) {
+          assert(
+            fmtUsd(usd) === formatDollars(usd),
+            `the page and the CLI say the same money: ${fmtUsd(usd)} vs ${formatDollars(usd)}`,
+          );
+        }
+        // And a cost that was really spent never reads as nothing.
+        assert(
+          fmtUsd(0.000027) === '$0.000027',
+          `a real cost is not rounded away, got ${fmtUsd(0.000027)}`,
+        );
+        // ...and the server still hands the page dollars, not microdollars.
+        assert(usdToDollars(27) === 0.000027, 'the conversion is still the kernel\'s unit');
       });
 
       await checkAsync('dashboard serves the supervision tree and budget panels', async () => {
@@ -15789,6 +15821,63 @@ async function runTopChecks(): Promise<void> {
     });
 
     rmSync(wideHome, { recursive: true, force: true });
+
+    await checkAsync('cortex top says the money at the resolution the kernel counts it', async () => {
+      // One model call costs about **$0.000027**. Printed to four decimals that
+      // is `$0.0000`, so `cortex top` used to say **$0.0000 spent** for a run
+      // that had spent real money — while `cortex limit`, reading the same
+      // record, said `$0.000027`. The kernel counts in microdollars; six
+      // decimals is what it can say exactly, and a cost that rounds away is
+      // not a small cost, it is no cost.
+      const home = mkdtempSync(join(tmpdir(), 'cortex-money-'));
+      writeMeta(home, {
+        pid: 2,
+        ppid: 1,
+        pgid: 2,
+        role: 'tapped',
+        state: 'zombie',
+        exitCode: 0,
+        exitReason: 'done',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        lastTransitionAt: '2026-01-01T00:00:10.000Z',
+        // 27 microdollars: one model call.
+        budgetsSpent: {
+          tokensIn: 100,
+          tokensOut: 20,
+          tokensCached: 0,
+          usdSpent: 27,
+          wallTimeMs: 10,
+          syscallCount: 1,
+        },
+        budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+        agent: { module: './agents/noop.js' } as ProcessMeta['agent'],
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      const prevHome = process.env['CORTEX_HOME'];
+      process.env['CORTEX_HOME'] = home;
+      try {
+        const result = await capture(() => cmdTop([]));
+        assert(result.code === 0, `exit 0, got ${result.code}: ${result.err}`);
+        // The summary line says it...
+        assert(
+          result.out.includes('$0.000027'),
+          `the summary says what it cost, got: ${result.out}`,
+        );
+        // ...and so does the row.
+        const row = rowOf(result.out, 2);
+        assert(row.includes('$0.000027'), `the row says what it cost, got: ${row}`);
+        // The rounded-away version is nowhere to be seen. (Zero is printed as
+        // $0.000000, which is not the same string.)
+        assert(
+          !result.out.includes('$0.0000 '),
+          `the cost was not rounded away, got: ${result.out}`,
+        );
+      } finally {
+        if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+        else process.env['CORTEX_HOME'] = prevHome;
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
 
     await checkAsync('cortex top refuses a --stall-after it cannot make sense of', async () => {
       const result = await capture(() => cmdTop(['--stall-after', 'soon']));

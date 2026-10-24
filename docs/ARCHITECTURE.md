@@ -1626,13 +1626,33 @@ field the state model defines as an integer count — where it meant `53`. Every
 other view then read a run that had spent money as a run that had spent
 nothing: `cortex limit` printed `usd: spent $0.000000`.
 
-So the conversion lives in one module (`src/cli/process_budget.ts`:
+So the conversion lives in one module (`src/money.ts`:
 `usdToDollars` / `dollarsToMicrodollars`), and the dashboard does not do it at
 all: the server converts once and hands the page `usdSpentDollars`, so the page
 is never in a position to get the scale wrong. A view that reads a raw
 microdollar counter and prints it next to a dollar sign is not a formatting
 choice — it is a number about money, and it has to be the same number
 everywhere it appears.
+
+**And a unit has exactly one format too.** The scale was fixed; the
+*precision* was not, and it cost the same thing. One model call costs about
+**$0.000027**, and printed to four decimals that is `$0.0000` — so `cortex top`
+said **$0.0000 spent** for a run that had spent real money, and the
+dashboard's budget panel said `$0.0000` in the operator's window, while
+`cortex limit` and the event row both said `$0.000027` from the same record.
+Two views of one process's cost, one of them rounding the cost away.
+
+The resolution is not a taste: **six decimals is what a microdollar count can
+say exactly.** A cost that rounds away is not a small cost, it is no cost —
+and a budget that reads as untouched is a budget nobody is watching.
+
+So the format lives beside the conversion, in the same module
+(`formatDollars`), and it is its own module rather than a CLI one because
+three layers have to print money: the CLI, the fetch tap (its budget-exceeded
+error), and the dashboard. A rule only the CLI layer can reach is a rule the
+other two reinvent — and they did. The page itself cannot import it (it is a
+static file served over HTTP), so it keeps its own copy of the rule and a
+smoke check holds the two to the same string.
 
 **A view that cannot ask does not go silent.** A kernel too old to know the
 `openCalls` command must not turn the column into a row of blanks: a blank

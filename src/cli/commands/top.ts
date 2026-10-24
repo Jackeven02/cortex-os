@@ -63,7 +63,7 @@ import {
 } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
 import { formatOutcomeCode } from '../process_outcome.js';
-import { usdToDollars } from '../process_budget.js';
+import { formatDollars, usdToDollars } from '../../money.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
 import { PROCESS_STATES } from '../../kernel/process_table.js';
 
@@ -92,7 +92,11 @@ const TOP_COLUMNS: readonly ColumnSpec[] = [
   { header: 'ROLE', max: 24, gap: 2 },
   { header: 'STATE', max: longest(PROCESS_STATES), gap: 2 },
   { header: 'TOKENS', max: longest(['0', '999', '999.9k', '999.9M']), gap: 2 },
-  { header: 'USD', max: 9, gap: 2 },
+  // Money is printed at the resolution the kernel counts it — six decimals
+  // (`$0.000027`). Nine characters is not enough for that: the widest a
+  // dollar amount gets here is "$1234.567890", and a cost that is cut with
+  // an ellipsis is a cost nobody can add up.
+  { header: 'USD', max: 12, gap: 2 },
   { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 0 },
 ];
 
@@ -182,7 +186,7 @@ function renderTop(
       `${stalled.length > 0 ? ` · ${stalled.length} stuck` : ''}` +
       `${view.live ? ' · live kernel' : ''}`,
   );
-  console.log(`${formatTokens(tokens)} tokens · $${usd.toFixed(4)} spent · home ${dir}`);
+  console.log(`${formatTokens(tokens)} tokens · ${formatDollars(usd)} spent · home ${dir}`);
   console.log('');
 
   if (all.length === 1) {
@@ -358,7 +362,7 @@ function cellsFor(
     m.role,
     m.state,
     formatTokens(m.budgetsSpent.tokensIn + m.budgetsSpent.tokensOut),
-    `$${usdToDollars(m.budgetsSpent.usdSpent).toFixed(4)}`,
+    formatDollars(usdToDollars(m.budgetsSpent.usdSpent)),
     noteWithSignals,
   ];
 }
