@@ -1758,6 +1758,22 @@ ceiling is charged for the input and the output, with the cached part inside
 the input and counted once. (Whether a cached token *should* be charged in
 full is still open — BACKLOG #092.)
 
+**And a spend says the ceiling it is measured against.** The kernel knows each
+budget's ceiling — the total a process may ever spend — and the views that
+showed the spend did not show it: `cortex ps` and `cortex top` printed `1.2k`
+and `$0.000000`, and a spend on its own is 12% of one budget and 99% of
+another. The two need very different answers, and the operator had no way to
+tell which one they were looking at: the ceiling was visible only in
+`cortex limit`, the report — which is not the view an operator watches.
+
+So the ceiling stands beside the spend it is measured against: `1.2k (300
+cached) of 10k`, `$0.000000 of $1.000000`, and `of ∞` for a budget that has no
+ceiling at all. Every view that prints a spend prints it — `cortex ps`,
+`cortex top`, the summary lines of `cortex spawn` and `cortex wrap`, and the
+dashboard's process rows — and the rule lives in one place
+(`src/cli/process_budget.ts`), so two views of one process cannot disagree
+about what its budget was.
+
 **And a call says what it spent, not just a process.** A process's spend is one
 total; a **call's** is a pair — what the model read and what it wrote, and the
 part of the input that came out of the provider's cache — and the price. The

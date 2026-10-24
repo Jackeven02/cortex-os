@@ -53,7 +53,7 @@ import {
   type ProcessRow,
   type ProcessView,
 } from '../process_view.js';
-import { cachedSuffix, formatTokenUsage, formatTokens } from '../../token_usage.js';
+import { cachedSuffix, formatTokens } from '../../token_usage.js';
 import {
   isStalled,
   readOpenCalls,
@@ -63,7 +63,7 @@ import {
 } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
 import { formatOutcomeCode, describeOutcome } from '../process_outcome.js';
-import { describeBudget } from '../process_budget.js';
+import { describeBudget, formatTokenBudget, formatUsdBudget } from '../process_budget.js';
 import { processNote } from '../process_note.js';
 import { formatDollars, usdToDollars } from '../../money.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
@@ -84,15 +84,42 @@ function longest(values: readonly string[]): number {
  * The widest a token cell may be.
  *
  * Derived from the rule instead of guessed at: a cell is the total a process
- * spent and — when the provider served part of the input out of its cache —
- * the cached count in brackets, and both are printed by one formatter. So the
- * widest cell is the one that formatter can produce, and it is produced here,
- * once, by asking the formatter itself.
+ * spent, the ceiling that spend is measured against, and — when the provider
+ * served part of the input out of its cache — the cached count in brackets.
+ * All of it is printed by one formatter. So the widest cell is the one that
+ * formatter can produce, and it is produced here, once, by asking the
+ * formatter itself.
  */
-const TOKENS_MAX = formatTokenUsage({
-  tokensIn: 9_999_999_999,
-  tokensOut: 0,
-  tokensCached: 9_999_999_999,
+const TOKENS_MAX = formatTokenBudget({
+  spent: {
+    tokensIn: 9_999_999_999,
+    tokensOut: 0,
+    tokensCached: 9_999_999_999,
+    usdSpent: 0,
+    wallTimeMs: 0,
+    syscallCount: 0,
+  },
+  remaining: { tokens: 9_999_999_999, usd: -1, wallTimeMs: -1 },
+}).length;
+
+/**
+ * The widest a money cell may be.
+ *
+ * Money is printed at the resolution the kernel counts it — six decimals
+ * (`$0.000027`) — so the widest a dollar amount gets is "$1234.567890", and
+ * a cost that is cut with an ellipsis is a cost nobody can add up. The cell
+ * carries the ceiling beside the spend, so it is asked of the formatter too.
+ */
+const USD_MAX = formatUsdBudget({
+  spent: {
+    tokensIn: 0,
+    tokensOut: 0,
+    tokensCached: 0,
+    usdSpent: 1_234_567_890,
+    wallTimeMs: 0,
+    syscallCount: 0,
+  },
+  remaining: { tokens: -1, usd: 1_234_567_890, wallTimeMs: -1 },
 }).length;
 
 /**
@@ -109,11 +136,7 @@ const TOP_COLUMNS: readonly ColumnSpec[] = [
   { header: 'ROLE', max: 24, gap: 2 },
   { header: 'STATE', max: longest(PROCESS_STATES), gap: 2 },
   { header: 'TOKENS', max: TOKENS_MAX, gap: 2 },
-  // Money is printed at the resolution the kernel counts it — six decimals
-  // (`$0.000027`). Nine characters is not enough for that: the widest a
-  // dollar amount gets here is "$1234.567890", and a cost that is cut with
-  // an ellipsis is a cost nobody can add up.
-  { header: 'USD', max: 12, gap: 2 },
+  { header: 'USD', max: USD_MAX, gap: 2 },
   { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 0 },
 ];
 
@@ -391,8 +414,8 @@ function cellsFor(
     String(m.pid),
     m.role,
     m.state,
-    formatTokenUsage(m.budgetsSpent),
-    formatDollars(usdToDollars(m.budgetsSpent.usdSpent)),
+    formatTokenBudget({ spent: m.budgetsSpent, remaining: m.budgetsRemaining }),
+    formatUsdBudget({ spent: m.budgetsSpent, remaining: m.budgetsRemaining }),
     note,
   ];
 }
@@ -417,9 +440,11 @@ call — what it is waiting for and for how long. When a live kernel is running,
 its own process table is merged in, so running agents appear in the tree too.
 
   STATE     running, ready, blocked, stopped, suspended, zombie
-  TOKENS    what the process spent -- tokens in+out -- and how much of the
-            input the provider served out of its cache: '1.2k (300 cached)'
-  USD       what that spend cost in money, at six decimals
+  TOKENS    what the process spent -- tokens in+out -- what that spend is
+            measured against, and how much of the input the provider served
+            out of its cache: '1.2k (300 cached) of 10k'
+  USD       what that spend cost in money, at six decimals, and the money
+            budget it is measured against: '$0.000027 of $1.000000'
   NOTE      what the process is waiting for: a channel (recv), a timer
             (sleep), a child (wait), a model call (llm_call), a tool call
             (tool_call). It also says what is queued for it: a signal the

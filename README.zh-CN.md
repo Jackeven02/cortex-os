@@ -25,14 +25,14 @@ $ cortex spawn --role coder --task "fix issue #42"
 
 # 看进程树
 $ cortex ps
-PID  PPID  ROLE            STATE    TOKENS  CAPS  AGE  NOTE
------------------------------------------------------------
-1    -     init            running  0       all   18s
-2    1     holder          blocked  0       all   18s  a channel — SIGTERM queued
-3    1     planner         blocked  0       all   18s  child 6 — SIGCHLD queued
-4    3     coder:overview  zombie   0       all   18s  exit 0 (coder overview complete)
-5    3     coder:install   zombie   0       all   18s  exit 0 (coder install complete)
-6    3     coder:api       blocked  0       all   18s  a timer
+PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE
+---------------------------------------------------------------
+1    -     init            running  0 of ∞      all   18s
+2    1     holder          blocked  0 of 20.0k  all   18s  a channel — SIGTERM queued
+3    1     planner         blocked  0 of ∞      all   18s  child 6 — SIGCHLD queued
+4    3     coder:overview  zombie   0 of ∞      all   18s  exit 0 (coder overview complete)
+5    3     coder:install   zombie   0 of ∞      all   18s  exit 0 (coder install complete)
+6    3     coder:api       blocked  0 of ∞      all   18s  a timer
 
 # 同样这些进程，但按它们真实的父子关系画成树，
 # 并标出各自在等什么、已经等了多久
@@ -40,14 +40,14 @@ $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
 0 tokens · $0.000000 spent · home .cortex
 
-      PID  ROLE            STATE    TOKENS  USD        NOTE
------------------------------------------------------------
-      1    init            running  0       $0.000000  1 syscall
-├─    2    holder          blocked  0       $0.000000  waiting on a channel for 18.7s — SIGTERM queued
-└─    3    planner         blocked  0       $0.000000  waiting on child 6 for 18.7s — SIGCHLD queued
-   ├─ 4    coder:overview  zombie   0       $0.000000  exit 0 (coder overview complete)
-   ├─ 5    coder:install   zombie   0       $0.000000  exit 0 (coder install complete)
-   └─ 6    coder:api       blocked  0       $0.000000  waiting on a timer for 18.6s
+      PID  ROLE            STATE    TOKENS      USD                    NOTE
+---------------------------------------------------------------------------
+      1    init            running  0 of ∞      $0.000000 of ∞         1 syscall
+├─    2    holder          blocked  0 of 20.0k  $0.000000 of $1.000000  waiting on a channel for 18.7s — SIGTERM queued
+└─    3    planner         blocked  0 of ∞      $0.000000 of ∞         waiting on child 6 for 18.7s — SIGCHLD queued
+   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞         exit 0 (coder overview complete)
+   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞         exit 0 (coder install complete)
+   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞         waiting on a timer for 18.6s
 
 # ...以及卡住的那一个，顺带把该跑的命令给你
 $ cortex top --stall-after 30000
@@ -243,7 +243,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 785 项断言，0 失败
+npx tsx scripts/smoke.ts                # 791 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。

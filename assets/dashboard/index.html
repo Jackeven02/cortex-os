@@ -283,13 +283,15 @@
     }
 
     const processTokens = (process) => Number(process.budgetsSpent ? (process.budgetsSpent.tokensIn ?? 0) + (process.budgetsSpent.tokensOut ?? 0) : process.tokens ?? 0) || 0;
-    // What the process spent, in tokens — and which part of it the provider
-    // served out of its cache. The cached tokens are a *part* of the input,
-    // not extra ones, and they are billed at the cache price: a process that
-    // spent 1,000 tokens for a fifth of the usual money was reading from the
-    // cache, and the window used to say nothing about it. The label comes
-    // from the server, which uses the same rule `cortex ps` prints — one
-    // rule, three views.
+    // What the process spent, in tokens — which part of it the provider
+    // served out of its cache, and the ceiling the spend is measured against.
+    // The cached tokens are a *part* of the input, not extra ones, and they
+    // are billed at the cache price: a process that spent 1,000 tokens for a
+    // fifth of the usual money was reading from the cache, and the window
+    // used to say nothing about it. A spend on its own is 12% of one budget
+    // and 99% of another, so the ceiling comes with it. The label comes from
+    // the server, which uses the same rule `cortex ps` prints — one rule,
+    // three views.
     const processTokenLabel = (process) => String(process.tokenLabel ?? processTokens(process).toLocaleString());
     // **What one call spent**, in words: what it read, what it wrote, and the
     // part of the input the provider served out of its cache.

@@ -11,7 +11,7 @@ import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView } from '../cli/process_view.js';
 import { describeOutcome } from '../cli/process_outcome.js';
-import { describeBudget } from '../cli/process_budget.js';
+import { describeBudget, formatTokenBudget } from '../cli/process_budget.js';
 import { usdToDollars } from '../money.js';
 import { formatTokenUsage, callUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
@@ -254,6 +254,11 @@ function withUsdDollars<T extends { budgetsSpent?: { usdSpent?: number } }>(
  * 1,000 tokens for a fifth of the usual money looked like any other — and the
  * operator could not make the tokens and the dollars add up.
  *
+ * The label also carries the **ceiling** the spend is measured against, for
+ * the same reason `cortex ps` and `cortex top` carry it: a spend on its own
+ * is 12% of one budget and 99% of another, and the window cannot answer
+ * "is this one about to run out?" without it.
+ *
  * The label travels with the row so the page never re-implements the rule: one
  * function, three views. The page's own number style is the only thing the
  * server does not decide here — it spells the numbers out (`1,234`) where the
@@ -265,17 +270,32 @@ function withTokenLabel<
       tokensIn?: number;
       tokensOut?: number;
       tokensCached?: number;
+      usdSpent?: number;
+      wallTimeMs?: number;
+      syscallCount?: number;
     };
+    budgetsRemaining?: { tokens?: number; usd?: number; wallTimeMs?: number };
   },
 >(row: T): T & { tokenLabel: string } {
   const spent = row.budgetsSpent;
+  const remaining = row.budgetsRemaining;
   return {
     ...row,
-    tokenLabel: formatTokenUsage(
+    tokenLabel: formatTokenBudget(
       {
-        tokensIn: spent?.tokensIn ?? 0,
-        tokensOut: spent?.tokensOut ?? 0,
-        tokensCached: spent?.tokensCached ?? 0,
+        spent: {
+          tokensIn: spent?.tokensIn ?? 0,
+          tokensOut: spent?.tokensOut ?? 0,
+          tokensCached: spent?.tokensCached ?? 0,
+          usdSpent: spent?.usdSpent ?? 0,
+          wallTimeMs: spent?.wallTimeMs ?? 0,
+          syscallCount: spent?.syscallCount ?? 0,
+        },
+        remaining: {
+          tokens: remaining?.tokens ?? -1,
+          usd: remaining?.usd ?? -1,
+          wallTimeMs: remaining?.wallTimeMs ?? -1,
+        },
       },
       (n) => n.toLocaleString(),
     ),

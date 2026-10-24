@@ -25,14 +25,14 @@ $ cortex spawn --role coder --task "fix issue #42"
 
 # Inspect the process tree
 $ cortex ps
-PID  PPID  ROLE            STATE    TOKENS  CAPS  AGE  NOTE
------------------------------------------------------------
-1    -     init            running  0       all   18s
-2    1     holder          blocked  0       all   18s  a channel — SIGTERM queued
-3    1     planner         blocked  0       all   18s  child 6 — SIGCHLD queued
-4    3     coder:overview  zombie   0       all   18s  exit 0 (coder overview complete)
-5    3     coder:install   zombie   0       all   18s  exit 0 (coder install complete)
-6    3     coder:api       blocked  0       all   18s  a timer
+PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE
+---------------------------------------------------------------
+1    -     init            running  0 of ∞      all   18s
+2    1     holder          blocked  0 of 20.0k  all   18s  a channel — SIGTERM queued
+3    1     planner         blocked  0 of ∞      all   18s  child 6 — SIGCHLD queued
+4    3     coder:overview  zombie   0 of ∞      all   18s  exit 0 (coder overview complete)
+5    3     coder:install   zombie   0 of ∞      all   18s  exit 0 (coder install complete)
+6    3     coder:api       blocked  0 of ∞      all   18s  a timer
 
 # Same processes, as the tree they actually are — and what each is waiting
 # on, and for how long
@@ -40,14 +40,14 @@ $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
 0 tokens · $0.000000 spent · home .cortex
 
-      PID  ROLE            STATE    TOKENS  USD        NOTE
------------------------------------------------------------
-      1    init            running  0       $0.000000  1 syscall
-├─    2    holder          blocked  0       $0.000000  waiting on a channel for 18.7s — SIGTERM queued
-└─    3    planner         blocked  0       $0.000000  waiting on child 6 for 18.7s — SIGCHLD queued
-   ├─ 4    coder:overview  zombie   0       $0.000000  exit 0 (coder overview complete)
-   ├─ 5    coder:install   zombie   0       $0.000000  exit 0 (coder install complete)
-   └─ 6    coder:api       blocked  0       $0.000000  waiting on a timer for 18.6s
+      PID  ROLE            STATE    TOKENS      USD                    NOTE
+---------------------------------------------------------------------------
+      1    init            running  0 of ∞      $0.000000 of ∞         1 syscall
+├─    2    holder          blocked  0 of 20.0k  $0.000000 of $1.000000  waiting on a channel for 18.7s — SIGTERM queued
+└─    3    planner         blocked  0 of ∞      $0.000000 of ∞         waiting on child 6 for 18.7s — SIGCHLD queued
+   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞         exit 0 (coder overview complete)
+   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞         exit 0 (coder install complete)
+   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞         waiting on a timer for 18.6s
 
 # ...and the one that is stuck, with the command to act on it
 $ cortex top --stall-after 30000
@@ -252,7 +252,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 785 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 791 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

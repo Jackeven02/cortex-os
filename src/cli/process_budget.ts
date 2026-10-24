@@ -26,6 +26,16 @@
  * So the ceiling is computed — `spent + remaining`, or ∞ when the budget is
  * unlimited — and the remainder is shown as what it is: what is **left**.
  *
+ * ## Where the ceiling reaches the operator
+ *
+ * `cortex limit` is the report, but it is not the view an operator watches:
+ * the tables are. And a table that printed the **spend** without the
+ * **ceiling** left the operator with a number they could not act on — "1.2k"
+ * is 12% of one budget and 99% of another, and the two need very different
+ * answers. So every view that prints a spend prints the ceiling it is
+ * measured against beside it (`formatTokenBudget`, `formatUsdBudget`), and
+ * two views of one process cannot disagree about what the ceiling is.
+ *
  * ## Why it lives here
  *
  * Two sources answer the same question: a live kernel's process table (for a
@@ -38,7 +48,7 @@
 
 import type { BudgetCounters, BudgetLimits } from '../kernel/types.js';
 import { formatDollars, usdToDollars } from '../money.js';
-import { formatTokenUsage, tokenUsage } from '../token_usage.js';
+import { formatTokenUsage, formatTokens, tokenUsage } from '../token_usage.js';
 
 /**
  * What the CLI knows about a process's budget.
@@ -135,8 +145,8 @@ export function formatBudgetLines(facts: BudgetFacts): readonly string[] {
   // those tokens were billed at the cache price while the ceiling was charged
   // the full count for them.
   const spentTokens = formatTokenUsage(facts.spent, (n) => String(n));
-  const tokenCeiling = budgetCeiling(tokenUsage(facts.spent).total, facts.remaining.tokens);
-  const usdCeiling = budgetCeiling(facts.spent.usdSpent, facts.remaining.usd);
+  const tokenCeiling = tokenCeilingOf(facts);
+  const usdCeiling = usdCeilingOf(facts);
   const wallCeiling = budgetCeiling(facts.spent.wallTimeMs, facts.remaining.wallTimeMs);
 
   return [
@@ -159,4 +169,83 @@ export function formatBudgetLines(facts: BudgetFacts): readonly string[] {
       `${facts.remaining.wallTimeMs}ms`,
     ),
   ];
+}
+
+/**
+ * The token budget's ceiling: the total the process may ever spend.
+ *
+ * `null` means **unlimited**. The same computation the budget report uses,
+ * so a table cell and the report cannot disagree about what the ceiling is.
+ */
+export function tokenCeilingOf(facts: BudgetFacts): number | null {
+  return budgetCeiling(tokenUsage(facts.spent).total, facts.remaining.tokens);
+}
+
+/**
+ * The money budget's ceiling: the total the process may ever spend.
+ *
+ * In **microdollars**, like the spend it is measured against — the conversion
+ * to dollars happens in the cell, not in the number.
+ */
+export function usdCeilingOf(facts: BudgetFacts): number | null {
+  return budgetCeiling(facts.spent.usdSpent, facts.remaining.usd);
+}
+
+/**
+ * A spend, next to the ceiling it is measured against.
+ *
+ * **"1.2k (300 cached) of 10k"** — the spend, and the total it is a part of.
+ *
+ * The ceiling belongs next to the spend, and not in a column of its own,
+ * because a number without the number it is measured against is a number
+ * the operator has to guess about: "1.2k" on its own is 12% of a budget or
+ * 99% of one, and the two need very different answers. The ceiling is the
+ * one that is stable — the spend moves, the ceiling is what was granted.
+ *
+ * `∞` when the budget has no ceiling: the spend is unbounded, and saying so
+ * is more useful than leaving it out.
+ *
+ * @param spent The spend, already formatted by whoever owns its shape.
+ * @param ceiling The total it is measured against, or `null` for unlimited.
+ * @param format How this view prints a number.
+ */
+export function formatBudgetCell(
+  spent: string,
+  ceiling: number | null,
+  format: (n: number) => string,
+): string {
+  return `${spent} of ${ceiling === null ? '∞' : format(ceiling)}`;
+}
+
+/**
+ * A process's token spend, next to the token budget's ceiling.
+ *
+ * The spend keeps the shape the token rule gives it — the total, and the
+ * cached part in brackets (`src/token_usage.ts`) — and the ceiling comes
+ * after it.
+ *
+ * @param facts What the process spent and what it has left.
+ * @param format How this view prints a number. The CLI shortens (`1.2k`),
+ *   the dashboard spells it out (`1,234`).
+ */
+export function formatTokenBudget(
+  facts: BudgetFacts,
+  format: (n: number) => string = formatTokens,
+): string {
+  return formatBudgetCell(
+    formatTokenUsage(facts.spent, format),
+    tokenCeilingOf(facts),
+    format,
+  );
+}
+
+/**
+ * A process's money spend, next to the money budget's ceiling.
+ *
+ * Both numbers are printed in dollars, at the resolution the kernel counts
+ * them (`src/money.ts`) — a ceiling printed at another resolution would not
+ * add up to the spend beside it.
+ */
+export function formatUsdBudget(facts: BudgetFacts): string {
+  return formatBudgetCell(dollars(facts.spent.usdSpent), usdCeilingOf(facts), dollars);
 }

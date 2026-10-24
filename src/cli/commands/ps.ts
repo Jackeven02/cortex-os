@@ -20,10 +20,9 @@ import {
   readProcessView,
   type ProcessRow,
 } from '../process_view.js';
-import { formatTokenUsage } from '../../token_usage.js';
 import { describeWait, readOpenCalls, type OpenCall } from '../open_call.js';
 import { describeOutcome } from '../process_outcome.js';
-import { describeBudget } from '../process_budget.js';
+import { describeBudget, formatTokenBudget } from '../process_budget.js';
 import { processNote } from '../process_note.js';
 import { probeKernel } from '../kernel_client.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
@@ -55,15 +54,22 @@ const CAPS_MAX = (() => {
  * The widest a token cell may be.
  *
  * Derived from the rule instead of guessed at: a cell is the total a process
- * spent and — when the provider served part of the input out of its cache —
- * the cached count in brackets, and both are printed by one formatter. So the
- * widest cell is the one that formatter can produce, and it is produced here,
- * once, by asking the formatter itself.
+ * spent, the ceiling that spend is measured against, and — when the provider
+ * served part of the input out of its cache — the cached count in brackets.
+ * All of it is printed by one formatter. So the widest cell is the one that
+ * formatter can produce, and it is produced here, once, by asking the
+ * formatter itself.
  */
-const TOKENS_MAX = formatTokenUsage({
-  tokensIn: 9_999_999_999,
-  tokensOut: 0,
-  tokensCached: 9_999_999_999,
+const TOKENS_MAX = formatTokenBudget({
+  spent: {
+    tokensIn: 9_999_999_999,
+    tokensOut: 0,
+    tokensCached: 9_999_999_999,
+    usdSpent: 0,
+    wallTimeMs: 0,
+    syscallCount: 0,
+  },
+  remaining: { tokens: 9_999_999_999, usd: -1, wallTimeMs: -1 },
 }).length;
 
 /**
@@ -112,10 +118,12 @@ OPTIONS
 COLUMNS
   PID PPID ROLE STATE TOKENS CAPS AGE NOTE
 
-  TOKENS is what the process spent, and says which part of it the provider
-  served out of its cache: '1.2k (300 cached)'. The cached tokens are part of
-  that total, not extra ones — they were read from the cache, and they are
-  billed at the cache price.
+  TOKENS is what the process spent and what it is measured against:
+  '1.2k (300 cached) of 10k'. The ceiling is the total the process may ever
+  spend, so a spend on its own — '1.2k' — is 12% of one budget and 99% of
+  another, and the two need very different answers; ∞ means the budget has
+  no ceiling. The cached tokens are part of that spend, not extra ones —
+  they were read from the cache, and they are billed at the cache price.
 
   NOTE says what the process is doing. For a process that is still alive, it
   says what it is waiting on — a channel, a child, a timer, a model call. It
@@ -231,7 +239,7 @@ COLUMNS
       p.ppid !== null ? String(p.ppid) : '-',
       p.role,
       p.state,
-      formatTokenUsage(p.budgetsSpent),
+      formatTokenBudget({ spent: p.budgetsSpent, remaining: p.budgetsRemaining }),
       formatCaps(p.capabilities),
       formatAge(ageMs),
       note(p),

@@ -320,6 +320,7 @@ import {
 } from '../src/cli/replay_core.js';
 import { processOutcome, formatOutcomeCode, describeOutcome } from '../src/cli/process_outcome.js';
 import { formatTokenUsage, formatTokens, tokenUsage, callUsage } from '../src/token_usage.js';
+import { formatTokenBudget, formatUsdBudget } from '../src/cli/process_budget.js';
 import type { CortexContext, LLMResponse, Timestamp } from '../src/kernel/types.js';
 import { OutputCapture } from '../src/cli/output_capture.js';
 import { bootCliKernel } from '../src/cli/index.js';
@@ -17992,6 +17993,44 @@ async function runTokenUsageChecks(): Promise<void> {
     assert(withoutCache === '1.2k', `a process with no cached tokens says nothing about it, got ${withoutCache}`);
   });
 
+  check('a budget cell says the spend and the ceiling it is measured against', () => {
+    // The spend on its own is 12% of one budget and 99% of another, and the
+    // two need very different answers. So the ceiling stands beside the
+    // spend — and a budget with no ceiling says so rather than saying
+    // nothing.
+    const spent = {
+      tokensIn: 1000,
+      tokensOut: 200,
+      tokensCached: 400,
+      usdSpent: 0,
+      wallTimeMs: 0,
+      syscallCount: 0,
+    };
+    const bounded = formatTokenBudget({
+      spent,
+      remaining: { tokens: 8800, usd: -1, wallTimeMs: -1 },
+    });
+    assert(
+      bounded === '1.2k (400 cached) of 10.0k',
+      `the cell names the ceiling, got ${bounded}`,
+    );
+    const unbounded = formatTokenBudget({
+      spent,
+      remaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+    });
+    assert(
+      unbounded === '1.2k (400 cached) of ∞',
+      `a budget with no ceiling says so, got ${unbounded}`,
+    );
+    const money = formatUsdBudget({
+      spent: { ...spent, usdSpent: 161 },
+      // The remainder is what the process has LEFT, so the ceiling — the
+      // spend plus the remainder — is the $1.00 it was granted.
+      remaining: { tokens: -1, usd: 999_839, wallTimeMs: -1 },
+    });
+    assert(money === '$0.000161 of $1.000000', `the money cell names the ceiling, got ${money}`);
+  });
+
   try {
     // --- §2 a real kernel, a real driver, a real cache hit ----------------
 
@@ -18023,7 +18062,13 @@ async function runTokenUsageChecks(): Promise<void> {
     writeEndpoint(tmp, server.endpoint);
     process.env['CORTEX_HOME'] = tmp;
 
-    const pid = await kernel.spawn({ role: 'cached', agent: { module: 'test:cached' } });
+    // A budget, so the views have a ceiling to say: a spend on its own is 12%
+    // of one budget and 99% of another.
+    const pid = await kernel.spawn({
+      role: 'cached',
+      agent: { module: 'test:cached' },
+      budgets: { tokens: 10_000, usd: 1_000_000, wallTimeMs: -1 },
+    });
 
     // Wait for the second call to land: the cached count is only there once
     // the driver has answered twice.
@@ -18119,6 +18164,44 @@ async function runTokenUsageChecks(): Promise<void> {
       );
     });
 
+    await checkAsync('cortex ps says the ceiling the spend is measured against', async () => {
+      const result = await capture(() => cmdPs([]));
+      assert(result.code === 0, `exit 0, got ${result.code}: ${result.err}`);
+      const row = psRow(result.out, unbrand(pid));
+      assert(row !== '', `the process is in the table, got: ${result.out}`);
+      // The spend, and the total it is measured against: '… of 10.0k'. A spend
+      // on its own is 12% of one budget and 99% of another, and the two need
+      // very different answers.
+      assert(
+        row.includes(`of ${formatTokens(10_000)}`),
+        `the row names the ceiling, got: ${row}`,
+      );
+    });
+
+    await checkAsync('cortex top says the ceiling too', async () => {
+      const result = await capture(() => cmdTop([]));
+      assert(result.code === 0, `exit 0, got ${result.code}: ${result.err}`);
+      const row = topRow(result.out, unbrand(pid));
+      assert(row !== '', `the process is in the tree, got: ${result.out}`);
+      assert(
+        row.includes(`of ${formatTokens(10_000)}`),
+        `the token cell names the ceiling, got: ${row}`,
+      );
+      assert(
+        row.includes(`of ${formatDollars(1)}`),
+        `the money cell names the ceiling, got: ${row}`,
+      );
+    });
+
+    await checkAsync('cortex limit and the tables agree about the ceiling', async () => {
+      const result = await capture(() => cmdLimit([String(unbrand(pid))]));
+      assert(result.code === 0, `exit 0, got ${result.code}: ${result.err}`);
+      assert(
+        result.out.includes(`limit ${10_000}`),
+        `the report names the same ceiling, got: ${result.out}`,
+      );
+    });
+
     const probe = await probeKernel(tmp);
     assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
     const client = probe.kind === 'live' ? probe.client : undefined;
@@ -18145,6 +18228,22 @@ async function runTokenUsageChecks(): Promise<void> {
         assert(html.includes('tokenLabel'), 'the page prints the label it is given');
         assert(html.includes('budgetCached'), 'the budget panel has a place for the cached total');
         assert(html.includes('<th>缓存</th>'), 'the budget table has a column for the cached part');
+      });
+
+      await checkAsync('the dashboard says the ceiling too', async () => {
+        const res = await fetch(`${dash.url}/api/processes`);
+        assert(res.status === 200, `status ${res.status}`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const row = rows.find((r) => r['pid'] === unbrand(pid));
+        assert(
+          row !== undefined,
+          `the process is in the list, got: ${JSON.stringify(rows.map((r) => r['pid']))}`,
+        );
+        const label = String(row!['tokenLabel'] ?? '');
+        assert(
+          label.includes(`of ${(10_000).toLocaleString()}`),
+          `the label names the ceiling, got: ${label}`,
+        );
       });
     } finally {
       await dash.close();
@@ -20345,6 +20444,31 @@ async function runOutcomeChecks(): Promise<void> {
       assert(
         spawned.out.includes("reading 'id'"),
         `the reason for the crash was not reported: ${spawned.out}`,
+      );
+    });
+
+    await checkAsync('cortex spawn says the ceiling the spend is measured against', async () => {
+      const home = join(tmp, 'home-budget');
+      process.env['CORTEX_HOME'] = home;
+      const module = join(tmp, 'quiet-agent.ts');
+      writeFileSync(
+        module,
+        `export default async function agent(ctx) {
+  ctx.now();
+}
+`,
+        'utf8',
+      );
+
+      const spawned = await capture(() =>
+        cmdSpawn(['--role', 'quiet', '--module', module, '--token-budget', '1000']),
+      );
+      assert(spawned.code === 0, `the agent ran: ${spawned.out}${spawned.err}`);
+      // The spend on its own is 12% of one budget and 99% of another, and the
+      // two need very different answers — so the summary says the ceiling too.
+      assert(
+        spawned.out.includes('tokens: 0 of 1000'),
+        `the summary names the ceiling, got: ${spawned.out}`,
       );
     });
   } finally {

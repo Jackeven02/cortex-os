@@ -1546,6 +1546,42 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The views that show what a process spent never said what it was measured
+  against.** A budget has two numbers: the **ceiling** — the total the process
+  may ever spend — and the **remainder**, which shrinks as it spends.
+  `cortex limit`, the report, said both, with the ceiling labelled as the
+  ceiling. The views an operator actually watches said only the spend:
+  `cortex ps` printed `1.2k`, `cortex top` printed `1.2k` and `$0.000000`,
+  and the dashboard's process rows printed the same.
+
+  A spend on its own is 12% of one budget and 99% of another, and the two
+  need very different answers — so the ceiling now stands beside the spend it
+  is measured against:
+
+  ```console
+  $ cortex ps
+  PID  PPID  ROLE            STATE    TOKENS    CAPS  AGE  NOTE
+  ------------------------------------------------------------
+  1    -     init            running  0 of ∞      all   18s
+  2    1     holder          blocked  0 of 20.0k  all   18s  a channel — SIGTERM queued
+  ```
+
+  and `of ∞` for a budget that has no ceiling at all.
+
+  Every view that prints a spend prints it: `cortex ps`, `cortex top`, the
+  summary lines of `cortex spawn` and `cortex wrap`, and the dashboard's
+  process rows. The rule lives in one place (`src/cli/process_budget.ts`), so
+  two views of one process cannot disagree about what its budget was — and
+  the report and the tables cannot disagree either, because they read the
+  same ceiling.
+
+  6 new smoke checks (785 → 791), reverse-verified: with the ceiling computed
+  as the remainder (the mistake `cortex limit` once made), five checks fail at
+  once and the tables print "of 9.7k" where the ceiling is 10.0k; with the
+  dashboard's label dropping the ceiling, its check fails; with `cortex top`'s
+  money cell dropping it, the top check fails on the money assertion alone;
+  and with `cortex spawn`'s summary line dropping it, the spawn check fails.
+
 - **The kernel knew which regions refuse writes, and no view said so.** A
   region's policy may declare `readOnly`, and then `memory_write` traps
   **`EPERM`** on it (ABI.md §4.4). The access mode belongs to the *binding*,
