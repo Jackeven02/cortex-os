@@ -649,6 +649,22 @@ For v0, **only install drivers you trust**. Same advice as npm packages generall
 
 **What `spec.json` holds, and why it is written so early.** The role, the agent spec, the memory region policies a process was created with, and the authority it was born with — its capability set, the pool it may escalate from, and its budget ceiling. The first three are the facts a restore needs to rebuild it, and the facts the `.csnap` body deliberately omits (STATE.md §4); the last three are the facts a *replacement* needs to be the same process rather than a stronger one (ABI §4.9, §12.1 below). It is written when the process is **created**, not when it exits: `meta.json` (which carries the same facts) is written at exit, so a snapshot of an agent that was still running when its kernel died would have had no spec anywhere on disk and could not be restored in a later session. The kernel reports the birth (`KernelOptions.onProcessStart`) and the CLI decides what to write; the kernel itself never touches the disk layout.
 
+**What `meta.json` holds, and who may write it.** The **exit record**: the kernel's own account of a process's life — its identity, the state it ended in, its exit code and reason, what it spent, and the capabilities it held (ABI §4.9). The kernel writes it at the ZOMBIE transition, through `KernelOptions.onProcessExit`; the CLI decides where it lands on disk.
+
+It has a second writer. The CLI writes a record of its own at the end of the command that ran the process — it knows the memory policies it declared and what the process was blocked on, and the kernel does not — so "whoever wrote last" used to decide what the file said, and the race was won by the thinner record. A `cortex spawn` that finished replaced the kernel's exit record with the CLI's, and the capabilities went with it: a process that held every capability was recorded as holding none, and `cortex ps` printed `-` for it — the *absence* of an answer, which is not the same as "everything". The same write put the process in the wrong process group too (the CLI wrote the process's own pid as its group; a child joins its parent's).
+
+So the two writers split the file by ownership, and neither may write the other's facts:
+
+| fact | author |
+|---|---|
+| identity, state, exit code and reason, budgets, capabilities | the **kernel** — it was there |
+| memory policies, blocked reason | the **CLI** — the kernel never sees them |
+| money | **grows only** — the CLI may add spend the kernel could not see (`cortex wrap`'s tap); nobody may make a process look like it spent less |
+
+A write is therefore a merge, not a replace. The kernel's account wins where the two meet, because it is the account of what actually happened; the CLI's declaration is kept, because the kernel has no way to know it; and a writer that can see spend the other cannot adds to the counters instead of replacing them.
+
+**One ending has two authors, and the rule says which one.** The ending belongs to whoever *decided* it. A process that ends itself was decided by the process, and the kernel's exit record is the account of that. But a run the **CLI** stops — `cortex wrap --timeout` — was decided by the CLI, and the kernel only saw a signal: its account of the wrapper process ("exited 1 (cancelled)") is not what an operator needs to read afterwards. What they need to read is that *we* killed it, and why. So the CLI says that it decided (`writeProcessView(dir, meta, { ownsEnding: true })`), and the record carries the CLI's account: `137`, the shell's own convention for a run we stopped, and "timed out after 1216ms".
+
 **What `output.log` holds, and why it is a separate file.** The `.crec` log
 records what a process **did** — its syscalls, with arguments and results. It
 says nothing about what the process **said**: `console.log` is not a syscall,

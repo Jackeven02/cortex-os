@@ -14,7 +14,7 @@
  */
 
 import { parseArgs } from 'node:util';
-import { bootCliKernel, defaultKernelDir, writeMeta, unbrand, type ProcessMeta } from '../index.js';
+import { bootCliKernel, defaultKernelDir, writeProcessView, heldCapabilities, unbrand, type ProcessMeta } from '../index.js';
 import { asProcessId, asChainId, type ChainId } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
 import { findCheckpointByTag, listCheckpoints, readExitRecord } from '../process_store.js';
@@ -225,7 +225,10 @@ EXAMPLES
       console.log(`process still ${e.state} after ${elapsed}ms`);
     }
 
-    // Write meta to disk.
+    // Write the record to disk — as the CLI's **view**, on top of whatever
+    // the kernel recorded. The kernel's exit record is the account of how the
+    // process ended, and the CLI's snapshot of a process that is already
+    // gone is a guess; a guess must not overwrite a fact.
     const meta: ProcessMeta = {
       pid: unbrand(newPid),
       ppid: restoredPpid,
@@ -243,9 +246,11 @@ EXAMPLES
         ? { memory: Object.fromEntries(restoredMemory) }
         : {}),
       ...(e?.blockedOn !== undefined ? { blockedOn: e.blockedOn } : {}),
+      // What the restored process was allowed to do (docs/ABI.md §4.9).
+      ...(e !== undefined ? { capabilities: heldCapabilities(e.capabilities) } : {}),
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
-    writeMeta(dir, meta);
+    writeProcessView(dir, meta);
 
     await kernel.shutdown();
     return done ? (outcome.exitCode ?? 1) : 0;

@@ -46,7 +46,7 @@ import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetL
 import { isCortexError } from '../kernel/errors.js';
 import { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir } from '../kernel/recorder.js';
 import { type ReplayMode, type ReplayRecordings } from '../kernel/replay.js';
-import { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, outputPath, readOutput, appendOutput, type ProcessMeta, type ProcessSpec, type OutputEntry } from './process_store.js';
+import { readAllMetas, readMeta, writeMeta, writeExitRecord, writeProcessView, heldCapabilities, readSpec, writeSpec, maxPidOnDisk, readExitRecord, outputPath, readOutput, appendOutput, type ProcessMeta, type ProcessSpec, type OutputEntry } from './process_store.js';
 import { OutputCapture } from './output_capture.js';
 
 import { cmdSpawn } from './commands/spawn.js';
@@ -502,8 +502,16 @@ export async function bootCliKernel(
     // the CLI booted itself; the supervision tree was invisible. The kernel
     // calls this at the ZOMBIE transition, before the entry is reaped, so the
     // full exit info is still on the entry.
+    //
+    // This is the kernel's own account of the process, so it is written as
+    // the **exit record**: it replaces the record's account of the process's
+    // life and keeps the CLI's declaration (the memory policies, what the
+    // process was blocked on). A plain overwrite here would drop the
+    // declaration every time the kernel wrote after the CLI had — and the
+    // reverse order dropped the capabilities, which is the fact that only the
+    // kernel has.
     onProcessExit: (meta) => {
-      writeMeta(dir, meta as unknown as Parameters<typeof writeMeta>[1]);
+      writeExitRecord(dir, meta);
     },
     // Persist a process's spec — role, agent, memory policies — when it is
     // *created*. The `.csnap` body deliberately omits it, and the meta.json
@@ -573,7 +581,7 @@ export function parsePid(s: string): ProcessId {
 // =============================================================================
 
 export { unbrand, asProcessId };
-export { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, outputPath, readOutput, appendOutput, type ProcessMeta, type ProcessSpec, type OutputEntry };
+export { readAllMetas, readMeta, writeMeta, writeExitRecord, writeProcessView, heldCapabilities, readSpec, writeSpec, maxPidOnDisk, readExitRecord, outputPath, readOutput, appendOutput, type ProcessMeta, type ProcessSpec, type OutputEntry };
 export { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir };
 
 // =============================================================================

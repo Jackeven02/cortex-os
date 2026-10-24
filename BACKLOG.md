@@ -203,6 +203,38 @@ The user-facing surface. Should feel like a real OS shell.
   recorder holds the exit frame until the test has looked — so it is
   deterministic rather than lucky.
 
+- [x] **#075** The CLI could erase what the kernel knew about a process →
+  **fixed.** `meta.json` has two writers, and they used to overwrite each
+  other: the kernel writes the **exit record** when a process dies (its own
+  account of the process's life), and the CLI writes a record of its own at
+  the end of the command that ran it (the memory policies it declared, what
+  the process was blocked on). **Whoever wrote last won, and the race was
+  won by the thinner record.** The CLI's record has no `capabilities` in it
+  at all, so a process that held every capability was recorded as holding
+  none and `cortex ps` printed `-` for it — the *absence* of an answer, not
+  "everything". The same write put the process in the wrong process group
+  (the CLI wrote the process's own pid as its group; a child joins its
+  parent's), and it replaced the kernel's account of the ending with a
+  snapshot the CLI took *after* the process was gone and reaped.
+  **The two writers now split the file by ownership**, and a write is a
+  merge rather than a replace: the kernel owns the process's life, the CLI
+  owns the declaration, and money only grows (the CLI may add spend the
+  kernel could not see — `cortex wrap`'s tap — and nobody may make a process
+  look like it spent less). **One ending has two possible authors and the
+  rule says which**: the ending belongs to whoever *decided* it, so a run the
+  CLI stopped for overrunning is recorded as the CLI stopped it (`137`,
+  `"timed out after 1216ms"`) instead of as what the wrapper process happened
+  to do on its way out ("exited 1 (cancelled)" — which reads like a command
+  that failed on its own). **Five new smoke checks** (716 → 721), each one
+  reverse-verified: the CLI writing over the kernel's record → "cortex spawn
+  does not erase what the process held" fails; a view rewriting the ending →
+  "a view cannot rewrite the account of an ending" fails; the exit record
+  replacing the declaration → "the exit record keeps the declaration" fails;
+  a view shrinking the spend → "money only grows" fails; the CLI's decided
+  ending being discarded → "the ending belongs to whoever decided it" fails.
+  The end-to-end check runs a real agent that throws a `TypeError`, through
+  the real `cortex spawn`, and reads the record off the disk.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

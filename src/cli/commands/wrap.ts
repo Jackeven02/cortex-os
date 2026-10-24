@@ -46,8 +46,9 @@ import {
   bootCliKernel,
   defaultKernelDir,
   ensureKernelDirs,
-  writeMeta,
+  writeProcessView,
   readExitRecord,
+  heldCapabilities,
   unbrand,
   DEFAULT_MEMORY_REGIONS,
 } from '../index.js';
@@ -374,6 +375,10 @@ export async function cmdWrap(args: string[]): Promise<number> {
     let state: ProcessState;
     let exitCode: number | null;
     let exitReason: string | null;
+    // The ending the *record* carries when the CLI is the one who decided it
+    // — see `writeProcessView`. `null` means "the process decided, and the
+    // kernel's exit record is the account of that".
+    let decidedExitCode: number | null = null;
 
     if (entry === undefined) {
       const exitRec = await readExitRecord(dir, current);
@@ -414,6 +419,13 @@ export async function cmdWrap(args: string[]): Promise<number> {
         await kernel.signals.send(current, 'SIGKILL', PID_INIT).catch(() => undefined);
         await kernel.settle(2000, () => new Promise((resolve) => setTimeout(resolve, 10)));
       }
+      // The CLI stopped this run, so the CLI owns the account of how it ended.
+      // The kernel only saw a signal, and the record it wrote says what the
+      // *wrapper process* did on its way out ("exited 1 (cancelled)") — which
+      // is not what an operator needs to read afterwards. What they need to
+      // read is that we killed it, and why: 137, the shell's own convention
+      // for a run we stopped (docs/INTEGRATIONS.md).
+      decidedExitCode = TIMEOUT_EXIT_CODE;
     }
 
     if (state === 'suspended') {
@@ -491,7 +503,11 @@ export async function cmdWrap(args: string[]): Promise<number> {
     }
 
     // Persist so `cortex ps` / `trace` / the dashboard see this run after the
-    // CLI exits. Same shape `cortex spawn` writes.
+    // CLI exits. Same shape `cortex spawn` writes — as the CLI's **view**,
+    // written on top of the kernel's exit record rather than over it. The
+    // kernel's account of how the process ended is the one that counts; the
+    // CLI contributes the declaration and the money its tap saw (the part
+    // the kernel's own counters cannot know), and money only grows.
     //
     // Under a restart policy the persisted pid is the LAST attempt, not the
     // original. Those differ, and the difference decides what a reader sees:
@@ -506,7 +522,7 @@ export async function cmdWrap(args: string[]): Promise<number> {
       pgid: finalPid,
       role: values.role,
       state,
-      exitCode,
+      exitCode: decidedExitCode ?? exitCode,
       exitReason,
       startedAt: entry?.startedAt ?? new Date(startTime).toISOString(),
       lastTransitionAt: entry?.lastTransitionAt ?? new Date().toISOString(),
@@ -515,9 +531,11 @@ export async function cmdWrap(args: string[]): Promise<number> {
       agent: agentSpec,
       ...(values.memory !== undefined ? { memory: regionPolicies } : {}),
       ...(entry?.blockedOn !== undefined ? { blockedOn: entry.blockedOn } : {}),
+      // What the run was allowed to do (docs/ABI.md §4.9).
+      ...(entry !== undefined ? { capabilities: heldCapabilities(entry.capabilities) } : {}),
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
-    writeMeta(dir, meta);
+    writeProcessView(dir, meta, decidedExitCode !== null ? { ownsEnding: true } : undefined);
 
     // A timed-out run must not report success.
     //

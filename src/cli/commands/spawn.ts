@@ -18,9 +18,10 @@ import {
   bootCliKernel,
   defaultKernelDir,
   ensureKernelDirs,
-  writeMeta,
+  writeProcessView,
   readMeta,
   readExitRecord,
+  heldCapabilities,
   unbrand,
   DEFAULT_MEMORY_REGIONS,
 } from '../index.js';
@@ -310,7 +311,16 @@ export async function cmdSpawn(args: string[]): Promise<number> {
     const remaining = entry?.budgetsRemaining ?? persistedMeta?.budgetsRemaining ?? { tokens: -1, usd: -1, wallTimeMs: -1 };
     console.log(`tokens: ${spent.tokensIn + spent.tokensOut} (in ${spent.tokensIn}, out ${spent.tokensOut})`);
 
-    // Write the meta.json so ps/trace can see this process later.
+    // Write the record so ps/trace can see this process later.
+    //
+    // As the CLI's **view**, not as a replacement: the kernel has already
+    // written its own account of how this process ended (the exit record),
+    // and that account is the one that counts. The CLI contributes what only
+    // it knows — the memory policies it declared, what the process was
+    // blocked on — and the fact that the kernel holds: what the process was
+    // allowed to do. It used to write a record of its own from scratch, and
+    // that record had no `capabilities` in it at all, so a process that held
+    // every capability was recorded as holding none.
     const meta: ProcessMeta = {
       pid: unbrand(pid),
       ppid: 1,
@@ -327,9 +337,14 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       ...(values.memory !== undefined ? { memory: regionPolicies } : {}),
       // Recorded so `top` can say what a still-blocked process is waiting on.
       ...(entry?.blockedOn !== undefined ? { blockedOn: entry.blockedOn } : {}),
+      // What the process was allowed to do (docs/ABI.md §4.9). The kernel
+      // knows this while the process is alive; the exit record keeps it
+      // afterwards. This view does not copy it back out of the record: the
+      // CLI does not get to answer for a process it can no longer see.
+      ...(entry !== undefined ? { capabilities: heldCapabilities(entry.capabilities) } : {}),
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
-    writeMeta(dir, meta);
+    writeProcessView(dir, meta);
 
     await kernel.shutdown();
     // An ending nobody saw is not a success: the command's own exit code

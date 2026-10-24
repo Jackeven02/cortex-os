@@ -590,6 +590,23 @@ process rather than as a stronger one: the replacement replays the spec, and
 falls back to the kernel's exit record when the spec is too old to say. See
 docs/ARCHITECTURE.md §12.1.
 
+**The exit record has one author per fact, and the CLI does not get to
+overwrite the kernel.** `meta.json` is written twice in a normal run — by the
+kernel when the process dies, and by the CLI at the end of the command that
+ran it — so "whoever wrote last" decided what the file said, and the race was
+won by the *thinner* record: the CLI's own snapshot has no `capabilities` in
+it, so a process that held every capability was recorded as holding none, and
+`cortex ps` printed `-` for it (`-` is the absence of an answer, not
+"everything"). The two writers now split the file by ownership — the kernel
+owns the process's life, the CLI owns the declaration (the memory policies,
+the blocked reason), and money only grows, because the CLI may know about
+spend the kernel could not see (`cortex wrap`'s tap) and nobody may make a
+process look like it spent less. One ending has two possible authors, and
+the rule says which: the ending belongs to whoever *decided* it, so a run the
+CLI stopped for overrunning is recorded as the CLI stopped it (`137`, "timed
+out after 1216ms"), not as what the wrapper process happened to do on its way
+out. See docs/ARCHITECTURE.md §7.
+
 #### What each capability gates
 
 | Capability | Gates | Not required for |

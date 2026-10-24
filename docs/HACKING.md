@@ -336,6 +336,18 @@ The same facts reach you three ways — `awaitExit`, the
 and they cannot disagree: all three are taken at the same moment, the ZOMBIE
 transition.
 
+**And the CLI cannot overwrite the kernel's account of it.** `meta.json` has
+two writers — the kernel, through `onProcessExit`, and the CLI, which knows
+things the kernel does not (the memory policies it declared, what the process
+was blocked on). They write the same file, so the CLI writes it as a **merge**
+(`writeProcessView`), not a replace: the kernel keeps the process's life
+(identity, state, exit code and reason, budgets, capabilities) and the CLI
+keeps the declaration. The one exception is the ending the **CLI** decided
+itself — a run it stopped for overrunning — which it claims explicitly
+(`{ ownsEnding: true }`). A host that writes its own `meta.json` should do
+the same: a view of a process that is already gone is a guess, and a guess
+that overwrites a fact is worse than no fact at all.
+
 **And the exit code is known before the process is gone.** A process that is
 `EXITING` already carries its exit code and reason: the outcome is recorded
 when it is **decided**, not after the cleanup. So a host that polls the table

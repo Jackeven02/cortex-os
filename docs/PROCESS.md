@@ -216,6 +216,16 @@ A zombie exists so the parent can `wait()` and learn the exit status. Once reape
 
 If the parent dies first, init (PID 1) inherits the zombie and reaps it immediately. There is no "double zombie" state.
 
+**The zombie is the end of the record, and the record has one author per
+fact.** The kernel writes the process's exit record at this transition — the
+code, the reason, what it spent, and the capabilities it held — and that is
+the kernel's own account of how the process lived. The CLI writes to the same
+file at the end of the command that ran the process, because it knows things
+the kernel does not (the memory policies it declared, what the process was
+blocked on). Neither may overwrite the other's facts, and the ending belongs
+to whoever *decided* it: a process that exits itself, or the CLI that stops a
+run for overrunning. See docs/ARCHITECTURE.md §7 and docs/ABI.md §4.9.
+
 ---
 
 ## 4. Process identity

@@ -37,7 +37,7 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, unlinkSync, mkdirSync, statSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 
-import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy, type BlockedReason, type Capability, CAPABILITIES } from '../kernel/types.js';
+import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy, type BlockedReason, type Capability, type PersistedProcessMeta, CAPABILITIES, DEFAULT_CAPABILITIES } from '../kernel/types.js';
 import { readRecords, existingCrecPath } from '../kernel/recorder.js';
 
 // =============================================================================
@@ -228,6 +228,139 @@ export function writeMeta(dir: string, meta: ProcessMeta): void {
     // could not be created.
   }
   writeFileSync(path, JSON.stringify(meta, null, 2), 'utf8');
+}
+
+/**
+ * Write the **exit record** — the kernel's own account of how a process ended.
+ *
+ * The kernel is the only writer that was there. It knows the process's
+ * identity, the state it ended in, the code it ended with, what it spent and
+ * what it was allowed to do (docs/ABI.md §4.2). Its account wins, because it
+ * is the account of what actually happened.
+ *
+ * The CLI owns the process's *declaration* — the memory policies it was given
+ * and what it was blocked on — and the kernel's record says nothing about
+ * either, so that part of the record is kept.
+ *
+ * This is a merge, not a replace, and it has to be: `meta.json` has two
+ * authors, and a plain overwrite makes the last one erase the first one's
+ * facts. Which one wrote last was a race — and the race was won by the
+ * *thinner* record. A `cortex spawn` that finished replaced the kernel's exit
+ * record with its own, and the capabilities the process held (the one thing
+ * the kernel persists that the syscall log cannot show) went with it: a
+ * process that held every capability was recorded as holding none, and
+ * `cortex ps` printed `-` for it — not "everything", the *absence* of an
+ * answer.
+ */
+export function writeExitRecord(dir: string, meta: PersistedProcessMeta): void {
+  const recorded = readMeta(dir, asProcessId(meta.pid));
+  if (recorded === undefined) {
+    writeMeta(dir, meta);
+    return;
+  }
+  writeMeta(dir, {
+    ...recorded,
+    ...meta,
+    // Money only grows: the CLI may know about spend the kernel could not
+    // see (`cortex wrap`'s tap), and nobody may make a process look like it
+    // spent less than the kernel recorded.
+    budgetsSpent: maxSpend(recorded.budgetsSpent, meta.budgetsSpent),
+  });
+}
+
+/**
+ * How the CLI's view of a process is written.
+ */
+export interface ProcessViewOptions {
+  /**
+   * Whether the **CLI** is the author of this ending.
+   *
+   * Normally the process ended itself, and the kernel's exit record is the
+   * account of how — the CLI is only reporting it. But when the CLI stops a
+   * run for overrunning, the CLI is the one who decided, and the kernel only
+   * saw a signal: the record would say "the wrapper process exited 1" where
+   * the truth is "we killed it, because it overran".
+   *
+   * So the CLI says so, and its account of the ending becomes the record's.
+   */
+  readonly ownsEnding?: boolean;
+}
+
+/**
+ * Write the **CLI's view** of a process, on top of what is already recorded.
+ *
+ * The record on disk is the kernel's — it is the writer that was there — so
+ * the kernel's facts are kept. The CLI contributes the declaration (the
+ * memory policies, what the process was blocked on) and fills in a fact the
+ * record does not have yet: a `meta.json` written by a build that did not
+ * record capabilities, for instance, gets them from the view.
+ *
+ * The CLI's snapshot of the *life* — its state, its exit code, its identity
+ * — is deliberately not allowed to overwrite the record. The CLI reads the
+ * process table at the end of a command, which is *after* the process is gone
+ * and reaped: at that point it is guessing, and a guess that overwrites a
+ * fact is worse than no fact at all. The one exception is the ending the CLI
+ * decided itself (`ownsEnding`).
+ */
+export function writeProcessView(
+  dir: string,
+  meta: ProcessMeta,
+  options?: ProcessViewOptions,
+): void {
+  const recorded = readMeta(dir, asProcessId(meta.pid));
+  if (recorded === undefined) {
+    writeMeta(dir, meta);
+    return;
+  }
+  writeMeta(dir, {
+    ...recorded,
+    // The declaration is the CLI's to set: the kernel never sees it.
+    ...(meta.memory !== undefined ? { memory: meta.memory } : {}),
+    ...(meta.blockedOn !== undefined ? { blockedOn: meta.blockedOn } : {}),
+    // A fact the record does not carry is filled in from the view.
+    ...(recorded.capabilities === undefined && meta.capabilities !== undefined
+      ? { capabilities: meta.capabilities }
+      : {}),
+    // The ending belongs to whoever decided it: the process, in which case
+    // the record already has it, or the CLI — which only happens when the
+    // CLI stopped the run itself.
+    ...(options?.ownsEnding === true
+      ? { exitCode: meta.exitCode, exitReason: meta.exitReason }
+      : {}),
+    budgetsSpent: maxSpend(recorded.budgetsSpent, meta.budgetsSpent),
+  });
+}
+
+/**
+ * The larger of two spend counters, field by field.
+ *
+ * "Money only grows" — the rule that lets two writers share one file. A
+ * writer that can see spend the other could not (`cortex wrap` reads the
+ * tapped child's LLM calls back off the log) adds to the counters; nobody
+ * may make a process look like it spent less than was already recorded.
+ */
+function maxSpend(a: BudgetCounters, b: BudgetCounters): BudgetCounters {
+  return {
+    tokensIn: Math.max(a.tokensIn, b.tokensIn),
+    tokensOut: Math.max(a.tokensOut, b.tokensOut),
+    tokensCached: Math.max(a.tokensCached, b.tokensCached),
+    usdSpent: Math.max(a.usdSpent, b.usdSpent),
+    wallTimeMs: Math.max(a.wallTimeMs, b.wallTimeMs),
+    syscallCount: Math.max(a.syscallCount, b.syscallCount),
+  };
+}
+
+/**
+ * The capabilities a process holds, as a record should say them.
+ *
+ * `null` on the entry means **unnarrowed** — the process holds everything
+ * (docs/ABI.md §4.9) — and that is *not* the same as holding the full set
+ * explicitly: an unnarrowed process can `release()` a capability and take it
+ * back, while a process holding an explicit set cannot. The record says what
+ * the process could do; the spec says whether it was narrowed.
+ */
+export function heldCapabilities(held: Set<Capability> | null): readonly Capability[] {
+  return held === null ? DEFAULT_CAPABILITIES : [...held];
 }
 
 /**

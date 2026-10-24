@@ -201,7 +201,7 @@ import {
 } from '../src/integrations/llm_tap.js';
 import { startDashboard } from '../src/dashboard/server.js';
 import { ActivityStore, toActivityEvent } from '../src/dashboard/event_store.js';
-import { writeMeta, type ProcessMeta } from '../src/cli/process_store.js';
+import { writeMeta, readMeta, writeExitRecord, writeProcessView, type ProcessMeta } from '../src/cli/process_store.js';
 
 import {
   FsToolDriver,
@@ -9633,6 +9633,12 @@ async function runWrapChecks(): Promise<void> {
       const meta = readMeta(home, asPid(2));
       assert(meta !== undefined, 'meta.json was written even for a killed run');
       assert(String(meta.exitReason).includes('timed out'), `reason records the timeout, got ${meta.exitReason}`);
+      // The run was killed, so the record says so — with the code the command
+      // returned, and the state the process is really in. The kernel only saw
+      // a signal, and its own account of the wrapper process ("exited 1
+      // (cancelled)") is not what an operator needs to read afterwards.
+      assert(meta.exitCode === 137, `the record says the run exited ${String(meta.exitCode)}, expected 137`);
+      assert(meta.state === 'zombie', `the record says the process is ${meta.state}`);
       assert(
         meta.budgetsSpent.tokensIn === 100 && meta.budgetsSpent.tokensOut === 20,
         `the spend before the kill survives it: ${meta.budgetsSpent.tokensIn}/${meta.budgetsSpent.tokensOut}`,
@@ -17519,6 +17525,239 @@ async function runOutcomeChecks(): Promise<void> {
   }
 }
 
+async function runRecordChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-record-'));
+  const prevHome = process.env['CORTEX_HOME'];
+
+  /** Run a command with its stdout and stderr captured. */
+  const capture = async (
+    run: () => Promise<number>,
+  ): Promise<{ code: number; out: string; err: string }> => {
+    let out = '';
+    let err = '';
+    const prevWrite = process.stdout.write;
+    const prevErr = console.error;
+    process.stdout.write = ((chunk: unknown): boolean => {
+      out += String(chunk);
+      return true;
+    }) as unknown as typeof process.stdout.write;
+    console.error = (...parts: unknown[]): void => {
+      err += parts.map((p) => String(p)).join(' ') + '\n';
+    };
+    try {
+      const code = await run();
+      return { code, out, err };
+    } finally {
+      process.stdout.write = prevWrite;
+      console.error = prevErr;
+    }
+  };
+
+  /** A minimal record, so a test can say exactly one thing about it. */
+  const record = (over: Partial<ProcessMeta> = {}): ProcessMeta => ({
+    pid: 2,
+    ppid: 1,
+    pgid: 2,
+    role: 'coder',
+    state: 'zombie',
+    exitCode: 1,
+    exitReason: 'boom',
+    startedAt: '2026-10-24T00:00:00.000Z',
+    lastTransitionAt: '2026-10-24T00:00:01.000Z',
+    budgetsSpent: { tokensIn: 3, tokensOut: 5, tokensCached: 0, usdSpent: 0, wallTimeMs: 100, syscallCount: 2 },
+    budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+    agent: { system: 'test' },
+    kernelAbiVersion: KERNEL_ABI_VERSION,
+    ...over,
+  });
+
+  try {
+    await checkAsync('cortex spawn does not erase what the process held', async () => {
+      // The kernel writes the exit record when a process dies: its own account
+      // of what the process was allowed to do (docs/ABI.md §4.9). The CLI
+      // wrote a record of its own afterwards, without that field, and it won —
+      // so a process that held every capability was recorded as holding none,
+      // and `cortex ps` printed `-` for it.
+      //
+      // `-` is not "everything". It is the absence of an answer.
+      const home = join(tmp, 'home-crash');
+      process.env['CORTEX_HOME'] = home;
+      const module = join(tmp, 'crash-agent.ts');
+      writeFileSync(
+        module,
+        `export default async function agent(ctx) {
+  ctx.now();
+  throw new TypeError("cannot read properties of undefined (reading 'id')");
+}
+`,
+        'utf8',
+      );
+
+      const spawned = await capture(() => cmdSpawn(['--role', 'crasher', '--module', module]));
+      const pidMatch = /\[pid (\d+)\]/.exec(spawned.out);
+      assert(pidMatch !== null, `the spawn did not report a pid: ${spawned.out}${spawned.err}`);
+      const pid = asProcessId(Number(pidMatch![1]));
+
+      const meta = readMeta(home, pid);
+      assert(meta !== undefined, 'the crashed agent left no record at all');
+      assert(
+        meta.capabilities !== undefined,
+        'the record lost the capabilities the process held',
+      );
+      assert(
+        meta.capabilities.length === CAPABILITIES.length,
+        `the record says the process held ${meta.capabilities.length} capabilities, expected ${CAPABILITIES.length}`,
+      );
+      // Which process group it was in: a child joins its parent's group
+      // (init's, here), and the CLI used to write the process's own pid there
+      // — a group the process was never in.
+      assert(
+        meta.pgid === 1,
+        `the record says the process was in group ${meta.pgid}, expected init's group (1)`,
+      );
+      // And the kernel's account of the ending is the one that is kept.
+      assert(meta.state === 'zombie', `the record says the process is ${meta.state}`);
+      assert(meta.exitCode === 1, `the record says the process exited ${String(meta.exitCode)}`);
+      assert(
+        meta.exitReason !== null && meta.exitReason.includes("reading 'id'"),
+        `the record lost the reason: ${String(meta.exitReason)}`,
+      );
+    });
+
+    await checkAsync('a view cannot rewrite the account of an ending', async () => {
+      // The CLI reads the process table at the end of a command — after the
+      // process is gone and reaped. What it has then is a guess, and a guess
+      // that overwrites a fact is worse than no fact.
+      const dir = join(tmp, 'view-cannot-rewrite');
+      writeExitRecord(dir, record({ capabilities: [...CAPABILITIES] }));
+
+      // A view that claims the run finished cleanly, and knows nothing about
+      // what the process was allowed to do.
+      writeProcessView(
+        dir,
+        record({
+          state: 'running',
+          exitCode: 0,
+          exitReason: 'completed',
+          capabilities: undefined,
+        }),
+      );
+
+      const meta = readMeta(dir, asProcessId(2));
+      assert(meta !== undefined, 'the record disappeared');
+      assert(meta.state === 'zombie', `the view rewrote the state: ${meta.state}`);
+      assert(meta.exitCode === 1, `the view rewrote the exit code: ${String(meta.exitCode)}`);
+      assert(
+        meta.exitReason === 'boom',
+        `the view rewrote the reason: ${String(meta.exitReason)}`,
+      );
+      assert(
+        meta.capabilities !== undefined && meta.capabilities.length === CAPABILITIES.length,
+        'the view erased the capabilities the kernel had recorded',
+      );
+    });
+
+    await checkAsync('the exit record keeps the declaration', async () => {
+      // The memory policies are the CLI's to know: the kernel is told about
+      // them, but it does not persist them. So the kernel's exit record must
+      // not drop them — a restore has to be able to re-declare the same
+      // regions (docs/ARCHITECTURE.md §4.2).
+      const dir = join(tmp, 'declaration');
+      writeProcessView(
+        dir,
+        record({
+          memory: {
+            episodic: { kind: 'cow', backing: 'inmem', maxEntries: 50 },
+            semantic: { kind: 'shared', backing: 'inmem', readOnly: true },
+          },
+        }),
+      );
+      writeExitRecord(dir, record({ capabilities: [...CAPABILITIES] }));
+
+      const meta = readMeta(dir, asProcessId(2));
+      assert(meta !== undefined, 'the record disappeared');
+      assert(meta.memory !== undefined, 'the exit record dropped the declaration');
+      assert(
+        meta.memory.episodic.maxEntries === 50,
+        `the declaration was altered: ${String(meta.memory.episodic.maxEntries)}`,
+      );
+      assert(meta.memory.semantic.readOnly === true, 'the read-only region was lost');
+    });
+
+    await checkAsync('money only grows', async () => {
+      // `cortex wrap`'s tap sees LLM calls that never went through the kernel,
+      // so the CLI knows spend the kernel does not. Adding it is right; making
+      // a process look like it spent *less* than the kernel recorded is not.
+      const dir = join(tmp, 'money');
+      writeExitRecord(dir, record({ budgetsSpent: { tokensIn: 10, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 100, syscallCount: 2 } }));
+
+      // The tap's money: the view knows more, so the record grows.
+      writeProcessView(
+        dir,
+        record({ budgetsSpent: { tokensIn: 160, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 100, syscallCount: 2 } }),
+      );
+      const grown = readMeta(dir, asProcessId(2));
+      assert(
+        grown?.budgetsSpent.tokensIn === 160,
+        `the tap's spend was lost: ${String(grown?.budgetsSpent.tokensIn)}`,
+      );
+
+      // A view that knows less must not shrink the record.
+      writeProcessView(
+        dir,
+        record({ budgetsSpent: { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 0, syscallCount: 0 } }),
+      );
+      const shrunk = readMeta(dir, asProcessId(2));
+      assert(
+        shrunk?.budgetsSpent.tokensIn === 160,
+        `a process was made to look like it spent less: ${String(shrunk?.budgetsSpent.tokensIn)}`,
+      );
+    });
+
+    await checkAsync('the ending belongs to whoever decided it', async () => {
+      // When the process ends itself, the kernel's exit record is the account
+      // of it and the CLI only reports it. When the **CLI** stops a run — a
+      // timeout — the kernel only saw a signal, and its account of the
+      // wrapper process ("exited 1 (cancelled)") is not the truth an operator
+      // needs. So the CLI says that it decided, and its account stands.
+      const dir = join(tmp, 'ending');
+      writeExitRecord(dir, record({ exitCode: 1, exitReason: 'node.exe exited 1 (cancelled)' }));
+
+      // A view that only reports: the record keeps the ending.
+      writeProcessView(dir, record({ exitCode: null, exitReason: 'unknown ending' }));
+      const reported = readMeta(dir, asProcessId(2));
+      assert(
+        reported?.exitCode === 1,
+        `the reported ending was rewritten: ${String(reported?.exitCode)}`,
+      );
+      assert(
+        reported?.exitReason === 'node.exe exited 1 (cancelled)',
+        `the reported reason was rewritten: ${String(reported?.exitReason)}`,
+      );
+
+      // A view that decided: its account stands.
+      writeProcessView(
+        dir,
+        record({ exitCode: 137, exitReason: 'timed out after 900ms' }),
+        { ownsEnding: true },
+      );
+      const decided = readMeta(dir, asProcessId(2));
+      assert(decided?.exitCode === 137, `the decided ending was lost: ${String(decided?.exitCode)}`);
+      assert(
+        decided?.exitReason === 'timed out after 900ms',
+        `the decided reason was lost: ${String(decided?.exitReason)}`,
+      );
+    });
+  } finally {
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -17558,6 +17797,7 @@ await runTransportChecks();
 await runBootChecks();
 await runReplayChecks();
 await runOutcomeChecks();
+await runRecordChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

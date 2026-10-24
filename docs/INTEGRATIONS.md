@@ -174,6 +174,8 @@ Each attempt is a **separate process with its own pid, directory and `.crec`**. 
 
 **A run cortex kills exits non-zero.** When `--timeout` expires, `cortex wrap` stops the child and returns `137` — the shell's own `128 + SIGKILL` convention. It is deliberately distinct from any code the child could return on its own, so a log tells "we killed it" from "it failed". This was a bug: the timeout path had a null exit code and fell through to `0`, which made `cortex wrap --timeout 60 -- pytest` go green on a hung suite.
 
+**And the record says so too.** The run's exit record — what `cortex ps` and `cortex top` read afterwards — carries the same account: `exitCode: 137`, `exitReason: "timed out after 1216ms"`, `state: "zombie"`. It used to say `"running"` with no code, because the CLI wrote its snapshot of the run *before* it killed it and then wrote that snapshot over the kernel's exit record. And when the two writers were separated by ownership (docs/ARCHITECTURE.md §7), the kernel's account of the wrapper process came through instead — "exited 1 (cancelled)", which reads like a command that failed on its own. The ending belongs to whoever decided it, and here the CLI decided it: we killed the run, and the record says that.
+
 **Timed-out runs are stopped, not abandoned.** When `--timeout` expires, cortex escalates `SIGTERM` → `SIGKILL` and waits for the child to actually die. A test asserts the child stops writing after the CLI exits, because a supervisor that leaks its child is not a supervisor.
 
 ### `--tap`: the one line your project has to add

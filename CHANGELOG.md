@@ -1589,6 +1589,71 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   exit frame until the test has looked at the table, so the window is opened
   on purpose instead of being waited for.
 
+- **The CLI could erase what the kernel knew about a process.** `meta.json` has
+  two writers, and they used to overwrite each other: the kernel writes the
+  **exit record** when a process dies (its own account of the process's life),
+  and the CLI writes a record of its own at the end of the command that ran
+  it (the memory policies it declared, what the process was blocked on).
+  Whoever wrote last won, and the race was won by the **thinner** record.
+
+  The CLI's record has no `capabilities` in it at all. So a process that held
+  every capability was recorded as holding none, and `cortex ps` printed `-`
+  for it — which is not "everything", it is the *absence* of an answer. The
+  same write also put the process in the wrong process group (the CLI wrote
+  the process's own pid as its group; a child joins its parent's), and it
+  replaced the kernel's account of how the process ended with a snapshot the
+  CLI took *after* the process was gone and reaped — a snapshot of a moment
+  that had already passed.
+
+  The two writers now split the file by **ownership**, and a write is a merge
+  rather than a replace (ARCHITECTURE.md §7, ABI.md §4.9):
+
+  | fact | author |
+  |---|---|
+  | identity, state, exit code and reason, budgets, capabilities | the **kernel** — it was there |
+  | memory policies, blocked reason | the **CLI** — the kernel never sees them |
+  | money | **grows only** — the CLI may add spend the kernel could not see (`cortex wrap`'s tap); nobody may make a process look like it spent less |
+
+  **One ending has two possible authors, and the rule says which.** The ending
+  belongs to whoever *decided* it. A process that exits itself was decided by
+  the process, and the kernel's exit record is the account of that — a CLI
+  view that merely reports it cannot rewrite it. But a run the **CLI** stops
+  (`cortex wrap --timeout`) was decided by the CLI, and the kernel only saw a
+  signal: its account of the wrapper process ("exited 1 (cancelled)") is not
+  what an operator needs to read afterwards. What they need to read is that
+  *we* killed it, and why. The CLI says that it decided, and the record
+  carries its account:
+
+  ```console
+  $ cortex wrap --role slow --timeout 1200 -- node -e "setInterval(()=>{},1000)"
+  [pid 2] still running after 1216ms — stopping it
+  process still running after 1216ms — returning 137
+  $ cortex ps
+  PID     PPID    ROLE          STATE         TOKENS    CAPS              AGE       WAITING
+  -----------------------------------------------------------------------------------------
+  2       1       slow          zombie        0         all               3s
+  ```
+
+  Before this, that record said `state: "running"` with no exit code — the
+  CLI's snapshot from before the kill. Now it says `zombie`, `137`,
+  `"timed out after 1216ms"`, and it keeps the capabilities the process held.
+
+  **Five new smoke checks** (716 → 721), each one reverse-verified — the
+  implementation was put back the way it was, and the check was watched to
+  fail: the CLI writing a record of its own over the kernel's → "cortex spawn
+  does not erase what the process held" fails ("the record lost the
+  capabilities the process held"); a view rewriting the ending → "a view
+  cannot rewrite the account of an ending" fails ("the view rewrote the
+  state: running"); the exit record replacing the declaration → "the exit
+  record keeps the declaration" fails ("the exit record dropped the
+  declaration"); a view shrinking the spend → "money only grows" fails ("a
+  process was made to look like it spent less: 0"); the CLI's own decided
+  ending being discarded → "the ending belongs to whoever decided it" fails
+  ("the decided ending was lost: 1").
+
+  The end-to-end check runs a real agent that throws a `TypeError`, through
+  the real `cortex spawn`, and reads the record off the disk.
+
 - **The output capture could be switched off without a word.** The tap that
   copies an agent's printed lines into `output.log` was installed by
   replacing `process.stdout.write`. That worked — until anything else
