@@ -91,6 +91,37 @@ function budgetLine(
 }
 
 /**
+ * What a process's budget says about it, in words.
+ *
+ * **A process that has run out of budget cannot go on, and the views have to
+ * say so.**
+ *
+ * The kernel knows: `budgetsRemaining` is zero for the budget that ran out.
+ * It used to be visible only in `cortex limit` — so a process that had been
+ * parked because its wall-clock ceiling had passed looked exactly like one
+ * that was merely waiting: a `ready` row that would never run again, and
+ * nothing in the table said why. (The wall clock now runs on the kernel's
+ * heartbeat, so that happens — a budget that only drained at a model call
+ * could not run out while the agent was doing nothing.)
+ *
+ * The budget that ran out is named the way the kernel's own frames name it —
+ * `tokens`, `usd`, `wallTime` (the `BudgetKind` vocabulary, ABI.md §6.1) — so
+ * the table and a `__sched:sigxcpu(...)` frame name the same cause the same
+ * way.
+ *
+ * Empty when the process still has budget: a view that says "out of tokens"
+ * about a process with a million tokens left is worse than silence.
+ */
+export function describeBudget(remaining: BudgetLimits): string {
+  const out: string[] = [];
+  if (remaining.tokens === 0) out.push('tokens');
+  if (remaining.usd === 0) out.push('usd');
+  if (remaining.wallTimeMs === 0) out.push('wallTime');
+  if (out.length === 0) return '';
+  return `out of ${out.join(', ')}`;
+}
+
+/**
  * The three budget lines, in the order the CLI prints them.
  *
  * One function, so every view phrases a budget the same way — and so a

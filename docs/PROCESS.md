@@ -569,13 +569,38 @@ Budgets decrement on every relevant syscall. When exhausted:
 - Default disposition: STOPPED
 - Supervisor may: increase budget, terminate, fork a fresh attempt
 
+**And the wall clock is a clock.** `wall_time_ms` is a ceiling on how long a
+process may **live**, so it is charged by time passing — not by the process
+doing something. It used to be charged only at an `llm_call`, and only when
+the budget was bounded, which meant two things were untrue at once: a process
+with no wall budget reported `wallTimeMs: 0` for a run that had lasted minutes
+(the views print that number — `cortex limit` says "wall time: spent 0ms"),
+and an agent that sat in `recv()` never drained its ceiling. A budget an
+agent can outlast by doing nothing is not a ceiling.
+
+The kernel charges it on its heartbeat — the scheduler's tick — so an idle
+agent spends its wall-clock budget exactly like one burning tokens, and the
+clock stops while the process is stopped or suspended (that time is not the
+agent's) and is exact at the exit.
+
+**The kernel cannot stop a process that is not running.** `SIGXCPU` is a
+signal, and a signal aimed at a process that is not RUNNING is queued until
+it runs again (PROCESS §7.2) — so a process whose wall-clock ceiling is
+reached while it is parked is *not* stopped by the kernel. It is left where
+it is, and the views say why (`cortex ps` prints "out of wallTime"), because
+a `ready` row that will never run again looks exactly like one that is
+merely waiting. The supervisor is what acts on it: `cortex supervise
+--kill-after` stops an agent the kernel cannot. (How a process that never
+wakes should be stopped gracefully is BACKLOG #057, and it is still open.)
+
 **And the log says which counter hit zero.** "Your agent was stopped" and
 "your agent ran out of tokens" are different facts, and only one of them tells
 the operator what to change — the budget, or the code that spends it. The
 scheduler records which one, and the trace renders it in the frame's own name:
 `__sched:sigxcpu(tokens)`. The budget kind is a closed vocabulary
 (`BudgetKind`: `tokens`, `usd`, `wallTime`), so a frame cannot say anything
-else (ABI.md §6.1).
+else (ABI.md §6.1). The views name the same budget the same way: the note
+column says "out of tokens", "out of usd", "out of wallTime".
 
 Budgets are inherited on `spawn()` (default: half of parent's remaining), reset on `fork()` (default; see STATE.md §2.4), preserved on `checkpoint()`/`restore()`.
 

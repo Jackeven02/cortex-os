@@ -62,7 +62,9 @@ import {
   type OpenCall,
 } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
-import { describeOutcome, formatOutcomeCode } from '../process_outcome.js';
+import { formatOutcomeCode, describeOutcome } from '../process_outcome.js';
+import { describeBudget } from '../process_budget.js';
+import { processNote } from '../process_note.js';
 import { formatDollars, usdToDollars } from '../../money.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
 import { PROCESS_STATES } from '../../kernel/process_table.js';
@@ -337,26 +339,35 @@ function cellsFor(
 ): string[] {
   // The column that makes the state legible: why is it not running, and for
   // how long.
-  let note = '';
+  let ending = '';
+  let waiting = '';
   if (m.state === 'zombie') {
     // The same wording `cortex ps` prints — one rule, two views.
-    note = describeOutcome(m);
+    ending = describeOutcome(m);
   } else if (call !== undefined) {
-    note = formatOpenCall(call, m.blockedOn, now);
+    waiting = formatOpenCall(call, m.blockedOn, now);
     if (stallAfterMs !== null && isStalled(call, now, stallAfterMs)) {
-      note += ' — stuck';
+      waiting += ' — stuck';
     }
   } else if (m.blockedOn !== undefined && m.blockedOn !== null) {
-    note = `waiting on ${describeBlocked(m.blockedOn)}`;
+    waiting = `waiting on ${describeBlocked(m.blockedOn)}`;
   } else if (m.state === 'running' || m.state === 'ready') {
     const n = m.budgetsSpent.syscallCount;
-    note = `${n} syscall${n === 1 ? '' : 's'}`;
+    waiting = `${n} syscall${n === 1 ? '' : 's'}`;
   }
   // A signal the kernel has queued for this process, if any. It is not
   // delivered until the process runs again, so it belongs with the note that
   // says why the process is not running — and the wording is the same one
   // `cortex ps` uses, so the two views cannot disagree.
-  const noteWithSignals = describePendingSignals(note, m.pendingSignals);
+  const noteWithSignals = describePendingSignals(waiting, m.pendingSignals);
+
+  // One cell, one order — the same order `cortex ps` prints: the ending
+  // first, then the budget, then what the process is waiting on.
+  const note = processNote({
+    ending,
+    budget: describeBudget(m.budgetsRemaining),
+    waiting: noteWithSignals,
+  });
 
   return [
     String(m.pid),
@@ -364,7 +375,7 @@ function cellsFor(
     m.state,
     formatTokens(m.budgetsSpent.tokensIn + m.budgetsSpent.tokensOut),
     formatDollars(usdToDollars(m.budgetsSpent.usdSpent)),
-    noteWithSignals,
+    note,
   ];
 }
 

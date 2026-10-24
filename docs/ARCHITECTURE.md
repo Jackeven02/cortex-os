@@ -184,6 +184,26 @@ The `wait` syscall is held to it too: a parent that is told "the child exited
 0" will believe the child succeeded, and a supervisor that believes that does
 not restart anything.
 
+**The wall clock is charged by time, not by work.** A process's
+`wallTimeMs` is the time it has been alive, and the table keeps the mark up
+to which it has already been counted (`lastWallAccountAt`). Every accounting
+pass — `spend()`, and the scheduler's heartbeat, `chargeWallClock()` — adds
+the real time since that mark and moves the mark to now. The clock runs while
+the process is alive and **pauses** while it is stopped or suspended (that
+time is not the agent's), and it is exact at the exit.
+
+It used to be charged only at an `llm_call`, and only when the budget was
+bounded. Two things were untrue at once: a process with no wall budget
+reported `wallTimeMs: 0` for a run that had lasted minutes — and the views
+print that number (`cortex limit` says "wall time: spent 0ms") — and a
+process that sat in `recv()` never drained its ceiling. A budget an agent can
+outlast by doing nothing is not a ceiling.
+
+The kernel's own process (PID 1) is not charged: init is the kernel, not an
+agent, and it spends no tokens and no usd either. Charging it would make the
+views that total an agent's spend report the kernel's uptime as if it were
+work.
+
 **Performance.** All operations O(1) except `listInState` which is O(n) over all processes. For v0 (target: hundreds of processes), this is fine. Post-v0 may add a per-state index.
 
 ### 4.3 `signals.ts`
@@ -318,6 +338,10 @@ interface Scheduler {
 
 **Internals.** A priority queue ordered by `(nice, enqueue_time)`. On each tick:
 
+0. Charge the wall clock — every process that is alive pays for the time that
+   passed since the last tick. This is the kernel's heartbeat, and it is what
+   makes a wall-clock ceiling a ceiling: an agent that is sitting in `recv()`
+   spends its budget exactly like one burning tokens (PROCESS.md §8.3).
 1. Pop highest-priority READY process whose budgets are not exhausted.
 2. Transition to RUNNING.
 3. Resume its async function (the agent's `await` returns).
@@ -1624,6 +1648,32 @@ The wording is one function (`describeOutcome`, in
 `src/cli/process_outcome.ts`), so `cortex top`, `cortex ps` and the
 dashboard cannot drift apart — and an unknown code still prints as `?`,
 because `?` is a question and `0` would be an answer the kernel never gave.
+
+**And the column says when the budget is gone.** A process whose ceiling has
+been reached cannot go on, and nothing else in the row said so: a `ready` row
+that will never run again looked exactly like one that was merely waiting.
+The wall clock runs on the kernel's heartbeat (PROCESS.md §8.3), so a parked
+agent can run out of wall time while it waits — and now the column names the
+budget that ran out: `out of tokens`, `out of usd`, `out of wallTime`. The
+words are the `BudgetKind` vocabulary, the same one a `__sched:sigxcpu(...)`
+frame carries, and the wording is one function (`describeBudget`, in
+`src/cli/process_budget.ts`).
+
+**And the order of the facts is the same everywhere.** One cell, one order:
+the ending first (a dead process is not waiting for anything), then the
+budget, then what it is waiting on. `cortex ps`, `cortex top` and the
+dashboard's page all use it (`processNote`, in `src/cli/process_note.ts`), so a
+table, a tree and a page cannot disagree about which fact comes first.
+
+**And the age column says how long a process lived.** A running process is
+aging, so its age is the time since it started. A finished process is not
+aging: it lived for a while and then it was over, and the kernel recorded
+how long that was. The column used to keep counting from the start, so a
+process that died 41 seconds in read as `7100.0h` the next day — a number
+about the record, not about the process. A finished process now shows its
+lifetime (`processAge`, in `src/cli/process_view.ts`); a record written
+before the kernel charged the wall clock carries no lifetime and falls back
+to the age.
 
 **And the table keeps its shape.** A table makes a promise: *the thing under
 STATE is the state*. That promise was broken by the simplest thing there is —

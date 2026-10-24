@@ -7558,6 +7558,61 @@ async function runMockLLMChecks(): Promise<void> {
     await reg.closeAll();
   });
 
+  await checkAsync('a wall-clock budget drains while the agent does nothing', async () => {
+    // The wall clock is a ceiling on how long a process may **live**, so it
+    // has to be charged by time passing — not by the process doing something.
+    //
+    // It used to be charged only at an `llm_call`, so an agent that sat in
+    // `recv()` never drained it: a 1000ms ceiling and an agent that did
+    // nothing at all for 1500ms came out with the full 1000ms still in hand.
+    // A budget that an agent can outlast by doing nothing is not a ceiling.
+    //
+    // The kernel's heartbeat charges the clock now (the scheduler's tick), so
+    // the ceiling is a ceiling.
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(mockLLM());
+    const table = await makeTable();
+    const pid = await runningPid(table, { budgets: { tokens: -1, usd: -1, wallTimeMs: 1000 } });
+
+    fakeNow += 1500; // the agent does nothing at all
+    table.chargeWallClock(); // ...and the heartbeat notices
+
+    const e = table.get(pid)!;
+    assert(
+      e.budgetsRemaining.wallTimeMs === 0,
+      `the ceiling was reached, got ${e.budgetsRemaining.wallTimeMs}`,
+    );
+    assert(
+      e.budgetsSpent.wallTimeMs >= 1500,
+      `the time is on the record, got ${e.budgetsSpent.wallTimeMs}`,
+    );
+    await reg.closeAll();
+  });
+
+  await checkAsync('the wall clock of an unlimited budget is still counted', async () => {
+    // An unlimited budget stays unlimited (`-1` is not a number that drains),
+    // but the time the process lived is still a fact — and it used to be
+    // reported as `0ms` for every agent that had no wall budget at all. The
+    // views print that number (`cortex limit` says "wall time: spent 0ms"),
+    // so it has to be the truth.
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    reg.registerLLM(mockLLM());
+    const table = await makeTable();
+    const dispatcher = makeDispatcher(table, reg);
+    const pid = await runningPid(table, { budgets: { tokens: -1, usd: -1, wallTimeMs: -1 } });
+
+    fakeNow += 2500;
+    await dispatcher.invoke(pid, 'llm_call', { messages: [userMsg('hi')] });
+
+    const e = table.get(pid)!;
+    assert(e.budgetsRemaining.wallTimeMs === -1, 'an unlimited budget stays unlimited');
+    assert(
+      e.budgetsSpent.wallTimeMs >= 2500,
+      `the time is on the record, got ${e.budgetsSpent.wallTimeMs}`,
+    );
+    await reg.closeAll();
+  });
+
   await checkAsync('E2E: llm_call writes an enter + exit record pair', async () => {
     const sub = join(tmp, 'rec-mock');
     await mkdir(sub, { recursive: true });
@@ -15833,7 +15888,70 @@ async function runTopChecks(): Promise<void> {
       assert(ending !== '', `cortex ps says the ending, got: ${psLine}`);
       assert(
         topEnding === ending,
-        `the two views use the same words, ps="${ending}" top="${topEnding}"`,
+        `the two views use the same words, ps="${ending}" top="${topEnding}"\n--- top ---\n${top.out}\n--- ps ---\n${ps.out}`,
+      );
+    });
+
+    await checkAsync('cortex ps shows a finished process its lifetime, not an age that keeps growing', async () => {
+      // A finished process is not aging: it lived for a while and then it was
+      // over. The AGE column used to keep counting from its start, so a
+      // process that died 41 seconds in read as "7100.0h" the next day — a
+      // number about the record, not about the process. The kernel records
+      // the time a process lived (the wall clock), so the table can say it.
+      writeMeta(tmp, {
+        pid: 98,
+        ppid: 1,
+        pgid: 98,
+        role: 'done',
+        state: 'zombie',
+        exitCode: 0,
+        exitReason: 'completed',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        lastTransitionAt: '2026-01-01T00:00:41.000Z',
+        budgetsSpent: {
+          tokensIn: 0,
+          tokensOut: 0,
+          tokensCached: 0,
+          usdSpent: 0,
+          wallTimeMs: 41000,
+          syscallCount: 3,
+        },
+        budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+        agent: { module: 'file:///nowhere.ts' },
+        capabilities: [],
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+
+      const result = await capture(() => cmdPs([]));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const line = psRow(result.out, 98);
+      assert(line !== '', `the process is listed, got: ${result.out}`);
+      assert(line.includes('41s'), `it shows the lifetime, got: ${line}`);
+    });
+
+    await checkAsync('cortex ps says when a process has run out of budget', async () => {
+      // A process whose ceiling has been reached cannot go on — and nothing in
+      // the row said so. The wall clock runs on the kernel's heartbeat now, so
+      // an agent that is parked can run out of wall time while it waits, and
+      // a `ready` row that will never run again looked exactly like one that
+      // was merely waiting.
+      await kernel.spawn({
+        role: 'dry',
+        agent: { module: 'test:dry', args: { mode: 'ok' } },
+        budgets: { tokens: -1, usd: -1, wallTimeMs: 0 },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const dry = kernel.table.list().find((info) => info.role === 'dry');
+      assert(dry !== undefined, 'the process is in the table');
+
+      const result = await capture(() => cmdPs([]));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const line = psRow(result.out, unbrand(dry!.pid));
+      assert(line !== '', `the process is listed, got: ${result.out}`);
+      assert(
+        line.includes('out of wallTime'),
+        `it says the budget is gone, got: ${line}`,
       );
     });
 
@@ -16872,6 +16990,38 @@ async function runDashboardLiveChecks(): Promise<void> {
           !html.includes('exitReason'),
           'the page does not work the ending out for itself',
         );
+      });
+
+      await checkAsync('the dashboard says when a process has run out of budget', async () => {
+        // The operator's window: a process that has run out of budget cannot
+        // go on, and nothing else in the row said so — a `ready` row that will
+        // never run again looked exactly like one that was merely waiting. The
+        // label comes from the server, which uses the same rule `cortex ps`
+        // and `cortex top` print.
+        await kernel.spawn({
+          role: 'dry',
+          agent: { module: 'test:dry', args: { mode: 'ok' } },
+          budgets: { tokens: -1, usd: -1, wallTimeMs: 0 },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+
+        const dry = kernel.table.list().find((info) => info.role === 'dry');
+        assert(dry !== undefined, 'the process is in the table');
+
+        const res = await fetch(`${dash.url}/api/processes`);
+        assert(res.status === 200, `status ${res.status}`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const row = rows.find((r) => r['pid'] === unbrand(dry!.pid));
+        assert(row !== undefined, 'the process is in the list');
+        assert(
+          row!['budgetLabel'] === 'out of wallTime',
+          `the row carries the budget, got ${String(row!['budgetLabel'])}`,
+        );
+
+        // And the page shows it — the label travels with the row, and the page
+        // prints what it is given.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        assert(html.includes('budgetLabel'), 'the page prints the label it is given');
       });
 
       await checkAsync('the process table follows what the kernel says happened', async () => {

@@ -499,6 +499,13 @@ export class Scheduler {
    *          runnable this tick.
    */
   async tick(): Promise<TickOutcome> {
+    // The wall clock first. It is charged by time passing, not by the process
+    // doing something — so an agent that is sitting in `recv()` drains its
+    // wall-clock budget exactly like one that is burning tokens, and a
+    // process with no wall budget at all reports the time it really lived
+    // instead of zero.
+    this.#table.chargeWallClock();
+
     if (this.#autoReconcile) this.reconcile();
 
     const pid = this.#selectNext();

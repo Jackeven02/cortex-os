@@ -1546,6 +1546,77 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A wall-clock budget was not a ceiling, and every agent reported that it had
+  lived for zero milliseconds.** `budgetsSpent.wallTimeMs` is the time a
+  process has been alive (PROCESS.md §8.3), and it was charged in exactly one
+  place: at an `llm_call`, and only when the budget was bounded. So two
+  things were untrue at once.
+
+  **Every agent reported zero.** A process with the default (unlimited) wall
+  budget never charged the clock at all, so `cortex limit` printed
+
+  ```console
+    wall time: spent 0ms / limit ∞
+  ```
+
+  for an agent that had been alive for minutes, and the dashboard's wall-clock
+  tile summed to zero. The number was on every screen, and it was wrong.
+
+  **And an idle agent could outlast its own ceiling.** A 1000ms wall budget and
+  an agent that sat in `recv()` for 1500ms came out with the full 1000ms still
+  in hand: the budget drained at model calls, so an agent that stopped calling
+  models stopped spending. A budget an agent can outlast by doing nothing is
+  not a ceiling.
+
+  **The clock is charged by time now.** The kernel charges it on its
+  heartbeat — the scheduler's tick — for every process that is alive, and
+  `spend()` charges it too, so it is one number whichever path notices the
+  time passing. The clock **pauses** while a process is stopped or suspended
+  (that time is not the agent's), and it is exact at the exit: the last slice
+  is charged on the way to ZOMBIE, so the recorded lifetime is the real one.
+
+  **The kernel's own process is not charged.** Init is the kernel, not an
+  agent: it spends no tokens and no usd, and charging it would make the views
+  that total an agent's spend report the kernel's uptime as if it were work.
+
+  **And a process that has run out of budget says so.** The wall clock running
+  on the heartbeat means a parked agent can run out of wall time while it
+  waits — and a `ready` row that will never run again looked exactly like one
+  that was merely waiting. The note column now names the budget that ran out
+  (`out of tokens`, `out of usd`, `out of wallTime`), in the same words as the
+  `__sched:sigxcpu(...)` frame that records it, and `cortex ps`, `cortex top`
+  and the dashboard all say it the same way.
+
+  **And a finished process shows its lifetime, not an age that keeps
+  growing.** The AGE column counted from the start, so a process that died 41
+  seconds in read as `7100.0h` the next day — a number about the record, not
+  about the process. A finished process now shows the time it was alive.
+
+  **Five new smoke checks** (760 → 765), all reverse-verified: with the
+  heartbeat switched off, "a wall-clock budget drains while the agent does
+  nothing" fails ("the ceiling was reached, got 1000"); with `spend()`'s
+  accrual put back behind the old "only when the budget is bounded" guard,
+  "the wall clock of an unlimited budget is still counted" fails ("the time
+  is on the record, got 0"); with the age formula back to "time since start",
+  "cortex ps shows a finished process its lifetime" fails ("got: … 7122.5h …");
+  with the budget label out of the note, "cortex ps says when a process has
+  run out of budget" fails; and with the server's label out of the row, "the
+  dashboard says when a process has run out of budget" fails.
+
+  No ABI change: `KERNEL_ABI_VERSION` stays `1.0.0`. The contract already
+  said `wall_time_ms` is "total wall-clock time alive" — this is the
+  implementation catching up with the contract, not the contract changing.
+  The budget *policy* is unchanged too: a bounded budget still drains at the
+  same rate, and an unlimited one is still unlimited (`-1`).
+
+  **One limit, stated rather than hidden:** the kernel still cannot stop a
+  process that is not running. `SIGXCPU` is a signal, and a signal aimed at a
+  process that is not RUNNING is queued until it runs again (PROCESS.md §7.2)
+  — so a process whose wall-clock ceiling is reached while it is parked is
+  left where it is. The views say why (`out of wallTime`), and the supervisor
+  is what acts on it. (How a process that never wakes should be stopped
+  gracefully is BACKLOG #057, and it is still open.)
+
 - **A finished run and a crashed one looked the same.** `cortex ps` printed the
   state `zombie` for a clean exit and for a crash alike, and the dashboard's
   process table printed the same word. `cortex top` said the truth —

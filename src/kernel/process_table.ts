@@ -113,6 +113,25 @@ export const PROCESS_STATES = [
 ] as const satisfies readonly ProcessState[];
 
 /**
+ * The states in which a process is **living**, and the wall clock runs.
+ *
+ * A stopped process (SIGSTOP, or the default SIGXCPU disposition) is not
+ * running, and a suspended one (checkpointed) is not running at all: their
+ * time is not the agent's, and charging it to them would drain a budget for
+ * work that is not happening. A process that has exited is done.
+ *
+ * The clock is *paused* for those states rather than reset: the time spent
+ * alive before a stop is still the process's, and the time spent stopped is
+ * not.
+ */
+const WALL_CLOCK_STATES: ReadonlySet<ProcessState> = new Set<ProcessState>([
+  'new',
+  'ready',
+  'running',
+  'blocked',
+]);
+
+/**
  * Why a process changed state — the **trigger** recorded with every
  * transition.
  *
@@ -242,9 +261,11 @@ export interface ProcessEntry {
   lastTransitionAt: Timestamp;
   /**
    * Timestamp up to which this process's wall-clock budget has already been
-   * charged. `spend()` accrues real elapsed time from here to now on each
-   * accounting pass, so a finite `wallTimeMs` budget actually drains. Kept
-   * monotonic; set at allocation and refreshed whenever budgets are reset.
+   * charged. The clock is charged from here to now on every accounting pass —
+   * `spend()` and the kernel's heartbeat (`chargeWallClock`) — so a finite
+   * `wallTimeMs` budget actually drains, and a process that runs long enough
+   * reports the time it really lived. Kept monotonic; set at allocation and
+   * refreshed whenever the clock is paused or the budgets are reset.
    */
   lastWallAccountAt: Timestamp;
   budgetsRemaining: BudgetLimits;
@@ -824,8 +845,23 @@ export class ProcessTable {
     }
 
     const now = this.#now();
+    const clockRan = this.#wallClockRuns(entry);
     entry.state = next;
     entry.lastTransitionAt = now;
+
+    // The wall clock follows the process's life: it runs while the process is
+    // alive, and it stops when the process stops being alive. The time spent
+    // alive before a stop is still the process's; the time spent stopped is
+    // not, and charging it would drain a budget for work that is not
+    // happening.
+    const clockRuns = this.#wallClockRuns(entry);
+    if (clockRan && !clockRuns) {
+      // The last slice of this process's life — charged, then paused.
+      this.#applyWallCharge(entry, this.#accrueWallTime(entry));
+    } else if (!clockRan && clockRuns) {
+      // The clock starts again now.
+      entry.lastWallAccountAt = now;
+    }
 
     // Side effects of specific transitions.
     if (next === 'blocked') {
@@ -1078,21 +1114,16 @@ export class ProcessTable {
     const tokensOut = delta.tokensOut ?? 0;
     const tokensCached = delta.tokensCached ?? 0;
     const usdSpent = delta.usdSpent ?? 0;
-    let wallTimeMs = delta.wallTimeMs ?? 0;
     const syscallCount = delta.syscallCount ?? 0;
 
-    // Accrue REAL elapsed time onto the wall-clock budget. A process can sit
-    // idle in `sleep()`/`recv()`/`wait()` between syscalls; without this the
-    // finite `wallTimeMs` limit would never drain and its SIGXCPU could never
-    // fire. Only meaningful for a bounded budget (>= 0) — unlimited stays -1.
-    if (remaining.wallTimeMs >= 0) {
-      const nowIso = this.#now();
-      const elapsed = Date.parse(nowIso) - Date.parse(entry.lastWallAccountAt);
-      if (Number.isFinite(elapsed) && elapsed > 0) {
-        wallTimeMs += elapsed;
-        entry.lastWallAccountAt = nowIso;
-      }
-    }
+    // The wall clock is **real time**, and it runs whatever the process is
+    // doing. It used to be charged here — and *only* here, and only when the
+    // budget was bounded — so an agent that sat in `recv()` never drained it,
+    // and a process with no wall budget at all reported "spent 0ms" for a run
+    // that had lasted minutes. The kernel's heartbeat charges the same clock
+    // (`chargeWallClock`), so it is one number whichever path notices the
+    // time passing.
+    const wallTimeMs = this.#accrueWallTime(entry) + (delta.wallTimeMs ?? 0);
 
     entry.budgetsSpent = {
       tokensIn: spent.tokensIn + tokensIn,
@@ -1109,6 +1140,82 @@ export class ProcessTable {
       usd: remaining.usd < 0 ? -1 : Math.max(0, remaining.usd - usdSpent),
       wallTimeMs:
         remaining.wallTimeMs < 0 ? -1 : Math.max(0, remaining.wallTimeMs - wallTimeMs),
+    };
+  }
+
+  /**
+   * Charge the wall clock.
+   *
+   * The wall-clock budget is a **ceiling on how long a process may live**, so
+   * it has to be charged by time passing — not by the process doing something.
+   * An agent that sits in `recv()` for ten minutes spends ten minutes of its
+   * budget doing nothing, and the budget that does not notice that is not a
+   * ceiling: it is a suggestion. So the kernel charges the clock on its
+   * heartbeat (the scheduler's tick), for every process that is alive.
+   *
+   * With a PID, only that process is charged — which is how the exit path
+   * closes the books on the last slice of a process's life.
+   */
+  chargeWallClock(pid?: ProcessId): void {
+    if (pid !== undefined) {
+      const entry = this.#entries.get(unbrand(pid));
+      if (entry === undefined || !this.#wallClockRuns(entry)) return;
+      this.#applyWallCharge(entry, this.#accrueWallTime(entry));
+      return;
+    }
+    for (const entry of this.#entries.values()) {
+      if (!this.#wallClockRuns(entry)) continue;
+      this.#applyWallCharge(entry, this.#accrueWallTime(entry));
+    }
+  }
+
+  /**
+   * Whether the wall clock is running for this process right now.
+   *
+   * - **The kernel's own process is not an agent.** Init spends no tokens and
+   *   no usd — and no wall clock either. Its liveness is the age of the
+   *   kernel, not a cost anybody is paying, and the views that total an
+   *   agent's spend would otherwise report the kernel's uptime as if it were
+   *   an agent's work.
+   * - **A stopped or suspended process is not running.** Its clock is paused
+   *   (see {@link WALL_CLOCK_STATES}).
+   */
+  #wallClockRuns(entry: ProcessEntry): boolean {
+    if (unbrand(entry.pid) === unbrand(PID_INIT)) return false;
+    return WALL_CLOCK_STATES.has(entry.state);
+  }
+
+  /**
+   * The wall-clock time to charge since the last accounting pass.
+   *
+   * Returns the elapsed milliseconds and moves the accounting mark to now.
+   * The caller applies it: `spend()` folds it into the counters it is already
+   * writing, and `chargeWallClock()` applies it on its own.
+   */
+  #accrueWallTime(entry: ProcessEntry): number {
+    const nowIso = this.#now();
+    const elapsed = Date.parse(nowIso) - Date.parse(entry.lastWallAccountAt);
+    if (!Number.isFinite(elapsed) || elapsed <= 0) return 0;
+    entry.lastWallAccountAt = nowIso;
+    return elapsed;
+  }
+
+  /**
+   * Charge `elapsed` milliseconds of wall-clock time to a process.
+   *
+   * An unlimited budget stays unlimited (`-1`); a bounded one drains, and
+   * stops at zero — the scheduler's budget gate does the rest.
+   */
+  #applyWallCharge(entry: ProcessEntry, elapsed: number): void {
+    if (elapsed <= 0) return;
+    const remaining = entry.budgetsRemaining.wallTimeMs;
+    entry.budgetsSpent = {
+      ...entry.budgetsSpent,
+      wallTimeMs: entry.budgetsSpent.wallTimeMs + elapsed,
+    };
+    entry.budgetsRemaining = {
+      ...entry.budgetsRemaining,
+      wallTimeMs: remaining < 0 ? -1 : Math.max(0, remaining - elapsed),
     };
   }
 

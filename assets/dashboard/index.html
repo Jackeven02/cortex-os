@@ -308,9 +308,16 @@
     // (`zombie`), so "did it finish, or did it die?" needed the trace view to
     // answer. The kernel knows the code and the reason; the label carries them.
     const processOutcome = (process) => (typeof process.outcomeLabel === 'string' ? process.outcomeLabel : '');
+    // **That it has run out of budget.** The label comes from the server, which
+    // uses the same rule `cortex ps` and `cortex top` print — one rule, three
+    // views. A process whose ceiling has been reached cannot go on, and nothing
+    // else in the row says so: a `ready` row that will never run again looks
+    // exactly like one that is merely waiting.
+    const processBudget = (process) => (typeof process.budgetLabel === 'string' ? process.budgetLabel : '');
     let insideKnown = false;
     let pendingKnown = false;
     let outcomeKnown = false;
+    let budgetKnown = false;
     let processData = [];
     let eventData = [];
 
@@ -319,11 +326,12 @@
       insideKnown = processData.some((process) => typeof process.insideLabel === 'string');
       pendingKnown = processData.some((process) => processPending(process) !== '');
       outcomeKnown = processData.some((process) => processOutcome(process) !== '');
+      budgetKnown = processData.some((process) => processBudget(process) !== '');
       // The column is hidden when there is nothing at all to put in it: a
       // column of blanks would claim that nothing is inside a call and that
       // no signal is waiting.
-      $('insideHead').hidden = !(insideKnown || pendingKnown || outcomeKnown);
-      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)} ${processInside(process)} ${processPending(process)} ${processOutcome(process)}`.toLowerCase().includes(query));
+      $('insideHead').hidden = !(insideKnown || pendingKnown || outcomeKnown || budgetKnown);
+      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)} ${processInside(process)} ${processPending(process)} ${processOutcome(process)} ${processBudget(process)}`.toLowerCase().includes(query));
       $('processRows').innerHTML = visible.length ? visible.map((process) => {
         const initial = String(process.role ?? '?').slice(0, 1).toUpperCase();
         const time = fmtLocal(process.startedAt);
@@ -332,10 +340,13 @@
         const inside = processInside(process);
         const pending = processPending(process);
         const outcome = processOutcome(process);
-        const detail = [inside, pending, outcome].filter(Boolean).join(' — ');
-        const insideCell = (insideKnown || pendingKnown || outcomeKnown) ? `<td class="inside-cell" title="${esc(detail)}">${esc(detail || '—')}</td>` : '';
+        const budget = processBudget(process);
+        // One cell, one order — the same order `cortex ps` prints: how it
+        // ended, then the budget, then what it is waiting on.
+        const detail = [outcome, budget, inside, pending].filter(Boolean).join(' — ');
+        const insideCell = (insideKnown || pendingKnown || outcomeKnown || budgetKnown) ? `<td class="inside-cell" title="${esc(detail)}">${esc(detail || '—')}</td>` : '';
         return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td>${insideCell}<td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td>${opsCell}</tr>`;
-      }).join('') : `<tr><td colspan="${insideKnown || pendingKnown || outcomeKnown ? 9 : 8}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
+      }).join('') : `<tr><td colspan="${insideKnown || pendingKnown || outcomeKnown || budgetKnown ? 9 : 8}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
       $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
       $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
     }
@@ -398,7 +409,7 @@
           roots.push(process);
         }
       }
-      const matches = (process) => `${process.pid} ${process.role} ${process.state} ${processInside(process)} ${processPending(process)} ${processOutcome(process)}`.toLowerCase().includes(query);
+      const matches = (process) => `${process.pid} ${process.role} ${process.state} ${processInside(process)} ${processPending(process)} ${processOutcome(process)} ${processBudget(process)}`.toLowerCase().includes(query);
       const keep = (process) => !query || matches(process) || (kids.get(process.pid) ?? []).some(keep);
       const byPid = (a, b) => a.pid - b.pid;
       roots.sort(byPid);
@@ -409,7 +420,8 @@
         const inside = processInside(process);
         const pending = processPending(process);
         const outcome = processOutcome(process);
-        const detail = [inside, pending, outcome].filter(Boolean).join(' — ');
+        const budget = processBudget(process);
+        const detail = [outcome, budget, inside, pending].filter(Boolean).join(' — ');
         const insideSpan = detail ? `<span class="tree-inside">${esc(detail)}</span>` : '';
         return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${tokens.toLocaleString()} tok</span>${insideSpan}</span></div>${children}`;
       };

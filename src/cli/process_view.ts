@@ -119,6 +119,27 @@ export function formatTokens(n: number): string {
 }
 
 /**
+ * How long a process has been alive.
+ *
+ * A running process is aging right now, so its age is the time since it
+ * started. A **finished** process is not aging: it lived for a while and then
+ * it was over, and the kernel recorded how long that was. So a finished
+ * process shows its lifetime — the time it was really alive — and not the
+ * time since it started, which keeps growing for as long as the record is on
+ * disk and says nothing at all about the process. A dead row that ages for
+ * days is a lie in the operator's first table.
+ *
+ * A record written before the kernel charged the wall clock carries no
+ * lifetime, and falls back to the age.
+ */
+export function processAge(row: ProcessRow, now: number): number {
+  const ended = row.state === 'zombie' || row.state === 'exiting';
+  if (ended && row.budgetsSpent.wallTimeMs > 0) return row.budgetsSpent.wallTimeMs;
+  if (row.startedAt === '—') return 0;
+  return now - new Date(row.startedAt).getTime();
+}
+
+/**
  * The bit of a live kernel the read-only views need.
  *
  * A `KernelClient` satisfies this. It is a separate interface so that a

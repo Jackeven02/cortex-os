@@ -6,11 +6,12 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { format } from 'node:util';
 import { asProcessId } from '../kernel/types.js';
-import type { BlockedReason, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
+import type { BlockedReason, BudgetLimits, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView } from '../cli/process_view.js';
 import { describeOutcome } from '../cli/process_outcome.js';
+import { describeBudget } from '../cli/process_budget.js';
 import { usdToDollars } from '../money.js';
 import { frameName } from '../cli/frame_name.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
@@ -215,12 +216,12 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
 
   if (options.processes !== undefined) {
     return [...options.processes()].map((row) =>
-      withOutcomeLabel(withCapsLabel(withUsdDollars(withInside(withPendingLabel(row))))),
+      withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withInside(withPendingLabel(row)))))),
     );
   }
   const view = await readProcessView(dir, options.kernel);
   return [...view.rows].map((row) =>
-    withOutcomeLabel(withCapsLabel(withUsdDollars(withInside(withPendingLabel(row))))),
+    withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withInside(withPendingLabel(row)))))),
   );
 }
 
@@ -291,6 +292,21 @@ function withOutcomeLabel<T extends { state: ProcessState; exitCode: number | nu
   row: T,
 ): T & { outcomeLabel: string } {
   return { ...row, outcomeLabel: describeOutcome(row) };
+}
+
+/**
+ * Put the budget on the row, in the same words `cortex ps` and `cortex top`
+ * print.
+ *
+ * A process that has run out of budget cannot go on, and nothing else in the
+ * row says so: a `ready` row that will never run again looks exactly like one
+ * that is merely waiting. The kernel knows which budget ran out (the
+ * remainder is zero), and the label says it.
+ */
+function withBudgetLabel<T extends { budgetsRemaining: BudgetLimits }>(
+  row: T,
+): T & { budgetLabel: string } {
+  return { ...row, budgetLabel: describeBudget(row.budgetsRemaining) };
 }
 
 /** Every write operation the dashboard knows how to perform. */

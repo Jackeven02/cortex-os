@@ -808,6 +808,62 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE (the column says how a process ended); PROCESS §7.2 and
   INTEGRATIONS (the column's name); both READMEs; CHANGELOG.
 
+- [x] **#090** A wall-clock budget was not a ceiling → **fixed.**
+  `budgetsSpent.wallTimeMs` is the time a process has been alive (PROCESS.md
+  §8.3), and it was charged in exactly one place: at an `llm_call`, and only
+  when the budget was bounded. Two things were untrue at once.
+
+  **Every agent reported zero.** A process with the default (unlimited) wall
+  budget never charged the clock at all, so `cortex limit` printed
+
+  ```
+  wall time: spent 0ms / limit ∞
+  ```
+
+  for an agent that had been alive for minutes, and the dashboard's wall-clock
+  tile summed to zero. The number was on every screen, and it was wrong.
+
+  **And an idle agent could outlast its own ceiling.** A 1000ms wall budget
+  and an agent that sat in `recv()` for 1500ms came out with the full 1000ms
+  still in hand: the budget drained at model calls, so an agent that stopped
+  calling models stopped spending. A budget an agent can outlast by doing
+  nothing is not a ceiling.
+
+  **The clock is charged by time now** — on the kernel's heartbeat (the
+  scheduler's tick), for every process that is alive, and by `spend()` too, so
+  it is one number whichever path notices. The clock **pauses** while a
+  process is stopped or suspended (that time is not the agent's), and it is
+  exact at the exit. The kernel's own process (PID 1) is not charged: init is
+  the kernel, not an agent, and it spends no tokens and no usd either.
+
+  **A process that has run out of budget now says so.** The wall clock
+  running on the heartbeat means a parked agent can run out of wall time
+  while it waits, and a `ready` row that will never run again looked exactly
+  like one that was merely waiting. The note column names the budget that ran
+  out — `out of tokens`, `out of usd`, `out of wallTime` — in the same words
+  as the `__sched:sigxcpu(...)` frame that records it.
+
+  **And a finished process shows its lifetime, not an age that keeps
+  growing.** The AGE column counted from the start, so a process that died 41
+  seconds in read as `7122.5h` the next day — a number about the record, not
+  about the process.
+
+  **Five new smoke checks** (760 → 765), all reverse-verified — with the
+  heartbeat off, with `spend()`'s accrual back behind the old guard, with the
+  age formula back to "time since start", with the budget label out of the
+  note, and with the server's label out of the row: one fails each time.
+
+  **One limit, stated rather than hidden:** the kernel still cannot stop a
+  process that is not running. `SIGXCPU` is a signal, and a signal aimed at a
+  process that is not RUNNING is queued until it runs again (PROCESS.md §7.2)
+  — so a process whose ceiling is reached while it is parked is left where it
+  is, and the supervisor is what acts on it. **How a process that never wakes
+  should be stopped gracefully is #057, and it is still open.**
+
+  Docs: PROCESS §8.3 (the wall clock, and what the kernel cannot do about a
+  parked process); ARCHITECTURE §4.2 and §4.8 (the table, the scheduler's
+  heartbeat, the ps table's age column and note order); CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

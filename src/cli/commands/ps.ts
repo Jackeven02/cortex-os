@@ -17,11 +17,14 @@ import {
   formatCaps,
   describePendingSignals,
   formatTokens,
+  processAge,
   readProcessView,
   type ProcessRow,
 } from '../process_view.js';
 import { describeWait, readOpenCalls, type OpenCall } from '../open_call.js';
 import { describeOutcome } from '../process_outcome.js';
+import { describeBudget } from '../process_budget.js';
+import { processNote } from '../process_note.js';
 import { probeKernel } from '../kernel_client.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
 import { PROCESS_STATES } from '../../kernel/process_table.js';
@@ -105,6 +108,10 @@ COLUMNS
   kernel knows the code and the reason, and 'zombie' on its own cannot tell a
   finished run from a crash.
 
+  And it says when the budget is gone: 'out of tokens', 'out of usd',
+  'out of wallTime'. A process whose ceiling has been reached cannot go on,
+  and a row that looks like any other waiting row says nothing about that.
+
   It also says what is waiting for the process: a signal the kernel has queued
   for it ('SIGTERM queued') is not delivered until the process runs again, so
   a 'cortex kill' on a wedged agent leaves a signal in the queue and the row
@@ -161,21 +168,16 @@ COLUMNS
    * the same fact cannot say different things about it.
    */
   /**
-   * What the row says about the process's situation — what it is doing, or
-   * how it ended.
+   * What the row says about the process's situation — how it ended, whether
+   * it has run out of budget, or what it is waiting on.
    *
-   * Two facts, one cell, one column. A process that has **ended** says how
-   * ("exit 1 (boom)"), because the kernel knows the code and the reason and
-   * `zombie` on its own cannot tell a finished run from a crash. A process
-   * that is still alive says what it is waiting on.
-   *
-   * The ending comes first: a dead process is not waiting for anything, and
-   * its row used to be blank in the one column that could have said why it
-   * died.
+   * Three facts, one cell, one order (see `src/cli/process_note.ts`): the
+   * ending first (a dead process is not waiting for anything), then the
+   * budget (a process whose ceiling has been reached cannot go on, and
+   * nothing else in the row says so), then the wait.
    */
   const note = (p: ProcessRow): string => {
     const ending = describeOutcome(p);
-    if (ending !== '') return ending;
     let wait = '';
     if (p.live) {
       const call = calls.get(p.pid);
@@ -184,7 +186,11 @@ COLUMNS
         wait = describeWait(call?.syscall ?? '', p.blockedOn);
       }
     }
-    return describePendingSignals(wait, p.pendingSignals);
+    return processNote({
+      ending,
+      budget: describeBudget(p.budgetsRemaining),
+      waiting: describePendingSignals(wait, p.pendingSignals),
+    });
   };
 
   if (filtered.length === 0) {
@@ -199,7 +205,7 @@ COLUMNS
   // and wide enough to say everything when the data is wide. The heading and
   // the rows come from the same list, so they cannot drift apart.
   const cells: string[][] = filtered.map((p) => {
-    const ageMs = p.startedAt === '—' ? 0 : now - new Date(p.startedAt).getTime();
+    const ageMs = processAge(p, now);
     return [
       String(p.pid),
       p.ppid !== null ? String(p.ppid) : '-',
