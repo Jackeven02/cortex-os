@@ -565,6 +565,13 @@ async function dispatch(
           entries: entries.length,
           truncated: entries.length >= REGION_COUNT_CAP,
           sharedWith,
+          // The resolved write-count ceiling: the region's own `maxEntries`
+          // when it declared one, else the kernel-wide cap, `-1` for
+          // unbounded. The `ENOMEM` check is measured against exactly this
+          // number, so it is the number the operator needs to see a region
+          // that is about to trap. The reply gained the field rather than the
+          // framing changing, so the transport's version does not move.
+          effectiveMaxEntries: info.effectiveMaxEntries,
         });
       }
       return { pid, role: entry.role, regions: described };

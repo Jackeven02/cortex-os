@@ -138,13 +138,16 @@ $ cortex logs 1234
 # Read back what a running process KNOWS — its memory regions.
 # The syscall log stores a hash of a memory value, not the value, so
 # `cortex trace` can show that the agent wrote something down and never what.
+# The table also says how much each region MAY hold: LIMIT is the write-count
+# ceiling the kernel enforces with ENOMEM, and WRITES is the count it is
+# measured against (ENTRIES is a different number — how many keys it holds).
 $ cortex memory 1234
 # memory of pid 1234 (coder)
-REGION          KIND      BACKING     ENTRIES   SHARED WITH
------------------------------------------------------------
-episodic        cow       inmem       12        -
-semantic        shared    inmem       3         1240
-procedural      private   inmem       0         -
+REGION          KIND      BACKING     ENTRIES   WRITES    LIMIT     SHARED WITH
+-------------------------------------------------------------------------------
+episodic        cow       inmem       0         0         100       -
+semantic        shared    inmem       2         3         ∞         -
+procedural      private   inmem       0         0         ∞         -
 $ cortex memory 1234 semantic
 # memory of pid 1234 (coder) — region 'semantic'
 issue:42        "found it — src/foo.ts:42"  2026-10-23T14:23:04.881Z
@@ -244,7 +247,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 781 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 782 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

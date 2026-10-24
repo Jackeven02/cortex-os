@@ -69,10 +69,10 @@ set the budget for 1234 (coder):
 # 跟随一个正在跑的 agent 的 syscall 流（有内核时是推送）
 $ cortex attach 1234
 # attach .cortex/processes/1234/log.crec (live — frames by push from the kernel)
-time          pid     syscall                                                    phase  duration   reversibility
-----------------------------------------------------------------------------------------------------------------
+time          pid     syscall                                                    phase  duration   reversibility spend
+----------------------------------------------------------------------------------------------------------------------
 14:23:01.402  1234    memory_read                                                 exit   -          idempotent
-14:23:04.115  1234    llm_call                                                   exit   2523ms     reversible
+14:23:04.115  1234    llm_call                                                   exit   2523ms     reversible    $0.000161 · 1.2k in / 80 out (900 cached)
 14:23:06.221  1234    __state:running->exiting(exit)                             exit   -          idempotent
 # pid 1234 exited with code 0 (completed)
 # detached
@@ -110,9 +110,9 @@ $ cortex replay 1234
 # 追踪每一次 syscall
 $ cortex trace 1234
 # tracing .cortex/processes/1234/log.crec
-time          pid     syscall                                                    phase  duration   reversibility
-----------------------------------------------------------------------------------------------------------------
-14:23:01.402  1234    llm_call                                                   exit   2523ms     reversible
+time          pid     syscall                                                    phase  duration   reversibility spend
+----------------------------------------------------------------------------------------------------------------------
+14:23:01.402  1234    llm_call                                                   exit   2523ms     reversible    $0.000161 · 1.2k in / 80 out (900 cached)
 14:23:04.115  1234    tool_call                                                  exit   -          irreversible
 14:23:06.221  1234    __state:running->exiting(exit)                             exit   -          idempotent
 # 3 record(s)
@@ -120,6 +120,10 @@ time          pid     syscall                                                   
 #  __state:running->blocked(recv)、__state:new->ready(spawn)、
 #  __init:restart-gave-up、__sched:parked(recv)、__signal:SIGTERM(queued) —— 所以一份日志
 #  读起来就是它本来该是的那个故事，而不是一排匿名占位符）
+# （而一次花了东西的调用会说出它花了什么：先说价格，再说它读了多少、
+#  写了多少 token，以及输入里有多少是服务商从缓存里读来的。
+#  什么都没花的帧什么都不说：空格子是诚实的，
+#  `$0.000000` 是一句断言）
 
 # 读回一个进程**打印**过的东西
 # （按进程分别保存，不再混进 daemon 的 stdout —— stdout 和 stderr 分开标注）
@@ -132,13 +136,15 @@ $ cortex logs 1234
 # 读回一个活着的进程**知道**的东西 —— 它的内存区域
 # syscall 日志里存的是 memory 值的哈希而不是值，所以
 # `cortex trace` 只能告诉你"它写了点什么"，永远不告诉你"写了什么"
+# 表格还会说出每个区域**能**装多少：LIMIT 是内核用 ENOMEM 兜住的写入次数上限，
+# WRITES 是这个上限所对照的那个计数（ENTRIES 是另一个数 —— 它装着多少个键）
 $ cortex memory 1234
 # memory of pid 1234 (coder)
-REGION          KIND      BACKING     ENTRIES   SHARED WITH
------------------------------------------------------------
-episodic        cow       inmem       12        -
-semantic        shared    inmem       3         1240
-procedural      private   inmem       0         -
+REGION          KIND      BACKING     ENTRIES   WRITES    LIMIT     SHARED WITH
+-------------------------------------------------------------------------------
+episodic        cow       inmem       0         0         100       -
+semantic        shared    inmem       2         3         ∞         -
+procedural      private   inmem       0         0         ∞         -
 $ cortex memory 1234 semantic
 # memory of pid 1234 (coder) — region 'semantic'
 issue:42        "found it — src/foo.ts:42"  2026-10-23T14:23:04.881Z
@@ -152,8 +158,8 @@ pid 1234 exited with code 0 (finished the task)
 # 和 `cortex trace` 读到的是同一批帧，只是推过来而不是轮询。
 $ cortex watch --pid 1234
 # watching the kernel event stream (Ctrl-C to stop)
-time          pid     syscall                                                    phase  duration   reversibility
-----------------------------------------------------------------------------------------------------------------
+time          pid     syscall                                                    phase  duration   reversibility spend
+----------------------------------------------------------------------------------------------------------------------
 19:50:09.072  1234    sleep                                                      exit   64ms       idempotent
 19:50:09.077  1234    __state:running->blocked(sleep)                            exit   -          idempotent
 19:50:09.138  1234    __state:blocked->ready(wait-return)                        exit   -          idempotent
@@ -232,7 +238,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 775 项断言，0 失败
+npx tsx scripts/smoke.ts                # 782 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -349,6 +355,10 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 **而且 token 数字会说出其中有多少是缓存读来的。** 服务商报的是整个 prompt，外加它其实不必再读一遍的那部分——而这些 token 是按缓存价计费的，不是新鲜价。大屏会说出来：进程表印 `1,234 (300 cached)`，预算面板多了一列 **缓存** 和一个 **缓存命中** 总数，事件表会说明单次调用里有多少是缓存读来的。
 
 **而且事件表里看得见这次调用花了多少钱。** `cortex wrap --tap` 把模型自己发出的 HTTP 调用记进和驱动调用同一份日志，所以这些调用同样出现在事件表里——带着它们的 token 和价格，写成 ABI 规定的 `usage` 形状，也就是所有读 `llm_call` 帧的人都在找的那个形状。
+
+**而且 `cortex trace` 也说。** 能说出一次调用花了什么的，不止大屏一个视图——CLI 最深的那个视图原本不能说，而它恰恰是运维为了弄清一个 agent 在干什么会打开的那个。它的最后一列现在会说出每次调用花了什么（`$0.000161 · 1.2k in / 80 out (900 cached)`），而且它和事件表用同一个函数读那一帧，所以两边不可能各说各话。什么都没花的帧什么都不说：空格子是诚实的，`$0.000000` 是一句断言。
+
+**而且大屏自己的时间线也说。** 运维的窗口不止一个视图：它有**事件表**（agent 做出的每一次调用）和 **Syscall 时间线**（每一帧，按顺序），两者读的是同一份 `.crec`。而时间线曾经说得比旁边的事件表还少：没有缓存那部分（服务端压根没读它）、没有价格（服务端发过来了、页面把它丢了），还有给一个从没说过自己写了多少 token 的调用印上 `0 out`。现在两边都问同一个 helper 要 token，服务端也用和 `cortex trace` 同一个函数读帧——所以终端、事件表和时间线对同一次调用说的是同一句话。
 
 **而且时间线读起来和终端里的一样。** 内核自己的帧在盘上是占位名（`__state`、`__sched`）——**区分**它们的是那个视图：`__state:running->blocked(recv)`、`__sched:sigxcpu(tokens)`。大屏印的是和 `cortex trace` 一样的名字，因为两边问的是同一个函数。
 

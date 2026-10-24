@@ -1546,6 +1546,57 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The kernel knew how much a memory region could hold, and no view said so.**
+  A region may declare a write-count ceiling — its own `maxEntries`, else the
+  kernel-wide `maxRegionEntries` — and `memory_write` traps **`ENOMEM`** on
+  the write that would exceed it (ABI.md §4.4). The kernel resolves that
+  ceiling per region and exposes it as `MemoryRegionInfo.effectiveMaxEntries`;
+  the transport even carries the write count it is measured against.
+
+  **No view said any of it.** `cortex memory`'s region table showed how many
+  *entries* a region held and stopped there, so an operator looking at a
+  region that was about to trap had no way to know it: the ceiling was
+  invisible until the agent's write failed.
+
+  **The table now says the ceiling, and the number it is measured against:**
+
+  ```console
+  $ cortex memory 2
+  # memory of pid 2 (coder)
+  REGION          KIND      BACKING     ENTRIES   WRITES    LIMIT     SHARED WITH
+  -------------------------------------------------------------------------------
+  episodic        cow       inmem       0         0         100       -
+  semantic        shared    inmem       2         3         ∞         -
+  procedural      private   inmem       0         0         ∞         -
+  ```
+
+  **Two columns, because they are two numbers.** The ceiling is a *write*
+  count, and `ENTRIES` is how many distinct keys the region holds — a region
+  with two entries written three times holds two entries and has made three
+  writes. Putting the cap next to the entry count alone would invite a
+  comparison the kernel never makes, so the write count stands beside it.
+
+  **A ceiling nobody reported is not an unbounded region.** The transport
+  reply gained the field (the reply grew; its framing did not, so the
+  transport's version does not move), and a kernel that does not report one
+  prints `?` rather than `∞` — `∞` would be a claim about a limit that was
+  never stated.
+
+  **1 new smoke check** (781 → 782), reverse-verified: with the server
+  dropping the ceiling, the transport check fails ("the bounded region's
+  ceiling is reported") and the table prints `?`; with every region reading as
+  unbounded, the table check fails ("the bounded region says its ceiling");
+  and with the write count column showing the entry count instead, it fails
+  again ("the write count is there").
+
+- **A smoke check that failed on its own, about one time in ten.** "The
+  transport read does not write a frame into the log" counted the frames in
+  the log before and after the operator's read — but the agent behind that
+  process was alive and retrying its `recv` every 50 ms, so the log grew on
+  its own and the check was a coin flip. It now asserts what it was actually
+  about: the read added no **memory** frame. The agent's own frames are the
+  agent's doing.
+
 - **The operator's window had two views of the same frame, and they disagreed.**
   The dashboard is not one view: it has the **event table** (every call the
   agent made) and the **syscall timeline** (every frame, in order), and both

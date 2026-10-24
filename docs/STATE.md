@@ -56,7 +56,7 @@ Every piece of state an agent has falls into one of these:
   - `shared` — both processes see the same backing store; writes are visible to both (see §8.1 on concurrency).
   - `cow` — copy-on-write. Reads shared until first write, then fork the page.
 - **Defaults:** `cow` for episodic, `shared` for semantic, `private` for procedural.
-- **Size ceiling:** each region may declare `maxEntries` — a write-count cap that `memory_write` enforces with `ENOMEM` *before* any copy-on-write divergence. Absent inherits the kernel-wide ceiling; `-1` opts that region out to unlimited. Declared per region via `cortex spawn`/`cortex daemon install --memory` and inherited on `fork` unless `memoryOverrides` supplies a different value.
+- **Size ceiling:** each region may declare `maxEntries` — a write-count cap that `memory_write` enforces with `ENOMEM` *before* any copy-on-write divergence. Absent inherits the kernel-wide ceiling; `-1` opts that region out to unlimited. Declared per region via `cortex spawn`/`cortex daemon install --memory` and inherited on `fork` unless `memoryOverrides` supplies a different value. **The ceiling is a fact the operator can see**: `cortex memory`'s region table prints the region's **write count** (the number the cap is measured against) and the resolved cap beside it (`∞` when unbounded, `?` when the kernel did not report one). The *entry* count is a different number — a region with three entries written fifteen times holds three entries and has made fifteen writes — so the cap is never printed beside the entry count alone.
 
 ### 2.4 Resource budgets
 

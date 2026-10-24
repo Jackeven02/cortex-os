@@ -14175,6 +14175,12 @@ async function runMemoryInspectChecks(): Promise<void> {
           // process table but never bound in the memory engine, because the
           // daemon birth path did not sync them.
           await ctx.memory_write('semantic', 'note', { hello: 'world' });
+          // …and again, with the same key: the region holds **one** entry and
+          // has made **two** writes, and it is the second number the write
+          // ceiling is measured against. A view that showed the entry count
+          // where the write count belongs would not be able to tell the two
+          // apart.
+          await ctx.memory_write('semantic', 'note', { hello: 'world' });
           for (;;) {
             try {
               await ctx.recv(undefined, { timeoutMs: 50 });
@@ -14190,7 +14196,9 @@ async function runMemoryInspectChecks(): Promise<void> {
         role: 'rememberer',
         agent: { module: 'test:rememberer' },
         memory: {
-          episodic: { kind: 'private', backing: 'inmem' },
+          // One region with a ceiling of its own, one without — so the view
+          // has both a bounded ceiling and an unbounded one to say.
+          episodic: { kind: 'private', backing: 'inmem', maxEntries: 5 },
           semantic: { kind: 'shared', backing: 'inmem' },
         },
       });
@@ -14230,13 +14238,32 @@ async function runMemoryInspectChecks(): Promise<void> {
       const client = probe.kind === 'live' ? probe.client : undefined;
 
       const listed = await client!.request<{
-        regions: readonly { region: string; kind: string; entries: number }[];
+        regions: readonly {
+          region: string;
+          kind: string;
+          entries: number;
+          writes: number;
+          effectiveMaxEntries?: number;
+        }[];
       }>('memory', { pid });
       assert(listed.regions.length === 2, `both regions are reported, got ${listed.regions.length}`);
       const semantic = listed.regions.find((r) => r.region === 'semantic');
       assert(semantic !== undefined, 'the semantic region is reported');
       assert(semantic!.kind === 'shared', `its kind is shared, got ${semantic!.kind}`);
       assert(semantic!.entries === 1, `it holds one entry, got ${semantic!.entries}`);
+      // The ceiling travels with the region: the region's own `maxEntries`
+      // when it declared one, and `-1` for the unbounded one.
+      const episodic = listed.regions.find((r) => r.region === 'episodic');
+      assert(episodic !== undefined, 'the episodic region is reported');
+      assert(
+        episodic!.effectiveMaxEntries === 5,
+        `the bounded region's ceiling is reported, got ${String(episodic!.effectiveMaxEntries)}`,
+      );
+      assert(
+        semantic!.effectiveMaxEntries === -1,
+        `the unbounded region says so, got ${String(semantic!.effectiveMaxEntries)}`,
+      );
+      assert(semantic!.writes === 2, `the write count is reported, got ${semantic!.writes}`);
 
       const dumped = await client!.request<{
         entries: readonly { key: string; value: unknown }[];
@@ -14267,20 +14294,31 @@ async function runMemoryInspectChecks(): Promise<void> {
       const logPath = existingCrecPath(tmp, asProcessId(pid));
       assert(existsSync(logPath), 'the daemon has a log');
 
-      const countFrames = async (): Promise<number> => {
-        let n = 0;
-        for await (const _rec of readRecords(logPath)) n++;
-        return n;
+      // The agent behind this process is alive and busy: it retries its `recv`
+      // every 50 ms, and each attempt is a frame of its own. So the log grows
+      // on its own, and "the log did not grow" was a coin flip — the check
+      // fired on its own while this round was being written. What the *read*
+      // must not add is a memory frame: the operator's read is not the
+      // process's doing, and a `memory_read` frame is what it would look like
+      // if it were recorded (ABI.md §4.4).
+      const syscalls = async (): Promise<readonly string[]> => {
+        const seen: string[] = [];
+        for await (const rec of readRecords(logPath)) seen.push(rec.syscall);
+        return seen;
       };
 
-      const before = await countFrames();
+      const before = await syscalls();
       const probe = await probeKernel(tmp);
       const client = probe.kind === 'live' ? probe.client : undefined;
       await client!.request('memory', { pid });
       await client!.request('memory', { pid, region: 'semantic' });
       client!.close();
-      const after = await countFrames();
-      assert(before === after, `the log did not grow (${before} -> ${after})`);
+      const after = await syscalls();
+      const added = after.slice(before.length);
+      assert(
+        added.every((syscall) => syscall !== 'memory_read' && syscall !== 'memory_write'),
+        `the read recorded no memory frame, got: ${added.join(', ')}`,
+      );
       assert(kernel.table.get(asProcessId(pid)) !== undefined, 'the process is still there');
     });
 
@@ -14303,6 +14341,57 @@ async function runMemoryInspectChecks(): Promise<void> {
       assert(out.includes('semantic'), `the region is listed, got: ${out}`);
       assert(out.includes('episodic'), `the other region is listed, got: ${out}`);
       assert(out.includes('SHARED WITH'), `the sharing column is there, got: ${out}`);
+    });
+
+    await checkAsync('cortex memory says how much a region may hold', async () => {
+      // The kernel knows each region's write-count ceiling — the number the
+      // `ENOMEM` check is measured against — and no view said so. The operator
+      // could see how many entries a region held and had no way to tell that
+      // the next write would trap.
+      process.env['CORTEX_HOME'] = tmp;
+      const pid = daemonPid!;
+      let out = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      let code: number;
+      try {
+        code = await cmdMemory([String(pid)]);
+      } finally {
+        process.stdout.write = prevWrite;
+      }
+      assert(code === 0, `exit 0, got ${code}`);
+
+      const lines = out.split('\n');
+      const header = lines.find((l) => l.startsWith('REGION'));
+      const episodic = lines.find((l) => l.startsWith('episodic'));
+      const semantic = lines.find((l) => l.startsWith('semantic'));
+      assert(header !== undefined, `the region table has a header, got: ${out}`);
+      assert(episodic !== undefined && semantic !== undefined, `both regions are listed, got: ${out}`);
+      // By position, not by word-search: the columns come from the header the
+      // table really printed.
+      const limitAt = header!.indexOf('LIMIT');
+      const writesAt = header!.indexOf('WRITES');
+      const limitWidth = header!.indexOf('SHARED WITH') - limitAt;
+      assert(limitAt > writesAt, `the columns are in order, got: ${header}`);
+      assert(
+        episodic!.slice(limitAt, limitAt + limitWidth).trim() === '5',
+        `the bounded region says its ceiling, got: ${episodic}`,
+      );
+      assert(
+        semantic!.slice(limitAt, limitAt + limitWidth).trim() === '∞',
+        `the unbounded region says so, got: ${semantic}`,
+      );
+      // And the write count the ceiling is measured against is there too —
+      // without it, a ceiling beside an entry count would be a comparison the
+      // kernel never makes. This region holds **one** entry and has made
+      // **two** writes, so the two columns cannot be the same number.
+      assert(
+        semantic!.slice(writesAt, limitAt).trim() === '2',
+        `the write count is there, got: ${semantic}`,
+      );
     });
 
     await checkAsync('cortex memory dumps a region', async () => {

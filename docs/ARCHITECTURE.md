@@ -269,6 +269,8 @@ interface MemoryManager {
 
 Per-region policies are declared on the CLI via `cortex spawn --memory <json>` and `cortex daemon install --memory <json>` — a JSON object keyed by region name, merged over the standard `episodic`/`semantic`/`procedural` defaults (override-by-name, add-new, keep-untouched). For daemons the resolved policies are persisted in the daemon spec (`daemons.json`) and applied on every (re)spawn; for spawned and restored processes they are written to the process's `.meta.json`, so a cross-invocation `cortex restore` re-declares the same regions (including their `maxEntries`/`readOnly`) rather than silently reverting to defaults. Fork inherits a region's `maxEntries` by reference; `memoryOverrides` may supply a different one for the child.
 
+**And the view says the ceiling.** The kernel knows the resolved cap, and the `ENOMEM` check is measured against it — but no view said so: `cortex memory`'s region table showed how many *entries* a region held and nothing else, so the operator could not tell that the next write would trap. The transport now carries the resolved ceiling with the region (`effectiveMaxEntries`, the ABI's own name; the reply gained a field, so the transport's version does not move), and the table prints it beside the **write count** — the number the cap is actually measured against. The entry count is a different number (a region with three entries written fifteen times holds three entries and has made fifteen writes), and putting a cap next to the entry count without the write count would invite a comparison the kernel never makes. A region the kernel did not report a ceiling for prints `?`, not `∞`: a ceiling nobody reported is not an unbounded region.
+
 **A declared region is not yet a bound one.** The policies live on the process-table entry; turning a logical region into a physical key is the memory engine's job (`attachRegion`, and `syncFromTable` to pull the declarations in). Every birth path has to do that sync, and the three are not the same code: the `spawn` syscall does it in the dispatcher, `restore` does it in the checkpoint manager, and a **daemon registration** does it in init. When the daemon path skipped it, a daemon's agent died on its *first* `memory_read` with `ENOENT` ("no such memory region") while the same agent under `cortex spawn` worked — the regions were declared, just never bound. PROCESS.md §6.1 has always promised "sets up memory regions per policy" for every process; the daemon path was the one that did not keep the promise.
 
 **Performance.** Reads and writes are O(1) plus driver overhead. COW duplication is O(region size) on first write. Acceptable for v0; per-key COW is post-v0.
@@ -1061,17 +1063,17 @@ wrote something down and never what it wrote down. The knowledge is the whole
 point of an agent that remembers, and the log deliberately does not carry it.
 
 The live kernel still has it. `cortex memory <pid>` reaches in: which regions
-a process has, what kind each one is, how much is in each, **who else can see
-them**, and the entries themselves.
+a process has, what kind each one is, how much is in each, **how much each one
+may hold**, **who else can see them**, and the entries themselves.
 
 ```
 $ cortex memory 2
 # memory of pid 2 (inbox-watcher)
-REGION          KIND      BACKING     ENTRIES   SHARED WITH
------------------------------------------------------------
-episodic        cow       inmem       2         -
-semantic        shared    inmem       3         3
-procedural      private   inmem       0         -
+REGION          KIND      BACKING     ENTRIES   WRITES    LIMIT     SHARED WITH
+-------------------------------------------------------------------------------
+episodic        cow       inmem       2         2         ∞         -
+semantic        shared    inmem       3         4         ∞         3
+procedural      private   inmem       0         0         ∞         -
 
 $ cortex memory 2 semantic
 # memory of pid 2 (inbox-watcher) — region 'semantic'

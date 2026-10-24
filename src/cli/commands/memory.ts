@@ -58,10 +58,20 @@ interface RegionInfo {
   readonly backing: string;
   readonly readOnly: boolean;
   readonly refCount: number;
+  /** The write count the ceiling is measured against. */
   readonly writes: number;
   readonly entries: number;
   readonly truncated: boolean;
   readonly sharedWith: readonly number[];
+  /**
+   * The resolved write-count ceiling: the region's own `maxEntries` when it
+   * declared one, else the kernel-wide cap. `-1` is unbounded.
+   *
+   * Optional because a kernel older than this field does not report it — and
+   * a ceiling nobody reported is **not** an unbounded region: it is a ceiling
+   * this build cannot see, and it prints as `?`.
+   */
+  readonly effectiveMaxEntries?: number;
 }
 
 /** One entry of a dumped region. */
@@ -113,6 +123,16 @@ OPTIONS
   --prefix <p>     Prefix scan
   --limit <n>      Maximum number of entries to return
   -h, --help       Show this help
+
+COLUMNS
+  ENTRIES      how many distinct keys the region holds
+  WRITES       how many writes the region has made — this is the number the
+               limit is measured against, and it is what a region that is
+               nearly full shows
+  LIMIT        the region's write-count ceiling: its own maxEntries when it
+               declared one, else the kernel-wide cap, ∞ when it is
+               unbounded. The write that would exceed it traps ENOMEM
+  SHARED WITH  the processes bound to the same physical region
 
 NOTES
   This reads a LIVE kernel. An agent's memory lives in the kernel's memory
@@ -202,6 +222,14 @@ EXAMPLES
  * is visible to every process that declared it, so knowing that agent 3 is
  * reading agent 2's notes is the difference between a shared scratchpad and
  * a leak.
+ *
+ * The `WRITES` and `LIMIT` columns are a pair, and they are about the same
+ * thing: the ceiling is a **write-count** cap, and the writes are what it is
+ * measured against. The `ENTRIES` column is a different number — how many
+ * distinct keys the region holds — and putting the cap next to it without the
+ * write count would invite a comparison the kernel never makes. A region with
+ * three entries written fifteen times holds three entries and has made
+ * fifteen writes, and it is the second number the cap is about.
  */
 function printRegions(result: MemoryListResult): void {
   console.log(`# memory of pid ${result.pid} (${result.role})`);
@@ -216,6 +244,8 @@ function printRegions(result: MemoryListResult): void {
     'KIND'.padEnd(10) +
     'BACKING'.padEnd(12) +
     'ENTRIES'.padEnd(10) +
+    'WRITES'.padEnd(10) +
+    'LIMIT'.padEnd(10) +
     'SHARED WITH';
   console.log(header);
   console.log('-'.repeat(header.length));
@@ -228,9 +258,25 @@ function printRegions(result: MemoryListResult): void {
         region.kind.padEnd(10) +
         region.backing.padEnd(12) +
         count.padEnd(10) +
+        String(region.writes).padEnd(10) +
+        formatLimit(region.effectiveMaxEntries).padEnd(10) +
         shared,
     );
   }
+}
+
+/**
+ * A region's write-count ceiling, as it is printed.
+ *
+ * `∞` when the region is unbounded, the number when it is bounded, and `?`
+ * when the kernel did not report one — a ceiling nobody reported is not an
+ * unbounded region, and printing `∞` there would be a claim about a limit that
+ * was never stated.
+ */
+function formatLimit(effectiveMaxEntries: number | undefined): string {
+  if (effectiveMaxEntries === undefined) return '?';
+  if (effectiveMaxEntries < 0) return '∞';
+  return String(effectiveMaxEntries);
 }
 
 /**
