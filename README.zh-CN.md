@@ -138,16 +138,21 @@ $ cortex logs 1234
 # `cortex trace` 只能告诉你"它写了点什么"，永远不告诉你"写了什么"
 # 表格还会说出每个区域**能**装多少：LIMIT 是内核用 ENOMEM 兜住的写入次数上限，
 # WRITES 是这个上限所对照的那个计数（ENTRIES 是另一个数 —— 它装着多少个键）
+# 表格还会说出谁**能写**：ACCESS 是这个进程自己能不能写
+# （只读的区写入会 trap EPERM），SHARED WITH 里的每个共享方也各自带一个 ——
+# 共享不等于能写
 $ cortex memory 1234
 # memory of pid 1234 (coder)
-REGION          KIND      BACKING     ENTRIES   WRITES    LIMIT     SHARED WITH
--------------------------------------------------------------------------------
-episodic        cow       inmem       0         0         100       -
-semantic        shared    inmem       2         3         ∞         -
-procedural      private   inmem       0         0         ∞         -
+REGION          KIND      BACKING     ACCESS     ENTRIES   WRITES    LIMIT     SHARED WITH
+------------------------------------------------------------------------------------------
+episodic        cow       inmem       read-write 0         0         100       -
+semantic        shared    inmem       read-write 2         3         ∞         1240 (read-only)
+procedural      private   inmem       read-write 0         0         ∞         -
 $ cortex memory 1234 semantic
-# memory of pid 1234 (coder) — region 'semantic'
-issue:42        "found it — src/foo.ts:42"  2026-10-23T14:23:04.881Z
+# memory of pid 1234 (coder) — region 'semantic' (read-write)
+issue:42     "found it — src/foo.ts:42"  2026-10-23T14:23:04.881Z
+last_result  "ok"  2026-10-23T14:23:06.115Z
+# 2 entries
 
 # 等一个进程结束 —— 拿到它**真实**的退出码
 # （退出码就是子进程自己的，所以 `cortex wait 2 || echo failed` 能用）
@@ -238,7 +243,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 782 项断言，0 失败
+npx tsx scripts/smoke.ts                # 785 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。

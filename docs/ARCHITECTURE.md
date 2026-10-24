@@ -271,6 +271,12 @@ Per-region policies are declared on the CLI via `cortex spawn --memory <json>` a
 
 **And the view says the ceiling.** The kernel knows the resolved cap, and the `ENOMEM` check is measured against it — but no view said so: `cortex memory`'s region table showed how many *entries* a region held and nothing else, so the operator could not tell that the next write would trap. The transport now carries the resolved ceiling with the region (`effectiveMaxEntries`, the ABI's own name; the reply gained a field, so the transport's version does not move), and the table prints it beside the **write count** — the number the cap is actually measured against. The entry count is a different number (a region with three entries written fifteen times holds three entries and has made fifteen writes), and putting a cap next to the entry count without the write count would invite a comparison the kernel never makes. A region the kernel did not report a ceiling for prints `?`, not `∞`: a ceiling nobody reported is not an unbounded region.
 
+**And the view says who may write.** A region's policy may also declare `readOnly`, and then `memory_write` traps **`EPERM`** on it (ABI.md §4.4) — the write is refused before anything else happens. That refusal is only meaningful on a **shared** region: a `shared` binding points every process that declared it at the same physical key, so a process whose own binding is read-only can read what the others write and cannot add a byte to it. (A read-only `private` or `cow` region is a region nothing can ever fill, because the only writer is the process that owns it.) Sharing is not writing, and the two facts live on different sides of the same region.
+
+The kernel knew both, and the transport already carried one of them: the region's own `readOnly` flag had been on the wire since `cortex memory` was born, and **no view printed it**. So an operator whose agent's write had just failed with `EPERM` was left with an errno and no way to know it was a policy and not a bug — and a writer looking at a shared region could see that a peer shared it but not whether that peer could change it.
+
+So the table now says both. The region's own right to write is the **`ACCESS`** column (`read-write`, or `read-only` when the binding refuses writes), and each peer in **`SHARED WITH`** carries its own (`3 (read-only)` — it can see this region and cannot write to it). The transport gained one field for the peers (`readOnlyPeers`, a subset of `sharedWith`) and one for the dump's header (`readOnly`); both are additions to a reply, so the transport's version does not move. The region dump names the same mode in its header — the table and the dump are two views of one region, and they say the same thing about it. An access mode nobody reported prints `?`, never `read-write`: a permission nobody stated is not a granted one.
+
 **A declared region is not yet a bound one.** The policies live on the process-table entry; turning a logical region into a physical key is the memory engine's job (`attachRegion`, and `syncFromTable` to pull the declarations in). Every birth path has to do that sync, and the three are not the same code: the `spawn` syscall does it in the dispatcher, `restore` does it in the checkpoint manager, and a **daemon registration** does it in init. When the daemon path skipped it, a daemon's agent died on its *first* `memory_read` with `ENOENT` ("no such memory region") while the same agent under `cortex spawn` worked — the regions were declared, just never bound. PROCESS.md §6.1 has always promised "sets up memory regions per policy" for every process; the daemon path was the one that did not keep the promise.
 
 **Performance.** Reads and writes are O(1) plus driver overhead. COW duplication is O(region size) on first write. Acceptable for v0; per-key COW is post-v0.
@@ -1064,19 +1070,20 @@ point of an agent that remembers, and the log deliberately does not carry it.
 
 The live kernel still has it. `cortex memory <pid>` reaches in: which regions
 a process has, what kind each one is, how much is in each, **how much each one
-may hold**, **who else can see them**, and the entries themselves.
+may hold**, **what this process may write to it**, **who else can see them and
+which of them may write**, and the entries themselves.
 
 ```
 $ cortex memory 2
 # memory of pid 2 (inbox-watcher)
-REGION          KIND      BACKING     ENTRIES   WRITES    LIMIT     SHARED WITH
--------------------------------------------------------------------------------
-episodic        cow       inmem       2         2         ∞         -
-semantic        shared    inmem       3         4         ∞         3
-procedural      private   inmem       0         0         ∞         -
+REGION          KIND      BACKING     ACCESS     ENTRIES   WRITES    LIMIT     SHARED WITH
+------------------------------------------------------------------------------------------
+episodic        cow       inmem       read-write 2         2         ∞         -
+semantic        shared    inmem       read-write 3         4         ∞         3 (read-only)
+procedural      private   inmem       read-write 0         0         ∞         -
 
 $ cortex memory 2 semantic
-# memory of pid 2 (inbox-watcher) — region 'semantic'
+# memory of pid 2 (inbox-watcher) — region 'semantic' (read-write)
 ticket:T-1180  {"id":"T-1180","category":"bug","reply":"Thanks for the report …"}  2026-10-23T19:05:33.842Z
 ```
 
@@ -1084,7 +1091,9 @@ The `SHARED WITH` column is the one that earns its keep: a `shared` region is
 visible to every process that declared it, so knowing that agent 3 is reading
 agent 2's notes is the difference between a shared scratchpad and a leak. It
 falls out of comparing physical keys, and it also catches the other case — a
-`cow` region whose forked child has not written yet.
+`cow` region whose forked child has not written yet. Each peer carries the
+access mode it holds the region under, because a peer that may only read it
+can see everything in it and cannot add a byte to it.
 
 It is a **read**, like `ps`: answered by the memory engine directly, not
 through the dispatcher, and not recorded in the `.crec`. It does need the live

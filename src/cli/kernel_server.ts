@@ -522,10 +522,16 @@ async function dispatch(
           ...(typeof args['limit'] === 'number' ? { limit: args['limit'] } : {}),
         };
         const entries = await kernel.memory.read(target, region, query);
+        // The region's access mode for *this* process. A read-only binding
+        // rejects `memory_write` with `EPERM` (ABI.md §4.4), so a view that
+        // dumps a region without saying whether this process may write to it
+        // leaves the operator guessing which of the two it is.
+        const info = kernel.memory.regionInfo(target, region);
         return {
           pid,
           role: entry.role,
           region,
+          ...(info !== undefined ? { readOnly: info.readOnly } : {}),
           entries: entries.map((e) => ({ key: e.key, value: e.value, at: e.at })),
         };
       }
@@ -545,12 +551,21 @@ async function dispatch(
         // that is every process that declared it — and for a `cow` region it
         // is a forked child that has not written yet. Either way it is the
         // answer to "who else can see this?".
+        //
+        // Sharing is not the same as writing. A peer whose own binding to
+        // this region is read-only can read everything here and cannot add a
+        // byte to it — its `memory_write` traps `EPERM` (ABI.md §4.4). So the
+        // peer list carries each peer's access mode too: "who else can see
+        // this, and which of them may write to it".
         const sharedWith: number[] = [];
+        const readOnlyPeers: number[] = [];
         for (const other of all) {
           if (unbrand(other.pid) === pid) continue;
           for (const otherRegion of kernel.memory.regionsOf(other.pid)) {
             if (otherRegion.bindingKey === info.bindingKey) {
-              sharedWith.push(unbrand(other.pid));
+              const otherPid = unbrand(other.pid);
+              sharedWith.push(otherPid);
+              if (otherRegion.readOnly) readOnlyPeers.push(otherPid);
               break;
             }
           }
@@ -565,6 +580,11 @@ async function dispatch(
           entries: entries.length,
           truncated: entries.length >= REGION_COUNT_CAP,
           sharedWith,
+          // The peers that may only read this region. A subset of
+          // `sharedWith`, and it is the answer to a different question than
+          // the list itself: the list says who can *see* the region, this
+          // says which of them may *write* to it.
+          readOnlyPeers,
           // The resolved write-count ceiling: the region's own `maxEntries`
           // when it declared one, else the kernel-wide cap, `-1` for
           // unbounded. The `ENOMEM` check is measured against exactly this

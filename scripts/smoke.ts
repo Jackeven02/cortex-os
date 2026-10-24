@@ -246,7 +246,7 @@ import {
 import { cmdDiff } from '../src/cli/commands/diff.js';
 import { cmdTrace, TRACE_SYSCALL_WIDTH, TRACE_HEADER } from '../src/cli/commands/trace.js';
 import { cmdLogs, alreadyShown } from '../src/cli/commands/logs.js';
-import { cmdMemory } from '../src/cli/commands/memory.js';
+import { cmdMemory, formatAccess, formatPeers } from '../src/cli/commands/memory.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
@@ -14161,6 +14161,26 @@ async function runMemoryInspectChecks(): Promise<void> {
 
   try {
     let daemonPid: number | undefined;
+    let readerPid: number | undefined;
+
+    // Run `cortex memory` and capture what it printed. The command writes to
+    // stdout, so a check has to stand in for it.
+    const memoryOutput = async (args: string[]): Promise<string> => {
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      const prevWrite = process.stdout.write;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      try {
+        const code = await cmdMemory(args);
+        assert(code === 0, `exit 0, got ${code}`);
+      } finally {
+        process.stdout.write = prevWrite;
+      }
+      return out;
+    };
 
     await checkAsync('a daemon-registered agent gets its memory regions bound', async () => {
       const kernel = await bootKernel({
@@ -14174,13 +14194,26 @@ async function runMemoryInspectChecks(): Promise<void> {
           // This used to trap ENOENT: the regions were declared in the
           // process table but never bound in the memory engine, because the
           // daemon birth path did not sync them.
-          await ctx.memory_write('semantic', 'note', { hello: 'world' });
+          //
+          // The same agent runs for both processes — the one that may write
+          // and the one whose binding is read-only — so the write has to
+          // tolerate the EPERM the read-only one traps. It must not kill the
+          // agent: the point of the check is that the region is still there
+          // to be looked at.
+          const write = async (): Promise<void> => {
+            try {
+              await ctx.memory_write('semantic', 'note', { hello: 'world' });
+            } catch (err) {
+              if ((err as { errno?: string }).errno !== 'EPERM') throw err;
+            }
+          };
+          await write();
           // …and again, with the same key: the region holds **one** entry and
           // has made **two** writes, and it is the second number the write
           // ceiling is measured against. A view that showed the entry count
           // where the write count belongs would not be able to tell the two
           // apart.
-          await ctx.memory_write('semantic', 'note', { hello: 'world' });
+          await write();
           for (;;) {
             try {
               await ctx.recv(undefined, { timeoutMs: 50 });
@@ -14203,6 +14236,29 @@ async function runMemoryInspectChecks(): Promise<void> {
         },
       });
       daemonPid = unbrand(pid);
+
+      // A second process bound to the **same physical region** with a
+      // read-only binding of its own. It can read everything the first one
+      // writes and cannot add a byte to it — its `memory_write` traps `EPERM`.
+      // Sharing is not writing, and the views have to tell those apart.
+      const reader = await kernel.registerDaemon({
+        role: 'reader',
+        agent: { module: 'test:reader' },
+        memory: {
+          semantic: { kind: 'shared', backing: 'inmem', readOnly: true },
+        },
+      });
+      readerPid = unbrand(reader);
+
+      // The read-only binding is not a label: the kernel really refuses the
+      // write, with the errno the ABI names (ABI.md §4.4).
+      let refused = '';
+      try {
+        await kernel.memory.write(reader, 'semantic', 'note', { hello: 'world' });
+      } catch (err) {
+        refused = (err as { errno?: string }).errno ?? '';
+      }
+      assert(refused === 'EPERM', `the read-only binding refuses the write, got ${refused}`);
 
       // The regions are *bound*, not merely declared.
       const regions = kernel.memory.regionsOf(pid);
@@ -14243,6 +14299,9 @@ async function runMemoryInspectChecks(): Promise<void> {
           kind: string;
           entries: number;
           writes: number;
+          readOnly: boolean;
+          sharedWith: readonly number[];
+          readOnlyPeers?: readonly number[];
           effectiveMaxEntries?: number;
         }[];
       }>('memory', { pid });
@@ -14264,6 +14323,44 @@ async function runMemoryInspectChecks(): Promise<void> {
         `the unbounded region says so, got ${String(semantic!.effectiveMaxEntries)}`,
       );
       assert(semantic!.writes === 2, `the write count is reported, got ${semantic!.writes}`);
+
+      // The access mode travels with it too — both this process's own and
+      // the peers'. The writer may write; the peer that shares the same
+      // physical region may only read it.
+      assert(semantic!.readOnly === false, `the writer may write, got ${String(semantic!.readOnly)}`);
+      assert(
+        semantic!.sharedWith.includes(readerPid!),
+        `the reader shares the region, got ${JSON.stringify(semantic!.sharedWith)}`,
+      );
+      assert(
+        semantic!.readOnlyPeers?.includes(readerPid!) === true,
+        `the reader may only read it, got ${JSON.stringify(semantic!.readOnlyPeers)}`,
+      );
+
+      // And the other side of the same region: the reader's own view says
+      // the opposite, about the same physical region.
+      const readerView = await client!.request<{
+        regions: readonly {
+          region: string;
+          readOnly: boolean;
+          sharedWith: readonly number[];
+          readOnlyPeers?: readonly number[];
+        }[];
+      }>('memory', { pid: readerPid });
+      const readerSemantic = readerView.regions.find((r) => r.region === 'semantic');
+      assert(readerSemantic !== undefined, 'the reader sees the same region');
+      assert(
+        readerSemantic!.readOnly === true,
+        `the reader may not write, got ${String(readerSemantic!.readOnly)}`,
+      );
+      assert(
+        readerSemantic!.sharedWith.includes(pid),
+        `the writer shares it too, got ${JSON.stringify(readerSemantic!.sharedWith)}`,
+      );
+      assert(
+        readerSemantic!.readOnlyPeers?.includes(pid) !== true,
+        `the writer is not read-only, got ${JSON.stringify(readerSemantic!.readOnlyPeers)}`,
+      );
 
       const dumped = await client!.request<{
         entries: readonly { key: string; value: unknown }[];
@@ -14323,21 +14420,7 @@ async function runMemoryInspectChecks(): Promise<void> {
     });
 
     await checkAsync('cortex memory prints the regions of a live process', async () => {
-      process.env['CORTEX_HOME'] = tmp;
-      const pid = daemonPid!;
-      let out = '';
-      const prevWrite = process.stdout.write;
-      process.stdout.write = ((chunk: unknown): boolean => {
-        out += String(chunk);
-        return true;
-      }) as unknown as typeof process.stdout.write;
-      let code: number;
-      try {
-        code = await cmdMemory([String(pid)]);
-      } finally {
-        process.stdout.write = prevWrite;
-      }
-      assert(code === 0, `exit 0, got ${code}`);
+      const out = await memoryOutput([String(daemonPid!)]);
       assert(out.includes('semantic'), `the region is listed, got: ${out}`);
       assert(out.includes('episodic'), `the other region is listed, got: ${out}`);
       assert(out.includes('SHARED WITH'), `the sharing column is there, got: ${out}`);
@@ -14348,21 +14431,7 @@ async function runMemoryInspectChecks(): Promise<void> {
       // `ENOMEM` check is measured against — and no view said so. The operator
       // could see how many entries a region held and had no way to tell that
       // the next write would trap.
-      process.env['CORTEX_HOME'] = tmp;
-      const pid = daemonPid!;
-      let out = '';
-      const prevWrite = process.stdout.write;
-      process.stdout.write = ((chunk: unknown): boolean => {
-        out += String(chunk);
-        return true;
-      }) as unknown as typeof process.stdout.write;
-      let code: number;
-      try {
-        code = await cmdMemory([String(pid)]);
-      } finally {
-        process.stdout.write = prevWrite;
-      }
-      assert(code === 0, `exit 0, got ${code}`);
+      const out = await memoryOutput([String(daemonPid!)]);
 
       const lines = out.split('\n');
       const header = lines.find((l) => l.startsWith('REGION'));
@@ -14397,21 +14466,108 @@ async function runMemoryInspectChecks(): Promise<void> {
     await checkAsync('cortex memory dumps a region', async () => {
       process.env['CORTEX_HOME'] = tmp;
       const pid = daemonPid!;
-      let out = '';
-      const prevWrite = process.stdout.write;
-      process.stdout.write = ((chunk: unknown): boolean => {
-        out += String(chunk);
-        return true;
-      }) as unknown as typeof process.stdout.write;
-      let code: number;
-      try {
-        code = await cmdMemory([String(pid), 'semantic']);
-      } finally {
-        process.stdout.write = prevWrite;
-      }
-      assert(code === 0, `exit 0, got ${code}`);
+      const out = await memoryOutput([String(pid), 'semantic']);
       assert(out.includes('note'), `the entry is printed, got: ${out}`);
       assert(out.includes('hello'), `the value is printed, got: ${out}`);
+    });
+
+    await checkAsync('cortex memory says who may write to a region', async () => {
+      // The kernel knows two different things about a shared region: whether
+      // THIS process may write to it, and whether the peers that share it may.
+      // A region table that said neither left the operator with an `EPERM`
+      // and no way to know it was not a bug.
+      const writerOut = await memoryOutput([String(daemonPid!)]);
+      const readerOut = await memoryOutput([String(readerPid!)]);
+
+      const header = writerOut.split('\n').find((l) => l.startsWith('REGION'));
+      assert(header !== undefined, `the region table has a header, got: ${writerOut}`);
+      // By position, not by word-search: the columns come from the header the
+      // table really printed.
+      const accessAt = header!.indexOf('ACCESS');
+      const entriesAt = header!.indexOf('ENTRIES');
+      const sharedAt = header!.indexOf('SHARED WITH');
+      assert(
+        accessAt > 0 && entriesAt > accessAt && sharedAt > entriesAt,
+        `the columns are in order, got: ${header}`,
+      );
+
+      const row = (out: string, name: string): string => {
+        const line = out.split('\n').find((l) => l.startsWith(name));
+        assert(line !== undefined, `${name} is listed, got: ${out}`);
+        return line!;
+      };
+      const writerRow = row(writerOut, 'semantic');
+      const readerRow = row(readerOut, 'semantic');
+
+      assert(
+        writerRow.slice(accessAt, entriesAt).trim() === 'read-write',
+        `the writer may write, got: ${writerRow}`,
+      );
+      assert(
+        readerRow.slice(accessAt, entriesAt).trim() === 'read-only',
+        `the reader may not, got: ${readerRow}`,
+      );
+
+      // And the peer list says the same about the other side of the same
+      // region: sharing is not writing.
+      const writerPeers = writerRow.slice(sharedAt).trim();
+      assert(
+        writerPeers === `${readerPid} (read-only)`,
+        `the writer sees a read-only peer, got: ${writerPeers}`,
+      );
+      const readerPeers = readerRow.slice(sharedAt).trim();
+      assert(
+        readerPeers === `${daemonPid} (read-write)`,
+        `the reader sees a writable peer, got: ${readerPeers}`,
+      );
+    });
+
+    await checkAsync('an access mode nobody reported is not a writable one', async () => {
+      // The kernel can be older than this view. A region whose access mode it
+      // did not report prints `?` — never `read-write`: that would be a claim
+      // about a permission nobody stated.
+      assert(
+        formatAccess(undefined) === '?',
+        `the unknown mode is ?, got ${formatAccess(undefined)}`,
+      );
+      assert(
+        formatAccess(true) === 'read-only',
+        `the read-only mode is named, got ${formatAccess(true)}`,
+      );
+      assert(
+        formatAccess(false) === 'read-write',
+        `the writable mode is named, got ${formatAccess(false)}`,
+      );
+      assert(
+        formatPeers([3], [3]) === '3 (read-only)',
+        `a read-only peer is marked, got ${formatPeers([3], [3])}`,
+      );
+      assert(
+        formatPeers([3], []) === '3 (read-write)',
+        `a writable peer is marked, got ${formatPeers([3], [])}`,
+      );
+      assert(
+        formatPeers([3], undefined) === '3 (?)',
+        `an unknown peer mode is ?, got ${formatPeers([3], undefined)}`,
+      );
+      assert(formatPeers([], []) === '-', `no peers is -, got ${formatPeers([], [])}`);
+    });
+
+    await checkAsync('cortex memory names the access mode when it dumps a region', async () => {
+      // The region table and the region dump are two views of one region, so
+      // they say the same thing about it.
+      const writerOut = await memoryOutput([String(daemonPid!), 'semantic']);
+      const readerOut = await memoryOutput([String(readerPid!), 'semantic']);
+      assert(
+        writerOut.startsWith(
+          `# memory of pid ${daemonPid} (rememberer) — region 'semantic' (read-write)`,
+        ),
+        `the writer's dump names it, got: ${writerOut}`,
+      );
+      assert(
+        readerOut.startsWith(`# memory of pid ${readerPid} (reader) — region 'semantic' (read-only)`),
+        `the reader's dump names it, got: ${readerOut}`,
+      );
     });
 
     await checkAsync('cortex memory says plainly that it needs a live kernel', async () => {

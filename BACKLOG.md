@@ -1082,6 +1082,52 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE §4.5 (the view says the ceiling); STATE §2.3 (the size
   ceiling, and the two numbers); CHANGELOG.
 
+- [x] **#097** The kernel knew which regions refuse writes, and no view said
+  so → **fixed.** A region's policy may declare `readOnly`, and then
+  `memory_write` traps **`EPERM`** on it (ABI.md §4.4). The access mode
+  belongs to the *binding*, not to the region: a `shared` region's physical
+  key is shared, so a process whose own binding is read-only reads what the
+  others write and cannot add a byte to it. Sharing is not writing, and the
+  two live on opposite sides of the same region.
+
+  **The flag was already on the wire and no view printed it.** The region's
+  own `readOnly` had been in the transport's `memory` reply since the command
+  was born. So an operator whose agent's write had just failed with `EPERM`
+  was left with an errno and no way to know it was a policy and not a bug —
+  and a writer looking at a shared region could see that a peer shared it,
+  but not whether that peer could change it.
+
+  **Now both sides say it:**
+
+  ```
+  REGION          KIND      BACKING     ACCESS     ENTRIES   WRITES    LIMIT     SHARED WITH
+  ------------------------------------------------------------------------------------------
+  episodic        cow       inmem       read-write 0         0         100       -
+  semantic        shared    inmem       read-write 1         2         ∞         3 (read-only)
+  procedural      private   inmem       read-write 0         0         ∞         -
+  ```
+
+  The region **dump** names the same mode in its header, because the table
+  and the dump are two views of one region and must not disagree about it.
+
+  **A permission nobody reported is not a granted one.** The transport gained
+  a field for the peers' modes (`readOnlyPeers`, a subset of `sharedWith`) and
+  one for the dump's header (`readOnly`); both are additions to a reply, so
+  the transport's version does not move. A mode the kernel did not report
+  prints `?` — never `read-write`.
+
+  **3 new smoke checks** (782 → 785), reverse-verified: with the server
+  dropping the peers' modes, the transport check fails ("the reader may only
+  read it") and the table prints `3 (?)` rather than claiming it can write;
+  with the dump reply dropping the mode, the dump check fails ("the writer's
+  dump names it") and the header prints `(?)`; with the view ignoring the
+  flag, three checks fail at once (the table, the dump header, and the
+  formatter itself); and with the peers' markers dropped, the peer assertion
+  fails ("the writer sees a read-only peer").
+
+  Docs: ARCHITECTURE §4.5 (the view says who may write); STATE §2.3 (write
+  access); ABI §3.2 (the errno table now names `memory_write`); CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

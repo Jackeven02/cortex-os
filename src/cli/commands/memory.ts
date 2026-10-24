@@ -64,6 +64,18 @@ interface RegionInfo {
   readonly truncated: boolean;
   readonly sharedWith: readonly number[];
   /**
+   * The peers that may only **read** this region — a subset of `sharedWith`.
+   *
+   * Sharing is not writing: a peer whose own binding to this region is
+   * read-only sees everything here and cannot add a byte to it (its
+   * `memory_write` traps `EPERM`). The peer list says who can *see* the
+   * region; this says which of them may *write* to it.
+   *
+   * Optional because a kernel older than this field does not report it — and
+   * an access mode nobody reported is not a writable one: it prints as `?`.
+   */
+  readonly readOnlyPeers?: readonly number[];
+  /**
    * The resolved write-count ceiling: the region's own `maxEntries` when it
    * declared one, else the kernel-wide cap. `-1` is unbounded.
    *
@@ -91,6 +103,13 @@ interface MemoryDumpResult {
   readonly pid: number;
   readonly role: string;
   readonly region: string;
+  /**
+   * Whether this process may write to the dumped region.
+   *
+   * Optional because a kernel older than this field does not report it, and an
+   * access mode nobody reported prints as `?` — not as `read-write`.
+   */
+  readonly readOnly?: boolean;
   readonly entries: readonly MemoryEntryView[];
 }
 
@@ -125,16 +144,25 @@ OPTIONS
   -h, --help       Show this help
 
 COLUMNS
+  ACCESS       what this process may do with the region: read-write, or
+               read-only when its own binding refuses writes (memory_write
+               then traps EPERM). '?' when the kernel did not report it
   ENTRIES      how many distinct keys the region holds
-  WRITES       how many writes the region has made — this is the number the
-               limit is measured against, and it is what a region that is
-               nearly full shows
+  WRITES       how many writes the region has had — every writer to it, not
+               only this process — this is the number the limit is measured
+               against, and it is what a region that is nearly full shows
   LIMIT        the region's write-count ceiling: its own maxEntries when it
                declared one, else the kernel-wide cap, ∞ when it is
                unbounded. The write that would exceed it traps ENOMEM
-  SHARED WITH  the processes bound to the same physical region
+  SHARED WITH  the processes bound to the same physical region, each with
+               the access mode it holds it under: a peer marked (read-only)
+               can see this region but cannot write to it
 
 NOTES
+  The region table and the region dump are two views of one region, so they
+  say the same thing about it: dumping a region names its access mode in the
+  header — (read-write) or (read-only).
+
   This reads a LIVE kernel. An agent's memory lives in the kernel's memory
   driver — with the default 'inmem' backing, in the kernel process's RAM —
   so there is no on-disk copy to fall back on. Start one with
@@ -230,6 +258,12 @@ EXAMPLES
  * write count would invite a comparison the kernel never makes. A region with
  * three entries written fifteen times holds three entries and has made
  * fifteen writes, and it is the second number the cap is about.
+ *
+ * The `ACCESS` column is this process's own right to write to the region,
+ * and the peers in `SHARED WITH` carry theirs. A read-only binding traps
+ * `memory_write` with `EPERM` (ABI.md §4.4), so a region table that did not
+ * say it left the operator with an `EPERM` and no way to know it was not a
+ * bug.
  */
 function printRegions(result: MemoryListResult): void {
   console.log(`# memory of pid ${result.pid} (${result.role})`);
@@ -243,6 +277,7 @@ function printRegions(result: MemoryListResult): void {
     'REGION'.padEnd(16) +
     'KIND'.padEnd(10) +
     'BACKING'.padEnd(12) +
+    'ACCESS'.padEnd(11) +
     'ENTRIES'.padEnd(10) +
     'WRITES'.padEnd(10) +
     'LIMIT'.padEnd(10) +
@@ -252,17 +287,56 @@ function printRegions(result: MemoryListResult): void {
 
   for (const region of result.regions) {
     const count = region.truncated ? `${region.entries}+` : String(region.entries);
-    const shared = region.sharedWith.length === 0 ? '-' : region.sharedWith.join(', ');
     console.log(
       region.region.padEnd(16) +
         region.kind.padEnd(10) +
         region.backing.padEnd(12) +
+        formatAccess(region.readOnly).padEnd(11) +
         count.padEnd(10) +
         String(region.writes).padEnd(10) +
         formatLimit(region.effectiveMaxEntries).padEnd(10) +
-        shared,
+        formatPeers(region.sharedWith, region.readOnlyPeers),
     );
   }
+}
+
+/**
+ * A region's access mode, as it is printed.
+ *
+ * `read-write` when the process may write to it, `read-only` when its own
+ * binding refuses writes, and `?` when the kernel did not report one — an
+ * access mode nobody reported is not a writable one, and printing
+ * `read-write` there would be a claim about a permission that was never
+ * stated.
+ */
+export function formatAccess(readOnly: boolean | undefined): string {
+  if (readOnly === undefined) return '?';
+  return readOnly ? 'read-only' : 'read-write';
+}
+
+/**
+ * The peers bound to the same physical region, each with the access mode it
+ * holds the region under.
+ *
+ * A peer that may only read the region sees everything in it and cannot add a
+ * byte to it — the same `EPERM` a read-only binding traps. The list says who
+ * can *see* the region; the marker says which of them may *write* to it, and
+ * a peer whose mode nobody reported is marked `?` rather than assumed
+ * writable.
+ */
+export function formatPeers(
+  sharedWith: readonly number[],
+  readOnlyPeers: readonly number[] | undefined,
+): string {
+  if (sharedWith.length === 0) return '-';
+  const readOnly = readOnlyPeers === undefined ? undefined : new Set(readOnlyPeers);
+  return sharedWith
+    .map((pid) =>
+      readOnly === undefined
+        ? `${pid} (?)`
+        : `${pid} (${readOnly.has(pid) ? 'read-only' : 'read-write'})`,
+    )
+    .join(', ');
 }
 
 /**
@@ -282,13 +356,19 @@ function formatLimit(effectiveMaxEntries: number | undefined): string {
 /**
  * Render a region's entries.
  *
+ * The header names the region's access mode, because the table does and the
+ * two views of one region must not disagree about who may write to it.
+ *
  * The value is printed as compact JSON — lossless for anything that came
  * through the wire, and greppable. A value that is not JSON-serialisable
  * falls back to `String(value)`, which is what the kernel's own serialiser
  * does.
  */
 function printEntries(result: MemoryDumpResult): void {
-  console.log(`# memory of pid ${result.pid} (${result.role}) — region '${result.region}'`);
+  console.log(
+    `# memory of pid ${result.pid} (${result.role}) — region '${result.region}' ` +
+      `(${formatAccess(result.readOnly)})`,
+  );
 
   if (result.entries.length === 0) {
     console.log('  (no entries)');

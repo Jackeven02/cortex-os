@@ -141,16 +141,21 @@ $ cortex logs 1234
 # The table also says how much each region MAY hold: LIMIT is the write-count
 # ceiling the kernel enforces with ENOMEM, and WRITES is the count it is
 # measured against (ENTRIES is a different number — how many keys it holds).
+# And it says who may WRITE: ACCESS is this process's own right to write
+# (a read-only region traps EPERM), and each peer in SHARED WITH carries its
+# own — sharing is not writing.
 $ cortex memory 1234
 # memory of pid 1234 (coder)
-REGION          KIND      BACKING     ENTRIES   WRITES    LIMIT     SHARED WITH
--------------------------------------------------------------------------------
-episodic        cow       inmem       0         0         100       -
-semantic        shared    inmem       2         3         ∞         -
-procedural      private   inmem       0         0         ∞         -
+REGION          KIND      BACKING     ACCESS     ENTRIES   WRITES    LIMIT     SHARED WITH
+------------------------------------------------------------------------------------------
+episodic        cow       inmem       read-write 0         0         100       -
+semantic        shared    inmem       read-write 2         3         ∞         1240 (read-only)
+procedural      private   inmem       read-write 0         0         ∞         -
 $ cortex memory 1234 semantic
-# memory of pid 1234 (coder) — region 'semantic'
-issue:42        "found it — src/foo.ts:42"  2026-10-23T14:23:04.881Z
+# memory of pid 1234 (coder) — region 'semantic' (read-write)
+issue:42     "found it — src/foo.ts:42"  2026-10-23T14:23:04.881Z
+last_result  "ok"  2026-10-23T14:23:06.115Z
+# 2 entries
 
 # Wait for a process to end — and get its REAL exit code
 # (the exit code is the child's own, so `cortex wait 2 || echo failed` works)
@@ -247,7 +252,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 782 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 785 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

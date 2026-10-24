@@ -1546,6 +1546,59 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The kernel knew which regions refuse writes, and no view said so.** A
+  region's policy may declare `readOnly`, and then `memory_write` traps
+  **`EPERM`** on it (ABI.md §4.4). The access mode belongs to the *binding*,
+  not to the region: a `shared` region's physical key is shared, so a process
+  whose own binding is read-only reads what the others write and cannot add a
+  byte to it. Sharing is not writing, and the two live on opposite sides of
+  the same region.
+
+  **The flag was already on the wire and no view printed it.** The region's
+  own `readOnly` had been in the transport's `memory` reply since the command
+  was born — so an operator whose agent's write had just failed with `EPERM`
+  was left with an errno and no way to know it was a policy and not a bug. A
+  writer looking at a shared region could see that a peer shared it, but not
+  whether that peer could change it.
+
+  **Now both sides say it.** The region's own right to write is the
+  **`ACCESS`** column, and each peer in **`SHARED WITH`** carries its own:
+
+  ```console
+  $ cortex memory 2
+  # memory of pid 2 (coder)
+  REGION          KIND      BACKING     ACCESS     ENTRIES   WRITES    LIMIT     SHARED WITH
+  ------------------------------------------------------------------------------------------
+  episodic        cow       inmem       read-write 0         0         100       -
+  semantic        shared    inmem       read-write 1         2         ∞         3 (read-only)
+  procedural      private   inmem       read-write 0         0         ∞         -
+  ```
+
+  The region **dump** names the same mode in its header — the table and the
+  dump are two views of one region, and they say the same thing about it:
+
+  ```console
+  $ cortex memory 3 semantic
+  # memory of pid 3 (reader) — region 'semantic' (read-only)
+  issue:42  "found it"  2026-10-24T20:28:27.203Z
+  # 1 entry
+  ```
+
+  **A permission nobody reported is not a granted one.** The transport gained
+  a field for the peers' modes (`readOnlyPeers`, a subset of `sharedWith`) and
+  one for the dump's header (`readOnly`); both are additions to a reply, so
+  the transport's version does not move. A mode the kernel did not report
+  prints `?` — never `read-write`.
+
+  **3 new smoke checks** (782 → 785), reverse-verified: with the server
+  dropping the peers' modes, the transport check fails ("the reader may only
+  read it") and the table prints `3 (?)` rather than claiming it can write;
+  with the dump reply dropping the mode, the dump check fails ("the writer's
+  dump names it") and the header prints `(?)`; with the view ignoring the
+  flag, three checks fail at once (the table, the dump header, and the
+  formatter itself); and with the peers' markers dropped, the peer assertion
+  fails ("the writer sees a read-only peer").
+
 - **The kernel knew how much a memory region could hold, and no view said so.**
   A region may declare a write-count ceiling — its own `maxEntries`, else the
   kernel-wide `maxRegionEntries` — and `memory_write` traps **`ENOMEM`** on

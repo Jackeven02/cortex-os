@@ -154,7 +154,7 @@ Modeled on POSIX where possible. New codes prefixed with `E` and documented here
 | `ENOENT` | No such entity (memory region, channel, snapshot) | `memory_read`, `recv`, `restore` |
 | `EAGAIN` | Resource temporarily unavailable; retry | `recv` (non-blocking), `spawn` (PID exhaustion — should never happen) |
 | `EINTR` | Syscall interrupted by signal | any blocking syscall |
-| `EPERM` | Permission denied | `kill` (cross-group), driver-internal |
+| `EPERM` | Permission denied | `kill` (cross-group), `memory_write` (read-only region), driver-internal |
 | `ETIMEDOUT` | Driver or kernel timeout | `llm_call`, `tool_call`, `recv` |
 | `ENOMEM` | Memory region full or budget exhausted | `memory_write` |
 | `EBADF` | Bad channel/file descriptor | `send`, `recv` |
