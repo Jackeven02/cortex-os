@@ -336,6 +336,20 @@ The same facts reach you three ways — `awaitExit`, the
 and they cannot disagree: all three are taken at the same moment, the ZOMBIE
 transition.
 
+**And the exit code is known before the process is gone.** A process that is
+`EXITING` already carries its exit code and reason: the outcome is recorded
+when it is **decided**, not after the cleanup. So a host that polls the table
+and sees `state === 'exiting'` can read the code the process will end with —
+it does not have to wait for the zombie, and it never has to guess.
+
+That matters because the gap between "the process is leaving" and "the exit
+code is written" used to be a real window: the exit frame's write awaits the
+disk, and a host that read the table in that window found nothing at all.
+`null` is the absence of an answer — report it as unknown, never as success.
+The CLI keeps that rule in one place (`src/cli/process_outcome.ts`), so
+`cortex spawn`, `cortex restore` and `cortex wrap` cannot tell the operator
+different stories about the same run.
+
 ### 7.2 The other host-facing surface
 
 | What you want | What to use |

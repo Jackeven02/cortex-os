@@ -56,6 +56,7 @@ import {
   type OpenCall,
 } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
+import { formatOutcomeCode } from '../process_outcome.js';
 
 /** A node in the rendered tree. */
 interface TreeNode {
@@ -301,7 +302,7 @@ function lineFor(
   // how long.
   let note = '';
   if (m.state === 'zombie') {
-    note = m.exitReason === null ? 'exited' : `exit ${m.exitCode ?? 0} (${m.exitReason})`;
+    note = m.exitReason === null ? 'exited' : `exit ${formatOutcomeCode(m.exitCode)} (${m.exitReason})`;
   } else if (call !== undefined) {
     note = formatOpenCall(call, m.blockedOn, now);
     if (stallAfterMs !== null && isStalled(call, now, stallAfterMs)) {

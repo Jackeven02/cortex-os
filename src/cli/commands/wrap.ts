@@ -53,6 +53,7 @@ import {
 } from '../index.js';
 import type { ProcessMeta } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
+import { processOutcome } from '../process_outcome.js';
 import type { AgentSpec, MemoryRegionPolicy, ProcessState, RestartPolicy } from '../../kernel/types.js';
 import { PID_INIT } from '../../kernel/process_table.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
@@ -83,54 +84,17 @@ const TIMEOUT_EXIT_CODE = 137;
  * its exit record, and the exit code only lands once that write is done. The
  * wrapper used to read that window as "no code" and default it to zero — so
  * `cortex wrap -- <command that failed with 127>` sometimes reported
- * success. The window is real: two disk writes sit between the process
- * becoming EXITING and the code being recorded.
+ * success. The window was real: two disk writes sat between the process
+ * becoming EXITING and the code being recorded. The kernel no longer has it
+ * (the outcome is recorded when it is *decided*), and the rule lives in one
+ * place now — `processOutcome` in `src/cli/process_outcome.ts` — so that
+ * `cortex spawn` and `cortex restore` cannot tell the operator a different
+ * story about the same run.
  *
- * Exported so the rule can be pinned on its own, the way `nextDeadline` and
- * `decideAuthority` are.
+ * Exported under this name so the rule can be pinned on its own, the way
+ * `nextDeadline` and `decideAuthority` are.
  */
-export function wrapOutcome(
-  entry:
-    | {
-        readonly state: ProcessState;
-        readonly exitCode: number | null;
-        readonly exitReason: string | null;
-      }
-    | undefined,
-  exitRecord: { readonly code: number; readonly reason: string } | undefined,
-): { state: ProcessState; exitCode: number | null; exitReason: string | null } {
-  if (entry === undefined) {
-    // Reaped: recover the REAL status from the .crec exit record rather than
-    // assuming success, or a killed run would print "code 0: completed".
-    return {
-      state: 'zombie',
-      exitCode: exitRecord?.code ?? 1,
-      exitReason:
-        exitRecord?.reason ?? 'reaped with no exit record (crashed or killed before recording)',
-    };
-  }
-  if (entry.state === 'exiting') {
-    // The code is not known yet. Whatever is available is used; what is
-    // not available stays **unknown** — a null code is reported as "the
-    // run never finished", never as success.
-    return {
-      state: 'exiting',
-      exitCode: exitRecord?.code ?? entry.exitCode,
-      exitReason: exitRecord?.reason ?? entry.exitReason,
-    };
-  }
-  if (entry.state === 'zombie') {
-    return {
-      state: 'zombie',
-      exitCode: entry.exitCode ?? exitRecord?.code ?? 1,
-      exitReason: entry.exitReason ?? exitRecord?.reason ?? 'completed',
-    };
-  }
-  if (entry.state === 'suspended') {
-    return { state: 'suspended', exitCode: 0, exitReason: 'checkpointed (suspended)' };
-  }
-  return { state: entry.state, exitCode: null, exitReason: null };
-}
+export const wrapOutcome = processOutcome;
 
 /**
  * Whether an attempt has finished, as far as the wrapper is concerned.

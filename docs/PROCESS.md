@@ -185,6 +185,22 @@ The process has called `exit()` or received a terminating signal. Cleanup is in 
 - Final budget counters are written
 - Exit code and reason are recorded
 
+**The outcome is decided before the state says `EXITING`.** The exit code and
+the reason are known the moment the exit is *requested* — the syscall was
+called with them — so the kernel records them before the transition, not
+after the cleanup. The exit frame in the log is written later, and that write
+awaits the disk; a host that read the process table in that window used to
+find no exit code at all.
+
+That window was not a harmless detail. "No exit code" is the absence of an
+answer, and the CLI turned the absence into zero — so `cortex spawn` on an
+agent that threw an exception sometimes printed `code 0: completed` and exited
+0, while the kernel's own metadata said `exitCode: 1` the whole time. The
+invariant now is:
+
+> **A process that is exiting already knows how it will end. And an ending
+> nobody saw is reported as unknown — never as success.**
+
 EXITING is bounded — if cleanup takes more than `exit_timeout_ms` (default 5000), the kernel escalates to ZOMBIE forcibly. This prevents hung drivers from blocking shutdown forever.
 
 ### 3.9 `ZOMBIE`

@@ -710,7 +710,11 @@ export class SignalManager {
     const recorder = this.#table.recorderFor(pid);
     const finalOffset = recorder?.currentOffset ?? entry.initialLogOffset;
 
-    this.#table.setExitInfo(pid, exitCode, exitReason, finalOffset);
+    // The outcome is decided before the state says "exiting" — the same
+    // order the exit syscall uses, so a reader of the process table never
+    // sees a process on its way out that does not know how it will end.
+    this.#table.setExitOutcome(pid, exitCode, exitReason);
+    this.#table.setFinalLogOffset(pid, finalOffset);
 
     await this.#table.setState(pid, 'exiting', {
       trigger: 'signal',
@@ -782,7 +786,10 @@ export class SignalManager {
 
     const recorder = this.#table.recorderFor(pid);
     const finalOffset = recorder?.currentOffset ?? entry.initialLogOffset;
-    this.#table.setExitInfo(pid, exitCode, exitReason, finalOffset);
+    // Same order as the exit syscall: the outcome first, then the offset,
+    // then the states.
+    this.#table.setExitOutcome(pid, exitCode, exitReason);
+    this.#table.setFinalLogOffset(pid, finalOffset);
 
     for (const next of path) {
       await this.#table.setState(pid, next, {

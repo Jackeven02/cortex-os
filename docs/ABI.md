@@ -203,6 +203,13 @@ Block until a child exits. If `pid` is omitted, wait for any child.
 - **Reversibility:** `idempotent` — calling twice on the same zombie returns the same result the first time and `ECHILD` the second
 - **Recording:** the PID waited on, the result
 
+`WaitResult.exitCode` is the child's **real** exit code — never a placeholder.
+The kernel records a child's outcome when it is decided (PROCESS.md §3.8), so
+a zombie always carries it. A child that ended in a way the kernel cannot name
+is reported as a failure, not as zero: a parent told "the child exited 0"
+will believe the child succeeded, and a supervisor that believes that does not
+restart anything.
+
 `WaitOptions`:
 
 ```typescript

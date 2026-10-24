@@ -645,8 +645,13 @@ export class ProcessTable {
     const reapedAt = this.#now();
     const result: WaitResult = {
       pid,
-      exitCode: entry.exitCode ?? 0,
-      exitReason: entry.exitReason ?? 'unknown',
+      // A zombie always knows how it ended: the outcome is recorded when it
+      // is decided, before the EXITING transition. The fallback is here for
+      // the impossible case, and it is **not** zero — a parent that is told
+      // "the child exited 0" will believe the child succeeded, and a child
+      // whose ending the kernel cannot name did not succeed.
+      exitCode: entry.exitCode ?? 1,
+      exitReason: entry.exitReason ?? 'unknown ending',
       budgetsSpent: { ...entry.budgetsSpent },
       syscallLogRange: [entry.initialLogOffset, entry.finalLogOffset ?? entry.initialLogOffset],
       reapedAt,
@@ -803,14 +808,38 @@ export class ProcessTable {
   }
 
   /**
-   * Record the final exit code and reason. Called by the exit syscall and
-   * by signal-induced termination, before the EXITING → ZOMBIE transition.
+   * Record how the process is going to end.
+   *
+   * Called the moment the outcome is **decided** — before the EXITING
+   * transition — so a reader of the table never sees a process that is on
+   * its way out without knowing how it will end. The exit syscall knows the
+   * code and the reason before it writes anything; the log frame and the
+   * final offset come later, and they are recorded separately.
+   *
+   * The two used to be one call, and the split is the fix: the exit path
+   * walks to EXITING, then *awaits* the recorder to write the exit frame,
+   * and only then set the code. Two disk writes sat in that window, and a
+   * host that read the table in it saw `exitCode: null` — and the honest
+   * reaction to "no exit code" is "it failed", not "it succeeded".
+   *
+   * docs/PROCESS.md §3.8 says the exit code and reason are recorded in
+   * EXITING. Now the code agrees.
    */
-  setExitInfo(pid: ProcessId, code: number, reason: string, finalLogOffset: SyscallOffset): void {
-    const entry = this.mustGet(pid, 'setExitInfo');
+  setExitOutcome(pid: ProcessId, code: number, reason: string): void {
+    const entry = this.mustGet(pid, 'setExitOutcome');
     entry.exitCode = code;
     entry.exitReason = reason;
-    entry.finalLogOffset = finalLogOffset;
+  }
+
+  /**
+   * Record the final log offset — the byte range the process's log spans.
+   *
+   * Separate from the outcome because it is only known once the last frame
+   * has been written, which is *after* the outcome is decided.
+   */
+  setFinalLogOffset(pid: ProcessId, offset: SyscallOffset): void {
+    const entry = this.mustGet(pid, 'setFinalLogOffset');
+    entry.finalLogOffset = offset;
   }
 
   // ---------------------------------------------------------------------------

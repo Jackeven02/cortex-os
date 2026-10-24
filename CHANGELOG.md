@@ -1545,6 +1545,50 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A crashed agent could be reported as a successful one.** `cortex spawn` on
+  an agent that threw an exception — a `TypeError`, a failed await — sometimes
+  printed `process exited (code 0: completed)` and **exited 0**. The kernel
+  knew the truth the whole time: the process's own metadata said
+  `exitCode: 1` with the reason, and the `.crec` held the exit frame. The CLI
+  read the process table in the moment between the process becoming `EXITING`
+  and its exit code being written, found nothing, and turned the absence of
+  an answer into zero. A shell script could not tell the difference.
+
+  **Two disk writes sat in that window**, and the window was real: the exit
+  path walks to `EXITING`, then *awaits* the recorder to write the exit frame,
+  and only then set the code. `cortex wrap` had already been bitten by the
+  same window and had its own fix; `cortex spawn` and `cortex restore` did
+  not, so the CLI could tell the operator different stories about the same
+  run.
+
+  **The kernel no longer has the window.** The outcome is recorded when it is
+  **decided** — the exit syscall was called with a code and a reason, so they
+  are known before the `EXITING` transition — not after the cleanup. A process
+  that is exiting now carries the code it will end with, so a host that reads
+  the table never has to guess (PROCESS.md §3.8, ARCHITECTURE.md §4.2). The
+  `wait` syscall is held to the same rule: an ending the kernel cannot name
+  is reported as a failure, because a parent told "the child exited 0" will
+  believe the child succeeded — and a supervisor that believes that does not
+  restart anything.
+
+  **And the CLI has one rule for it**, in `src/cli/process_outcome.ts`:
+  **an unknown ending is reported as unknown, never as success.** `cortex
+  spawn`, `cortex restore`, `cortex top` and `cortex wrap` all go through it,
+  so they cannot disagree. An unknown code prints as `?`, because `?` is a
+  question and `0` is an answer — and the answer would be a lie.
+
+  **Three new smoke checks** (713 → 716), all three reverse-verified: the
+  outcome published after the exit frame is written again → "a process knows
+  how it will end before it is gone" fails ("the exit code was not known
+  while exiting: null"); the shared rule turning an unknown ending back into
+  a zero → "a missing exit code is never a success" fails; the CLI zeroing
+  the code it just read → "cortex spawn reports a crash as a crash" fails
+  (and prints the old shape: `code 0: cannot read properties of undefined`).
+
+  The kernel check is deterministic rather than lucky: the recorder holds the
+  exit frame until the test has looked at the table, so the window is opened
+  on purpose instead of being waited for.
+
 - **The output capture could be switched off without a word.** The tap that
   copies an agent's printed lines into `output.log` was installed by
   replacing `process.stdout.write`. That worked — until anything else

@@ -17,7 +17,8 @@ import { parseArgs } from 'node:util';
 import { bootCliKernel, defaultKernelDir, writeMeta, unbrand, type ProcessMeta } from '../index.js';
 import { asProcessId, asChainId, type ChainId } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
-import { findCheckpointByTag, listCheckpoints } from '../process_store.js';
+import { findCheckpointByTag, listCheckpoints, readExitRecord } from '../process_store.js';
+import { processOutcome, formatOutcomeCode } from '../process_outcome.js';
 import { KernelCommandError, probeKernel, type KernelProbe } from '../kernel_client.js';
 
 export async function cmdRestore(args: string[]): Promise<number> {
@@ -212,8 +213,14 @@ EXAMPLES
 
     const e = kernel.table.get(newPid);
     const elapsed = Date.now() - startTime;
+    // The same rule as `cortex spawn` and `cortex wrap`: an ending nobody
+    // saw is unknown, and unknown is not success.
+    const exitRec = e === undefined || e.exitCode === null ? await readExitRecord(dir, newPid) : undefined;
+    const outcome = processOutcome(e, exitRec);
     if (done) {
-      console.log(`process exited (code ${e?.exitCode ?? 0}: ${e?.exitReason ?? 'completed'})`);
+      console.log(
+        `process exited (code ${formatOutcomeCode(outcome.exitCode)}: ${outcome.exitReason ?? 'unknown'})`,
+      );
     } else if (e !== undefined) {
       console.log(`process still ${e.state} after ${elapsed}ms`);
     }
@@ -225,8 +232,8 @@ EXAMPLES
       pgid: unbrand(newPid),
       role: e?.role ?? 'restored',
       state: e?.state ?? 'zombie',
-      exitCode: e?.exitCode ?? null,
-      exitReason: e?.exitReason ?? null,
+      exitCode: outcome.exitCode,
+      exitReason: outcome.exitReason,
       startedAt: e?.startedAt ?? restored?.startedAt ?? new Date(startTime).toISOString(),
       lastTransitionAt: e?.lastTransitionAt ?? new Date().toISOString(),
       budgetsSpent: e?.budgetsSpent ?? restored?.budgetsSpent ?? { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: elapsed, syscallCount: 0 },
@@ -241,7 +248,7 @@ EXAMPLES
     writeMeta(dir, meta);
 
     await kernel.shutdown();
-    return done ? (e?.exitCode ?? 0) : 0;
+    return done ? (outcome.exitCode ?? 1) : 0;
   } catch (err) {
     await kernel.shutdown();
     throw err;

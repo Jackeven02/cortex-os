@@ -171,6 +171,38 @@ The user-facing surface. Should feel like a real OS shell.
   engine dropped from the public surface → "the replay engine is part of the
   public surface" fails.
 
+- [x] **#074** A crashed agent could be reported as a successful one →
+  **fixed.** `cortex spawn` on an agent that threw an exception sometimes
+  printed `process exited (code 0: completed)` and **exited 0**, while the
+  kernel's own metadata said `exitCode: 1` with the reason the whole time.
+  A shell script could not tell the difference, and the project's own
+  feedback file already carries the lesson: *"轮询测试要把「读不到退出码」
+  当失败而不是 `?? 0` 兜底 —— 我们正是被 `exitCode ?? 0` 掩盖了整整一轮，
+  误以为 C1 修复已被验证。"* **The CLI read the process table in the moment
+  between the process becoming `EXITING` and its exit code being written,
+  found nothing, and turned the absence of an answer into zero.** The window
+  was real: two disk writes sat between the two events, and the exit path
+  *awaited* the recorder in between. `cortex wrap` had already been bitten by
+  it and had its own fix — `cortex spawn` and `cortex restore` had not, so
+  the CLI could tell the operator different stories about the same run.
+  **The kernel no longer has the window**: the outcome is recorded when it
+  is **decided** (the exit syscall was called with a code and a reason, so
+  they are known before the `EXITING` transition), not after the cleanup —
+  which is what PROCESS.md §3.8 has been claiming all along. **And the CLI
+  has one rule for it** (`src/cli/process_outcome.ts`): an unknown ending is
+  reported as unknown, never as success; an unknown code prints as `?`,
+  because `?` is a question and `0` is an answer. **The `wait` syscall is
+  held to it too**: a parent told "the child exited 0" believes the child
+  succeeded, and a supervisor that believes that does not restart anything.
+  **Three new smoke checks** (713 → 716), all three reverse-verified: the
+  outcome published after the exit frame again → "a process knows how it
+  will end before it is gone" fails; the shared rule turning an unknown
+  ending back into a zero → "a missing exit code is never a success" fails;
+  the CLI zeroing the code it just read → "cortex spawn reports a crash as
+  a crash" fails. The kernel check opens the window on purpose — the
+  recorder holds the exit frame until the test has looked — so it is
+  deterministic rather than lucky.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---
@@ -205,7 +237,7 @@ Three demos that prove the abstraction matters. Each one becomes a GIF in the RE
 ## Phase 5 — Polish & launch
 
 - [x] **#044** Landing page (`cortex.sh` or similar — domain to be checked)
-  - Built as **`docs/index.html`** — a single self-contained, dependency-free page (no CDN, no build step) so it is servable directly by **GitHub Pages from `/docs`** with zero configuration. Sections: hero + an animated replay of the Demo B reboot transcript; the "function vs process" contrast that is the whole thesis; a primitive grid for the sixteen CLI verbs; the three killer demos with links to their live replays (`demo-a/b/c.html`); a quickstart (clone → offline mock → supervision tree) beside a real agent snippet; and an honest status panel (13 modules / 24 syscalls / 7 drivers / 713 smoke checks) with the v0 caveats stated plainly. A custom domain (`cortex.sh`) is still to be decided/registered — the page works on `github.io` today.
+  - Built as **`docs/index.html`** — a single self-contained, dependency-free page (no CDN, no build step) so it is servable directly by **GitHub Pages from `/docs`** with zero configuration. Sections: hero + an animated replay of the Demo B reboot transcript; the "function vs process" contrast that is the whole thesis; a primitive grid for the sixteen CLI verbs; the three killer demos with links to their live replays (`demo-a/b/c.html`); a quickstart (clone → offline mock → supervision tree) beside a real agent snippet; and an honest status panel (13 modules / 24 syscalls / 7 drivers / 716 smoke checks) with the v0 caveats stated plainly. A custom domain (`cortex.sh`) is still to be decided/registered — the page works on `github.io` today.
 - [x] **#045** `docs/HACKING.md` — how to contribute, how to write a driver
   - Covers: dev setup (`tsc` + `tsx scripts/smoke.ts`, with an explicit note that `npm test` is *not* the suite and `tests/` is intentionally empty); project layout; the "documents are the contract" rule; the four coding conventions (branded ids, `exactOptionalPropertyTypes` conditional-spread, errno errors / `ProcessExitSignal`, zero runtime deps); how to write each of the three drivers (`ILLMDriver`/`IToolDriver`/`IMemoryDriver`) with a minimal echo-driver example and the reversibility/forkable discipline; how to write an agent + the four gotchas (absolute module path, per-process memory regions, fork/restore re-runs from the top, `--driver` only applies to prompt agents); **how to write a host** (§7 — the one that keeps costing people time: a host is *not* in the process tree, so the `wait` syscall is unavailable to it and `Kernel.awaitExit` is the way to wait; plus the host API quick-reference and what a host cannot do); how to add a syscall (the five files to touch together); and the testing/submitting conventions. Grounded in the real interfaces, not invented.
 - [x] **#046** `docs/COOKBOOK.md` — common patterns (supervision, pipelines, daemons, fork-and-compare)

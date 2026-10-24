@@ -26,6 +26,7 @@ import {
 } from '../index.js';
 import type { ProcessMeta } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
+import { processOutcome, formatOutcomeCode } from '../process_outcome.js';
 import { KernelCommandError, probeKernel } from '../kernel_client.js';
 import type { AgentSpec, Capability, ProcessState, MemoryRegionPolicy } from '../../kernel/types.js';
 import { parseCapabilities } from '../../kernel/types.js';
@@ -254,24 +255,25 @@ export async function cmdSpawn(args: string[]): Promise<number> {
     let exitCode: number | null;
     let exitReason: string | null;
 
-    if (entry === undefined) {
-      // Already reaped: the in-memory exitCode is gone. Recover the REAL
-      // status from the .crec exit record instead of assuming success — a
-      // crashed/trapped run must not be reported as "code 0: completed".
-      const exitRec = await readExitRecord(dir, pid);
-      state = 'zombie';
-      if (exitRec !== undefined) {
-        exitCode = exitRec.code;
-        exitReason = exitRec.reason;
-      } else {
-        exitCode = 1;
-        exitReason = 'reaped with no exit record (crashed or killed before recording)';
-      }
-      done = true;
-    } else if (entry.state === 'zombie' || entry.state === 'exiting') {
-      state = 'zombie';
-      exitCode = entry.exitCode ?? 0;
-      exitReason = entry.exitReason ?? 'completed';
+    if (entry === undefined || entry.state === 'zombie' || entry.state === 'exiting') {
+      // What the table knows, and — when the table cannot answer — what the
+      // log knows. The rule that **an unknown ending is never a success**
+      // lives in one place (`processOutcome`), so this command cannot tell
+      // the operator a different story from `cortex wrap` or `cortex
+      // restore` about the same run.
+      //
+      // It used to. A process is EXITING for a moment before its exit code
+      // is readable, and this command read that moment as "no code" and
+      // defaulted it to zero — so an agent that threw a TypeError sometimes
+      // printed `code 0: completed` and exited 0.
+      const exitRec =
+        entry === undefined || entry.exitCode === null ? await readExitRecord(dir, pid) : undefined;
+      const outcome = processOutcome(entry, exitRec);
+      // A process that is still walking out is over as far as the operator
+      // is concerned, and the meta is written once — so it says "zombie".
+      state = outcome.state === 'exiting' ? 'zombie' : outcome.state;
+      exitCode = outcome.exitCode;
+      exitReason = outcome.exitReason;
       done = true;
     } else if (entry.state === 'suspended') {
       // The agent checkpointed itself with detach:true. This is a clean
@@ -296,7 +298,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       }
       console.log(`  resume with: cortex restore --chain ${lastChain ?? '<chainId>'}`);
     } else if (done) {
-      console.log(`process exited (code ${exitCode}: ${exitReason})`);
+      console.log(`process exited (code ${formatOutcomeCode(exitCode)}: ${exitReason ?? 'unknown'})`);
     } else {
       console.log(`process still ${state} after ${elapsed}ms — consider increasing --timeout`);
     }
@@ -330,7 +332,9 @@ export async function cmdSpawn(args: string[]): Promise<number> {
     writeMeta(dir, meta);
 
     await kernel.shutdown();
-    return done ? (exitCode ?? 0) : 0;
+    // An ending nobody saw is not a success: the command's own exit code
+    // must say so, or a shell would carry on as if the agent had worked.
+    return done ? (exitCode ?? 1) : 0;
   } catch (err) {
     await kernel.shutdown();
     throw err;

@@ -1545,6 +1545,16 @@ export class SyscallDispatcher {
     const entry = this.#table.mustGet(pid, 'exit');
     const stateBefore = entry.state;
 
+    // The path is computed **before** anything is recorded: a process that
+    // cannot exit must not be left carrying an exit code it never reached.
+    const path = this.#exitPathFrom(pid, stateBefore);
+
+    // The outcome is decided now, before the state says "exiting" — so a
+    // reader of the process table never sees a process on its way out that
+    // does not know how it will end. The log frame and the final offset come
+    // after, and they are recorded separately.
+    this.#table.setExitOutcome(pid, code, exitReason);
+
     // A process that exits while parked in `sleep()` leaves a live timer behind
     // whose only job would be to wake a dead PID.
     this.#cancelSleep(pid);
@@ -1552,7 +1562,7 @@ export class SyscallDispatcher {
     // Walk to EXITING. Legal directly from running/blocked/stopped; new/ready
     // route through running first. checkpointing/suspended have no edge to
     // exiting (docs/PROCESS.md §5) — exit from those is a kernel bug.
-    await this.#walkToExiting(pid, stateBefore);
+    await this.#walkToExiting(pid, path);
 
     // Write the exit record *before* the recorder is closed by reap.
     const recorder = this.#table.recorderFor(pid);
@@ -1575,7 +1585,7 @@ export class SyscallDispatcher {
     }
 
     const finalLogOffset = recorder?.currentOffset ?? entry.initialLogOffset;
-    this.#table.setExitInfo(pid, code, exitReason, finalLogOffset);
+    this.#table.setFinalLogOffset(pid, finalLogOffset);
     await this.#table.setState(pid, 'zombie', { trigger: 'exit', code });
 
     // Persist metadata NOW, before `init.handleZombie` may reap the entry.
@@ -1594,28 +1604,35 @@ export class SyscallDispatcher {
     throw new ProcessExitSignal(code, exitReason);
   }
 
+  /**
+   * The states a process walks through on its way out.
+   *
+   * Computed before anything is recorded, so that a process that cannot exit
+   * is not left carrying an exit code it never reached.
+   */
+  #exitPathFrom(pid: ProcessId, from: ProcessState): readonly ProcessState[] {
+    switch (from) {
+      case 'exiting':
+        return [];
+      case 'running':
+      case 'blocked':
+      case 'stopped':
+        return ['exiting'];
+      case 'ready':
+        return ['running', 'exiting'];
+      case 'new':
+        return ['ready', 'running', 'exiting'];
+      default:
+        return trap('EINVAL', 'exit', {
+          pid: unbrand(pid),
+          state: from,
+          reason: 'cannot exit from this state',
+        });
+    }
+  }
+
   /** Drive a live process to EXITING along legal edges. */
-  async #walkToExiting(pid: ProcessId, from: ProcessState): Promise<void> {
-    const path: readonly ProcessState[] = (() => {
-      switch (from) {
-        case 'exiting':
-          return [];
-        case 'running':
-        case 'blocked':
-        case 'stopped':
-          return ['exiting'];
-        case 'ready':
-          return ['running', 'exiting'];
-        case 'new':
-          return ['ready', 'running', 'exiting'];
-        default:
-          return trap('EINVAL', 'exit', {
-            pid: unbrand(pid),
-            state: from,
-            reason: 'cannot exit from this state',
-          });
-      }
-    })();
+  async #walkToExiting(pid: ProcessId, path: readonly ProcessState[]): Promise<void> {
     for (const next of path) {
       await this.#table.setState(pid, next, { trigger: 'exit' });
     }

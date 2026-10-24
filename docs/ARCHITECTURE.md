@@ -161,6 +161,29 @@ interface ProcessTable {
 
 **Internals.** Two `Map`s: `byPid` (PID → ProcessInfo) and `byParent` (PPID → Set<PID>). PID counter is a `bigint` (u64 semantics in JS). State transitions validate against PROCESS.md §5; illegal transitions throw `ESTATE`.
 
+**The outcome is recorded when it is decided.** A process's exit code and
+reason are known the moment its exit is *requested* — the syscall was called
+with them — so the table carries them **before** the EXITING transition, not
+after the cleanup. The exit frame in the log is written later, and that write
+awaits the disk; there used to be a window in which the table said "exiting"
+and "no exit code", and a host that read it found nothing.
+
+That window was not harmless. "No exit code" is the absence of an answer, and
+the CLI turned the absence into zero: `cortex spawn` on an agent that threw
+an exception sometimes printed `code 0: completed` and exited 0, while the
+kernel's own metadata said `exitCode: 1` the whole time. The invariant now
+holds in two halves:
+
+> **A process that is exiting already knows how it will end. And an ending
+> nobody saw is reported as unknown — never as success.**
+
+The second half is the CLI's, and it lives in one place
+(`src/cli/process_outcome.ts`) so that `cortex spawn`, `cortex restore` and
+`cortex wrap` cannot tell the operator different stories about the same run.
+The `wait` syscall is held to it too: a parent that is told "the child exited
+0" will believe the child succeeded, and a supervisor that believes that does
+not restart anything.
+
 **Performance.** All operations O(1) except `listInState` which is O(n) over all processes. For v0 (target: hundreds of processes), this is fine. Post-v0 may add a per-state index.
 
 ### 4.3 `signals.ts`

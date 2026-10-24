@@ -314,6 +314,7 @@ import {
   formatDivergence,
   type ComparedCall,
 } from '../src/cli/replay_core.js';
+import { processOutcome, formatOutcomeCode } from '../src/cli/process_outcome.js';
 import type { CortexContext, LLMResponse, Timestamp } from '../src/kernel/types.js';
 import { OutputCapture } from '../src/cli/output_capture.js';
 import { bootCliKernel } from '../src/cli/index.js';
@@ -926,8 +927,10 @@ async function runProcessTableChecks(): Promise<void> {
       tick();
       await table.setState(pid, 'running', { trigger: 'dispatch' });
       tick();
+      table.setExitOutcome(pid, 0, 'normal');
+      table.setFinalLogOffset(pid, asSyscallOffset(0));
+      tick();
       await table.setState(pid, 'exiting', { trigger: 'exit-syscall' });
-      table.setExitInfo(pid, 0, 'normal', asSyscallOffset(0));
       tick();
       await table.setState(pid, 'zombie', { trigger: 'cleanup-done' });
 
@@ -1033,8 +1036,11 @@ async function runProcessTableChecks(): Promise<void> {
       const pid = await table.allocate({ ppid: null, role: 'init', agent });
       await table.setState(pid, 'ready');
       await table.setState(pid, 'running');
+      // The outcome is decided before the process starts leaving — the same
+      // order the kernel uses, so a zombie always knows how it ended.
+      table.setExitOutcome(pid, 42, 'test-exit');
+      table.setFinalLogOffset(pid, asSyscallOffset(123));
       await table.setState(pid, 'exiting');
-      table.setExitInfo(pid, 42, 'test-exit', asSyscallOffset(123));
       await table.setState(pid, 'zombie');
 
       const result = await table.reap(pid);
@@ -4788,7 +4794,8 @@ async function runInitChecks(): Promise<void> {
     if (e.state === 'ready') await table.setState(pid, 'running', { trigger: 'test' });
     const rec = table.recorderFor(pid);
     const off = rec?.currentOffset ?? asSyscallOffset(0);
-    table.setExitInfo(pid, code, reason, off);
+    table.setExitOutcome(pid, code, reason);
+    table.setFinalLogOffset(pid, off);
     await table.setState(pid, 'exiting', { trigger: 'test-exit' });
     await table.setState(pid, 'zombie', { trigger: 'test-exit' });
     await init.handleZombie(pid, code, reason);
@@ -5469,7 +5476,8 @@ async function runDispatcherChecks(): Promise<void> {
   ): Promise<void> {
     await table.setState(pid, 'ready', { trigger: 'test' });
     await table.setState(pid, 'running', { trigger: 'test' });
-    table.setExitInfo(pid, code, reason, asSyscallOffset(0));
+    table.setExitOutcome(pid, code, reason);
+    table.setFinalLogOffset(pid, asSyscallOffset(0));
     await table.setState(pid, 'exiting', { trigger: 'test-exit' });
     await table.setState(pid, 'zombie', { trigger: 'test-exit' });
   }
@@ -17309,6 +17317,208 @@ export default async function agent(ctx) {
   }
 }
 
+/**
+ * How a process ended — and the rule that an unknown ending is not a success.
+ *
+ * The bug this group pins down was found by running it: an agent that threw
+ * a `TypeError` was reported by `cortex spawn` as `code 0: completed`, and
+ * the command exited 0. The kernel knew the truth the whole time — the
+ * process's meta said `exitCode: 1` with the reason — but the CLI read the
+ * process table in the moment between the process becoming EXITING and its
+ * exit code being written, found nothing, and turned "nothing" into zero.
+ *
+ * Two fixes, checked here: the kernel publishes the outcome when it is
+ * *decided* (so there is no window), and the CLI has one rule for "what do
+ * I know" that an unknown ending never reads as success.
+ */
+async function runOutcomeChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-outcome-'));
+  const kernels: Kernel[] = [];
+  const prevHome = process.env['CORTEX_HOME'];
+
+  /** Run a command with its stdout and stderr captured. */
+  const capture = async (
+    run: () => Promise<number>,
+  ): Promise<{ code: number; out: string; err: string }> => {
+    let out = '';
+    let err = '';
+    const prevWrite = process.stdout.write;
+    const prevErr = console.error;
+    process.stdout.write = ((chunk: unknown): boolean => {
+      out += String(chunk);
+      return true;
+    }) as unknown as typeof process.stdout.write;
+    console.error = (...parts: unknown[]): void => {
+      err += parts.map((p) => String(p)).join(' ') + '\n';
+    };
+    try {
+      const code = await run();
+      return { code, out, err };
+    } finally {
+      process.stdout.write = prevWrite;
+      console.error = prevErr;
+    }
+  };
+
+  try {
+    await checkAsync('a process knows how it will end before it is gone', async () => {
+      // The exit path walks to EXITING and *then* writes the exit frame, and
+      // that write awaits the disk. A host that read the table in that
+      // window found no exit code — and the honest reaction to "no exit
+      // code" is "it failed", not "it succeeded".
+      //
+      // The window is made deterministic here: the recorder holds the exit
+      // frame until the test has looked at the table.
+      let releaseExit: (() => void) | undefined;
+      const exitHeld = new Promise<void>((resolve) => {
+        releaseExit = resolve;
+      });
+      let exitSeen: (() => void) | undefined;
+      const exitStarted = new Promise<void>((resolve) => {
+        exitSeen = resolve;
+      });
+
+      const recorderFactory: NonNullable<KernelOptions['recorderFactory']> = async (pid) => {
+        const rec = await Recorder.open({ pid, dir: join(tmp, 'window', String(unbrand(pid))) });
+        type AppendFn = typeof rec.append;
+        const append: AppendFn = rec.append.bind(rec);
+        (rec as unknown as { append: AppendFn }).append = async (input) => {
+          // The *outcome* frame — the one the exit path writes after it has
+          // walked to EXITING. The `enter` frame of the same syscall is
+          // written before that, and blocking it would catch the process
+          // still running.
+          if (input.syscall === 'exit' && input.phase === 'exit') {
+            exitSeen?.();
+            await exitHeld;
+          }
+          return append(input);
+        };
+        return rec;
+      };
+
+      const kernel = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir: join(tmp, 'window'),
+        autoStart: true,
+        recorderFactory,
+        loadDrivers: async (reg) => {
+          reg.registerLLM(new MockLLMDriver());
+          reg.registerMemory(inmemMemory());
+        },
+        agentLoader: async () => async (ctx) => {
+          ctx.exit(7, 'leaving on purpose');
+        },
+      });
+      kernels.push(kernel);
+      const pid = await kernel.spawn({ role: 'leaver', agent: { module: 'test:leaver' } });
+
+      await exitStarted;
+      const entry = kernel.table.get(pid);
+      assert(entry !== undefined, 'the process was gone before it could be read');
+      assert(entry.state === 'exiting', `expected EXITING, got ${entry.state}`);
+      assert(
+        entry.exitCode === 7,
+        `the exit code was not known while exiting: ${String(entry.exitCode)}`,
+      );
+      assert(
+        entry.exitReason === 'leaving on purpose',
+        `the exit reason was not known while exiting: ${String(entry.exitReason)}`,
+      );
+      releaseExit?.();
+    });
+
+    await checkAsync('a missing exit code is never a success', async () => {
+      // Reaped, with no exit record to fall back on: the ending is unknown,
+      // and unknown is not success.
+      const reaped = processOutcome(undefined, undefined);
+      assert(
+        reaped.exitCode !== 0,
+        `an unknown ending was reported as success: ${String(reaped.exitCode)}`,
+      );
+      assert(
+        reaped.exitCode === 1,
+        `an unknown ending should read as a failure, got ${String(reaped.exitCode)}`,
+      );
+
+      // The exit record is the durable answer, and it survives the reap.
+      const recorded = processOutcome(undefined, { code: 5, reason: 'boom' });
+      assert(recorded.exitCode === 5, `the exit record was not used: ${String(recorded.exitCode)}`);
+
+      // A zombie knows how it ended.
+      const zombie = processOutcome(
+        { state: 'zombie', exitCode: 3, exitReason: 'bad' },
+        undefined,
+      );
+      assert(zombie.exitCode === 3, `the zombie's code was lost: ${String(zombie.exitCode)}`);
+
+      // A zombie that somehow carries none is not a success either.
+      const bare = processOutcome({ state: 'zombie', exitCode: null, exitReason: null }, undefined);
+      assert(bare.exitCode !== 0, `a code-less zombie was reported as success: ${String(bare.exitCode)}`);
+
+      // A process on its way out whose outcome nobody has seen stays
+      // **unknown** — a null code is "never finished", not "succeeded".
+      const exiting = processOutcome(
+        { state: 'exiting', exitCode: null, exitReason: null },
+        undefined,
+      );
+      assert(exiting.exitCode === null, `an unknown ending became a code: ${String(exiting.exitCode)}`);
+      assert(exiting.exitCode !== 0, 'an unknown ending was reported as success');
+
+      // A suspended process paused; it did not fail.
+      const suspended = processOutcome(
+        { state: 'suspended', exitCode: null, exitReason: null },
+        undefined,
+      );
+      assert(suspended.exitCode === 0, `a pause was reported as a failure: ${String(suspended.exitCode)}`);
+
+      // And an unknown code prints as a question, because `?` is a question
+      // and `0` is an answer.
+      assert(formatOutcomeCode(null) === '?', 'an unknown code did not print as a question');
+      assert(formatOutcomeCode(0) === '0', 'a known code did not print as itself');
+    });
+
+    await checkAsync('cortex spawn reports a crash as a crash', async () => {
+      const home = join(tmp, 'home-crash');
+      process.env['CORTEX_HOME'] = home;
+      const module = join(tmp, 'crash-agent.ts');
+      writeFileSync(
+        module,
+        `export default async function agent(ctx) {
+  ctx.now();
+  throw new TypeError("cannot read properties of undefined (reading 'id')");
+}
+`,
+        'utf8',
+      );
+
+      const spawned = await capture(() => cmdSpawn(['--role', 'crasher', '--module', module]));
+      assert(
+        spawned.code !== 0,
+        `a crashed agent was reported as a success: ${spawned.out}${spawned.err}`,
+      );
+      assert(spawned.out.includes('code 1'), `the crash was not reported: ${spawned.out}`);
+      assert(
+        spawned.out.includes("reading 'id'"),
+        `the reason for the crash was not reported: ${spawned.out}`,
+      );
+    });
+  } finally {
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -17347,6 +17557,7 @@ await runKernelHardeningChecks();
 await runTransportChecks();
 await runBootChecks();
 await runReplayChecks();
+await runOutcomeChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
