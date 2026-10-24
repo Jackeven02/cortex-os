@@ -244,7 +244,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 779 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 781 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -366,6 +366,8 @@ Read-only by default. With a live kernel in the directory (`cortex daemon run`),
 **And the event table shows what a call cost.** `cortex wrap --tap` records the model's own HTTP calls into the same log a driver call goes into, so those calls show up in the event table too — with their tokens and their price, written in the ABI's `usage` shape, the same shape every other reader of an `llm_call` frame looks in.
 
 **And `cortex trace` says it too.** The window was not the only view that could say what a call spent — the CLI's deepest view could not, and it was the view an operator opens to find out what an agent has been doing. Its last column now says what each call spent (`$0.000161 · 1.2k in / 80 out (900 cached)`), and it reads the frame with the same function the event table does, so the two cannot disagree. A frame that spent nothing says nothing: an empty cell is honest, and `$0.000000` would be a claim about a number nobody spent.
+
+**And so does the window's own timeline.** The operator's window has two views of the same frames — the event table and the syscall timeline — and the timeline used to say less than the event table beside it: no cached part (the server was not even reading it), no price (the server sent it and the page dropped it), and `0 out` for a call that never reported how many tokens it wrote. Both now ask one helper for the tokens, and the server reads the frame with the same function the CLI's trace uses — so the terminal, the event table and the timeline all say the same thing about the same call.
 
 **And the timeline reads like the terminal's.** The kernel's own frames are placeholders on disk (`__state`, `__sched`) — the *view* is what distinguishes them: `__state:running->blocked(recv)`, `__sched:sigxcpu(tokens)`. The window prints the same names `cortex trace` does, because both ask the same function.
 

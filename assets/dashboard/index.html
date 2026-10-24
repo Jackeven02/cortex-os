@@ -291,6 +291,27 @@
     // from the server, which uses the same rule `cortex ps` prints — one
     // rule, three views.
     const processTokenLabel = (process) => String(process.tokenLabel ?? processTokens(process).toLocaleString());
+    // **What one call spent**, in words: what it read, what it wrote, and the
+    // part of the input the provider served out of its cache.
+    //
+    // **Only the counters the frame reported.** A counter nobody reported is
+    // not a counter of zero — printing "0 out" for a call that never said how
+    // many tokens it wrote is a claim about a number that was never made. The
+    // server reads the frame with the same function the CLI's trace reads it
+    // with (`callUsage`), so the window and the terminal cannot disagree.
+    //
+    // The window has **two** views of a frame — the event table and the
+    // syscall timeline — and they ask this one function, so they cannot
+    // disagree with each other either.
+    function callSummary(record) {
+      const parts = [];
+      if (record.tokensIn !== undefined) parts.push(`${Number(record.tokensIn).toLocaleString()} in`);
+      if (record.tokensOut !== undefined) parts.push(`${Number(record.tokensOut).toLocaleString()} out`);
+      const cached = Number(record.tokensCached ?? 0);
+      const text = parts.join(' / ');
+      if (cached <= 0) return text;
+      return text === '' ? `(${cached.toLocaleString()} cached)` : `${text} (${cached.toLocaleString()} cached)`;
+    }
     // What this agent was allowed to do. The label comes from the server,
     // which uses the same rule `cortex ps` prints — one rule, two views.
     const processCaps = (process) => String(process.capsLabel ?? '—');
@@ -389,14 +410,14 @@
         const audit = (event.audit && typeof event.audit === 'object') ? event.audit : null;
         const auditText = audit ? Object.entries(audit).slice(0, 3).map(([k, v]) => `${k}=${String(v).slice(0, 12)}`).join(' · ') : '';
         const auditTitle = audit ? JSON.stringify(audit) : '';
-        // The cached tokens are a **part** of the input above, not extra ones:
-        // the provider reports the whole prompt and says how much of it came
-        // out of its cache. They are billed at the cache price, so a call that
-        // read 1,000 tokens out of the cache is not a call that cost 1,000
-        // tokens — and the row has to say so.
-        const cachedTokens = Number(event.tokensCached ?? 0);
-        const cachedSummary = cachedTokens > 0 ? ` (${cachedTokens.toLocaleString()} cached)` : '';
-        const tokenSummary = event.tokensIn === undefined && event.tokensOut === undefined ? (event.model ?? '—') : `${Number(event.tokensIn ?? 0).toLocaleString()} in / ${Number(event.tokensOut ?? 0).toLocaleString()} out${cachedSummary}${event.model ? ` · ${event.model}` : ''}`;
+        // What the call spent, in the same words the syscall timeline prints:
+        // what it read, what it wrote, and the part of the input the provider
+        // served out of its cache. The cached tokens are a **part** of the
+        // input, not extra ones — they were read out of the provider's cache,
+        // and they are billed at the cache price — so a call that read 1,000
+        // tokens out of the cache is not a call that cost 1,000 tokens.
+        const spent = callSummary(event);
+        const tokenSummary = spent === '' ? (event.model ?? '—') : `${spent}${event.model ? ` · ${event.model}` : ''}`;
         const errorSummary = event.errorMessage ? `${event.error ?? '错误'}: ${event.errorMessage}` : (event.error ?? '—');
         // The cost, as a string, computed **here** — not as a template literal
         // dropped into an HTML attribute. A nested template inside `title="…"`
@@ -677,6 +698,28 @@
       return true;
     }
 
+    // One frame in the syscall timeline — the window's second view of the
+    // same frames `cortex trace` prints, and it has to say the same things:
+    // what the call spent (the tokens it read and wrote, the part of the
+    // input that came out of the cache), what that cost, and which model
+    // answered.
+    //
+    // The timeline used to say less than every other view: it printed the
+    // tokens raw (so "1200" beside the event table's "1,200"), it had no
+    // cached part at all, it dropped the price the server had already sent
+    // it, and it printed "0 out" for a call that never reported how many
+    // tokens it wrote. One function builds the row, and it asks the same
+    // `callSummary` the event table asks.
+    function traceItem(record) {
+      const parts = [String(record.frame ?? record.syscall)];
+      const spent = callSummary(record);
+      if (spent !== '') parts.push(spent);
+      if (record.model) parts.push(String(record.model));
+      if (record.usd !== undefined) parts.push(fmtUsd(Number(record.usd)));
+      if (record.errorMessage) parts.push(`${record.error ?? '错误'}: ${record.errorMessage}`);
+      return `<div class="trace-item"><span class="trace-time">${esc(new Date(record.timestamp).toLocaleTimeString())}</span><span class="trace-syscall">${esc(parts.join(' · '))}</span><span class="trace-phase">${esc(record.phase)}${record.durationMs === undefined ? '' : ` · ${esc(record.durationMs)} ms`}</span></div>`;
+    }
+
     async function showTrace(pid) {
       $('traceTitle').textContent = `进程 ${pid} · Syscall 时间线`;
       $('traceBody').innerHTML = '<div class="empty">正在读取记录…</div>';
@@ -685,7 +728,7 @@
         const response = await fetch(`/api/trace/${encodeURIComponent(pid)}`);
         const records = await response.json();
         if (!response.ok) throw new Error(records.error ?? '读取失败');
-        $('traceBody').innerHTML = records.length ? `<div class="trace-list">${records.map((record) => `<div class="trace-item"><span class="trace-time">${esc(new Date(record.timestamp).toLocaleTimeString())}</span><span class="trace-syscall">${esc(record.frame ?? record.syscall)}${record.tokensIn === undefined ? '' : ` · ${esc(record.tokensIn)} in / ${esc(record.tokensOut ?? 0)} out`}${record.model ? ` · ${esc(record.model)}` : ''}${record.errorMessage ? ` · ${esc(record.error)}: ${esc(record.errorMessage)}` : ''}</span><span class="trace-phase">${esc(record.phase)}${record.durationMs === undefined ? '' : ` · ${esc(record.durationMs)} ms`}</span></div>`).join('')}</div>` : '<div class="empty">这个进程还没有 syscall 记录。</div>';
+        $('traceBody').innerHTML = records.length ? `<div class="trace-list">${records.map((record) => traceItem(record)).join('')}</div>` : '<div class="empty">这个进程还没有 syscall 记录。</div>';
       } catch (error) {
         $('traceBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
       }

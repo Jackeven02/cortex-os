@@ -10177,7 +10177,11 @@ type PageFn = (...args: unknown[]) => unknown;
  * to exercise *it* has to take the code from the page, not from a copy
  * that can drift away from what ships.
  */
-function pageFunction(html: string, name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal'): PageFn {
+function pageFunction(
+  html: string,
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem',
+  deps?: Readonly<Record<string, PageFn>>,
+): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
   const header = isConst ? `const ${name} = ` : `function ${name}(`;
   const at = html.indexOf(header);
@@ -10204,7 +10208,11 @@ function pageFunction(html: string, name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmt
     assert(close > open, `the page's ${name}() never closes`);
     src = html.slice(at, close + 1);
   }
-  return new Function(src + '\nreturn ' + name + ';')() as PageFn;
+  // A helper may need the page's other helpers — the timeline row needs `esc`
+  // and `fmtUsd` — so they are handed to it the way the page hands them over.
+  const names = Object.keys(deps ?? {});
+  const values = names.map((key) => (deps as Record<string, PageFn>)[key]!);
+  return new Function(...names, src + '\nreturn ' + name + ';')(...values) as PageFn;
 }
 
 /** Render one event row the way the dashboard page renders it. */
@@ -10230,33 +10238,29 @@ function renderDashboardEventRow(html: string, event: Record<string, unknown>): 
   }
   assert(close > open, "the page's event row template never closes");
   const body = html.slice(open + 1, close);
-  const fn = new Function('event', 'esc', 'fmtUsd', 'eventLabel', 'fmtLocal', body) as (
+  const callSummary = pageFunction(html, 'callSummary');
+  const fn = new Function('event', 'esc', 'fmtUsd', 'eventLabel', 'fmtLocal', 'callSummary', body) as (
     e: Record<string, unknown>,
     escFn: PageFn,
     usdFn: PageFn,
     labelFn: PageFn,
     timeFn: PageFn,
+    summaryFn: PageFn,
   ) => string;
-  return fn(event, esc, fmtUsd, eventLabel, fmtLocal);
+  return fn(event, esc, fmtUsd, eventLabel, fmtLocal, callSummary);
 }
 
 /** Render one row of the dashboard's syscall timeline, the way the page does. */
 function renderDashboardTraceRow(html: string, record: Record<string, unknown>): string {
   const esc = pageFunction(html, 'esc');
-  const marker = 'records.map((record) => ';
-  const at = html.indexOf(marker);
-  assert(at >= 0, 'the page still renders a syscall timeline');
-  const start = at + marker.length;
-  // The row template is one template literal; the map call closes right
-  // before `.join('')`.
-  const end = html.indexOf(").join('')", start);
-  assert(end > start, "the page's trace row template never closes");
-  const expr = html.slice(start, end);
-  const fn = new Function('record', 'esc', `return (${expr});`) as (
-    r: Record<string, unknown>,
-    escFn: PageFn,
-  ) => string;
-  return fn(record, esc);
+  const fmtUsd = pageFunction(html, 'fmtUsd');
+  const callSummary = pageFunction(html, 'callSummary');
+  // The row is a named function on the page (`traceItem`), so the check
+  // exercises the page's own code rather than a copy of it. It asks the
+  // page's own `callSummary` for the tokens, so the two views of a frame
+  // cannot drift apart in the check either.
+  const traceItem = pageFunction(html, 'traceItem', { esc, fmtUsd, callSummary });
+  return String(traceItem(record));
 }
 
 async function runDashboardChecks(): Promise<void> {
@@ -10283,7 +10287,7 @@ async function runDashboardChecks(): Promise<void> {
       callId: 'c1',
       phase: 'exit',
       durationMs: 12,
-      result: { text: 'hi', model: 'gpt-test', usage: { inputTokens: 7, outputTokens: 3, cachedTokens: 0, usd: 0.001 } },
+      result: { text: 'hi', model: 'gpt-test', usage: { inputTokens: 7, outputTokens: 3, cachedTokens: 5, usd: 0.001 } },
     });
     // A trapped syscall whose error message leaks an API key: the dashboard
     // must surface a sanitized errorMessage, never the raw secret.
@@ -10459,6 +10463,84 @@ async function runDashboardChecks(): Promise<void> {
         assert(
           !row.includes('>__state<'),
           `the row does not show the bare placeholder, got: ${row}`,
+        );
+      });
+
+      await checkAsync('the dashboard timeline says what a call spent', async () => {
+        // The timeline read the usage with its own inline shape — and that
+        // shape had no `cachedTokens` in it, so a call the provider served
+        // out of its cache read as a call that was not. The server now reads
+        // the frame with the same function the CLI's trace reads it with
+        // (`callUsage`), and says what it found.
+        const res = await fetch(`${dash.url}/api/trace/2`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const call = rows.find((r) => r['phase'] === 'exit' && r['syscall'] === 'llm_call');
+        assert(call !== undefined, 'the call is in the timeline');
+        assert(
+          call!['tokensIn'] === 7 && call!['tokensOut'] === 3,
+          `the tokens are surfaced, got: ${String(call!['tokensIn'])}`,
+        );
+        assert(
+          call!['tokensCached'] === 5,
+          `the cached part is surfaced, got: ${String(call!['tokensCached'])}`,
+        );
+        assert(call!['usd'] === 0.001, `the price is surfaced, got: ${String(call!['usd'])}`);
+      });
+
+      await checkAsync("the window's two views of a frame say the same thing", async () => {
+        // The window has two views of the same frame — the event table and the
+        // syscall timeline — and they used to disagree about it: the timeline
+        // printed the tokens raw ("1200" beside the event table's "1,200"), it
+        // had no cached part, it dropped the price the server had already sent
+        // it, and it printed "0 out" for a call that never reported how many
+        // tokens it wrote.
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        const record = {
+          timestamp: '2026-09-28T00:00:05.000Z',
+          syscall: 'llm_call',
+          frame: 'llm_call',
+          phase: 'exit',
+          durationMs: 12,
+          model: 'gpt-test',
+          tokensIn: 1200,
+          tokensOut: 80,
+          tokensCached: 900,
+          usd: 0.001,
+        };
+        const timeline = renderDashboardTraceRow(html, record);
+        const event = renderDashboardEventRow(html, record);
+        // The expectation comes from the page's own helper, so the check holds
+        // the two views to the *same words* — including the way a number is
+        // written. The timeline used to print the tokens raw ("1200") beside
+        // the event table's "1,200".
+        const summary = String(pageFunction(html, 'callSummary')(record));
+        assert(summary.includes('in /'), `the summary says what it read and wrote: ${summary}`);
+        assert(summary.includes('(900 cached)'), `the summary says what was cached: ${summary}`);
+        assert(timeline.includes(summary), `the timeline says it the same way: ${summary}`);
+        assert(event.includes(summary), `the event row says it the same way: ${summary}`);
+        // The price: the server has always sent it, and the timeline used to
+        // drop it on the floor.
+        assert(
+          timeline.includes('$0.001000'),
+          `the timeline says what it cost, got: ${timeline}`,
+        );
+        // And a counter the frame never reported is not a counter of zero.
+        const partial = { ...record, tokensOut: undefined, tokensCached: undefined };
+        const partialTimeline = renderDashboardTraceRow(html, partial);
+        const partialSummary = String(pageFunction(html, 'callSummary')(partial));
+        assert(
+          partialTimeline.includes(partialSummary),
+          `the timeline says what was reported, got: ${partialTimeline}`,
+        );
+        assert(
+          !partialTimeline.includes('0 out'),
+          `an unreported counter is not a zero: ${partialTimeline}`,
+        );
+        const partialEvent = renderDashboardEventRow(html, partial);
+        assert(
+          !partialEvent.includes('0 out'),
+          `an unreported counter is not a zero: ${partialEvent}`,
         );
       });
 

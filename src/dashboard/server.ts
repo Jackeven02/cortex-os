@@ -13,7 +13,7 @@ import { formatCaps, describePendingSignals, readProcessView } from '../cli/proc
 import { describeOutcome } from '../cli/process_outcome.js';
 import { describeBudget } from '../cli/process_budget.js';
 import { usdToDollars } from '../money.js';
-import { formatTokenUsage } from '../token_usage.js';
+import { formatTokenUsage, callUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
 import {
@@ -759,10 +759,13 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         }
         const records = [];
         for await (const record of readRecords(path)) {
-          const result = record.syscall === 'llm_call' ? record.result as {
-            model?: string;
-            usage?: { inputTokens?: number; outputTokens?: number; usd?: number };
-          } | undefined : undefined;
+          // What the call spent, read by the same function the CLI's trace and
+          // the event table read it with (`callUsage`, in
+          // `src/token_usage.ts`). The timeline used to read the usage with
+          // its own inline shape — and that shape had no `cachedTokens` in it,
+          // so a call served out of the provider's cache read as a call that
+          // was not.
+          const usage = callUsage(record.syscall, record.result);
           records.push({
             timestamp: record.timestamp, pid: Number(record.pid), syscall: record.syscall,
             // The name a human reads. The kernel's own frames are placeholders
@@ -776,10 +779,11 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             stateBefore: record.stateBefore, stateAfter: record.stateAfter,
             reversibility: record.reversibility, error: record.error?.errno,
             ...(record.error !== undefined ? { errorMessage: safeErrorMessage(record.error.message) } : {}),
-            ...(result?.model !== undefined ? { model: result.model } : {}),
-            ...(result?.usage?.inputTokens !== undefined ? { tokensIn: result.usage.inputTokens } : {}),
-            ...(result?.usage?.outputTokens !== undefined ? { tokensOut: result.usage.outputTokens } : {}),
-            ...(result?.usage?.usd !== undefined ? { usd: result.usage.usd } : {}),
+            ...(usage?.model !== undefined ? { model: usage.model } : {}),
+            ...(usage?.inputTokens !== undefined ? { tokensIn: usage.inputTokens } : {}),
+            ...(usage?.outputTokens !== undefined ? { tokensOut: usage.outputTokens } : {}),
+            ...(usage?.cachedTokens !== undefined ? { tokensCached: usage.cachedTokens } : {}),
+            ...(usage?.usd !== undefined ? { usd: usage.usd } : {}),
           });
           if (records.length > 1000) records.shift();
         }

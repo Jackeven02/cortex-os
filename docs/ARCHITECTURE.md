@@ -1770,6 +1770,22 @@ wrote says `1.2k in`, not `1.2k in / 0 out`. And a frame that spent nothing at
 all says nothing — an empty cell is honest, and `$0.000000` would be a claim
 about a number nobody spent.
 
+**And the window's own two views of a frame now say the same thing.** The
+operator's window is not one view: it has the **event table** (every call the
+agent made) and the **syscall timeline** (every frame, in order), and both
+read the same `.crec`. The timeline read the usage with its own inline shape
+— and that shape had no `cachedTokens` in it, so a call the provider served
+out of its cache read as a call that was not. It also printed the tokens raw
+(`1200` beside the event table's `1,200`), it dropped the price the server
+had already sent it, and it printed `0 out` for a call that never reported
+how many tokens it wrote.
+
+So the server reads the frame with `callUsage` — the same function the CLI's
+trace reads it with — and the page asks **one** helper (`callSummary`) for
+the tokens, which both the event row and the timeline row use. Two views of
+one frame inside one window cannot drift apart, and neither of them can drift
+from the terminal.
+
 **And a unit has exactly one conversion point.** `budgetsSpent.usdSpent` is in
 **microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4). Three
 places disagreed about that, and two of them were wrong by a factor of a

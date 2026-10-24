@@ -1546,6 +1546,41 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The operator's window had two views of the same frame, and they disagreed.**
+  The dashboard is not one view: it has the **event table** (every call the
+  agent made) and the **syscall timeline** (every frame, in order), and both
+  read the same `.crec`. The timeline read the usage with its own inline
+  shape — and that shape had **no `cachedTokens` in it**, so a call the
+  provider served out of its cache read as a call that was not. It printed
+  the tokens raw (`1200` beside the event table's `1,200`), it **dropped the
+  price the server had already sent it**, and it printed `0 out` for a call
+  that never reported how many tokens it wrote.
+
+  So a call that cost `$0.000161` and read 900 of its 1,200 tokens out of the
+  provider's cache showed up in the window as `1200 in / 80 out` — next to the
+  event table, in the same window, saying `1,200 in / 80 out (900 cached)`.
+
+  **One reader on the server.** The timeline now reads the frame with
+  `callUsage` — the same function the CLI's trace and the event table use
+  (`src/token_usage.ts`) — so all three views say the same thing about the
+  same call, and the server cannot read a frame one way for one endpoint and
+  another way for the next.
+
+  **One helper on the page.** The page is a static file and cannot import
+  that module, so it keeps its own copy of the *shape* — `callSummary` — and
+  **both** the event row and the timeline row ask it. Two views of one frame
+  inside one window cannot drift apart, and a counter the frame never
+  reported stays absent in both: the window says `1,200 in`, not `1,200 in /
+  0 out`.
+
+  2 new smoke checks (779 → 781), both reverse-verified: with the server
+  reading the usage without the cached part, the timeline check fails ("the
+  cached part is surfaced"); with the timeline dropping the price, the
+  two-views check fails ("the timeline says what it cost"); with an
+  unreported counter printed as zero, it fails again ("an unreported counter
+  is not a zero"); and with the timeline formatting the tokens its own way, it
+  fails the other way ("the timeline says it the same way").
+
 - **`cortex trace` did not say what a model call cost.** The kernel records the
   usage of a model call in the frame's result — the tokens it read and wrote,
   the part of the input the provider served out of its cache, and the price
