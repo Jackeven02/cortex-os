@@ -349,6 +349,7 @@ transition.
 | **watch everything, as it happens** | **`kernel.subscribe(listener)`** |
 | see whether a process is *stuck* | **`kernel.openCalls()`** — the call each process is inside, and since when |
 | ...and if you want the frames themselves | read its `.crec` and pair the `enter`/`exit` frames |
+| follow a log that is still being written | **`new LogTail(path)`** — `read()` returns only the frames written since the last call |
 
 `KernelOptions.onProcessExit` is still worth wiring — it is how you persist
 your own metadata, and it fires at the same instant as `awaitExit` resolves.
@@ -361,7 +362,6 @@ the call id, when the call started, and the call's arguments. That last one is
 not decoration: the arguments are what say a `wait` carries its own deadline,
 and a **declared wait is not a stall** — a supervisor that cannot see the
 deadline will kill a planner for keeping its word.
-
 The kernel can answer because it writes every syscall as an `enter` frame and
 its partner, and it knows which pairs are still open. Reading the log and
 pairing the frames yourself gives the same answer — the `since` is that
@@ -369,6 +369,26 @@ frame's own timestamp, not a second reading of the clock — but it costs
 O(bytes) instead of O(processes), and the log of a long-lived agent grows for
 as long as the agent runs. Use the kernel's answer when there is a kernel;
 keep the log for the case where there is not.
+
+**`LogTail` is for the case where there is no kernel — or where you want the
+frames themselves.** `readRecords(path)` answers "what is in this file" by
+reading the whole file, every time; a watcher that asks "what is new" that
+way pays for the whole history on every poll. `new LogTail(path)` follows
+the file instead: `read()` returns only the frames written since the last
+call, and reports the byte offset it stopped at. Two details worth knowing:
+
+- **A torn frame at EOF is not an error.** The writer may be interrupted
+  mid-frame; the read stops before it and the next call picks it up.
+- **A file that was replaced is reported, not guessed at.** The tail checks
+  that the frame it read last is still there, at the same offset, with the
+  same call id — so a log that was swapped for a different one is read again
+  from the beginning and reported as `replaced`, instead of splicing two
+  histories together.
+
+The dashboard's activity panel is built on exactly this (see
+`src/dashboard/event_store.ts`), and the difference is measured: on a real
+6 MB log, re-reading cost **301 ms** per refresh, and following costs **3–4
+ms**.
 
 `kernel.subscribe(listener)` is the other shape again: it reports what the
 kernel does as it does it — a process being born, a process ending with its

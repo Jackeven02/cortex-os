@@ -42,6 +42,57 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The dashboard stopped paying for the whole history on every change.** The
+  activity panel is built from the syscall logs — every `.crec` of every
+  process — and it used to be **rebuilt from scratch on every change**: every
+  log read from byte 0, every frame decoded, the newest few kept. That is
+  O(the whole history) per change, and the history of a long-lived agent is
+  the thing that grows.
+
+  Measured on a real directory with a real kernel's log: a **3 MB** log cost
+  **154 ms** per read, and a **6 MB** one cost **301 ms** — paid again on
+  every filesystem change, which during a busy agent is several times a
+  second. The operator's window got slower exactly as the operator needed it.
+
+  **The feed is read once and then followed.** Each process's log gets a
+  cursor (`LogTail`, in `src/kernel/recorder.ts` — the format knowledge stays
+  with the format), and every refresh reads only what has been written since.
+  Measured on the same directory afterwards: the first request still costs the
+  whole log (227 ms — it has to be read once), and every request after it
+  costs **3–4 ms**, whatever the history has grown to. The `/api/events`
+  route, the disk-path stream and the live path's seed all read from the one
+  store, so a page that reconnects does not re-read the history either.
+
+  **A follower has to know it is still following the same history.** A log
+  that was replaced by a *different* file of the same size does not look
+  truncated, and the bytes at the old offset are then the middle of a frame —
+  which reads as "the writer has not finished the frame yet", not as "this is
+  a different history". So the frame that was read last is checked: it has to
+  still be at that offset, with that length, saying the same thing. One
+  frame's worth of reading to know that the rest is still the rest, and a
+  file that fails the check is read again from the beginning and reported as
+  replaced — because keeping the old events would be showing a past the disk
+  has erased.
+
+  **And the store says when it cannot answer.** It keeps the newest 5000
+  events of each kind — the same cap the API has always had — and a window
+  that reaches back past what it kept is a window it cannot answer, so the
+  caller asks the disk. A shorter answer than the disk holds would be a
+  truncation nobody can see.
+
+  **5 new smoke checks** (687 → 692), all five reverse-verified: the tail
+  reading the whole file every time → "the activity feed does not read the
+  same bytes twice" fails ("a second read with nothing new read 8248 bytes")
+  and "the dashboard does not re-read the logs it has already read" fails
+  ("the second request re-read the log: 8232 bytes"); the frame check
+  dropped → "a log that was replaced does not leave the old history behind"
+  fails; and the conversion moved → "the activity feed shows the same events
+  whether it was read all at once or followed" fails.
+
+  No ABI change: the `.crec` format is untouched — `LogTail` reads it, and
+  does not write it. A host that follows a log can use it
+  (`docs/HACKING.md` §7).
+
 - **`cortex ps` says what each agent is waiting on.** The flat table had the
   state and nothing else: `blocked`, with no word about *what* the process was
   blocked on — and `running` for an agent four minutes into a model call,

@@ -1130,6 +1130,39 @@ dashboard instead of stopping it — the operator's way out was the one thing
 that did not work. The server now drops its connections when it closes, and
 closing twice is not an error.
 
+**And the activity panel follows the logs instead of re-reading them.** The
+panel is built from the syscall logs — every `.crec` of every process — and it
+used to be **rebuilt from scratch on every change**: every log read from byte
+0, every frame decoded, the newest few kept. That is O(the whole history) per
+change, and the history of a long-lived agent is the thing that grows.
+Measured on a real directory with a real kernel's log: a **3 MB** log cost
+**154 ms** per read, and a **6 MB** one cost **301 ms** — paid again on every
+filesystem change, which during a busy agent is several times a second. The
+operator's window got slower exactly as the operator needed it.
+
+So the feed is **read once and then followed**. Each process's log gets a
+cursor (`LogTail`, in `src/kernel/recorder.ts` — the format knowledge stays
+with the format), and every refresh reads only what has been written since.
+Measured on the same directory afterwards: the first request still costs the
+whole log (**227 ms** — it has to be read once), and every request after it
+costs **3–4 ms**, whatever the history has grown to.
+
+**A follower has to know it is still following the same history.** A log that
+was replaced by a *different* file of the same size does not look truncated,
+and the bytes at the old offset are then the middle of a frame — which reads
+as "the writer has not finished the frame yet", not as "this is a different
+history". So the frame that was read last is checked: it has to still be at
+that offset, with that length, saying the same thing. One frame's worth of
+reading to know that the rest is still the rest, and a file that fails the
+check is read again from the beginning and reported as replaced — because
+keeping the old events would be showing a past the disk has erased.
+
+**And the store says when it cannot answer.** It keeps the newest 5000 events
+of each kind — the same cap the API has always had — and a window that reaches
+back past what it kept is a window it cannot answer, so the caller asks the
+disk. A shorter answer than the disk holds would be a truncation nobody can
+see.
+
 **The startup window is real, and the kernel closes it.** The stream only
 carries what happens *after* a subscriber connects — a supervisor that
 starts while the agent is already blocked would never see that `recv`'s

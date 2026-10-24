@@ -200,6 +200,7 @@ import {
   type TapCallInfo,
 } from '../src/integrations/llm_tap.js';
 import { startDashboard } from '../src/dashboard/server.js';
+import { ActivityStore, toActivityEvent } from '../src/dashboard/event_store.js';
 import { writeMeta, type ProcessMeta } from '../src/cli/process_store.js';
 
 import {
@@ -10030,6 +10031,246 @@ async function runDashboardChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Dashboard activity-store checks (#071)
+// =============================================================================
+
+/**
+ * The activity feed is read once and then followed.
+ *
+ * It used to be rebuilt from the disk on every change: every `.crec` of every
+ * process was read from byte 0, every frame decoded, and the newest few
+ * kept. That is O(the whole history) per change, and the history of a
+ * long-lived agent is the thing that grows — measured on a real directory, a
+ * 3 MB log cost 154 ms per read and a 6 MB one cost 301 ms.
+ *
+ * So the feed follows the logs instead. The checks below pin three things:
+ * the events it shows are the events the log holds, it does not read the same
+ * bytes twice, and it does not keep a history the disk has erased.
+ */
+async function runDashboardStoreChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, existsSync, statSync, copyFileSync, mkdirSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-dashstore-'));
+
+  const base = {
+    pid: asProcessId(2),
+    stateBefore: 'running' as const,
+    stateAfter: 'running' as const,
+    reversibility: 'reversible' as const,
+    kernelAbiVersion: KERNEL_ABI_VERSION,
+  };
+
+  /** Write one frame into a log under `root`, and return the recorder. */
+  const writeFrame = async (
+    root: string,
+    syscall: string,
+    callId: string,
+    phase: 'enter' | 'exit' | 'trap',
+    at: string,
+    extra: Record<string, unknown> = {},
+  ): Promise<Recorder> => {
+    const dir = join(root, 'processes', '2');
+    mkdirSync(dir, { recursive: true });
+    const rec = await Recorder.open({ pid: asProcessId(2), dir });
+    await rec.append({
+      ...base,
+      timestamp: at,
+      syscall,
+      callId,
+      phase,
+      ...(phase === 'enter' ? { args: {} } : {}),
+      ...extra,
+    } as never);
+    return rec;
+  };
+
+  try {
+    // --- the reference: what a full scan of the log says -------------------
+    const fullScan = async (root: string): Promise<unknown[]> => {
+      const events: unknown[] = [];
+      for await (const record of readRecords(join(root, 'processes', '2', 'log.crec'))) {
+        const event = toActivityEvent(record, 2);
+        if (event !== undefined) events.push(event);
+      }
+      return events.sort((a, b) =>
+        Date.parse(String((b as { at?: string }).at)) - Date.parse(String((a as { at?: string }).at)),
+      );
+    };
+
+    await checkAsync('the activity feed shows the same events whether it was read all at once or followed', async () => {
+      const root = join(tmp, 'same');
+      const rec = await writeFrame(root, 'llm_call', 'c1', 'enter', '2026-09-28T00:00:01.000Z');
+      await rec.append({
+        ...base,
+        timestamp: '2026-09-28T00:00:02.000Z',
+        syscall: 'llm_call',
+        callId: 'c1',
+        phase: 'exit',
+        durationMs: 12,
+        result: { text: 'hi', model: 'gpt-test', usage: { inputTokens: 7, outputTokens: 3, cachedTokens: 0, usd: 0.001 } },
+      } as never);
+      await rec.append({
+        ...base,
+        timestamp: '2026-09-28T00:00:03.000Z',
+        syscall: 'tool_call',
+        callId: 'c2',
+        phase: 'exit',
+        result: { output: { structured: { audit: { correlation_id: 'abc' } } } },
+      } as never);
+      await rec.close();
+
+      const store = new ActivityStore();
+      await store.refresh(root);
+
+      const followed = store.read({}).events;
+      const scanned = await fullScan(root);
+      assert(scanned.length > 0, 'the log holds events to show');
+      assert(
+        JSON.stringify(followed) === JSON.stringify(scanned),
+        `the same events, followed=${JSON.stringify(followed)} scanned=${JSON.stringify(scanned)}`,
+      );
+    });
+
+    await checkAsync('the activity feed does not read the same bytes twice', async () => {
+      const root = join(tmp, 'bytes');
+      const logPath = join(root, 'processes', '2', 'log.crec');
+      const rec = await writeFrame(root, 'llm_call', 'c1', 'exit', '2026-09-28T00:00:02.000Z', {
+        durationMs: 12,
+        result: { text: 'hi' },
+      });
+      // A log worth reading twice: one frame is not a history.
+      for (let i = 0; i < 40; i += 1) {
+        await rec.append({
+          ...base,
+          timestamp: `2026-09-28T00:00:${String(3 + i).padStart(2, '0')}.000Z`,
+          syscall: 'memory_read',
+          callId: `m${i}`,
+          phase: 'exit',
+          durationMs: 1,
+        } as never);
+      }
+
+      const store = new ActivityStore();
+      await store.refresh(root);
+      const afterFirst = store.bytesRead;
+      const size = statSync(logPath).size;
+      assert(afterFirst >= size, `the first read reads the whole log, got ${afterFirst} of ${size}`);
+
+      // Nothing changed: the second read must not pay for the history again.
+      await store.refresh(root);
+      assert(
+        store.bytesRead === afterFirst,
+        `a second read with nothing new read ${store.bytesRead - afterFirst} bytes`,
+      );
+
+      // One more frame: the read must cost the frame, not the log.
+      await rec.append({
+        ...base,
+        timestamp: '2026-09-28T00:01:00.000Z',
+        syscall: 'llm_call',
+        callId: 'c3',
+        phase: 'exit',
+        durationMs: 3,
+      } as never);
+      await store.refresh(root);
+      const growth = store.bytesRead - afterFirst;
+      assert(growth > 0, `the new frame was read, grew ${growth} bytes`);
+      assert(growth < size / 2, `reading one frame cost ${growth} bytes of a ${size} byte log`);
+      await rec.close();
+    });
+
+    await checkAsync('a frame written after the feed read the log shows up exactly once', async () => {
+      const root = join(tmp, 'newframe');
+      const rec = await writeFrame(root, 'llm_call', 'c1', 'exit', '2026-09-28T00:00:02.000Z');
+
+      const store = new ActivityStore();
+      await store.refresh(root);
+      await rec.append({
+        ...base,
+        timestamp: '2026-09-28T00:00:05.000Z',
+        syscall: 'llm_call',
+        callId: 'c4',
+        phase: 'exit',
+        durationMs: 4,
+      } as never);
+      await store.refresh(root);
+
+      const events = store.read({}).events as Array<{ runId?: string }>;
+      const seen = events.filter((e) => e.runId === 'c4');
+      assert(seen.length === 1, `the new frame is shown once, got ${seen.length}`);
+      await rec.close();
+    });
+
+    await checkAsync('a log that was replaced does not leave the old history behind', async () => {
+      const root = join(tmp, 'replaced');
+      const rec = await writeFrame(root, 'llm_call', 'c1', 'exit', '2026-09-28T00:00:02.000Z');
+      await rec.close();
+
+      const store = new ActivityStore();
+      await store.refresh(root);
+      const before = store.read({}).events as Array<{ runId?: string }>;
+      assert(before.length === 1 && before[0]!.runId === 'c1', 'the feed holds the old history');
+
+      // A different log at the same path, with a frame the old one never had.
+      // The feed has to show the new history, not both.
+      const other = join(tmp, 'other');
+      const otherRec = await writeFrame(other, 'memory_read', 'new-1', 'exit', '2026-09-28T01:00:00.000Z', {
+        durationMs: 1,
+      });
+      await otherRec.close();
+      copyFileSync(
+        join(other, 'processes', '2', 'log.crec'),
+        join(root, 'processes', '2', 'log.crec'),
+      );
+
+      await store.refresh(root);
+      const after = store.read({}).events as Array<{ runId?: string }>;
+      assert(
+        after.length === 1 && after[0]!.runId === 'new-1',
+        `only the new history is shown, got ${JSON.stringify(after.map((e) => e.runId))}`,
+      );
+    });
+
+    await checkAsync('the dashboard does not re-read the logs it has already read', async () => {
+      const root = join(tmp, 'dashboard');
+      const rec = await writeFrame(root, 'llm_call', 'c1', 'exit', '2026-09-28T00:00:02.000Z', {
+        durationMs: 12,
+      });
+      for (let i = 0; i < 40; i += 1) {
+        await rec.append({
+          ...base,
+          timestamp: `2026-09-28T00:00:${String(3 + i).padStart(2, '0')}.000Z`,
+          syscall: 'memory_read',
+          callId: `m${i}`,
+          phase: 'exit',
+          durationMs: 1,
+        } as never);
+      }
+      await rec.close();
+      const size = statSync(join(root, 'processes', '2', 'log.crec')).size;
+
+      const dash = await startDashboard({ dir: root, port: 0 });
+      try {
+        await fetch(`${dash.url}/api/events?limit=50`);
+        const afterFirst = dash.activity.bytesRead;
+        assert(afterFirst >= size, `the first request reads the log, got ${afterFirst} of ${size}`);
+
+        await fetch(`${dash.url}/api/events?limit=50`);
+        assert(
+          dash.activity.bytesRead === afterFirst,
+          `the second request re-read the log: ${dash.activity.bytesRead - afterFirst} bytes`,
+        );
+      } finally {
+        await dash.close();
+      }
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // FS tool driver checks
 // =============================================================================
 
@@ -16316,6 +16557,7 @@ await runLangchainChecks();
 await runLLMTapChecks();
 await runWrapChecks();
 await runDashboardChecks();
+await runDashboardStoreChecks();
 await runDashboardLiveChecks();
 await runAttachPushChecks();
 await runFsChecks();

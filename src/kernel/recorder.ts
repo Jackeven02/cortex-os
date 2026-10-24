@@ -451,6 +451,99 @@ export class Recorder {
 // =============================================================================
 
 /**
+ * Where a frame is and what it was.
+ *
+ * It is what a follower checks to know that the history it is extending is
+ * still the history: the frame has to still be at that offset, with that
+ * length, saying the same thing.
+ */
+interface FrameStamp {
+  /** The file offset the frame starts at. */
+  readonly offset: number;
+  /** The frame's payload length. */
+  readonly length: number;
+  /** The frame's call id. */
+  readonly callId: string;
+}
+
+/**
+ * Decode the frames in a buffer, starting at `start`.
+ *
+ * Yields each record as it is decoded, so a caller that stops early stops the
+ * work, and a corrupt frame in the middle throws at exactly the point it
+ * always did. `base` is the file offset of `buf[0]`, so the errors can point
+ * at the place in the file rather than at the place in the buffer.
+ *
+ * Returns where the last complete frame ended, and what that frame was —
+ * the last frame is what a follower checks to know that the history it is
+ * extending is still the history.
+ */
+function* decodeFrames(
+  buf: Buffer,
+  start: number,
+  base: number,
+  op: string,
+  path: string,
+): Generator<SyscallRecord, { end: number; last: FrameStamp | undefined }, undefined> {
+  let cursor = start;
+  let last: FrameStamp | undefined;
+  while (cursor < buf.byteLength) {
+    // Need at least the length prefix to proceed.
+    if (buf.byteLength - cursor < CREC_FRAME_PREFIX_SIZE) {
+      // Torn frame header at EOF. Discard.
+      break;
+    }
+
+    const declaredLength = buf.readUInt32BE(cursor);
+    const frameStart = cursor;
+    const payloadStart = cursor + CREC_FRAME_PREFIX_SIZE;
+    const payloadEnd = payloadStart + declaredLength;
+
+    if (payloadEnd > buf.byteLength) {
+      // Torn frame payload at EOF. Discard.
+      break;
+    }
+
+    const payload = buf.subarray(payloadStart, payloadEnd);
+    let decoded: unknown;
+    try {
+      decoded = decode(payload);
+    } catch (err) {
+      throw new CortexError('ERECORD', op, {
+        message: 'CBOR decode failed mid-file (corruption?)',
+        details: { path, frameStart: base + frameStart, declaredLength },
+        cause: err,
+      });
+    }
+
+    // Validate the decoded shape minimally. We do not do full schema
+    // validation here — that is the replay engine's job — but we do check
+    // the fields the reader itself relies on.
+    if (
+      typeof decoded !== 'object' ||
+      decoded === null ||
+      !('syscall' in decoded) ||
+      !('phase' in decoded)
+    ) {
+      throw new CortexError('ERECORD', op, {
+        message: 'decoded frame is not a SyscallRecord',
+        details: { path, frameStart: base + frameStart },
+      });
+    }
+
+    const record = decoded as SyscallRecord;
+    yield record;
+    last = {
+      offset: base + frameStart,
+      length: declaredLength,
+      callId: typeof record.callId === 'string' ? record.callId : '',
+    };
+    cursor = payloadEnd;
+  }
+  return { end: cursor, last };
+}
+
+/**
  * Read all records from a .crec file, in order.
  *
  * Validates the magic header. Stops silently at a torn frame at EOF (the
@@ -486,62 +579,214 @@ export async function* readRecords(path: string): AsyncGenerator<SyscallRecord> 
     });
   }
 
-  let cursor = CREC_HEADER_SIZE;
-  while (cursor < buf.byteLength) {
-    // Need at least the length prefix to proceed.
-    if (buf.byteLength - cursor < CREC_FRAME_PREFIX_SIZE) {
-      // Torn frame header at EOF. Discard.
-      return;
-    }
+  const frames = decodeFrames(buf, CREC_HEADER_SIZE, 0, 'readRecords', path);
+  let step = frames.next();
+  while (!step.done) {
+    yield step.value;
+    step = frames.next();
+  }
+}
 
-    const declaredLength = buf.readUInt32BE(cursor);
-    const frameStart = cursor;
-    const payloadStart = cursor + CREC_FRAME_PREFIX_SIZE;
-    const payloadEnd = payloadStart + declaredLength;
+/**
+ * What one read of a {@link LogTail} found.
+ */
+export interface TailRead {
+  /** The frames written since the previous read. */
+  readonly records: readonly SyscallRecord[];
+  /** The byte offset just past the last complete frame. */
+  readonly offset: number;
+  /**
+   * How many bytes were read from the file.
+   *
+   * It is here to be measured: "the reader does not re-read what it already
+   * read" is a claim about bytes, and a claim about bytes needs bytes.
+   */
+  readonly bytes: number;
+  /**
+   * True when the file was replaced or truncated under us.
+   *
+   * The frames that were read are gone, so the caller has to forget them —
+   * a reader that kept showing a history the disk no longer has would be
+   * showing a past that did not happen.
+   */
+  readonly replaced: boolean;
+}
 
-    if (payloadEnd > buf.byteLength) {
-      // Torn frame payload at EOF. Discard.
-      return;
-    }
+/**
+ * A reader that follows a `.crec` file as it grows.
+ *
+ * `readRecords` answers "what is in this file", and it answers it by reading
+ * the whole file, every time. That is the right answer for a file that is
+ * finished, and the wrong one for a file that is still being written to: a
+ * watcher that asks "what is new" by re-reading everything pays for the
+ * whole history on every poll — and the history of a long-lived agent is
+ * exactly the thing that grows.
+ *
+ * This follows the file instead. It remembers how far it has read, and each
+ * call returns only the frames written since the last one. The frames are
+ * the frames `readRecords` would return, in the same order; the difference is
+ * only how much of the file is read to get them.
+ *
+ * ## The awkward parts, and what it does with them
+ *
+ * - **A torn frame at EOF** (the writer was interrupted mid-frame) is not an
+ *   error: the read stops before it, the offset points at its start, and the
+ *   next call picks the frame up once the rest of it has been written.
+ * - **A file that shrank** was replaced, not appended to. The frames read so
+ *   far are gone, so this starts over from the beginning and reports
+ *   `replaced: true` — the caller has to know, because the events it
+ *   derived from those frames are no longer true.
+ */
+export class LogTail {
+  /** The file this follows. */
+  readonly path: string;
 
-    const payload = buf.subarray(payloadStart, payloadEnd);
-    let decoded: unknown;
+  /** The byte offset just past the last complete frame. */
+  #offset = 0;
+
+  /** Whether the magic header has been read and accepted. */
+  #headerDone = false;
+
+  /**
+   * The file's identity as of the last read (`device:inode`).
+   *
+   * A log that was replaced by a different file of the same size would not
+   * look truncated, and reading it from the old offset would splice two
+   * histories together. The identity is what says "this is a different
+   * file".
+   */
+  #identity: string | undefined;
+
+  /**
+   * The last frame that was read.
+   *
+   * A file that was replaced by one that is *bigger* does not look
+   * truncated, and the bytes at the old offset are then the middle of a
+   * frame — which reads as "the writer has not finished the frame yet", not
+   * as "this is a different history". So the frame we last read is checked:
+   * it has to still be at that offset, with that length, saying the same
+   * thing. One frame's worth of reading to know that the rest is still the
+   * rest.
+   */
+  #lastFrame: FrameStamp | undefined;
+
+  constructor(path: string) {
+    this.path = path;
+  }
+
+  /** The byte offset just past the last complete frame. */
+  get offset(): number {
+    return this.#offset;
+  }
+
+  /**
+   * Read the frames written since the last call.
+   *
+   * @throws CortexError EINVAL when the file is not a `.crec`, ERECORD when a
+   *   frame in the middle of it cannot be decoded.
+   */
+  async read(): Promise<TailRead> {
+    let handle: FileHandle;
     try {
-      decoded = decode(payload);
+      handle = await open(this.path, 'r');
     } catch (err) {
-      throw new CortexError('ERECORD', 'readRecords', {
-        message: 'CBOR decode failed mid-file (corruption?)',
-        details: { path, frameStart, declaredLength },
-        cause: err,
-      });
+      throw wrapIoError('LogTail.read', this.path, err);
+    }
+    try {
+      const stat = await handle.stat();
+      const identity = `${String(stat.dev)}:${String(stat.ino)}`;
+      let replaced =
+        stat.size < this.#offset ||
+        (this.#identity !== undefined && this.#identity !== identity);
+      if (!replaced && this.#lastFrame !== undefined && this.#offset > 0) {
+        // The history we are extending has to still be there.
+        replaced = !(await this.#sameHistory(handle));
+      }
+      if (replaced) {
+        // The file was replaced or truncated: the frames we read are gone.
+        this.#offset = 0;
+        this.#headerDone = false;
+        this.#lastFrame = undefined;
+      }
+      this.#identity = identity;
+      const from = replaced ? 0 : this.#offset;
+      try {
+        const tail = await this.#readFrom(handle, from, stat.size);
+        return { ...tail, replaced };
+      } catch (err) {
+        if (from === 0) throw err;
+        // The bytes we were following are not the bytes that are there. The
+        // file was replaced by one that is not an extension of it — the same
+        // path, different history — so the only honest thing to do is read
+        // it from the beginning and say that it was replaced.
+        this.#offset = 0;
+        this.#headerDone = false;
+        this.#lastFrame = undefined;
+        const again = await this.#readFrom(handle, 0, stat.size);
+        return { ...again, replaced: true };
+      }
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * Whether the frame last read is still at the place it was read from.
+   *
+   * It has to be there with the same length and the same call id. Anything
+   * else means the file is not the file we were following.
+   */
+  async #sameHistory(handle: FileHandle): Promise<boolean> {
+    const frame = this.#lastFrame as FrameStamp;
+    const buf = Buffer.alloc(CREC_FRAME_PREFIX_SIZE + frame.length);
+    const { bytesRead } = await handle.read(buf, 0, buf.length, frame.offset);
+    if (bytesRead < buf.length) return false;
+    if (buf.readUInt32BE(0) !== frame.length) return false;
+    try {
+      const decoded = decode(buf.subarray(CREC_FRAME_PREFIX_SIZE)) as { callId?: unknown };
+      return decoded?.callId === frame.callId;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Read the frames between `from` and the end of the file. */
+  async #readFrom(
+    handle: FileHandle,
+    from: number,
+    size: number,
+  ): Promise<Omit<TailRead, 'replaced'>> {
+    const length = Math.max(0, size - from);
+    const buf = Buffer.alloc(length);
+    if (length > 0) await handle.read(buf, 0, length, from);
+
+    let cursor = 0;
+    if (!this.#headerDone) {
+      if (buf.byteLength < CREC_HEADER_SIZE) {
+        // Not even the header yet — the file is still being created.
+        return { records: [], offset: from, bytes: length };
+      }
+      const magic = buf.subarray(0, CREC_HEADER_SIZE);
+      if (!magic.equals(Buffer.from(CREC_MAGIC))) {
+        throw new CortexError('EINVAL', 'LogTail.read', {
+          message: 'not a .crec file (magic mismatch)',
+          details: { path: this.path },
+        });
+      }
+      this.#headerDone = true;
+      cursor = CREC_HEADER_SIZE;
     }
 
-    // Validate the decoded shape minimally. We do not do full schema
-    // validation here — that is the replay engine's job — but we do check
-    // the fields the reader itself relies on.
-    if (
-      typeof decoded !== 'object' ||
-      decoded === null ||
-      !('syscall' in decoded) ||
-      !('phase' in decoded)
-    ) {
-      throw new CortexError('ERECORD', 'readRecords', {
-        message: 'decoded frame is not a SyscallRecord',
-        details: { path, frameStart },
-      });
+    const frames = decodeFrames(buf, cursor, from, 'LogTail.read', this.path);
+    const records: SyscallRecord[] = [];
+    let result = frames.next();
+    while (!result.done) {
+      records.push(result.value);
+      result = frames.next();
     }
-
-    // Validate self-described offset matches physical position. A mismatch
-    // means the file was edited externally or the writer had a bug. Surface
-    // it but do not throw — the record is still usable.
-    const record = decoded as SyscallRecord;
-    if (typeof record.byteOffset === 'number' && record.byteOffset !== frameStart) {
-      // TODO: emit a warning hook once the kernel has a logging subsystem.
-      // For now, silently yield. The replay engine can detect this if it cares.
-    }
-
-    yield record;
-    cursor = payloadEnd;
+    this.#offset = from + result.value.end;
+    if (result.value.last !== undefined) this.#lastFrame = result.value.last;
+    return { records, offset: this.#offset, bytes: length };
   }
 }
 

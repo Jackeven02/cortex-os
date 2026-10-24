@@ -11,6 +11,12 @@ import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
 import { formatCaps, readProcessView } from '../cli/process_view.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
+import {
+  ActivityStore,
+  safeErrorMessage,
+  toActivityEvent,
+  type ActivityEvent,
+} from './event_store.js';
 import type { KernelCommand } from '../cli/kernel_protocol.js';
 import type { Capability } from '../kernel/types.js';
 
@@ -55,6 +61,14 @@ export interface DashboardOptions {
 export interface RunningDashboard {
   readonly server: Server;
   readonly url: string;
+  /**
+   * The activity feed the dashboard shows, and how much it has read.
+   *
+   * It is here to be asked, not to be admired: a dashboard that is falling
+   * behind is a dashboard that is paying for the whole history on every
+   * change, and `bytesRead` is the number that says so.
+   */
+  readonly activity: ActivityStore;
   close(): Promise<void>;
 }
 
@@ -88,14 +102,6 @@ const MAX_SCAN = 5000;
  */
 const PROCESS_REFRESH_DEBOUNCE_MS = 250;
 
-function safeErrorMessage(message: string): string {
-  return message
-    .replace(/\bBearer\s+\S+/gi, 'Bearer [REDACTED]')
-    .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
-    .replace(/(authorization|api[_-]?key|token|secret)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
-    .slice(0, 240);
-}
-
 async function readEvents(dir: string, range: TimeRange): Promise<unknown[]> {
   const path = join(dir, 'integrations', 'langchain', 'events.jsonl');
   if (!existsSync(path)) return [];
@@ -120,70 +126,18 @@ async function readEvents(dir: string, range: TimeRange): Promise<unknown[]> {
  * One event in the dashboard's activity panel.
  *
  * Derived from a syscall frame — the same frame the `.crec` log holds.
+ *
+ * The conversion itself lives in `./event_store.ts`, because the disk path
+ * and the push path both use it, and two places that turn a frame into an
+ * event will turn it into two different events.
  */
-interface DashboardEvent {
-  type: string;
-  at: string;
-  runId: string;
-  pid: number;
-  name: string;
-  durationMs?: number;
-  error?: string;
-  errorMessage?: string;
-  model?: string;
-  tokensIn?: number;
-  tokensOut?: number;
-  usd?: number;
-  audit?: Record<string, unknown>;
-}
+type DashboardEvent = ActivityEvent;
 
 /**
  * Turn a syscall frame into a dashboard event — or `undefined` when the
  * frame is not one the dashboard shows.
- *
- * The disk path and the live path both go through here, so a frame that
- * arrives by push looks exactly like the same frame read off disk. Two
- * rules, and they are the same rules the log view uses: a call's `enter`
- * frame is not an event (the `exit` frame is), and the kernel's own
- * `__`-prefixed bookkeeping frames are not the agent's work.
  */
-function toDashboardEvent(record: SyscallRecord, pid: number): DashboardEvent | undefined {
-  if (record.phase === 'enter' || record.syscall.startsWith('__')) return undefined;
-  const type =
-    record.syscall === 'llm_call'
-      ? 'llm.call'
-      : record.syscall === 'tool_call'
-        ? 'tool.call'
-        : `kernel.${record.syscall}`;
-  // Tools may attach a generic `audit` object to their structured
-  // output. It is passed through verbatim — the dashboard does not
-  // know (or care) what domains put inside it.
-  const toolResult = record.result as
-    | { output?: { structured?: { audit?: Record<string, unknown> } } }
-    | undefined;
-  const audit = record.syscall === 'tool_call' ? toolResult?.output?.structured?.audit : undefined;
-  const llmResult =
-    record.syscall === 'llm_call'
-      ? (record.result as
-          | { model?: string; usage?: { inputTokens?: number; outputTokens?: number; usd?: number } }
-          | undefined)
-      : undefined;
-  return {
-    type,
-    at: record.timestamp,
-    runId: record.callId,
-    pid,
-    name: record.syscall,
-    ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
-    ...(record.error !== undefined ? { error: record.error.errno } : {}),
-    ...(record.error !== undefined ? { errorMessage: safeErrorMessage(record.error.message) } : {}),
-    ...(llmResult?.model !== undefined ? { model: llmResult.model } : {}),
-    ...(llmResult?.usage?.inputTokens !== undefined ? { tokensIn: llmResult.usage.inputTokens } : {}),
-    ...(llmResult?.usage?.outputTokens !== undefined ? { tokensOut: llmResult.usage.outputTokens } : {}),
-    ...(llmResult?.usage?.usd !== undefined ? { usd: llmResult.usage.usd } : {}),
-    ...(audit !== undefined ? { audit } : {}),
-  };
-}
+const toDashboardEvent = toActivityEvent;
 
 async function readSyscallEvents(dir: string, range: TimeRange): Promise<unknown[]> {
   const events: DashboardEvent[] = [];
@@ -436,6 +390,10 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
   const dir = options.dir ?? '.cortex';
   const host = options.host ?? '127.0.0.1';
   const port = options.port ?? 4173;
+  // One store for the whole dashboard: the activity feed is read once and
+  // then followed, and every path that shows it — the JSON API, the disk
+  // stream, the live stream's seed — reads it from here.
+  const store = new ActivityStore();
   const server = createServer(async (request, response) => {
     try {
       const url = new URL(request.url ?? '/', 'http://localhost');
@@ -473,11 +431,22 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           ...(Number.isFinite(fromMs) ? { from: fromMs } : {}),
           ...(Number.isFinite(toMs) ? { to: toMs } : {}),
         };
-        const [callbacks, syscalls] = await Promise.all([
-          readEvents(dir, range),
-          readSyscallEvents(dir, range),
-        ]);
-        const merged = [...callbacks, ...syscalls].sort(byNewest);
+        // The feed is read once and then followed, so this is the cost of
+        // what is *new*, not of the whole history.
+        await store.refresh(dir);
+        let merged: readonly unknown[];
+        if (store.covers(range)) {
+          merged = store.read(range).events;
+        } else {
+          // The window reaches back past what the store kept. The disk still
+          // has it, so the disk is asked — a shorter answer than the disk
+          // gives would be a truncation nobody can see.
+          const [callbacks, syscalls] = await Promise.all([
+            readEvents(dir, range),
+            readSyscallEvents(dir, range),
+          ]);
+          merged = [...callbacks, ...syscalls].sort(byNewest);
+        }
         response.setHeader('x-total-count', String(merged.length));
         json(response, 200, merged.slice(offset, offset + limit));
         return;
@@ -601,11 +570,12 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             // Seed the panel from the disk, so it is not empty when the
             // dashboard opens: the kernel only carries what happens from
             // now on.
-            const [callbacks, syscalls] = await Promise.all([
-              readEvents(dir, {}),
-              readSyscallEvents(dir, {}),
-            ]);
-            recent = [...callbacks, ...syscalls].sort(byNewest).slice(0, limit);
+            //
+            // The seed comes from the store, which has already read the logs
+            // once and follows them from there — so a page that reconnects
+            // does not re-read the whole history of every process.
+            await store.refresh(dir);
+            recent = [...store.read({}).events].slice(0, limit);
             for (const event of recent) {
               const runId = (event as { runId?: string }).runId;
               if (runId !== undefined) seeded.add(runId);
@@ -627,15 +597,15 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           // No live stream after all: fall through to the disk path.
         }
 
-        // --- the disk path: watch the directory and re-read ---------------
+        // --- the disk path: watch the directory and follow the logs -------
         const push = async (): Promise<void> => {
           try {
-            const [callbacks, syscalls] = await Promise.all([
-              readEvents(dir, {}),
-              readSyscallEvents(dir, {}),
-            ]);
+            // Only what is new since the last time. The old path re-read
+            // every log from byte 0 on every change, which is the history of
+            // every agent — paid again, and again, for the operator's window.
+            await store.refresh(dir);
             send('processes', await listProcesses(dir, options));
-            send('events', [...callbacks, ...syscalls].sort(byNewest).slice(0, limit));
+            send('events', [...store.read({}).events].slice(0, limit));
           } catch {
             // Transient read failure: keep the stream alive.
           }
@@ -729,6 +699,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
   return {
     server,
     url: `http://${host}:${actualPort}`,
+    activity: store,
     close,
   };
 }
