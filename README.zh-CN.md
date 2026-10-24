@@ -232,7 +232,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 748 项断言，0 失败
+npx tsx scripts/smoke.ts                # 750 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -347,6 +347,8 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 **而且大屏里的钱，和 CLI 里印的钱是同一笔钱。** 成本面板读的是内核的微美元计数器，在服务端换算一次，显示成美元——所以一个花了 `$0.003400` 的进程，在这里和 `cortex top` 里都读作 `$0.003400`，而不是一个视图说 `$3400`、另一个说 `$0.0034`。而且它按内核计数的精度打印：一次模型调用大约 `$0.000027`，这里就显示 `$0.000027`——而不是 `$0.0000`，一个花了真钱的运行就那样看起来像没花过钱。
 
 **而且事件表里看得见这次调用花了多少钱。** `cortex wrap --tap` 把模型自己发出的 HTTP 调用记进和驱动调用同一份日志，所以这些调用同样出现在事件表里——带着它们的 token 和价格，写成 ABI 规定的 `usage` 形状，也就是所有读 `llm_call` 帧的人都在找的那个形状。
+
+**而且时间线读起来和终端里的一样。** 内核自己的帧在盘上是占位名（`__state`、`__sched`）——**区分**它们的是那个视图：`__state:running->blocked(recv)`、`__sched:sigxcpu(tokens)`。大屏印的是和 `cortex trace` 一样的名字，因为两边问的是同一个函数。
 
 三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
 

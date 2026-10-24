@@ -240,7 +240,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 748 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 750 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -358,6 +358,8 @@ Read-only by default. With a live kernel in the directory (`cortex daemon run`),
 **And the money in it is the money the CLI prints.** The cost panel reads the kernel's microdollar counter, converts it once on the server, and shows dollars — so a process that spent `$0.003400` reads as `$0.003400` here *and* in `cortex top`, instead of one view saying `$3400` and the other saying `$0.0034`. And it is printed at the resolution the kernel counts: one model call costs about `$0.000027`, and that reads as `$0.000027` — not `$0.0000`, which is how a run that spent real money comes to look like a run that spent nothing.
 
 **And the event table shows what a call cost.** `cortex wrap --tap` records the model's own HTTP calls into the same log a driver call goes into, so those calls show up in the event table too — with their tokens and their price, written in the ABI's `usage` shape, the same shape every other reader of an `llm_call` frame looks in.
+
+**And the timeline reads like the terminal's.** The kernel's own frames are placeholders on disk (`__state`, `__sched`) — the *view* is what distinguishes them: `__state:running->blocked(recv)`, `__sched:sigxcpu(tokens)`. The window prints the same names `cortex trace` does, because both ask the same function.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

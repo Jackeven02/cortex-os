@@ -10057,6 +10057,25 @@ function renderDashboardEventRow(html: string, event: Record<string, unknown>): 
   return fn(event, esc, fmtUsd, eventLabel, fmtLocal);
 }
 
+/** Render one row of the dashboard's syscall timeline, the way the page does. */
+function renderDashboardTraceRow(html: string, record: Record<string, unknown>): string {
+  const esc = pageFunction(html, 'esc');
+  const marker = 'records.map((record) => ';
+  const at = html.indexOf(marker);
+  assert(at >= 0, 'the page still renders a syscall timeline');
+  const start = at + marker.length;
+  // The row template is one template literal; the map call closes right
+  // before `.join('')`.
+  const end = html.indexOf(").join('')", start);
+  assert(end > start, "the page's trace row template never closes");
+  const expr = html.slice(start, end);
+  const fn = new Function('record', 'esc', `return (${expr});`) as (
+    r: Record<string, unknown>,
+    escFn: PageFn,
+  ) => string;
+  return fn(record, esc);
+}
+
 async function runDashboardChecks(): Promise<void> {
   const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
@@ -10163,6 +10182,101 @@ async function runDashboardChecks(): Promise<void> {
         assert(trap['errorMessage'] === 'auth failed for key [REDACTED]', `trace sanitizes secrets, got ${String(trap['errorMessage'])}`);
         const exit = rows.find((r) => r['phase'] === 'exit' && r['syscall'] === 'llm_call')!;
         assert(exit['model'] === 'gpt-test' && exit['tokensIn'] === 7, 'trace surfaces model and usage');
+      });
+
+      await checkAsync('the dashboard and cortex trace name a frame the same way', async () => {
+        // The dashboard's timeline printed the **recorded** syscall name, so a
+        // kernel frame read as the bare placeholder `__state` — while
+        // `cortex trace` printed `__state:running->blocked(recv)` for the same
+        // frame. Two views of one log, and the operator's window was the one
+        // that said nothing at all.
+        //
+        // The cause was in the recording the whole time; the view dropped it.
+        // Now both views ask the same function for the name.
+        const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
+        await rec.append({
+          timestamp: '2026-09-28T00:00:05.000Z', pid: asProcessId(2), syscall: '__state',
+          callId: 'named-1', phase: 'exit',
+          args: { from: 'running', to: 'blocked', trigger: 'recv' },
+          stateBefore: 'running', stateAfter: 'blocked', reversibility: 'idempotent',
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        });
+        await rec.append({
+          timestamp: '2026-09-28T00:00:05.100Z', pid: asProcessId(2), syscall: '__sched',
+          callId: 'named-2', phase: 'exit',
+          args: { action: 'sigxcpu', budgetKind: 'tokens' },
+          stateBefore: 'running', stateAfter: 'stopped', reversibility: 'idempotent',
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        });
+        await rec.flush();
+        await rec.close();
+
+        const res = await fetch(`${dash.url}/api/trace/2`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const state = rows.find((r) => r['callId'] === 'named-1')!;
+        const sched = rows.find((r) => r['callId'] === 'named-2')!;
+        assert(
+          state['frame'] === '__state:running->blocked(recv)',
+          `the dashboard names the transition: ${String(state['frame'])}`,
+        );
+        assert(
+          sched['frame'] === '__sched:sigxcpu(tokens)',
+          `the dashboard names the budget: ${String(sched['frame'])}`,
+        );
+        // The recorded name is still there, unchanged — the format is frozen.
+        assert(state['syscall'] === '__state', `the recorded name is untouched: ${String(state['syscall'])}`);
+
+        // ...and the CLI says the same thing about the same frame.
+        const prevHome = process.env['CORTEX_HOME'];
+        const prevLog = console.log;
+        process.env['CORTEX_HOME'] = tmp;
+        let out = '';
+        console.log = (...parts: unknown[]): void => {
+          out += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        try {
+          await cmdTrace(['2']);
+        } finally {
+          console.log = prevLog;
+          if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+          else process.env['CORTEX_HOME'] = prevHome;
+        }
+        assert(
+          out.includes('__state:running->blocked(recv)'),
+          `cortex trace names it the same way: ${out}`,
+        );
+        assert(
+          out.includes('__sched:sigxcpu(tokens)'),
+          `cortex trace names the budget the same way: ${out}`,
+        );
+      });
+
+      await checkAsync('the dashboard page shows the frame, not the placeholder', async () => {
+        // The page reads the named frame, so the window says what the
+        // terminal says — and the check renders a row with the page's own
+        // code, because a page that mentions the field is not a page that
+        // shows it.
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        assert(html.includes('record.frame'), 'the timeline reads the named frame');
+
+        const row = renderDashboardTraceRow(html, {
+          timestamp: '2026-09-28T00:00:05.000Z',
+          syscall: '__state',
+          frame: '__state:running->blocked(recv)',
+          phase: 'exit',
+        });
+        // The page escapes what it renders, so the expectation is escaped the
+        // same way — by the page's own escaper.
+        const esc = pageFunction(html, 'esc') as (value: unknown) => string;
+        assert(
+          row.includes(esc('__state:running->blocked(recv)')),
+          `the row shows the named frame, got: ${row}`,
+        );
+        assert(
+          !row.includes('>__state<'),
+          `the row does not show the bare placeholder, got: ${row}`,
+        );
       });
 
       await checkAsync('dashboard trace for an unknown pid is 404', async () => {

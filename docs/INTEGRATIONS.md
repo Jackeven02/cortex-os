@@ -334,7 +334,7 @@ The event table includes model name and token usage from completed LLM calls —
 The API is available at:
 
 - `GET /api/processes` — process table (live or persisted). Each row carries the kernel's own `budgetsSpent` **in microdollars** (STATE.md §2.4) *and* `usdSpentDollars`, the same spend already converted to dollars — the page is handed dollars so it cannot print a microdollar counter next to a dollar sign.
-- `GET /api/trace/:pid` — redacted syscall timeline.
+- `GET /api/trace/:pid` — redacted syscall timeline. Each row carries `syscall` — the **recorded** syscall name, unchanged, for a reader that matches on it — and `frame`, the name a human reads: `__state:running->blocked(recv)`, `__sched:sigxcpu(tokens)`. The two are the same frame; `frame` is what `cortex trace` prints, so the window and the terminal say the same thing.
 - `GET /api/events?from=&to=&offset=&limit=` — merged callback + syscall events, newest first. `from`/`to` are millisecond timestamps; results are paginated and the total count is returned in the `x-total-count` header.
 - `GET /api/checkpoints` — checkpoints under `processes/<pid>/checkpoints/`, parsed from file names (`createdAt`/`chainId`) plus on-disk size.
 - `GET /api/ops` — reports which write operations are enabled: `{ allowOps: boolean, ops: string[] }`.

@@ -11,6 +11,7 @@ import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView } from '../cli/process_view.js';
 import { usdToDollars } from '../money.js';
+import { frameName } from '../cli/frame_name.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
 import {
   ActivityStore,
@@ -686,6 +687,13 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           } | undefined : undefined;
           records.push({
             timestamp: record.timestamp, pid: Number(record.pid), syscall: record.syscall,
+            // The name a human reads. The kernel's own frames are placeholders
+            // on disk (`__state`, `__sched`, …) and the *view* is what
+            // distinguishes them — `__state:running->blocked(recv)`,
+            // `__sched:sigxcpu(tokens)`. `cortex trace` prints that name, and
+            // the operator's window must not say something else about the same
+            // frame.
+            frame: frameName(record),
             callId: record.callId, phase: record.phase, durationMs: record.durationMs,
             stateBefore: record.stateBefore, stateAfter: record.stateAfter,
             reversibility: record.reversibility, error: record.error?.errno,

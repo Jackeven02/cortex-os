@@ -1546,6 +1546,45 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The operator's window called a kernel frame `__state`.** `cortex trace`
+  prints the kernel's own bookkeeping frames under the name that distinguishes
+  them — `__state:running->blocked(recv)`, `__sched:sigxcpu(tokens)` — and the
+  **dashboard's timeline**, which reads the same `.crec`, printed the
+  *recorded* syscall name:
+
+  ```json
+  {"syscall":"__state","phase":"exit","stateBefore":"running","stateAfter":"blocked"}
+  ```
+
+  So the same frame read as `__state:running->blocked(recv)` in the terminal
+  and as `__state` in the window — five rows of the operator's timeline that
+  said "something happened" and not what. The cause was in the recording the
+  whole time; the view dropped it.
+
+  The naming rule lived in `cortex trace`'s own module, and a rule only one
+  command can reach is a rule every other view reinvents. It moved into a
+  module **both** can reach (`src/cli/frame_name.ts`), and the timeline API
+  now carries the name a human reads:
+
+  ```json
+  {"syscall":"__state","frame":"__state:running->blocked(recv)","phase":"exit"}
+  ```
+
+  `syscall` is still the recorded name — the `.crec` format is frozen, and a
+  reader that matches on it keeps working. `frame` is the view, and the page
+  shows that one.
+
+  **Two new smoke checks** (748 → 750), both reverse-verified: the API stops
+  naming the frame → "the dashboard names the transition: __state"; the page
+  goes back to the raw name → "the timeline reads the named frame". The page
+  check renders a row with the page's *own* code, because a page that mentions
+  the field is not a page that shows it.
+
+  Verified in the browser as well: the timeline dialog now reads
+  `__state:new->ready(spawn)`, `__state:ready->running(scheduler-dispatch)`,
+  `__sched:parked`, `__state:running->exiting(exit)`,
+  `__state:exiting->zombie(exit)` — the same names the terminal prints.
+
 - **The scheduler's frames said what happened, and not why.** `cortex trace`
   shows the kernel's own bookkeeping frames — `__state`, `__signal`, `__init`,
   `__sched` — and each one is named after the thing that distinguishes it. The

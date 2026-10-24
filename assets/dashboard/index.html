@@ -641,7 +641,7 @@
         const response = await fetch(`/api/trace/${encodeURIComponent(pid)}`);
         const records = await response.json();
         if (!response.ok) throw new Error(records.error ?? '读取失败');
-        $('traceBody').innerHTML = records.length ? `<div class="trace-list">${records.map((record) => `<div class="trace-item"><span class="trace-time">${esc(new Date(record.timestamp).toLocaleTimeString())}</span><span class="trace-syscall">${esc(record.syscall)}${record.tokensIn === undefined ? '' : ` · ${esc(record.tokensIn)} in / ${esc(record.tokensOut ?? 0)} out`}${record.model ? ` · ${esc(record.model)}` : ''}${record.errorMessage ? ` · ${esc(record.error)}: ${esc(record.errorMessage)}` : ''}</span><span class="trace-phase">${esc(record.phase)}${record.durationMs === undefined ? '' : ` · ${esc(record.durationMs)} ms`}</span></div>`).join('')}</div>` : '<div class="empty">这个进程还没有 syscall 记录。</div>';
+        $('traceBody').innerHTML = records.length ? `<div class="trace-list">${records.map((record) => `<div class="trace-item"><span class="trace-time">${esc(new Date(record.timestamp).toLocaleTimeString())}</span><span class="trace-syscall">${esc(record.frame ?? record.syscall)}${record.tokensIn === undefined ? '' : ` · ${esc(record.tokensIn)} in / ${esc(record.tokensOut ?? 0)} out`}${record.model ? ` · ${esc(record.model)}` : ''}${record.errorMessage ? ` · ${esc(record.error)}: ${esc(record.errorMessage)}` : ''}</span><span class="trace-phase">${esc(record.phase)}${record.durationMs === undefined ? '' : ` · ${esc(record.durationMs)} ms`}</span></div>`).join('')}</div>` : '<div class="empty">这个进程还没有 syscall 记录。</div>';
       } catch (error) {
         $('traceBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
       }

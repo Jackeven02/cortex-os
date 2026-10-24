@@ -683,6 +683,45 @@ The user-facing surface. Should feel like a real OS shell.
   PROCESS.md §8.3 (the log says which counter hit zero) and §7 (SIGXCPU is
   about tokens, USD **or wall time**).
 
+- [x] **#087** The dashboard's timeline calls a kernel frame `__state`, while
+  `cortex trace` calls it `__state:running->blocked(recv)` → **fixed.** Two
+  views of one log, disagreeing about what it says — and the operator's window
+  was the one that said nothing:
+
+  ```json
+  {"syscall":"__state","phase":"exit","stateBefore":"running","stateAfter":"blocked"}
+  ```
+
+  The cause was in the recording the whole time; the view dropped it. The
+  naming rule lived in `cortex trace`'s own module, and a rule only one
+  command can reach is a rule every other view reinvents — it was reinvented
+  once already.
+
+  The rule moved into a module **both** can reach (`src/cli/frame_name.ts`),
+  and the timeline API now carries the name a human reads next to the
+  recorded one:
+
+  ```json
+  {"syscall":"__state","frame":"__state:running->blocked(recv)","phase":"exit"}
+  ```
+
+  `syscall` is unchanged — the `.crec` format is frozen, and a reader that
+  matches on the recorded name keeps working. `frame` is the view, and the
+  page shows that one.
+
+  **Two new smoke checks** (748 → 750), both reverse-verified: the API stops
+  naming the frame → "the dashboard names the transition: __state"; the page
+  goes back to the raw name → "the timeline reads the named frame". The page
+  check renders a row with the page's *own* code, because a page that
+  mentions the field is not a page that shows it.
+
+  Verified in the browser as well: the timeline dialog reads the same names
+  the terminal prints.
+
+  Docs: INTEGRATIONS (the `frame` field of `/api/trace/:pid`); ARCHITECTURE
+  (the operator's window says the same thing, and a rule only one command can
+  reach is a rule every other view reinvents); CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

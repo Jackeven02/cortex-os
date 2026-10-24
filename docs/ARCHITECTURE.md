@@ -1287,6 +1287,29 @@ genuinely cannot fit — a driver registering a very long syscall name — is
 **cut and marked** (`…`): a fact that does not fit must not lose its tail
 silently.
 
+**And the operator's window says the same thing.** The naming rule was in
+`cortex trace`'s own module — and the **dashboard's timeline**, which reads
+the same `.crec`, printed the *recorded* syscall name. So the same frame read
+as `__state:running->blocked(recv)` in the terminal and as `__state` in the
+window: five rows of the operator's timeline that said "something happened"
+and not what.
+
+Two views of one log, disagreeing about what it says — and the window is the
+one an operator watches. So the naming rule moved into a module **both** can
+reach (`src/cli/frame_name.ts`), and the dashboard's timeline API now carries
+the name a human reads:
+
+```json
+{"syscall":"__state","frame":"__state:running->blocked(recv)","phase":"exit"}
+```
+
+`syscall` is still there and still the recorded name — the `.crec` format is
+frozen, and a reader that matches on the recorded name keeps working. `frame`
+is the view, and the page shows that one.
+
+A rule that only one command can reach is a rule every other view reinvents.
+This one was reinvented once already.
+
 **And it made the shell a supervisor.** A stream is only half a story. Until
 something *acts* on it, the operator is still the one who has to be there —
 and the project's strongest demo (a planner that notices a hung coder, kills
