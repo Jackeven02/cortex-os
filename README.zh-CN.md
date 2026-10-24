@@ -50,6 +50,18 @@ $ cortex top --stall-after 30000
 # pid 6 has been inside recv for 880154ms — over your 30000ms threshold.
 #   cortex supervise 6 --kill-after 30000
 
+# 这个 agent 一共可以花多少，以及还剩多少
+# （运行中 agent 的预算在内核里，所以这需要活内核：`cortex daemon run`；
+#   已经结束的进程则从它的退出记录里回答）
+$ cortex limit 1234
+pid 1234 (coder):
+  tokens:    spent 12300 / limit 20000 (7700 left)
+  usd:       spent $0.014000 / limit $1.000000 ($0.986000 left)
+  wall time: spent 120000ms / limit ∞
+$ cortex limit 1234 --tokens 20000   # 上限是 20000 —— 不是在原有基础上再加
+set the budget for 1234 (coder):
+  tokens:    spent 12300 / limit 20000 (7700 left)
+
 # 跟随一个正在跑的 agent 的 syscall 流（有内核时是推送）
 $ cortex attach 1234
 # attach .cortex/processes/1234/log.crec (live — frames by push from the kernel)
@@ -185,7 +197,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`replay`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 跟着一个 agent 的 syscall 流 —— 有活内核且那个进程还在内核里时，帧是**推**过来的（中位延迟 1 毫秒，而且 agent 一结束，跟随就自己收尾，并报出它真实的退出码）；没有内核时才去 tail 日志文件；有活内核时它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex restore --live` 能把快照**放回**那个内核，`cortex fork <pid>` 能把运行中的 agent 克隆成第二条可以驱动、可以对比的分支，`cortex daemon stop` 还能再把它停下来。`cortex top` 读的是每个活进程自己的日志 —— 读法跟 `cortex supervise` 完全一样，所以这个视图和那个会动手的命令**不可能各说各话**；加上 `--stall-after <ms>`，它会把超过**你的**阈值的进程标出来，顺带把该跑的命令给你。它还会说清楚**哪些信号正在排队**：发给一个卡死 agent 的 `kill` 不会立刻送达，而是排队等着一次可能永远不会来的唤醒 —— 视图会说出来，而不是把这件事只留给刚刚发出它的那条命令。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
+上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`replay`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 跟着一个 agent 的 syscall 流 —— 有活内核且那个进程还在内核里时，帧是**推**过来的（中位延迟 1 毫秒，而且 agent 一结束，跟随就自己收尾，并报出它真实的退出码）；没有内核时才去 tail 日志文件；有活内核时它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex restore --live` 能把快照**放回**那个内核，`cortex fork <pid>` 能把运行中的 agent 克隆成第二条可以驱动、可以对比的分支，`cortex daemon stop` 还能再把它停下来。`cortex top` 读的是每个活进程自己的日志 —— 读法跟 `cortex supervise` 完全一样，所以这个视图和那个会动手的命令**不可能各说各话**；加上 `--stall-after <ms>`，它会把超过**你的**阈值的进程标出来，顺带把该跑的命令给你。它还会说清楚**哪些信号正在排队**：发给一个卡死 agent 的 `kill` 不会立刻送达，而是排队等着一次可能永远不会来的唤醒 —— 视图会说出来，而不是把这件事只留给刚刚发出它的那条命令。`cortex limit` 也能碰到**运行中** agent 的预算 —— 预算是内核持有的东西，所以这条命令去问真正持有这个进程的内核，而不是自己 boot 一个除了 init 什么都没有的内核；它还把**上限**（这个进程总共可以花多少）和**还剩多少**分开说，因为一个会在你脚底下变小的数字不是上限。`--tokens N` 设的就是这个上限；已经结束的进程会**拒绝**改预算 —— 它花了多少是内核的记录。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
 
 ---
 
@@ -213,7 +225,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 729 项断言，0 失败
+npx tsx scripts/smoke.ts                # 732 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。

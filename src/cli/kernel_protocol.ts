@@ -88,6 +88,13 @@ export const KERNEL_PROTOCOL_VERSION = 1;
  * whole log to pair the frames — costs O(bytes) for a fact the kernel has in
  * O(processes).
  *
+ * `limit` is a read *and* a write, and it is the operator's own verb on a
+ * process's budget: read it, or change the ceiling. It is not a syscall —
+ * the ABI has no `set_budget` — so it is answered by the kernel's own
+ * accounting rather than through the dispatcher, and it is not recorded. The
+ * budget a *process* sees is still read through the `budget()` syscall
+ * (ABI.md §4.8), which the ABI leaves unrecorded on purpose.
+ *
  * Everything else is answered by the ordinary dispatcher path and therefore
  * is recorded.
  */
@@ -98,6 +105,7 @@ export type KernelCommand =
   | 'memory'
   | 'send'
   | 'kill'
+  | 'limit'
   | 'wait'
   | 'subscribe'
   | 'checkpoint'

@@ -359,6 +359,22 @@ function parseEventKinds(raw: unknown): Set<string> | null {
   return kinds.size === 0 ? null : kinds;
 }
 
+/**
+ * A number the client sent, or `undefined` when it did not send one.
+ *
+ * Absent means "leave it alone" — which is what an operator means by naming
+ * only one of the three budgets. A value that is not a number is an error,
+ * not a silent `undefined`: a budget that was asked for and not applied is
+ * worse than one that was refused.
+ */
+function optionalNumber(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+    throw new WireError('EINVAL', `not a number: ${String(raw)}`);
+  }
+  return raw;
+}
+
 /** Map a thrown error onto the wire's error shape. */
 function toWireError(err: unknown): { errno: string; message: string; details?: unknown } {
   if (err instanceof WireError) {
@@ -623,6 +639,75 @@ async function dispatch(
                 ? 'delivered'
                 : 'dropped';
       return { outcome, pid, signal, state: after?.state ?? null };
+    }
+
+    case 'limit': {
+      // A process's budget: read it, or change its ceiling.
+      //
+      // This is the operator's own verb on a budget, and it is the only way
+      // to reach one: a running agent has no `meta.json` yet (the kernel
+      // writes that when it exits), so the on-disk record cannot answer for
+      // it, and the local CLI invocation that spawns an agent is gone by the
+      // time anybody wants to change its budget.
+      const pid = Number(args['pid']);
+      if (!Number.isInteger(pid)) {
+        throw new WireError('EINVAL', `invalid pid: ${String(args['pid'])}`);
+      }
+      const target = asProcessId(pid);
+      const entry = kernel.table.get(target);
+      if (entry === undefined) {
+        throw new WireError('ESRCH', `no such process: ${pid}`);
+      }
+
+      // The ceilings the operator asked for. `usd` is in microdollars, the
+      // unit the ABI uses (ABI.md §4.8).
+      const tokens = optionalNumber(args['tokens']);
+      const usd = optionalNumber(args['usd']);
+      const wallTimeMs = optionalNumber(args['wallTimeMs']);
+
+      if (tokens === undefined && usd === undefined && wallTimeMs === undefined) {
+        // A read: what it has spent and what it has left.
+        return {
+          pid,
+          role: entry.role,
+          spent: { ...entry.budgetsSpent },
+          remaining: { ...entry.budgetsRemaining },
+        };
+      }
+
+      // A write: a **ceiling**, not a remainder. The kernel keeps the
+      // remainder, so the ceiling is converted here — against the counters
+      // read at this very moment, which is what makes it exact. (A client
+      // that read the spend and then converted it would be racing the very
+      // spending it is trying to cap.)
+      const spentTokens = entry.budgetsSpent.tokensIn + entry.budgetsSpent.tokensOut;
+      const remaining = {
+        tokens:
+          tokens === undefined
+            ? entry.budgetsRemaining.tokens
+            : tokens < 0
+              ? -1
+              : Math.max(0, tokens - spentTokens),
+        usd:
+          usd === undefined
+            ? entry.budgetsRemaining.usd
+            : usd < 0
+              ? -1
+              : Math.max(0, usd - entry.budgetsSpent.usdSpent),
+        wallTimeMs:
+          wallTimeMs === undefined
+            ? entry.budgetsRemaining.wallTimeMs
+            : wallTimeMs < 0
+              ? -1
+              : Math.max(0, wallTimeMs - entry.budgetsSpent.wallTimeMs),
+      };
+      kernel.scheduler.setBudget(target, remaining);
+      return {
+        pid,
+        role: entry.role,
+        spent: { ...entry.budgetsSpent },
+        remaining: { ...entry.budgetsRemaining },
+      };
     }
 
     case 'wait': {

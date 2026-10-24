@@ -2222,6 +2222,80 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   (and the failure shows the row still carrying `"pendingSignals":["SIGTERM"]`
   — the kernel told the dashboard, and nobody turned it into words).
 
+- **A budget had a ceiling, and `cortex limit` printed the remainder under the
+  label "limit".** The command told two lies, and they were both about the
+  operator's own numbers.
+
+  **The first: it could not reach a running agent's budget at all.** It booted
+  a kernel of its own and looked there — and that kernel holds nothing but
+  init, so it answered "no such process" for an agent `cortex ps` was showing
+  as running. Its *setting* path looked in the same empty kernel, so **no
+  budget could ever be set on anything at all**: the operator's verb on a
+  process's budget could not reach a process.
+
+  **The second: the number it did print was the wrong number.** The kernel
+  keeps a budget's *remainder* (what is left, shrinking as the process spends)
+  and the spend; the *ceiling* — the total the process may ever spend — is
+  their sum. The command printed the remainder, under the word "limit":
+
+  ```console
+  $ cortex limit 3
+  pid 3 (spender):
+    tokens:     spent 42 / limit 958
+  ```
+
+  for an agent spawned with `--token-budget 1000` that had spent 42 tokens.
+  The ceiling was 1000 — and 1000 was nowhere to be seen. The number on the
+  right of the slash was the remainder, wearing the label of the limit: a
+  number that shrinks under the operator's feet, read as a fixed promise.
+
+  Now the transport carries a `limit` command (additive — the frozen syscall
+  ABI is untouched, and the ABI has no `set_budget`: a process cannot raise
+  its own ceiling), and `cortex limit` asks the kernel that holds the process.
+  It has to: a running agent has no `meta.json` yet (the kernel writes that
+  when it exits), so the on-disk record cannot answer for it. A process that
+  has finished is still answered — from that record.
+
+  The ceiling is printed as the ceiling, and the remainder as what is left:
+
+  ```console
+  $ cortex limit 3
+  pid 3 (spender):
+    tokens:    spent 42 / limit 1000 (958 left)
+    usd:       spent $0.000000 / limit ∞
+    wall time: spent 0ms / limit ∞
+  ```
+
+  `--tokens N` now means **the ceiling is N** — what the help says, and what
+  an operator means by it. The kernel keeps the remainder, so the ceiling is
+  converted on the way in, against the spend read at the same moment: a
+  client that read the spend and then converted it would be racing the very
+  spending it is trying to cap. And a **finished process refuses to have its
+  budget rewritten** — what it spent is the kernel's record, written down when
+  it ended, and rewriting it would be rewriting history; the command says so
+  rather than answering "no such process" and pretending the question was
+  about existence.
+
+  The write is the operator's own action, not the process's, so it is not
+  recorded in the `.crec` — like `budget()` (ABI.md §4.8), a budget is not
+  something the agent did. The CLI speaks dollars and the wire speaks
+  microdollars (the ABI's unit), and the conversion happens in one place.
+
+  **Three new smoke checks** (729 → 732), each one reverse-verified: the
+  ceiling→remainder conversion dropped → "a remote limit reads and sets a live
+  agent's budget" fails ("the ceiling is the total, got 1000 left"); the
+  ceiling computed as the remainder → "cortex limit says what an agent may
+  spend in total, and can change it" fails ("the ceiling is the total, got:
+  … spent 100 / limit 900 (900 left)" — the old bug, back in its old shape);
+  the CLI unable to reach the live kernel → the same check fails ("exit 0,
+  got 1: cortex limit: no such process: 5 (no .meta.json found)"); and a
+  finished process allowed to have its budget rewritten → "a finished process
+  refuses to have its budget rewritten" fails ("exit 1, got 0").
+
+  No syscall, `.crec`, or `.csnap` format change — `KERNEL_ABI_VERSION` stays
+  `1.0.0`, and the transport's own version stays `1` (a new command is
+  additive).
+
 ### Documentation
 
 - **The kernel-size claim was off by more than half.** MANIFESTO §II.3

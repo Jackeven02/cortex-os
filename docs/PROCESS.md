@@ -548,6 +548,15 @@ Budgets decrement on every relevant syscall. When exhausted:
 
 Budgets are inherited on `spawn()` (default: half of parent's remaining), reset on `fork()` (default; see STATE.md §2.4), preserved on `checkpoint()`/`restore()`.
 
+**A budget has a ceiling and a remainder, and they are not the same number.** The
+kernel keeps the remainder — what is left — and the spend; the ceiling (the
+total the process may ever spend) is their sum, and is unlimited when the
+remainder is `-1`. The remainder shrinks as the process spends, so a view that
+prints it under the label "limit" is printing a moving number as a fixed
+promise. `cortex limit` prints the ceiling and then what is left of it, from
+whichever source has the truth: the live kernel's process table for a running
+agent, the exit record for one that has finished (docs/COOKBOOK.md).
+
 ### 8.4 Async I/O
 
 LLM and tool calls are async. While waiting, the process is BLOCKED, and the scheduler runs other processes. This is how cortex achieves "thousands of agents on a laptop" — most of them are blocked most of the time.

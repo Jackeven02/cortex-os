@@ -65,6 +65,7 @@ Every piece of state an agent has falls into one of these:
 - Wall-clock time alive.
 - Syscall count.
 - **Copy semantics:** configurable. Default is **reset to zero** on fork. The fork is a new attempt; the parent's sunk cost should not burden it. Alternatives: `inherit`, `split`.
+- **A budget has two numbers, and they are not the same number: the ceiling and the remainder.** The kernel keeps the *remainder* (`budgetsRemaining` — what is left, which shrinks as the process spends) and the *spend* (`budgetsSpent`). The **ceiling** — the total the process may ever spend — is the sum of the two, and is unlimited when the remainder is `-1`. Printing the remainder under the label "limit" is how a number that moves under the operator's feet gets read as a fixed promise, so every view that names a budget must name the ceiling and mark the remainder as what is left. `cortex limit` is the view (docs/COOKBOOK.md).
 
 ### 2.5 Driver / tool state
 

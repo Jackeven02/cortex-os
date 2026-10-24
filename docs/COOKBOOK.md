@@ -196,6 +196,45 @@ cortex spawn --role hoarder --task "..." --max-region-entries 500 \
   # semantic opts out to unlimited (-1)
 ```
 
+### A budget has a ceiling and a remainder
+
+They are not the same number, and the difference shows up in what `cortex limit`
+prints:
+
+```console
+$ cortex limit 3
+pid 3 (spender):
+  tokens:    spent 42 / limit 1000 (958 left)
+  usd:       spent $0.000000 / limit ∞
+  wall time: spent 0ms / limit ∞
+```
+
+`limit 1000` is the **ceiling** — the total this process may ever spend.
+`958 left` is the **remainder** — what is left of the ceiling right now, which
+shrinks as the process spends. The kernel keeps the remainder (STATE.md §2.4);
+the ceiling is `spent + remaining`, and `∞` means the budget is unlimited.
+
+**`--tokens N` sets the ceiling**, not a top-up: `cortex limit 3 --tokens 1000`
+means "this process may spend 1000 tokens in total", and the kernel is told the
+remainder that leaves. (A top-up would have made the ceiling 2000 — the 42
+already spent, the 958 that was left, and 1000 more.)
+
+### Setting a budget needs a live kernel
+
+```console
+$ cortex limit 3 --tokens 5000
+cortex limit: pid 3 is not running — a budget is a thing a running process has.
+  (start a kernel with 'cortex daemon run', then 'cortex limit 3 --tokens N')
+```
+
+A running agent has no `meta.json` yet — the kernel writes that when the
+process exits — so the on-disk record cannot answer for it, and the command has
+to reach the kernel that holds it (`cortex daemon run`). That is also why
+setting a budget on a process that has *finished* is refused rather than
+attempted: what it spent is the kernel's record, and rewriting it would be
+rewriting history. Reading a finished process still works — from the exit
+record.
+
 A region's own `maxEntries` (in `--memory`) takes precedence over the global
 `--max-region-entries`: `absent` inherits it, `-1` is unlimited, `0+` is a hard
 cap. `--memory` is a JSON object keyed by region name, merged over the standard

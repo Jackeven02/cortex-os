@@ -943,6 +943,43 @@ and the file. The other route is the signal: `SIGUSR2` means "checkpoint now"
 (docs/PROCESS.md §7.4), so `cortex kill <pid> --signal SIGUSR2` asks a live
 agent to save itself.
 
+**And it made the budget reachable.** `cortex limit` used to boot a kernel of
+its own and look there — and that kernel holds nothing but init, so the
+command answered "no such process" for an agent `cortex ps` was showing as
+running. It could not *set* a budget on anything either, ever: the setting
+path looked in the same empty kernel. It now asks the kernel that holds the
+process, the way `checkpoint` and `kill` do, and falls back to the on-disk
+exit record for a process that has finished — a running agent has no
+`meta.json` yet (the kernel writes that when it exits), so the disk cannot
+answer for it and the transport must.
+
+Two things about that verb are worth naming, because both are the difference
+between a number and a promise:
+
+- **The ceiling is not the remainder.** The kernel keeps the *remainder* —
+  what is left — and the spend; the ceiling (the total the process may ever
+  spend) is their sum (STATE.md §2.4). `cortex limit` used to print the
+  remainder under the label "limit", so an agent spawned with
+  `--token-budget 1000` that had spent 42 tokens read as `limit 958` — a
+  number that shrinks under the operator's feet, wearing the label of a fixed
+  promise. It now prints the ceiling and then what is left of it. And
+  `--tokens N` means the ceiling is N, which is what the help says and what
+  an operator means by it: the kernel keeps the remainder, so the ceiling is
+  converted on the way in, against the spend read at the same moment — a
+  client that read the spend and then converted it would be racing the very
+  spending it is trying to cap.
+- **A finished process refuses to have its budget rewritten.** What it spent
+  is the kernel's record, written down when it ended. Changing it would be
+  changing history, so the command says no — and says *why*: a budget is a
+  thing a running process has.
+
+The write is the operator's own action, not the process's, so it is **not
+recorded**: the ABI has no `set_budget` (a process cannot raise its own
+ceiling), and a budget change is not something the agent did — it is something
+the operator did to the agent. The budget a *process* sees is still read
+through the `budget()` syscall (ABI.md §4.8), which the ABI leaves unrecorded
+on purpose.
+
 **And it gave the shell a lifecycle.** `cortex spawn` boots a kernel of its
 own, runs the agent to completion, and exits — the agent's life is bounded by
 the command, and every later `cortex` invocation finds only the files it left

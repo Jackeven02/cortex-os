@@ -549,6 +549,22 @@ Return current budget state (spent and remaining). Read-only.
 - **Reversibility:** `idempotent`
 - **Recording:** not recorded (would bloat logs); derived from other syscalls' recordings
 
+**What it does not return: the ceiling.** The counters carry the *spend* and
+the *remainder* — and the remainder shrinks as the process spends. The ceiling
+(the total the process may ever spend) is `spent + remaining`, and is
+unlimited when the remainder is `-1` (STATE.md §2.4). So a caller that wants
+"how much may this process still spend" must ask for the remainder, and a
+caller that wants "how much may this process spend in total" must add the two
+up. Naming the remainder "the limit" is a lie the ABI cannot tell a caller out
+of — which is why the views that print it (`cortex limit`) name the ceiling and
+mark the remainder as what is left.
+
+**Setting a budget is not a syscall.** The ABI has no `set_budget`: a process
+cannot raise its own ceiling, and the operator's verb on a budget is a *host*
+action (the transport's `limit` command, ABI.md §11) — which is why it is
+answered by the kernel's own accounting rather than through the dispatcher,
+and why it is not recorded in the `.crec`.
+
 ### 4.9 Capabilities
 
 Three syscalls that let a process run with **less** authority than the kernel would otherwise give it. This is the section §9.2 promised for v1.

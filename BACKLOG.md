@@ -337,6 +337,50 @@ The user-facing surface. Should feel like a real OS shell.
   failure shows the row still carrying `"pendingSignals":["SIGTERM"]` — the
   kernel told the dashboard, and nobody turned it into words).
 
+- [x] **#079** A budget had a ceiling, and `cortex limit` printed the remainder
+  under the label "limit" → **fixed.** Two lies in one command, both of them
+  about the operator's own numbers.
+
+  **The first: a running agent's budget was unreachable.** `cortex limit` booted
+  a kernel of its own and looked there — and that kernel holds nothing but
+  init, so it answered "no such process" for an agent `cortex ps` was showing
+  as running. The *setting* path looked in the same empty kernel, so **no
+  budget could ever be set on anything at all**.
+
+  **The second: the number it did print was the wrong number.** The kernel
+  keeps a budget's *remainder* (what is left, shrinking as the process spends)
+  and the spend; the *ceiling* — the total the process may ever spend — is
+  their sum. The command printed the remainder, under the word "limit": an
+  agent spawned with `--token-budget 1000` that had spent 42 tokens read as
+  `spent 42 / limit 958`. The ceiling was 1000, and 1000 was nowhere to be
+  seen — a number that shrinks under the operator's feet, wearing the label of
+  a fixed promise.
+
+  The transport now carries a `limit` command (additive; the frozen syscall
+  ABI is untouched, and the ABI has no `set_budget` — a process cannot raise
+  its own ceiling), and the command asks the kernel that holds the process.
+  It has to: a running agent has no `meta.json` yet, so the on-disk record
+  cannot answer for it. A finished process is still answered — from that
+  record, and it **refuses to have its budget rewritten** (what it spent is
+  the kernel's record; rewriting it would be rewriting history).
+
+  `--tokens N` now means **the ceiling is N** — what the help says and what an
+  operator means by it. The kernel keeps the remainder, so the ceiling is
+  converted on the way in, against the spend read at the same moment: a
+  client that read the spend and then converted it would be racing the very
+  spending it is trying to cap.
+
+  **Three new smoke checks** (729 → 732), all reverse-verified: the
+  ceiling→remainder conversion dropped → "a remote limit reads and sets a live
+  agent's budget" fails ("the ceiling is the total, got 1000 left"); the
+  ceiling computed as the remainder → "cortex limit says what an agent may
+  spend in total, and can change it" fails ("the ceiling is the total, got:
+  … spent 100 / limit 900 (900 left)" — the old bug, back in its old shape);
+  the CLI unable to reach the live kernel → the same check fails ("exit 0, got
+  1: cortex limit: no such process: 5 (no .meta.json found)"); and a finished
+  process allowed to have its budget rewritten → "a finished process refuses to
+  have its budget rewritten" fails ("exit 1, got 0").
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

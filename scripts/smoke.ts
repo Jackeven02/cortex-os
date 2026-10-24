@@ -251,6 +251,7 @@ import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import { cmdPs } from '../src/cli/commands/ps.js';
+import { cmdLimit } from '../src/cli/commands/limit.js';
 import { formatCaps } from '../src/cli/process_view.js';
 import { readOpenCall, readOpenCallsFromKernel, isDeclaredWait } from '../src/cli/open_call.js';
 import { cmdTop } from '../src/cli/commands/top.js';
@@ -14928,6 +14929,85 @@ async function runTopChecks(): Promise<void> {
       );
     });
 
+    await checkAsync('cortex limit says what an agent may spend in total, and can change it', async () => {
+      // Two faults in one command, both of them found by running it.
+      //
+      // It could not reach a live kernel: it booted a kernel of its own,
+      // looked in it, and found nothing but init — so it answered "no such
+      // process" for an agent `cortex ps` was showing as running, and no
+      // budget could ever be set on anything at all.
+      //
+      // And it printed the *remainder* under the label "limit", so the ceiling
+      // was nowhere to be seen: an agent spawned with `--token-budget 1000`
+      // that had spent 42 tokens read as "limit 958".
+      const pid = await kernel.spawn({
+        role: 'budgeted',
+        agent: { module: 'test:wedged', args: { mode: 'wedged' } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const unlimited = await capture(() => cmdLimit([String(unbrand(pid))]));
+      assert(unlimited.code === 0, `exit 0, got ${unlimited.code}: ${unlimited.err}`);
+      assert(
+        unlimited.out.includes('limit ∞'),
+        `an unlimited budget says so, got: ${unlimited.out}`,
+      );
+
+      // The kernel's own accounting: this agent has already spent 100 tokens.
+      kernel.table.spend(pid, { tokensIn: 100 });
+
+      const set = await capture(() => cmdLimit([String(unbrand(pid)), '--tokens', '1000']));
+      assert(set.code === 0, `exit 0, got ${set.code}: ${set.err}`);
+      assert(set.out.includes('limit 1000'), `the ceiling is the total, got: ${set.out}`);
+
+      const shown = await capture(() => cmdLimit([String(unbrand(pid))]));
+      assert(shown.code === 0, `exit 0, got ${shown.code}: ${shown.err}`);
+      assert(
+        shown.out.includes('limit 1000'),
+        `the ceiling is what it says — not the remainder, which moves — got: ${shown.out}`,
+      );
+      assert(
+        shown.out.includes('900 left'),
+        `what is left of the ceiling is said too, got: ${shown.out}`,
+      );
+    });
+
+    await checkAsync('a finished process refuses to have its budget rewritten', async () => {
+      // A budget is a thing a running process has. What a finished process
+      // spent is the kernel's record, written down when the process ended —
+      // so the command says no rather than pretending it can rewrite the
+      // past. (It used to boot a kernel of its own and answer "no such
+      // process" for everything, which was a different lie: not "no", but
+      // "this does not exist".)
+      const pid = await kernel.spawn({
+        role: 'finished',
+        agent: { module: 'test:ok', args: { mode: 'ok' } },
+      });
+
+      // Wait for it to end and for init to reap it. Once the kernel no longer
+      // holds the entry, the process *is* finished — that is the condition
+      // the refusal is about. (The scheduler dispatches on its own clock, so
+      // this waits on wall time rather than on a tick count.)
+      const deadline = Date.now() + 5000;
+      let gone = false;
+      while (Date.now() < deadline && !gone) {
+        gone = kernel.table.get(pid) === undefined;
+        if (!gone) await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert(gone, 'the process has been reaped');
+
+      const refused = await capture(() => cmdLimit([String(unbrand(pid)), '--tokens', '500']));
+      assert(refused.code === 1, `exit 1, got ${refused.code}: ${refused.out}`);
+      assert(
+        refused.err.includes('not running'),
+        `it says the process is not running, got: ${refused.err}`,
+      );
+      assert(
+        refused.err.includes('a budget is a thing a running process has'),
+        `it says why, got: ${refused.err}`,
+      );
+    });
+
     await checkAsync('cortex ps and cortex top use the same words for the same wait', async () => {
       // One rule, two views. `ps` prints the noun ("a model call"); `top`
       // prints the sentence ("waiting on a model call for 12.3s"). Phrased
@@ -16677,6 +16757,40 @@ async function runTransportChecks(): Promise<void> {
           processes.some((p) => p.pid === 1),
           'the live table contains init',
         );
+      });
+
+      await checkAsync('a remote limit reads and sets a live agent\'s budget', async () => {
+        // A budget is a thing a running process has, and a running process has
+        // no `meta.json` yet (the kernel writes that when it exits). So
+        // without a way to reach the live kernel, the ceiling of a running
+        // agent was unreachable from the shell at all.
+        const pid = await kernel.spawn({ role: 'budgeted', agent: { module: 'test:listener' } });
+        assert(await waitFor(() => kernel.table.get(pid)?.state === 'blocked'), 'the agent parked');
+
+        const before = await client!.request<{ remaining: { tokens: number } }>('limit', {
+          pid: unbrand(pid),
+        });
+        assert(
+          before.remaining.tokens === -1,
+          `the agent starts unlimited, got ${before.remaining.tokens}`,
+        );
+
+        // The kernel's own accounting: it has spent 100 tokens already.
+        kernel.table.spend(pid, { tokensIn: 100 });
+
+        await client!.request('limit', { pid: unbrand(pid), tokens: 1000 });
+        const after = await client!.request<{
+          spent: { tokensIn: number };
+          remaining: { tokens: number };
+        }>('limit', { pid: unbrand(pid) });
+
+        // The ceiling is the **total**, not a top-up: 1000, of which 100 is
+        // already spent. A top-up would have made the ceiling 1100.
+        assert(
+          after.remaining.tokens === 900,
+          `the ceiling is the total, got ${after.remaining.tokens} left`,
+        );
+        assert(after.spent.tokensIn === 100, 'the spend is untouched');
       });
 
       await checkAsync('a remote ps leaves no trace in the kernel\'s log', async () => {
