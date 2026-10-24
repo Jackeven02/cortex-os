@@ -1094,7 +1094,7 @@ never be seen — is how a supervisor ends up waiting on a corpse.
 leave. The kernel can be stopped, and it can crash — and when it does, the
 socket closes and the stream stops without saying a word. That silence is
 the dangerous kind: a `watch` that ends because its kernel died looks exactly
-like a watch that finished, and a supervisor that keeps polling a dead socket
+like a watch that finished, and a supervisor that keeps waiting on a dead socket
 looks exactly like a supervisor that is still supervising.
 
 So the transport says when the connection ends. `KernelClient` reports it
@@ -1197,6 +1197,40 @@ The probe that decides is **bounded**: a kernel that accepts the connection
 and then never answers is reported as unreachable, instead of hanging the
 command that asked. A liveness check that can hang is not a liveness check.
 
+**And the supervisor stopped waking up for nothing.** `cortex supervise` was
+built on the stream, but its *decisions* were still made on a timer: it woke
+every 250 ms to ask itself whether anything had changed. So a process that
+ended at 10:00:00.100 was reported at 10:00:00.310, a stall threshold was
+crossed up to a quarter of a second late, and a supervisor watching a quiet
+agent for an hour woke it fourteen thousand times to find nothing.
+
+The supervisor now sleeps until something can matter: an event from the
+kernel, an interrupt, the kernel going away, or the **next deadline** — the
+stall threshold, the terminate grace, the operator's `--timeout-ms`. The
+deadline rule is one function (`nextDeadline`), and a **declared wait has no
+deadline at all**: an agent that said it would be back in an hour is not
+something to wake up for, and a `sleep` is not a stall. The rule that decides
+what counts as a stall lives in one place (`isDeclaredWait`) and is shared with
+`cortex top` — the view and the killer cannot disagree about what a hang is.
+
+Measured on a live kernel, with the clock started at the kernel's own
+`process-exit` event and stopped when the supervisor's line reached the
+terminal:
+
+| | reaction after the kernel said so |
+|---|---|
+| the old 250 ms tick | 106 ms / 156 ms / 261 ms |
+| event-driven | **0 ms / 0 ms / 0 ms** |
+
+**And it cannot miss an ending.** The subscription opens **before** the state
+check, so a process that ends while the supervisor is still starting up has
+its ending already in hand — the same rule `cortex attach` and `cortex logs`
+follow. And a process that is *already* over is reported as over: a zombie
+whose parent is still alive is still in the kernel's table, and the supervisor
+reads the ending out of it instead of waiting for a `process-exit` event that
+has been and gone. (Before this, that case waited forever — the supervisor
+had no way to learn that the ending it was waiting for had already happened.)
+
 **And the replacement was the same agent.** `cortex supervise --restart` puts a
 fresh agent in a dead one's place, rebuilt from the spec that was persisted
 when it was born (`processes/<pid>/spec.json`). That spec carried the role,
@@ -1274,6 +1308,17 @@ them looked identical from the outside.
   JavaScript, or parked on a promise — is invisible to it, because there is
   no frame to pair. The kernel is cooperative and does not preempt
   (PROCESS.md §8.2); nothing short of real isolation would catch that.
+- **A process the kernel already reaped cannot be supervised after the
+  fact.** The supervisor can report an ending that has *already happened* —
+  but only when the kernel still holds the process. A process that ended
+  normally is collected by the dispatcher as soon as it exits, and a process
+  killed by a signal is reaped by init once its parent is init or is already
+  gone; either way it leaves the table, and `cortex supervise <pid>` answers
+  `no such process`. The exit status itself is not lost — the kernel keeps it
+  for the *parent* to collect with `wait()` — but a host is not in the
+  process tree and has no parent to be. So "supervise a process that already
+  ended" works for the case the kernel still remembers (a zombie under a
+  live parent) and not for the rest.
 - `cortex attach` follows the `.crec` file on disk when there is no live
   kernel (which the daemon writes to), and takes the frames by push when
   there is one; `cortex logs --follow` has the same shape: it takes the

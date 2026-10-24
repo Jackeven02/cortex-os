@@ -246,7 +246,7 @@ import { cmdLogs, alreadyShown } from '../src/cli/commands/logs.js';
 import { cmdMemory } from '../src/cli/commands/memory.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
-import { cmdSupervise, decideAuthority } from '../src/cli/commands/supervise.js';
+import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import { cmdTop } from '../src/cli/commands/top.js';
 import {
@@ -13089,6 +13089,26 @@ async function runSuperviseChecks(): Promise<void> {
           await ctx.recv();
           return;
         }
+        if (mode === 'spawner') {
+          // Spawns a child that gets stuck, kills it, and stays alive.
+          //
+          // Two things make this the scenario it is:
+          //
+          //   - a **live parent** means the child's zombie is not reaped (the
+          //     kernel does not reap a zombie somebody may still wait() for),
+          //     so its ending is still a fact the table holds;
+          //   - it is killed with a **signal**, not an exit: a process that
+          //     exits is reaped from the table by the dispatcher right away
+          //     (its status is retained for the parent's wait()), so only a
+          //     signalled death leaves a zombie behind.
+          const child = await ctx.spawn({
+            role: 'doomed',
+            agent: { module: 'test:stuck', args: { mode: 'stuck' } },
+          });
+          await ctx.kill(child.pid, 'SIGKILL');
+          await ctx.sleep(30000);
+          return;
+        }
         if (mode === 'sleeper') {
           // A declared wait. Long, but not stuck.
           await ctx.sleep(900);
@@ -13139,12 +13159,21 @@ async function runSuperviseChecks(): Promise<void> {
 
     const capture = async (
       run: () => Promise<number>,
-    ): Promise<{ code: number; out: string; err: string }> => {
+    ): Promise<{
+      code: number;
+      out: string;
+      err: string;
+      /** Each write, with the moment it happened. */
+      marks: { at: number; text: string }[];
+    }> => {
       let out = '';
       let err = '';
+      const marks: { at: number; text: string }[] = [];
       const prevWrite = process.stdout.write;
       process.stdout.write = ((chunk: unknown): boolean => {
-        out += String(chunk);
+        const text = String(chunk);
+        out += text;
+        marks.push({ at: Date.now(), text });
         return true;
       }) as unknown as typeof process.stdout.write;
       console.error = (...parts: unknown[]): void => {
@@ -13152,7 +13181,7 @@ async function runSuperviseChecks(): Promise<void> {
       };
       try {
         const code = await run();
-        return { code, out, err };
+        return { code, out, err, marks };
       } finally {
         process.stdout.write = prevWrite;
         console.error = prevErr;
@@ -13373,6 +13402,150 @@ async function runSuperviseChecks(): Promise<void> {
       assert(
         result.err.includes('no such process'),
         `the reason is reported, got: ${result.err.trim()}`,
+      );
+    });
+
+    await checkAsync('cortex supervise reacts to the ending as it happens', async () => {
+      // The supervisor's whole job is to answer "what happened to this
+      // agent" — and the kernel answers it the moment it happens. A
+      // supervisor that decides on a timer is late by up to a tick, and a
+      // tick is a quarter of a second of the agent's life nobody was
+      // watching.
+      const pid = await kernel.spawn({
+        role: 'reactor',
+        agent: { module: 'test:fail', args: { mode: 'fail' } },
+      });
+
+      // The kernel's own moment of the ending — not the supervisor's.
+      let exitedAt: number | undefined;
+      const off = kernel.subscribe((event) => {
+        if (event.kind === 'process-exit' && event.pid === unbrand(pid)) {
+          exitedAt = Date.now();
+        }
+      });
+
+      const result = await capture(() =>
+        cmdSupervise([String(unbrand(pid)), '--kill-after', '5000']),
+      );
+      off();
+
+      assert(
+        result.out.includes(`pid ${unbrand(pid)} exited with code 1`),
+        `the ending was reported, got: ${result.out}`,
+      );
+      assert(exitedAt !== undefined, 'the kernel reported the ending');
+      const reactedAt = result.marks.find((m) => m.text.includes('exited with code'))?.at;
+      assert(reactedAt !== undefined, `the supervisor's line was written, got: ${result.out}`);
+      assert(
+        reactedAt - exitedAt! < 150,
+        `the supervisor reacted in ${reactedAt - exitedAt!}ms — it must not wait for a tick`,
+      );
+    });
+
+    await checkAsync('cortex supervise kills at the threshold, not a tick later', async () => {
+      const pid = await kernel.spawn({
+        role: 'stuck-threshold',
+        agent: { module: 'test:stuck', args: { mode: 'stuck' } },
+      });
+
+      const result = await capture(() =>
+        cmdSupervise([String(unbrand(pid)), '--kill-after', '300']),
+      );
+
+      const killed = /has been inside recv for (\d+)ms/.exec(result.out);
+      assert(killed !== null, `the stall was noticed, got: ${result.out}`);
+      const stuckMs = Number(killed![1]);
+      // The threshold is 300 ms. A supervisor that decides on a tick kills it
+      // up to a tick late; one that decides on the deadline kills it at the
+      // threshold. The number it prints is the difference.
+      assert(
+        stuckMs <= 400,
+        `it was killed at ${stuckMs}ms — the threshold is 300ms, and a tick later is not the threshold`,
+      );
+    });
+
+    await checkAsync('cortex supervise reports an ending that has already happened', async () => {
+      // A process whose parent is still alive stays a **zombie**: the kernel
+      // does not reap a zombie somebody may still wait() for. Its
+      // `process-exit` event has been and gone, so a supervisor that waits
+      // for that event waits for something that will never arrive. It has to
+      // read the ending out of the table instead.
+      await kernel.spawn({
+        role: 'spawner',
+        agent: { module: 'test:spawner', args: { mode: 'spawner' } },
+      });
+
+      let doomed: number | undefined;
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        for (const entry of kernel.table.list()) {
+          if (entry.role === 'doomed') {
+            doomed = unbrand(entry.pid);
+            break;
+          }
+        }
+        if (doomed !== undefined) {
+          const state = kernel.table.get(asProcessId(doomed))?.state;
+          if (state === 'zombie') break;
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert(
+        doomed !== undefined,
+        `the child was spawned; table=${kernel.table.list().map((e) => `${e.pid}:${e.role}:${e.state}`).join(',')}`,
+      );
+      assert(
+        kernel.table.get(asProcessId(doomed))?.state === 'zombie',
+        `the child is a zombie, got ${kernel.table.get(asProcessId(doomed))?.state ?? 'gone'}`,
+      );
+
+      const result = await capture(() =>
+        cmdSupervise([String(doomed), '--kill-after', '5000', '--timeout-ms', '5000']),
+      );
+
+      assert(
+        result.out.includes(`pid ${doomed} exited with code 137`),
+        `the ending was reported, got: ${result.out}`,
+      );
+      assert(
+        result.code === 137,
+        `the supervisor returns the process's own exit code, got ${result.code}`,
+      );
+    });
+
+    await checkAsync('the supervisor knows when it next has to look', async () => {
+      // The rule, pinned on its own: the timing of a supervisor's decisions
+      // is not something an end-to-end test can be relied on to land in.
+      const base = {
+        openCall: undefined,
+        killAfterMs: null,
+        terminating: false,
+        terminateDeadline: 0,
+        timeoutMs: null,
+        startedAt: 1000,
+      };
+      assert(
+        nextDeadline(base) === undefined,
+        'with nothing that can change, the supervisor sleeps until the kernel says something',
+      );
+      const call = { callId: 'c1', syscall: 'recv', since: 5000 };
+      assert(
+        nextDeadline({ ...base, openCall: call, killAfterMs: 300 }) === 5300,
+        `the stall threshold is the deadline, got ${nextDeadline({ ...base, openCall: call, killAfterMs: 300 })}`,
+      );
+      const sleeping = { callId: 'c2', syscall: 'sleep', since: 5000 };
+      assert(
+        nextDeadline({ ...base, openCall: sleeping, killAfterMs: 300 }) === undefined,
+        'a sleep is a declared wait, so it has no deadline',
+      );
+      assert(
+        nextDeadline({ ...base, timeoutMs: 500 }) === 1500,
+        `the operator's timeout is a deadline, got ${nextDeadline({ ...base, timeoutMs: 500 })}`,
+      );
+      assert(
+        nextDeadline({ ...base, terminating: true, terminateDeadline: 7000, timeoutMs: 500 }) ===
+          7000,
+        'a termination in flight is not cut short by the operator timeout',
       );
     });
 

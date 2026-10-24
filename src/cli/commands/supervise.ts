@@ -80,13 +80,10 @@ import {
   KernelCommandError,
   type KernelClient,
 } from '../kernel_client.js';
-import { readOpenCall, isStalled, type OpenCall } from '../open_call.js';
+import { readOpenCall, isStalled, isDeclaredWait, type OpenCall } from '../open_call.js';
 import { asProcessId, CAPABILITIES, type Capability } from '../../kernel/types.js';
 import { parseSemver } from '../../kernel/driver_registry.js';
 import { readMeta, type ProcessMeta, type ProcessSpec } from '../process_store.js';
-
-/** How often the supervisor looks at its own state, in ms. */
-const POLL_INTERVAL_MS = 250;
 
 /**
  * How long a terminated process is given to actually die, before it is
@@ -98,6 +95,76 @@ const TERMINATE_GRACE_MS = 5000;
 
 /** The exit code `timeout(1)` uses for "I had to intervene". */
 const EXIT_INTERVENED = 124;
+
+/**
+ * When the supervisor next has to look.
+ *
+ * `undefined` means **nothing can change until the kernel says so** — so the
+ * supervisor waits for an event instead of waking up on a timer. That is the
+ * whole difference between a supervisor that reacts in milliseconds and one
+ * that reacts on its next tick, and between an idle supervisor that costs
+ * nothing and one that wakes four times a second to find nothing.
+ *
+ * The three things that can pass a deadline on their own:
+ *
+ *   - the **stall threshold**: the open call has been open longer than
+ *     `--kill-after`. A *declared* wait has no deadline — the agent said it
+ *     would be back, and punishing it for keeping its word would be wrong
+ *     (and would wake the supervisor up for nothing, forever).
+ *   - the **terminate grace**: SIGTERM was sent and the grace period ends.
+ *   - the **operator's timeout**: `--timeout-ms`. It does not apply while a
+ *     termination is in flight — a supervisor that walks away between the
+ *     SIGTERM and the SIGKILL leaves a process nobody is watching.
+ */
+export interface SupervisorDeadlines {
+  /** The call the supervised process is inside, if any. */
+  readonly openCall: OpenCall | undefined;
+  /** `--kill-after`, in ms — or `null` when there is no such policy. */
+  readonly killAfterMs: number | null;
+  /** Whether a SIGTERM is waiting for the process to actually go. */
+  readonly terminating: boolean;
+  /** When the terminate grace ends. */
+  readonly terminateDeadline: number;
+  /** `--timeout-ms`, in ms — or `null` when there is no such bound. */
+  readonly timeoutMs: number | null;
+  /** When the supervisor started. */
+  readonly startedAt: number;
+}
+
+/**
+ * The next moment the supervisor has to look, or `undefined` when it can
+ * sleep until the kernel says something.
+ *
+ * Exported because the rule is worth pinning on its own: the timing of a
+ * supervisor's decisions is not something an end-to-end test can be relied
+ * on to land in.
+ */
+export function nextDeadline(state: SupervisorDeadlines): number | undefined {
+  let earliest: number | undefined;
+  const consider = (at: number): void => {
+    if (earliest === undefined || at < earliest) earliest = at;
+  };
+
+  if (state.terminating) {
+    // A termination in flight: the grace period is the only deadline. The
+    // operator's timeout does not apply here — walking away between the
+    // SIGTERM and the SIGKILL leaves a process nobody is watching.
+    consider(state.terminateDeadline);
+    return earliest;
+  }
+
+  if (
+    state.killAfterMs !== null &&
+    state.openCall !== undefined &&
+    !isDeclaredWait(state.openCall)
+  ) {
+    consider(state.openCall.since + state.killAfterMs);
+  }
+  if (state.timeoutMs !== null) {
+    consider(state.startedAt + state.timeoutMs);
+  }
+  return earliest;
+}
 
 /** The event shapes this command reads off the stream. */
 interface WireEvent {
@@ -323,29 +390,209 @@ export async function cmdSupervise(args: string[]): Promise<number> {
   /** Set when the kernel goes away while we are supervising. */
   let kernelGone = false;
 
+  // ---- what wakes the supervisor -------------------------------------------
+  /** Resolves the wait when something happens that the supervisor must see. */
+  let wakeUp: (() => void) | undefined;
+  /** Set when something happened while the supervisor was busy. */
+  let dirty = false;
+
+  const wake = (): void => {
+    dirty = true;
+    wakeUp?.();
+  };
+
+  /**
+   * Wait until the kernel says something, or until the next deadline.
+   *
+   * There is no tick. A supervisor that wakes four times a second to find
+   * nothing is a supervisor that costs the operator four wake-ups a second,
+   * and a decision that waits for the next tick is a decision that is late.
+   */
+  const waitForWake = (deadline: number | undefined): Promise<void> =>
+    new Promise<void>((resolve) => {
+      let timer: NodeJS.Timeout | undefined;
+      const done = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        wakeUp = undefined;
+        resolve();
+      };
+      wakeUp = done;
+      if (deadline !== undefined) {
+        // At least a millisecond: a deadline that has already passed must not
+        // turn the loop into a busy spin.
+        timer = setTimeout(done, Math.max(1, deadline - Date.now()));
+      }
+    });
+
   // If the kernel goes away, the supervisor has to say so and stop. A
   // supervisor that hangs on after its kernel died is worse than useless: it
   // looks like it is still supervising, and the process it was watching is
   // nobody's business any more.
   client.onClose(() => {
     kernelGone = true;
+    wake();
   });
 
-  // The process has to exist before it can be supervised.
-  try {
-    const listing = await client.request<{ processes: { pid: number }[] }>('ps');
-    if (!listing.processes.some((p) => p.pid === pid)) {
-      console.error(`cortex supervise: no such process: ${pid}`);
-      client.close();
-      return 1;
+  // ---- the state the supervisor keeps --------------------------------------
+  let currentPid = pid;
+  let restarts = 0;
+  /** What the *stream* says the process is inside — trustworthy once it spoke. */
+  let handlerOpenCall: OpenCall | undefined;
+  /** Whether the stream has told us about a call opening or closing. */
+  let handlerSpoke = false;
+  /** What the supervisor believes the process is inside. */
+  let openCall: OpenCall | undefined;
+  let pendingExit: { code: number | null; reason: string | null } | undefined;
+  /** Set while a SIGTERM is waiting for the process to actually go. */
+  let terminating = false;
+  let terminateDeadline = 0;
+  /** True when the supervisor killed the current incarnation. */
+  let intervened = false;
+  /** Set when the kernel reports that our SIGTERM was queued, not delivered. */
+  let escalateNow = false;
+  let stopped = false;
+
+  const onSignal = (): void => {
+    stopped = true;
+    wake();
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+
+  /** Fold one event off the stream into what the supervisor knows. */
+  const handleEvent = (event: WireEvent): void => {
+    if (event.kind === 'record' && event.pid === currentPid) {
+      const record = event.record;
+      if (record === undefined) return;
+      if (record.syscall === '__signal') {
+        // The kernel reports what it did with the signal we sent. A
+        // **queued** SIGTERM means the target was not running: the signal
+        // sits in its pending queue until it wakes up (docs/PROCESS.md
+        // §7.2), and a process that is stuck may never wake. There is
+        // nothing to wait for, so the grace period is skipped.
+        const signalArgs = record.args as { signal?: string; outcome?: string } | undefined;
+        if (signalArgs?.signal === 'SIGTERM' && signalArgs.outcome === 'queued') {
+          escalateNow = true;
+        }
+        return;
+      }
+      if (record.phase === 'enter') {
+        // Internal frames (`__state`, `__sched`, …) are the kernel's own
+        // bookkeeping and do not open a call the agent is sitting in.
+        if (record.syscall.startsWith('__')) return;
+        // The call's own timestamp, not the moment the event was handled:
+        // the two commands that read this must measure the same thing.
+        const at = Date.parse(record.timestamp ?? '');
+        handlerOpenCall = {
+          callId: record.callId,
+          syscall: record.syscall,
+          since: Number.isNaN(at) ? Date.now() : at,
+          ...(record.args !== undefined ? { args: record.args } : {}),
+        };
+        handlerSpoke = true;
+        openCall = handlerOpenCall;
+        return;
+      }
+      // An exit (or a trap) closes a call — but only a *real* one. The
+      // kernel's own bookkeeping frames are not calls, and must not be
+      // mistaken for one closing.
+      if (record.syscall.startsWith('__')) return;
+      handlerSpoke = true;
+      if (handlerOpenCall !== undefined && handlerOpenCall.callId === record.callId) {
+        handlerOpenCall = undefined;
+      }
+      openCall = handlerOpenCall;
+      return;
     }
+    if (event.kind === 'process-exit' && event.pid === currentPid) {
+      pendingExit = {
+        code: event.exitCode ?? null,
+        reason: event.exitReason ?? null,
+      };
+    }
+  };
+
+  // ---- the subscription opens FIRST ----------------------------------------
+  //
+  // The ending of the supervised process arrives as an event, and an event
+  // that has already been and gone cannot be waited for. If the state check
+  // came first, a process that ended in between would leave the supervisor
+  // waiting for something that will never arrive — and with nothing else to
+  // wake it, that wait is forever. The same rule `cortex attach` and
+  // `cortex logs` follow: subscribe, then read the history.
+  let unsubscribe: (() => void) | undefined;
+  try {
+    unsubscribe = await client.subscribe((raw) => {
+      try {
+        handleEvent(raw as WireEvent);
+      } finally {
+        wake();
+      }
+    }, {
+      kinds: ['record', 'process-exit'],
+    });
   } catch (err) {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
     client.close();
     if (err instanceof KernelCommandError) {
       console.error(`cortex supervise: ${err.errno}: ${err.message}`);
       return 1;
     }
     throw err;
+  }
+
+  // ---- and only then: does the process exist, and is it still alive? -------
+  let target:
+    | { readonly state?: string; readonly exitCode?: number | null; readonly exitReason?: string | null }
+    | undefined;
+  try {
+    const listing = await client.request<{
+      processes: {
+        pid: number;
+        state?: string;
+        exitCode?: number | null;
+        exitReason?: string | null;
+      }[];
+    }>('ps');
+    target = listing.processes.find((p) => p.pid === pid);
+  } catch (err) {
+    unsubscribe();
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    client.close();
+    if (err instanceof KernelCommandError) {
+      console.error(`cortex supervise: ${err.errno}: ${err.message}`);
+      return 1;
+    }
+    throw err;
+  }
+
+  if (target === undefined) {
+    console.error(`cortex supervise: no such process: ${pid}`);
+    unsubscribe();
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    client.close();
+    return 1;
+  }
+
+  if (target.state === 'zombie' || target.state === 'exiting') {
+    // It is **already over**. That is an ending to report, not a process to
+    // wait for: its `process-exit` event has been and gone, and waiting for
+    // it would wait forever.
+    const codeText =
+      target.exitCode === null || target.exitCode === undefined
+        ? 'abnormally'
+        : `with code ${target.exitCode}`;
+    const reasonText =
+      target.exitReason === null || target.exitReason === undefined ? '' : ` (${target.exitReason})`;
+    console.log(`# pid ${pid} exited ${codeText}${reasonText}`);
+    unsubscribe();
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    client.close();
+    return target.exitCode ?? 1;
   }
 
   console.log(`# supervising pid ${pid}`);
@@ -364,93 +611,19 @@ export async function cmdSupervise(args: string[]): Promise<number> {
     }
   }
 
-  let currentPid = pid;
-  let restarts = 0;
   // What the process is *already* inside when the supervisor starts. The
   // stream cannot tell us — that `enter` frame was written before we were
-  // listening — so the log is asked instead.
-  let openCall: OpenCall | undefined = await readOpenCall(dir, pid);
+  // listening — so the log is asked instead. But the stream may have spoken
+  // already (it is subscribed, and the log takes a moment to read), and then
+  // the stream is the newer answer: it has seen everything since the
+  // subscription, the log has not.
+  const logOpenCall = await readOpenCall(dir, pid);
+  openCall = handlerSpoke ? handlerOpenCall : logOpenCall;
   if (openCall !== undefined) {
     console.log(
       `# pid ${pid} is already inside ${openCall.syscall} ` +
         `(since ${new Date(openCall.since).toISOString()})`,
     );
-  }
-  let pendingExit: { code: number | null; reason: string | null } | undefined;
-  /** Set while a SIGTERM is waiting for the process to actually go. */
-  let terminating = false;
-  let terminateDeadline = 0;
-  /** True when the supervisor killed the current incarnation. */
-  let intervened = false;
-  /** Set when the kernel reports that our SIGTERM was queued, not delivered. */
-  let escalateNow = false;
-  let stopped = false;
-
-  const onSignal = (): void => {
-    stopped = true;
-  };
-  process.on('SIGINT', onSignal);
-  process.on('SIGTERM', onSignal);
-
-  let unsubscribe: (() => void) | undefined;
-  try {
-    unsubscribe = await client.subscribe((raw) => {
-      const event = raw as WireEvent;
-      if (event.kind === 'record' && event.pid === currentPid) {
-        const record = event.record;
-        if (record === undefined) return;
-        if (record.syscall === '__signal') {
-          // The kernel reports what it did with the signal we sent. A
-          // **queued** SIGTERM means the target was not running: the signal
-          // sits in its pending queue until it wakes up (docs/PROCESS.md
-          // §7.2), and a process that is stuck may never wake. There is
-          // nothing to wait for, so the grace period is skipped.
-          const signalArgs = record.args as
-            | { signal?: string; outcome?: string }
-            | undefined;
-          if (signalArgs?.signal === 'SIGTERM' && signalArgs.outcome === 'queued') {
-            escalateNow = true;
-          }
-          return;
-        }
-        if (record.phase === 'enter') {
-          // Internal frames (`__state`, `__sched`, …) are the kernel's own
-          // bookkeeping and do not open a call the agent is sitting in.
-          if (record.syscall.startsWith('__')) return;
-          // The call's own timestamp, not the moment the event was handled:
-          // the two commands that read this must measure the same thing.
-          const at = Date.parse(record.timestamp ?? '');
-          openCall = {
-            callId: record.callId,
-            syscall: record.syscall,
-            since: Number.isNaN(at) ? Date.now() : at,
-            ...(record.args !== undefined ? { args: record.args } : {}),
-          };
-          return;
-        }
-        if (openCall !== undefined && openCall.callId === record.callId) {
-          openCall = undefined;
-        }
-        return;
-      }
-      if (event.kind === 'process-exit' && event.pid === currentPid) {
-        pendingExit = {
-          code: event.exitCode ?? null,
-          reason: event.exitReason ?? null,
-        };
-      }
-    }, {
-      kinds: ['record', 'process-exit'],
-    });
-  } catch (err) {
-    process.off('SIGINT', onSignal);
-    process.off('SIGTERM', onSignal);
-    client.close();
-    if (err instanceof KernelCommandError) {
-      console.error(`cortex supervise: ${err.errno}: ${err.message}`);
-      return 1;
-    }
-    throw err;
   }
 
   const startedAt = Date.now();
@@ -458,7 +631,24 @@ export async function cmdSupervise(args: string[]): Promise<number> {
 
   try {
     for (;;) {
-      await delay(POLL_INTERVAL_MS);
+      // Sleep until something can matter: an event from the kernel, an
+      // interrupt, the kernel going away, or the next deadline. Nothing
+      // else — there is no tick, and nothing is decided on a timer that the
+      // kernel could have told us about sooner.
+      if (!dirty) {
+        await waitForWake(
+          nextDeadline({
+            openCall,
+            killAfterMs,
+            terminating,
+            terminateDeadline,
+            timeoutMs,
+            startedAt,
+          }),
+        );
+      }
+      dirty = false;
+
       if (stopped) {
         console.log('# interrupted');
         exitCode = 130;
@@ -481,7 +671,7 @@ export async function cmdSupervise(args: string[]): Promise<number> {
       // The timeout is the operator's bound, but it does not cut a
       // termination in half: a supervisor that walks away between the
       // SIGTERM and the SIGKILL leaves a process nobody is watching.
-      if (timeoutMs !== null && !terminating && Date.now() - startedAt > timeoutMs) {
+      if (timeoutMs !== null && !terminating && Date.now() - startedAt >= timeoutMs) {
         console.log(`# gave up after ${timeoutMs}ms`);
         exitCode = 1;
         break;
@@ -599,7 +789,13 @@ export async function cmdSupervise(args: string[]): Promise<number> {
           });
           currentPid = spawned.pid;
           intervened = false;
-          openCall = undefined;
+          // The replacement is a different process, so the stream's view of
+          // "what is it inside" starts empty again — and the log is asked
+          // about the replacement, the same way it was asked about the
+          // original.
+          handlerOpenCall = undefined;
+          handlerSpoke = false;
+          openCall = await readOpenCall(dir, currentPid);
           console.log(
             `# restarted as pid ${currentPid} (role=${spec.role}, caps=${authority.label})`,
           );

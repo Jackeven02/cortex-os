@@ -42,6 +42,57 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The supervisor stopped waking up for nothing.** `cortex supervise` was
+  built on the event stream, but its *decisions* were still made on a timer: it
+  woke every 250 ms to ask itself whether anything had changed. So a process
+  that ended at 10:00:00.100 was reported at 10:00:00.310, a stall threshold
+  was crossed up to a quarter of a second late, and a supervisor watching a
+  quiet agent for an hour woke it fourteen thousand times to find nothing.
+
+  The supervisor now sleeps until something can matter: **an event from the
+  kernel, an interrupt, the kernel going away, or the next deadline.** There
+  is no tick. The deadline rule is one function (`nextDeadline`), and a
+  **declared wait has no deadline at all** — an agent that said it would be
+  back in an hour is not something to wake up for, and a `sleep` is not a
+  stall. The rule that decides "what counts as a stall" now lives in one
+  place (`isDeclaredWait`), shared with `cortex top`, so the two commands
+  cannot disagree about what a hang is.
+
+  Measured on a live kernel, with the clock started at the kernel's own
+  `process-exit` event and stopped when the supervisor's line reached the
+  terminal:
+
+  | | reaction after the kernel said so |
+  |---|---|
+  | the old 250 ms tick | 106 ms / 156 ms / 261 ms |
+  | event-driven | **0 ms / 0 ms / 0 ms** |
+
+- **The supervisor cannot miss an ending.** The subscription opens **before**
+  the state check — the same rule `cortex attach` and `cortex logs` follow —
+  so a process that ends while the supervisor is still starting up has its
+  ending already in hand. (Before this, the check came first, and a process
+  that ended in that window left the supervisor waiting for an event that had
+  already been and gone: it waited forever.)
+
+  And a process that is **already over** is reported as over. A zombie whose
+  parent is still alive is still in the kernel's table, and the supervisor
+  reads the ending out of it instead of waiting for a `process-exit` that
+  will never come:
+
+  ```console
+  $ cortex supervise 12
+  # pid 12 exited with code 137 (signal:SIGKILL)
+  ```
+
+  **4 smoke checks** (668 → 672), all four reverse-verified: putting the wait
+  back on a fixed 5-second poll → the supervisor reacts 5004 ms late instead
+  of immediately, and kills a quarter of a second after the threshold instead
+  of on it; removing the "already ended" branch → the supervisor waits out its
+  whole timeout instead of reporting an ending that already happened.
+
+  No ABI change: `KERNEL_ABI_VERSION` stays 1.0.0. This is the same
+  `subscribe` command `cortex watch` uses; only the host's reaction changed.
+
 - **`cortex logs --follow` streams by push — and ends when the agent ends.**
   The last poller in the CLI. It followed a process's printed output by
   re-reading `output.log` every 250 ms and printing whatever was new, so a line

@@ -76,8 +76,12 @@ export const EXEMPT_FROM_STALL: ReadonlySet<string> = new Set(['sleep']);
  * A `wait` with **no** deadline is not a declared wait. That is the call
  * that hangs forever when the child hangs (BACKLOG #057), and it is the one
  * worth killing.
+ *
+ * Exported because a caller has to know it too: a supervisor that arms a
+ * deadline for a declared wait would wake up for nothing, over and over, for
+ * as long as the agent politely waits.
  */
-function isDeclaredWait(call: OpenCall): boolean {
+export function isDeclaredWait(call: OpenCall): boolean {
   if (EXEMPT_FROM_STALL.has(call.syscall)) return true;
   if (call.syscall !== 'wait') return false;
   // The `wait` frame records its arguments as a positional tuple:
