@@ -464,6 +464,24 @@ async function dispatch(
       return { processes };
     }
 
+    case 'openCalls': {
+      // A read, like `ps`: the operator asking which call an agent is in is
+      // not something the agent did, so it is not recorded. The kernel's own
+      // bookkeeping answers it — the same pairing the log shows, kept as it
+      // happens — so the host does not have to read a log that grows for as
+      // long as the agent runs.
+      const calls = [...kernel.openCalls().entries()].map(([pid, call]) => ({
+        pid,
+        syscall: call.syscall,
+        callId: call.callId,
+        since: call.since,
+        // The arguments travel with the call, because they are what say a
+        // `wait` is a *declared* wait — one that carries its own deadline.
+        ...(call.args !== undefined ? { args: call.args } : {}),
+      }));
+      return { calls };
+    }
+
     case 'memory': {
       const pid = Number(args['pid']);
       if (!Number.isInteger(pid)) {

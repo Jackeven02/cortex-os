@@ -83,12 +83,18 @@ export const KERNEL_PROTOCOL_VERSION = 1;
  * *push* rather than answer. It opens a stream on the same socket and is not
  * recorded either — watching is not doing.
  *
+ * `openCalls` is a read like `ps`: "which call is this process inside" is a
+ * fact the kernel already has, and the host's alternative — reading the
+ * whole log to pair the frames — costs O(bytes) for a fact the kernel has in
+ * O(processes).
+ *
  * Everything else is answered by the ordinary dispatcher path and therefore
  * is recorded.
  */
 export type KernelCommand =
   | 'ping'
   | 'ps'
+  | 'openCalls'
   | 'memory'
   | 'send'
   | 'kill'

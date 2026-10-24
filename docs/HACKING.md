@@ -347,12 +347,28 @@ transition.
 | be told when a process is created | `KernelOptions.onProcessStart` |
 | be told when a process ends | `KernelOptions.onProcessExit` |
 | **watch everything, as it happens** | **`kernel.subscribe(listener)`** |
-| see whether a process is *stuck* | read its `.crec` and pair the `enter`/`exit` frames |
+| see whether a process is *stuck* | **`kernel.openCalls()`** — the call each process is inside, and since when |
+| ...and if you want the frames themselves | read its `.crec` and pair the `enter`/`exit` frames |
 
 `KernelOptions.onProcessExit` is still worth wiring — it is how you persist
 your own metadata, and it fires at the same instant as `awaitExit` resolves.
 But it is a *notification*, not a *join*: it tells you a process ended, it
 does not wait for one.
+
+**`kernel.openCalls()` answers "what is this process doing?" without the log.**
+It returns, for every process that is inside a syscall, the syscall's name,
+the call id, when the call started, and the call's arguments. That last one is
+not decoration: the arguments are what say a `wait` carries its own deadline,
+and a **declared wait is not a stall** — a supervisor that cannot see the
+deadline will kill a planner for keeping its word.
+
+The kernel can answer because it writes every syscall as an `enter` frame and
+its partner, and it knows which pairs are still open. Reading the log and
+pairing the frames yourself gives the same answer — the `since` is that
+frame's own timestamp, not a second reading of the clock — but it costs
+O(bytes) instead of O(processes), and the log of a long-lived agent grows for
+as long as the agent runs. Use the kernel's answer when there is a kernel;
+keep the log for the case where there is not.
 
 `kernel.subscribe(listener)` is the other shape again: it reports what the
 kernel does as it does it — a process being born, a process ending with its

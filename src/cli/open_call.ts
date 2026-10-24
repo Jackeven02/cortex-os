@@ -43,6 +43,7 @@ import { existsSync } from 'node:fs';
 
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { asProcessId } from '../kernel/types.js';
+import type { KernelCommand } from './kernel_protocol.js';
 
 /** A syscall call that has started and has not yet finished. */
 export interface OpenCall {
@@ -110,6 +111,73 @@ export function isDeclaredWait(call: OpenCall): boolean {
 export function isStalled(call: OpenCall, now: number, thresholdMs: number): boolean {
   if (isDeclaredWait(call)) return false;
   return now - call.since > thresholdMs;
+}
+
+/**
+ * The bit of a live kernel the open-call reader needs.
+ *
+ * A `KernelClient` satisfies this. It is an interface rather than a concrete
+ * client so that a caller which *already* holds a connection can hand it
+ * over instead of opening (and closing) another one.
+ */
+export interface OpenCallSource {
+  request(cmd: KernelCommand, args?: Record<string, unknown>): Promise<unknown>;
+}
+
+/**
+ * The call each live process is inside, as the **kernel** says.
+ *
+ * The kernel knows this: the dispatcher writes every syscall as an `enter`
+ * frame and its partner, and it knows which pairs are still open. Asking it
+ * is O(processes); reading the log is O(bytes) — and the log of a long-lived
+ * agent grows for as long as the agent runs, so a view that reads it on every
+ * invocation gets slower exactly as the operator needs it most.
+ *
+ * The answer is the *same* fact the log would give: the kernel's entry is
+ * set when the `enter` frame is written and cleared when its partner is, and
+ * the `since` it reports is that frame's own timestamp. So the two readings
+ * cannot disagree — they are the same pairing, kept two ways.
+ *
+ * @returns The open calls, or `undefined` when the kernel **could not be
+ *   asked** — a kernel too old to know the command, or one that is not
+ *   answering. The caller falls back to the log then. An empty map is a
+ *   different answer: the kernel was asked and has no open calls.
+ */
+export async function readOpenCallsFromKernel(
+  source: OpenCallSource | undefined,
+): Promise<Map<number, OpenCall> | undefined> {
+  if (source === undefined) return undefined;
+  let raw: unknown;
+  try {
+    raw = await source.request('openCalls');
+  } catch {
+    // A kernel that cannot answer is a kernel we know nothing about; the
+    // caller falls back to the log rather than pretending there is no call.
+    return undefined;
+  }
+  const calls = (raw as { calls?: unknown }).calls;
+  if (!Array.isArray(calls)) return undefined;
+  const out = new Map<number, OpenCall>();
+  for (const entry of calls) {
+    const call = entry as {
+      pid?: unknown;
+      syscall?: unknown;
+      callId?: unknown;
+      since?: unknown;
+      args?: unknown;
+    };
+    if (typeof call.pid !== 'number' || typeof call.syscall !== 'string') continue;
+    const at = Date.parse(typeof call.since === 'string' ? call.since : '');
+    out.set(call.pid, {
+      callId: typeof call.callId === 'string' ? call.callId : '',
+      syscall: call.syscall,
+      since: Number.isNaN(at) ? Date.now() : at,
+      // The arguments come with the call: they are what say a `wait` carries
+      // its own deadline, and a declared wait is never a stall.
+      ...(call.args !== undefined ? { args: call.args } : {}),
+    });
+  }
+  return out;
 }
 
 /**

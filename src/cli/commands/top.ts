@@ -47,8 +47,14 @@
 import { parseArgs } from 'node:util';
 
 import { defaultKernelDir } from '../index.js';
-import { readProcessView, type ProcessRow } from '../process_view.js';
-import { isStalled, readOpenCall, type OpenCall } from '../open_call.js';
+import { readProcessView, type ProcessRow, type ProcessView } from '../process_view.js';
+import {
+  isStalled,
+  readOpenCall,
+  readOpenCallsFromKernel,
+  type OpenCall,
+} from '../open_call.js';
+import { probeKernel } from '../kernel_client.js';
 
 /** A node in the rendered tree. */
 interface TreeNode {
@@ -93,16 +99,49 @@ export async function cmdTop(args: string[]): Promise<number> {
   }
 
   const dir = defaultKernelDir();
-  const view = await readProcessView(dir);
-  const all = view.rows;
+  // The kernel knows which call each process is inside; the log only says so
+  // if somebody reads all of it. One probe, one connection — the same one
+  // the process view uses.
+  const probe = await probeKernel(dir);
+  const client = probe.kind === 'live' ? probe.client : undefined;
+  try {
+    const view = await readProcessView(dir, client);
+    const all = view.rows;
 
-  // What each *live* process is inside, and for how long. A process the
-  // kernel has already finished is not "inside" anything, even if it was
-  // killed in the middle of a call — its log would keep the unpaired `enter`
-  // frame, and reading that as "still inside" would be a lie.
-  const now = Date.now();
-  const inside = await readOpenCalls(dir, all);
+    // What each *live* process is inside, and for how long. A process the
+    // kernel has already finished is not "inside" anything, even if it was
+    // killed in the middle of a call — its log would keep the unpaired
+    // `enter` frame, and reading that as "still inside" would be a lie.
+    //
+    // With a live kernel the **kernel** answers: it writes every syscall as
+    // an `enter` frame and its partner and knows which pairs are still open,
+    // so the fact is O(processes) to read instead of O(bytes). Without one,
+    // the log is all there is — and it is read once, not per poll.
+    const now = Date.now();
+    const fromKernel = await readOpenCallsFromKernel(client);
+    const raw = fromKernel ?? (await readOpenCalls(dir, all));
+    // The same filter for both readings: a process the kernel no longer holds
+    // is not inside anything, even though its log keeps the `enter` frame of
+    // the call it was killed in. Two readings of one fact have to make the
+    // same choice, or they are two facts.
+    const live = new Set(all.filter((row) => row.live).map((row) => row.pid));
+    const inside = new Map([...raw].filter(([pid]) => live.has(pid)));
 
+    return renderTop(dir, view, all, inside, now, stallAfterMs);
+  } finally {
+    client?.close();
+  }
+}
+
+/** Print the tree. Split out so the connection can be closed on every path. */
+function renderTop(
+  dir: string,
+  view: ProcessView,
+  all: readonly ProcessRow[],
+  inside: Map<number, OpenCall>,
+  now: number,
+  stallAfterMs: number | null,
+): number {
   const roots = buildTree(all);
 
   // --- header: one line that says what the whole thing adds up to ----------

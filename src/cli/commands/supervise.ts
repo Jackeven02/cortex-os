@@ -80,7 +80,7 @@ import {
   KernelCommandError,
   type KernelClient,
 } from '../kernel_client.js';
-import { readOpenCall, isStalled, isDeclaredWait, type OpenCall } from '../open_call.js';
+import { readOpenCallsFromKernel, isStalled, isDeclaredWait, type OpenCall } from '../open_call.js';
 import { asProcessId, CAPABILITIES, type Capability } from '../../kernel/types.js';
 import { parseSemver } from '../../kernel/driver_registry.js';
 import { readMeta, type ProcessMeta, type ProcessSpec } from '../process_store.js';
@@ -613,12 +613,18 @@ export async function cmdSupervise(args: string[]): Promise<number> {
 
   // What the process is *already* inside when the supervisor starts. The
   // stream cannot tell us — that `enter` frame was written before we were
-  // listening — so the log is asked instead. But the stream may have spoken
-  // already (it is subscribed, and the log takes a moment to read), and then
-  // the stream is the newer answer: it has seen everything since the
-  // subscription, the log has not.
-  const logOpenCall = await readOpenCall(dir, pid);
-  openCall = handlerSpoke ? handlerOpenCall : logOpenCall;
+  // listening — but the **kernel** can: it writes every syscall as an
+  // `enter` frame and its partner, and it knows which pairs are still open.
+  // Asking it is O(processes); reading the log would be O(bytes) for a fact
+  // the kernel already has.
+  //
+  // The stream may have spoken already (it is subscribed, and the question
+  // takes a moment to answer), and then the stream is the newer answer: it
+  // has seen everything since the subscription, the kernel's answer is from
+  // before it.
+  const kernelCalls = (await readOpenCallsFromKernel(client)) ?? new Map<number, OpenCall>();
+  const kernelOpenCall = kernelCalls.get(pid);
+  openCall = handlerSpoke ? handlerOpenCall : kernelOpenCall;
   if (openCall !== undefined) {
     console.log(
       `# pid ${pid} is already inside ${openCall.syscall} ` +
@@ -790,12 +796,14 @@ export async function cmdSupervise(args: string[]): Promise<number> {
           currentPid = spawned.pid;
           intervened = false;
           // The replacement is a different process, so the stream's view of
-          // "what is it inside" starts empty again — and the log is asked
+          // "what is it inside" starts empty again — and the kernel is asked
           // about the replacement, the same way it was asked about the
           // original.
           handlerOpenCall = undefined;
           handlerSpoke = false;
-          openCall = await readOpenCall(dir, currentPid);
+          openCall = ((await readOpenCallsFromKernel(client)) ?? new Map<number, OpenCall>()).get(
+            currentPid,
+          );
           console.log(
             `# restarted as pid ${currentPid} (role=${spec.role}, caps=${authority.label})`,
           );

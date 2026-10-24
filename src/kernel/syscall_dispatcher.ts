@@ -584,6 +584,32 @@ interface Waiter {
   timer: unknown | null;
 }
 
+/**
+ * The call a process is inside right now.
+ *
+ * The same facts the log's unpaired `enter` frame carries: which syscall,
+ * which call id, and when it started. `since` is the **frame's own
+ * timestamp**, so the kernel's answer and the log's answer are the same
+ * number — not two answers that happen to be close.
+ */
+export interface OpenCallRecord {
+  /** The syscall the process is inside (`recv`, `llm_call`, `tool_call`, …). */
+  readonly syscall: SyscallName;
+  /** The call's id — the same one its `enter` frame carries. */
+  readonly callId: string;
+  /** When the call started, as an ISO timestamp. */
+  readonly since: string;
+  /**
+   * The call's arguments, exactly as its `enter` frame recorded them.
+   *
+   * Not decoration: the arguments are what say a `wait` is a **declared**
+   * wait — one that carries its own deadline — and a supervisor that cannot
+   * see the deadline kills a planner for keeping its word. The log's reader
+   * got this from the frame; the kernel's reader has to get it from here.
+   */
+  readonly args?: unknown;
+}
+
 // =============================================================================
 // §7. SyscallDispatcher
 // =============================================================================
@@ -630,6 +656,28 @@ export class SyscallDispatcher {
   #sleepHandles = new Map<number, unknown>();
   /** pid → records of synchronous syscalls awaiting their next flush. */
   #syncPending = new Map<number, SyscallRecordInput[]>();
+  /**
+   * pid → the calls it has open right now, keyed by call id.
+   *
+   * The log says the same thing — `enter` frames with no partner — but only
+   * if somebody reads the whole file, and the log of a long-lived agent
+   * grows for as long as the agent runs. This is the kernel's own
+   * bookkeeping, and it is what a host should ask for: "which call is this
+   * process inside" is a fact the kernel has.
+   *
+   * The shape is the log's shape: **keyed by call id**, so a process with
+   * two calls in flight keeps two entries and closing one does not close the
+   * other. A process is normally inside one call at a time, but nothing
+   * forbids an agent from awaiting two — `Promise.all([ctx.sleep(100),
+   * ctx.recv()])` — and a single slot per pid would then report the wrong
+   * call, or none at all.
+   *
+   * The lifetime is exactly the lifetime of the unpaired `enter` frame: the
+   * entry is set when that frame is written and cleared when its `exit` or
+   * `trap` partner is. That is why this cannot disagree with the log — it
+   * *is* the log's pairing, kept as it happens.
+   */
+  #openCalls = new Map<number, Map<string, OpenCallRecord>>();
   /**
    * PIDs whose exit metadata has already been persisted.
    *
@@ -755,12 +803,31 @@ export class SyscallDispatcher {
     const entryOffset = this.#table.recorderFor(pid)?.currentOffset ?? asSyscallOffset(0);
 
     if (recorded) {
-      await this.#write(pid, syscall, callId, 'enter', {
+      // The shaped arguments — the same ones the frame gets — so the
+      // kernel's answer and the log's answer are one answer, not two that
+      // happen to agree about the syscall and disagree about the rest.
+      const shapedArgs = this.#shapeArgs(pid, syscall, args);
+      const enteredAt = await this.#write(pid, syscall, callId, 'enter', {
         stateBefore,
         stateAfter: stateBefore,
         reversibility: staticReversibility,
-        args: this.#shapeArgs(pid, syscall, args),
+        args: shapedArgs,
       });
+      // The call is open from here until its `exit`/`trap` partner is
+      // written. This is the same pairing the log shows, kept as it
+      // happens — so a host never has to read the log to learn it.
+      const record: OpenCallRecord = {
+        syscall,
+        callId,
+        since: enteredAt,
+        ...(shapedArgs !== undefined ? { args: shapedArgs } : {}),
+      };
+      const open = this.#openCalls.get(unbrand(pid));
+      if (open === undefined) {
+        this.#openCalls.set(unbrand(pid), new Map([[callId, record]]));
+      } else {
+        open.set(callId, record);
+      }
     }
 
     // A `send` is prepared but not committed: the module hands back a
@@ -824,6 +891,18 @@ export class SyscallDispatcher {
         });
       }
       throw err;
+    } finally {
+      // The call is closed: its partner frame (exit, trap, or the exit
+      // syscall's own frame) has been written. The `enter` frame is no
+      // longer unpaired, so neither is this — and *only* this call is
+      // closed: a process with two calls in flight keeps the other one.
+      if (recorded) {
+        const open = this.#openCalls.get(unbrand(pid));
+        if (open !== undefined) {
+          open.delete(callId);
+          if (open.size === 0) this.#openCalls.delete(unbrand(pid));
+        }
+      }
     }
   }
 
@@ -2057,6 +2136,9 @@ export class SyscallDispatcher {
    * no-op; a recorder write failure surfaces as `ERECORD` per
    * docs/ARCHITECTURE.md §2.3 ("we would rather halt than produce a partial
    * log").
+   *
+   * Returns the timestamp the frame carries, so the caller can use the
+   * frame's own clock rather than a second reading of it.
    */
   async #write(
     pid: ProcessId,
@@ -2072,9 +2154,9 @@ export class SyscallDispatcher {
       readonly error?: { readonly errno: string; readonly message: string; readonly details?: unknown };
       readonly durationMs?: number;
     },
-  ): Promise<void> {
+  ): Promise<string> {
     const recorder = this.#table.recorderFor(pid);
-    if (recorder === null) return;
+    if (recorder === null) return this.#now();
 
     const rec: SyscallRecordInput = {
       timestamp: this.#now(),
@@ -2102,6 +2184,43 @@ export class SyscallDispatcher {
         cause: err,
       });
     }
+    return rec.timestamp;
+  }
+
+  // ---------------------------------------------------------------------------
+  // §7.12 The calls that are open right now
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The call each process is inside, if it is inside one.
+   *
+   * A **read**, like `ps`: the operator asking which call an agent is in is
+   * not something the agent did, so it is not recorded.
+   *
+   * The answer is the kernel's own bookkeeping — the same pairing the log
+   * shows, kept as it happens — so a host does not have to read a log that
+   * grows for as long as the agent runs to learn it. And because the entry
+   * is cleared when the call's partner frame is written, it cannot report a
+   * call that has already ended.
+   *
+   * When a process has more than one call open, the **most recently
+   * opened** one is reported — the same choice the log's reader makes when
+   * it pairs the frames and keeps the last unpaired one. Two readings of
+   * one fact have to make the same choice, or they are two facts.
+   */
+  openCalls(): ReadonlyMap<number, OpenCallRecord> {
+    const out = new Map<number, OpenCallRecord>();
+    for (const [pid, open] of this.#openCalls) {
+      // A process the kernel no longer holds is not inside anything. Its log
+      // may still carry an unpaired `enter` frame — the frame was written and
+      // its partner never was — but the process is gone, and reading that as
+      // "it is still inside that call" would be a lie.
+      if (!this.#table.has(asProcessId(pid))) continue;
+      let latest: OpenCallRecord | undefined;
+      for (const record of open.values()) latest = record;
+      if (latest !== undefined) out.set(pid, latest);
+    }
+    return out;
   }
 }
 

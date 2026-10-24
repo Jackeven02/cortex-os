@@ -42,6 +42,64 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The host stopped rebuilding what the kernel already knew.** `cortex top` and
+  `cortex supervise` both answer one question — *which call is this process
+  inside, and for how long?* — and they used to answer it by reading the
+  process's whole `.crec` and pairing the frames themselves. The kernel can
+  answer it directly: it writes every syscall as an `enter` frame and its
+  partner, and it knows which pairs are still open. The host was rebuilding a
+  fact the kernel had, at O(bytes) instead of O(processes) — and the log of a
+  long-lived agent grows for as long as the agent runs, so the operator's most
+  frequent question got slower exactly as it was most needed.
+
+  So the kernel answers: `Kernel.openCalls()` on the host side, `openCalls` on
+  the transport. The entry is set when the `enter` frame is written and cleared
+  when its partner is, and the `since` it reports is **that frame's own
+  timestamp** — so the kernel's answer and the log's answer are the same
+  number, not two numbers that happen to be close. Measured against a live
+  kernel with a 13 MB log: the log path took 273–283 ms per view, the kernel
+  path 0–1 ms.
+
+  The call's **arguments** travel with it, and that is not decoration: the
+  arguments are what say a `wait` carries its own deadline, and a declared wait
+  is not a stall. An earlier version of this dropped them, and the bounded
+  `wait` was promptly called a stall — caught by the existing check, because
+  the view and the supervisor must agree about what "stuck" means.
+
+  **And the pairing is by call id, because a process can be inside two calls.**
+  Nothing forbids an agent from awaiting two syscalls at once. The second
+  reaches the dispatcher before the first has parked the process, so both are
+  admitted — and the second then traps, because by then the process is no
+  longer RUNNING. A bookkeeping that kept one slot per process would close
+  the first call's slot when the second call closed, and report "nothing" for
+  a process that is demonstrably still inside its `sleep`. A real run against
+  a real kernel showed exactly that: the log said `sleep`, the kernel said
+  nothing, and the process was still in the sleep.
+
+  **A kernel that cannot be asked is not a kernel with nothing to say.** The
+  reader returns nothing at all when the kernel is too old to know the command
+  or is not answering, and the caller falls back to the log; an *empty* answer
+  from a kernel that was asked means the kernel really has no open calls. And
+  a process the kernel no longer holds is not reported at all — a dead
+  process's log keeps the `enter` frame of the call it was killed in, and
+  reading that as "still inside that call" is a lie.
+
+  **5 smoke checks** (676 → 681), all five reverse-verified: `cortex top`
+  reading the log again → "cortex top still knows what a process is inside when
+  the log says nothing" fails; the kernel stamping the time at query time
+  instead of the frame's own → "the kernel and the log say the same thing
+  about an open call" fails, and so does the stall marking, because a call
+  that started "now" is never stale; the kernel dropping the arguments → both
+  the declared-wait agreement and the bounded-wait view fail; the supervisor
+  reading the log instead of asking → "cortex supervise finds the call even
+  when the log says nothing" fails; and one slot per process instead of one
+  per call → "a process with two calls in flight still reports the one it is
+  inside" fails.
+
+  No ABI change: `Kernel.openCalls()` is a host method and `openCalls` is an
+  additive transport command, so `KERNEL_ABI_VERSION` stays 1.0.0 and
+  `KERNEL_PROTOCOL_VERSION` does not move either.
+
 - **`cortex wrap` stopped reporting success for a run that failed.** A
   process that is **exiting** has not finished: the kernel records its exit
   code *after* it gets there — two disk writes sit between the two — so there

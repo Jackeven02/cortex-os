@@ -250,6 +250,7 @@ import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import { cmdPs } from '../src/cli/commands/ps.js';
 import { formatCaps } from '../src/cli/process_view.js';
+import { readOpenCall, readOpenCallsFromKernel, isDeclaredWait } from '../src/cli/open_call.js';
 import { cmdTop } from '../src/cli/commands/top.js';
 import {
   listDaemons,
@@ -13272,7 +13273,8 @@ async function runSuperviseChecks(): Promise<void> {
 
       // Let it get properly stuck *before* the supervisor starts. The
       // `recv`'s `enter` frame is now in the past — the stream cannot tell
-      // the supervisor about it, so the log has to.
+      // the supervisor about it, so the kernel has to: it is the one that
+      // wrote the frame and knows which pairs are still open.
       await new Promise((resolve) => setTimeout(resolve, 400));
 
       const result = await capture(() =>
@@ -13290,6 +13292,34 @@ async function runSuperviseChecks(): Promise<void> {
       assert(
         result.code === 124,
         `the supervisor reports that it intervened (124), got ${result.code}`,
+      );
+    });
+
+    await checkAsync('cortex supervise finds the call even when the log says nothing', async () => {
+      const pid = await kernel.spawn({
+        role: 'stuck-mute',
+        agent: { module: 'test:stuck', args: { mode: 'stuck' } },
+      });
+
+      // Let it get properly stuck, then empty the log under it. The `enter`
+      // frame the answer used to be read from is gone, and the stream has
+      // nothing to say (the frame predates the subscription) — so the kernel
+      // is the only place left that can answer.
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const result = await withEmptiedLog(tmp, unbrand(pid), () =>
+        capture(() =>
+          cmdSupervise([String(unbrand(pid)), '--kill-after', '999999999', '--timeout-ms', '300']),
+        ),
+      );
+
+      assert(
+        result.out.includes('is already inside recv'),
+        `the supervisor found the call the process was already in, got: ${result.out}`,
+      );
+      assert(
+        result.code === 1,
+        `the supervisor gives up at its own bound, got ${result.code}`,
       );
     });
 
@@ -13988,6 +14018,30 @@ function topRow(out: string, pid: number): string {
 }
 
 /**
+ * Empty a process's log for the duration of one call, and put it back after.
+ *
+ * The point is to ask the kernel a question the log used to answer. With the
+ * log emptied, the only thing that can still say "this process is inside
+ * `recv`" is the kernel itself — which is where the answer comes from now.
+ *
+ * The recorder holds the file open in append mode, and libuv opens with
+ * `FILE_SHARE_WRITE`, so truncating it from here is allowed; the processes
+ * these fixtures park are stuck inside a syscall and write nothing more, so
+ * nothing lands in the hole.
+ */
+async function withEmptiedLog<T>(dir: string, pid: number, run: () => Promise<T>): Promise<T> {
+  const { readFileSync, writeFileSync } = await import('node:fs');
+  const path = existingCrecPath(dir, asProcessId(pid));
+  const original = readFileSync(path);
+  try {
+    writeFileSync(path, Buffer.alloc(0));
+    return await run();
+  } finally {
+    writeFileSync(path, original);
+  }
+}
+
+/**
  * `cortex top` — the view that tells the operator what is stuck.
  *
  * The process table cannot answer this. A listener parked on a channel and an
@@ -14036,6 +14090,16 @@ async function runTopChecks(): Promise<void> {
             }
           }
           ctx.exit(0, 'listened');
+          return;
+        }
+        if (mode === 'parallel') {
+          // Two syscalls in flight at once. The second is handed to the
+          // dispatcher before the first has parked the process, so both are
+          // admitted; the second then traps (the process is no longer
+          // RUNNING) and the catch swallows it. What is left is a process
+          // inside one call, with the *other* call's frame already closed —
+          // which is the case a one-slot-per-process bookkeeping gets wrong.
+          await Promise.all([ctx.sleep(5000), ctx.recv().catch(() => undefined)]);
           return;
         }
         if (mode === 'waiter') {
@@ -14105,6 +14169,96 @@ async function runTopChecks(): Promise<void> {
       );
     });
 
+    await checkAsync('the kernel and the log say the same thing about an open call', async () => {
+      // Two readings of one fact. The kernel keeps its own pairing of the
+      // `enter` frames it writes; the log is the same pairing written down.
+      // If they ever disagreed, the operator would be shown a stall that is
+      // not there — or miss one that is.
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+      try {
+        const fromKernel = await readOpenCallsFromKernel(client);
+        assert(fromKernel !== undefined, 'the kernel answers the question');
+        const kernelCall = fromKernel!.get(unbrand(wedged));
+        assert(kernelCall !== undefined, 'the kernel says what the process is inside');
+
+        const fromLog = await readOpenCall(tmp, unbrand(wedged));
+        assert(fromLog !== undefined, 'the log says it too');
+
+        assert(
+          kernelCall!.syscall === fromLog!.syscall,
+          `the same syscall, kernel=${kernelCall!.syscall} log=${fromLog!.syscall}`,
+        );
+        assert(
+          kernelCall!.callId === fromLog!.callId,
+          `the same call id, kernel=${kernelCall!.callId} log=${fromLog!.callId}`,
+        );
+        assert(
+          kernelCall!.since === fromLog!.since,
+          `the same moment, kernel=${kernelCall!.since} log=${fromLog!.since}`,
+        );
+      } finally {
+        client?.close();
+      }
+    });
+
+    await checkAsync('a process with two calls in flight still reports the one it is inside', async () => {
+      // A process is normally inside one call at a time, but nothing forbids
+      // an agent from awaiting two: the second is handed to the dispatcher
+      // before the first has parked the process, so both are admitted, and
+      // the second then traps.
+      //
+      // That is the case a one-slot-per-process bookkeeping gets wrong: when
+      // the second call closes, the first is still open — and a bookkeeping
+      // that kept one slot would report "nothing" for a process that is
+      // demonstrably still inside its `sleep`.
+      const parallel = await kernel.spawn({
+        role: 'parallel',
+        agent: { module: 'test:parallel', args: { mode: 'parallel' } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+      try {
+        const fromKernel = await readOpenCallsFromKernel(client);
+        assert(fromKernel !== undefined, 'the kernel answers the question');
+        const kernelCall = fromKernel!.get(unbrand(parallel));
+        assert(
+          kernelCall !== undefined,
+          'the kernel still says what the process is inside, even though another call closed',
+        );
+
+        const fromLog = await readOpenCall(tmp, unbrand(parallel));
+        assert(fromLog !== undefined, 'the log says it too');
+        assert(
+          kernelCall!.syscall === fromLog!.syscall &&
+            kernelCall!.callId === fromLog!.callId &&
+            kernelCall!.since === fromLog!.since,
+          `the same call, kernel=${kernelCall!.syscall}/${kernelCall!.callId} ` +
+            `log=${fromLog!.syscall}/${fromLog!.callId}`,
+        );
+      } finally {
+        client?.close();
+      }
+    });
+
+    await checkAsync('cortex top still knows what a process is inside when the log says nothing', async () => {
+      // The log is emptied under the kernel's feet: the `enter` frame the
+      // answer used to be read from is gone. Only the kernel can still say it.
+      const result = await withEmptiedLog(tmp, unbrand(wedged), () => capture(() => cmdTop([])));
+
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const row = topRow(result.out, unbrand(wedged));
+      assert(row !== '', `the process is still in the tree, got: ${result.out}`);
+      assert(
+        /waiting on a channel for \d/.test(row),
+        `it still says what it is waiting for, got: ${row}`,
+      );
+    });
+
     await checkAsync('cortex top --stall-after marks the wedged one and hands over the command', async () => {
       const result = await capture(() => cmdTop(['--stall-after', '300']));
 
@@ -14136,14 +14290,17 @@ async function runTopChecks(): Promise<void> {
       );
     });
 
-    await checkAsync('cortex top does not call a bounded wait stuck', async () => {
-      const planner = await kernel.spawn({
-        role: 'planner',
-        agent: { module: 'test:waiter', args: { mode: 'waiter' } },
-      });
-      // Let it get to the `wait` and stay there.
-      await new Promise((resolve) => setTimeout(resolve, 500));
+    // A planner waiting on a child, with a deadline of its own. It is
+    // hoisted out of the checks below because two of them look at it: what
+    // the view says about it, and what the kernel says about it.
+    const planner = await kernel.spawn({
+      role: 'planner',
+      agent: { module: 'test:waiter', args: { mode: 'waiter' } },
+    });
+    // Let it get to the `wait` and stay there.
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
+    await checkAsync('cortex top does not call a bounded wait stuck', async () => {
       const result = await capture(() => cmdTop(['--stall-after', '200']));
 
       assert(result.code === 0, `exit 0, got ${result.code}`);
@@ -14157,6 +14314,40 @@ async function runTopChecks(): Promise<void> {
         !row.includes('— stuck'),
         `a wait that carries its own deadline is a declared wait, not a stall, got: ${row}`,
       );
+    });
+
+    await checkAsync('the kernel and the log agree about a declared wait', async () => {
+      // The arguments are part of the answer, not decoration: a `wait` that
+      // carries its own deadline is a *declared* wait, and a supervisor that
+      // cannot see the deadline kills a planner for keeping its word. So the
+      // kernel has to hand over the arguments, not just the syscall's name.
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+      try {
+        const fromKernel = await readOpenCallsFromKernel(client);
+        assert(fromKernel !== undefined, 'the kernel answers the question');
+        const kernelCall = fromKernel!.get(unbrand(planner));
+        assert(kernelCall !== undefined, 'the kernel says what the planner is inside');
+        assert(
+          kernelCall!.syscall === 'wait',
+          `it is inside a wait, got ${kernelCall!.syscall}`,
+        );
+        assert(
+          isDeclaredWait(kernelCall!),
+          'the kernel-side call is a declared wait — it carries its own deadline',
+        );
+
+        const fromLog = await readOpenCall(tmp, unbrand(planner));
+        assert(fromLog !== undefined, 'the log says it too');
+        assert(
+          JSON.stringify(kernelCall!.args) === JSON.stringify(fromLog!.args),
+          `the same arguments, kernel=${JSON.stringify(kernelCall!.args)} ` +
+            `log=${JSON.stringify(fromLog!.args)}`,
+        );
+      } finally {
+        client?.close();
+      }
     });
 
     await checkAsync("cortex top's tree lines its columns up", async () => {

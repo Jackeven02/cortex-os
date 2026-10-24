@@ -1100,13 +1100,67 @@ dashboard instead of stopping it — the operator's way out was the one thing
 that did not work. The server now drops its connections when it closes, and
 closing twice is not an error.
 
-**The startup window is real, and the log closes it.** The stream only
+**The startup window is real, and the kernel closes it.** The stream only
 carries what happens *after* a subscriber connects — a supervisor that
 starts while the agent is already blocked would never see that `recv`'s
 `enter` frame, because it was written before the supervisor was listening.
-So the supervisor reads the process's log once at startup and works out which
-call is still open (and when it opened). The log is the record of what the
-process is doing; asking it is cheaper than guessing.
+So the supervisor asks the kernel once at startup which call is still open
+(and when it opened). The kernel can answer because it wrote those frames:
+it knows which `enter` frames still have no partner. (It used to read the
+process's log to find out — the same answer, at O(bytes) instead of
+O(processes). See "the kernel knows it" below.)
+
+**The kernel knows it, so the host does not rebuild it.** "Which call is this
+process inside, and for how long?" is a fact the kernel *has*: it writes
+every syscall as an `enter` frame and its partner, and it knows which pairs
+are still open. The host's alternative was to read the whole log and pair the
+frames itself — the same answer, kept twice, at O(bytes) for a fact the
+kernel has in O(processes). The log of a long-lived agent grows for as long
+as the agent runs, so a view that reads it on every invocation gets slower
+exactly as the operator needs it most.
+
+So the kernel answers: `Kernel.openCalls()` on the host side, `openCalls` on
+the transport. The entry is set when the `enter` frame is written and cleared
+when its partner is, and the `since` it reports is **that frame's own
+timestamp** — so the kernel's answer and the log's answer are the same
+number, not two numbers that happen to be close. The call's arguments travel
+with it, because the arguments are what say a `wait` carries its own
+deadline: a declared wait is not a stall, and a supervisor that cannot see
+the deadline kills a planner for keeping its word. (An earlier version of
+this dropped the arguments, and the bounded `wait` was promptly called a
+stall — the same answer, minus the part that made it an answer.)
+
+**The pairing is by call id, because a process can be inside two calls.** A
+process is normally inside one syscall at a time, but nothing forbids an
+agent from awaiting two: `Promise.all([ctx.sleep(1000), ctx.recv()])`. The
+second call reaches the dispatcher before the first has parked the process,
+so both are admitted — and the second then traps, because by then the
+process is no longer RUNNING. A bookkeeping that kept **one slot per
+process** would close the first call's slot when the second call closed, and
+report "nothing" for a process that is demonstrably still inside its sleep.
+So the kernel's map is keyed by call id, exactly like the log's pairing, and
+when several calls are open the **most recently opened** one is reported —
+the same choice the log's reader makes, because two readings of one fact
+have to make the same choice or they are two facts.
+
+**A process that is gone is not inside anything.** A dead process's log
+keeps the `enter` frame of the call it was killed in, and reading that as
+"still inside that call" is a lie. So the kernel does not report a process
+it no longer holds, and the view applies the same liveness filter to both
+readings — one rule, two paths.
+
+`cortex top` and `cortex supervise` now ask the kernel first, and fall back
+to the log only when there is no kernel to ask, or when the kernel is too old
+to know the command. Measured against a live kernel with a 13 MB log: the log
+path took 273–283 ms per view, the kernel path 0–1 ms, and the two reported
+the *same* `since` to the millisecond.
+
+**A kernel that cannot be asked is not a kernel with nothing to say.** The two
+answers have to stay distinct. "The kernel has no open calls" is a fact; "the
+kernel is too old to know the command" is a different one, and answering the
+second with the first would make a view quietly report that nothing is
+stuck. So the reader returns nothing at all when it cannot ask, and the
+caller falls back to the log.
 
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
@@ -1322,14 +1376,21 @@ them looked identical from the outside.
   issue the `kill` itself. That is deliberate — an operator watching a
   kernel must not be able to change what the kernel does by watching it —
   but it means the supervisor is a program, not a kernel feature.
+- **Without a live kernel, the open-call view is the log again.** `cortex top`
+  and `cortex supervise` ask the kernel first, but a kernel that is not
+  running (or is too old to know `openCalls`) leaves the log as the only
+  source — and the log is O(bytes), not O(processes). A 13 MB log cost
+  273–283 ms per view; the same view against the kernel cost 0–1 ms. So the
+  cost of the operator's most frequent question still tracks the size of the
+  agent's history when there is no kernel to ask.
 - **A driver call does not park the process.** The kernel does not preempt a
   running process to mark it BLOCKED, so an agent in a slow `llm_call` reads
   as `running` in `cortex ps`, and `blockedOn` is `null` (PROCESS.md §3.7).
-  `cortex top` finds the stall anyway — it reads the log — but `ps` is the
-  flat table and does not, and a *host* that only looks at the process table
-  will not see it either. The reserved `llm` / `tool` blocked reasons exist
-  for exactly this and are not yet produced; turning them on is a state-model
-  change (BACKLOG #060).
+  `cortex top` finds the stall anyway — it asks the kernel which call the
+  process is inside — but `ps` is the flat table and does not, and a *host*
+  that only looks at the process table will not see it either. The reserved
+  `llm` / `tool` blocked reasons exist for exactly this and are not yet
+  produced; turning them on is a state-model change (BACKLOG #060).
 - **The supervisor cannot see a hang that never made a syscall.** Its signal
   is "this process is inside one syscall, and has been for too long". A
   process that stops calling the kernel altogether — spinning in plain

@@ -171,6 +171,7 @@ import {
   SYSCALL_ALLOWED_STATES,
   SyscallDispatcher,
   isProcessExitSignal,
+  type OpenCallRecord,
   type SyscallName,
 } from './syscall_dispatcher.js';
 import { DriverRegistry } from './driver_registry.js';
@@ -1092,6 +1093,26 @@ export class Kernel {
         waiter.timer = timer;
       }
     });
+  }
+
+  /**
+   * The call each live process is inside right now.
+   *
+   * The host-facing version of the log's unpaired `enter` frame: which
+   * syscall the process is in, which call id, and when it started.
+   *
+   * Why the kernel answers this rather than the host working it out: the
+   * answer is *in* the kernel — the dispatcher writes every syscall as an
+   * `enter` frame and its partner, and it knows which pairs are still open —
+   * while the host's way of learning it is to read the whole log. That is
+   * O(bytes) for a fact the kernel has in O(processes), and the log of a
+   * long-lived agent grows for as long as the agent runs.
+   *
+   * A **read**, like `ps`: an operator looking at which call an agent is in
+   * is not something the agent did, so it is not recorded.
+   */
+  openCalls(): ReadonlyMap<number, OpenCallRecord> {
+    return this.dispatcher.openCalls();
   }
 
   /**

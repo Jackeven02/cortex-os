@@ -907,6 +907,16 @@ The ABI is now frozen, which changes what "what comes next" means.
 
 **Requiring `2.0`:** anything that removes or renames a syscall, changes what an argument means, changes the errno contract, changes `ProcessInfo`, or changes the `.crec` / `.csnap` format.
 
+**What is *not* an ABI change: the host's side of the kernel.** The agent
+surface is `ctx`. The *host* surface — the `Kernel` class, and the transport
+the CLI speaks — is not part of the frozen contract, because an agent cannot
+observe it: `Kernel.openCalls()` (which call each process is inside, and
+since when) and the transport's `openCalls` command were added for exactly
+that reason. Adding a host method does not touch `KERNEL_ABI_VERSION`. The
+transport has its own version, `KERNEL_PROTOCOL_VERSION`, and it moves only
+when the *framing* of an existing command changes — adding a command is
+additive, so `openCalls` did not move it either.
+
 **Recording ownership — resolved in stages, because none of it is an ABI change:** the modules `memory.ts`, `ipc.ts`, `fork.ts` and `checkpoint.ts` predate the dispatcher and used to write their own `.crec` frames (`memory_read`, `memory_write`, `send`, `recv`, `fork`, `checkpoint`, `restore`). The on-disk format is identical either way, so this is internal tidying rather than a contract change — which is exactly why it was not allowed to hold the freeze hostage.
 
 `memory_read`, `memory_write`, `recv` and `checkpoint` now record through the dispatcher like every other syscall: each gains the `enter` frame it never had, their `trap` frames come from the dispatcher's uniform path, and the redaction rules the modules applied are unchanged because the dispatcher applies the same shaping — a read records `{count, valuesHash}` instead of the returned values, and a write hashes any value above the manager's `largeValueBytes` threshold (or any value whose caller set `recordHashOnly`). `MemoryManager` no longer owns a recorder or a call-ID counter.
