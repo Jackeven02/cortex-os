@@ -62,7 +62,7 @@ import {
   type OpenCall,
 } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
-import { formatOutcomeCode } from '../process_outcome.js';
+import { describeOutcome, formatOutcomeCode } from '../process_outcome.js';
 import { formatDollars, usdToDollars } from '../../money.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
 import { PROCESS_STATES } from '../../kernel/process_table.js';
@@ -339,7 +339,8 @@ function cellsFor(
   // how long.
   let note = '';
   if (m.state === 'zombie') {
-    note = m.exitReason === null ? 'exited' : `exit ${formatOutcomeCode(m.exitCode)} (${m.exitReason})`;
+    // The same wording `cortex ps` prints — one rule, two views.
+    note = describeOutcome(m);
   } else if (call !== undefined) {
     note = formatOpenCall(call, m.blockedOn, now);
     if (stallAfterMs !== null && isStalled(call, now, stallAfterMs)) {

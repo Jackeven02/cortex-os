@@ -466,8 +466,8 @@ kernel's own word (`queued`), and in the same words everywhere:
 
 ```console
 $ cortex ps
-PID  PPID  ROLE     STATE    TOKENS  CAPS  AGE  WAITING
--------------------------------------------------------
+PID  PPID  ROLE     STATE    TOKENS  CAPS  AGE  NOTE
+----------------------------------------------------
 1    -     init     running  0       all   40s
 2    1     blocker  blocked  0       all   40s  a channel — SIGTERM queued
 
@@ -481,7 +481,7 @@ cortex top — 2 processes · 1 running · 1 blocked · live kernel
 └─ 2    blocker  blocked  0       $0.000000  waiting on a channel for 40.3s — SIGTERM queued
 ```
 
-`cortex ps` puts it in the WAITING column, `cortex top` in its NOTE, and the
+`cortex ps` puts it in the NOTE column, `cortex top` in its NOTE, and the
 dashboard in the column it keeps for "where this process is". One rule, three
 views: the wording comes from one function (`describePendingSignals`), so a
 table, a tree and a page cannot drift apart.

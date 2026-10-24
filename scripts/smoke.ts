@@ -296,6 +296,7 @@ import {
   specPath,
   outputPath,
   readOutput,
+  writeMeta,
   type ProcessMeta,
   type ProcessSpec,
 } from '../src/cli/process_store.js';
@@ -317,7 +318,7 @@ import {
   formatDivergence,
   type ComparedCall,
 } from '../src/cli/replay_core.js';
-import { processOutcome, formatOutcomeCode } from '../src/cli/process_outcome.js';
+import { processOutcome, formatOutcomeCode, describeOutcome } from '../src/cli/process_outcome.js';
 import type { CortexContext, LLMResponse, Timestamp } from '../src/kernel/types.js';
 import { OutputCapture } from '../src/cli/output_capture.js';
 import { bootCliKernel } from '../src/cli/index.js';
@@ -15569,6 +15570,21 @@ async function runTopChecks(): Promise<void> {
           ctx.exit(0, 'waited');
           return;
         }
+        if (mode === 'killed') {
+          // A process that dies by signal. Its zombie stays in the table —
+          // init only reaps a zombie whose parent is gone or is init — so the
+          // live views have a finished process to show, with a code and a
+          // reason the kernel knows.
+          await ctx.kill(ctx.pid, 'SIGKILL');
+          return;
+        }
+        if (mode === 'leaver') {
+          // A parent that spawns a child which dies and **never waits for it**,
+          // so the dead child stays in the table.
+          await ctx.spawn({ role: 'dead', agent: { module: 'test:dead', args: { mode: 'killed' } } });
+          await ctx.recv();
+          return;
+        }
         ctx.exit(0, 'all good');
       },
     });
@@ -15732,6 +15748,93 @@ async function runTopChecks(): Promise<void> {
       const line = psRow(result.out, unbrand(wedged));
       assert(line !== '', `the wedged process is listed, got: ${result.out}`);
       assert(line.includes('a channel'), `it says what it is waiting on, got: ${line}`);
+    });
+
+    await checkAsync('cortex ps says how a finished process ended', async () => {
+      // A run that finished and a run that died read as the same word —
+      // `zombie` — in the table an operator reads first. So "did it finish,
+      // or did it crash?" needed a second command to answer, and the answer
+      // was in the row the whole time: the kernel knows the code and the
+      // reason, and `ProcessRow` has carried both from the start.
+      await kernel.spawn({
+        role: 'leaver',
+        agent: { module: 'test:leaver', args: { mode: 'leaver' } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 600));
+
+      const dead = kernel.table.list().find((info) => info.role === 'dead');
+      assert(dead !== undefined, 'the child died and is still in the table');
+      assert(
+        dead!.exitCode === 137,
+        `the kernel knows the exit code, got ${String(dead!.exitCode)}`,
+      );
+
+      const result = await capture(() => cmdPs([]));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const line = psRow(result.out, unbrand(dead!.pid));
+      assert(line !== '', `the process is listed, got: ${result.out}`);
+      assert(
+        line.includes('exit 137 (signal:SIGKILL)'),
+        `it says how it ended, got: ${line}`,
+      );
+    });
+
+    await checkAsync('cortex ps says how a process from an earlier run ended', async () => {
+      // The other half of the same fact: a process that finished in an
+      // earlier run left a `meta.json` behind, and that file carries the code
+      // and the reason. The table says them the same way.
+      writeMeta(tmp, {
+        pid: 99,
+        ppid: 1,
+        pgid: 99,
+        role: 'finished',
+        state: 'zombie',
+        exitCode: 3,
+        exitReason: 'boom',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        lastTransitionAt: '2026-01-01T00:00:01.000Z',
+        budgetsSpent: {
+          tokensIn: 0,
+          tokensOut: 0,
+          tokensCached: 0,
+          usdSpent: 0,
+          wallTimeMs: 0,
+          syscallCount: 0,
+        },
+        budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+        agent: { module: 'file:///nowhere.ts' },
+        capabilities: [],
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+
+      const result = await capture(() => cmdPs([]));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const line = psRow(result.out, 99);
+      assert(line !== '', `the process is listed, got: ${result.out}`);
+      assert(line.includes('exit 3 (boom)'), `it says how it ended, got: ${line}`);
+    });
+
+    await checkAsync('the two process views say the same ending', async () => {
+      // One rule, two views. `cortex top` said how a process ended and `cortex
+      // ps` did not; now both say it, in the same words — an operator who
+      // reads "exit 1 (boom)" in one and something else in the other has to
+      // work out whether those are the same thing.
+      const dead = kernel.table.list().find((info) => info.role === 'dead');
+      assert(dead !== undefined, 'the dead child is still in the table');
+
+      const ps = await capture(() => cmdPs([]));
+      const top = await capture(() => cmdTop([]));
+      const psLine = psRow(ps.out, unbrand(dead!.pid));
+      const topLine = topRow(top.out, unbrand(dead!.pid));
+      assert(psLine !== '' && topLine !== '', `both views list it: ${ps.out} / ${top.out}`);
+
+      const ending = /exit \d+ \([^)]*\)/.exec(psLine)?.[0] ?? '';
+      const topEnding = /exit \d+ \([^)]*\)/.exec(topLine)?.[0] ?? '';
+      assert(ending !== '', `cortex ps says the ending, got: ${psLine}`);
+      assert(
+        topEnding === ending,
+        `the two views use the same words, ps="${ending}" top="${topEnding}"`,
+      );
     });
 
     await checkAsync('cortex ps says which signals are queued for a process', async () => {
@@ -16436,6 +16539,21 @@ async function runDashboardLiveChecks(): Promise<void> {
           await ctx.recv();
           return;
         }
+        if (mode === 'killed') {
+          // A process that dies by signal: its zombie stays in the table (init
+          // only reaps a zombie whose parent is gone or is init), so the
+          // operator's window has a finished process to show.
+          await ctx.kill(ctx.pid, 'SIGKILL');
+          return;
+        }
+        if (mode === 'leaver') {
+          // A parent that spawns a child which dies and never waits for it:
+          // the dead child stays in the table, so the window has a finished
+          // process to show.
+          await ctx.spawn({ role: 'dead', agent: { module: 'test:dead', args: { mode: 'killed' } } });
+          await ctx.recv();
+          return;
+        }
         // Alive and doing nothing: the dashboard must still show it.
         await ctx.recv();
         return;
@@ -16709,6 +16827,50 @@ async function runDashboardLiveChecks(): Promise<void> {
         assert(
           psLine!.includes('spawn'),
           `cortex ps prints the same authority, got: ${psLine}`,
+        );
+      });
+
+      await checkAsync('the dashboard says how a finished process ended', async () => {
+        // The operator's window showed a finished run and a crashed one with
+        // the same word — `zombie` — so "did it finish, or did it die?"
+        // needed the trace view to answer. The kernel knows the code and the
+        // reason; the row carries them, in the same words `cortex ps` and
+        // `cortex top` print.
+        await kernel.spawn({
+          role: 'leaver',
+          agent: { module: 'test:leaver', args: { mode: 'leaver' } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 600));
+
+        const dead = kernel.table.list().find((info) => info.role === 'dead');
+        assert(dead !== undefined, 'the child died and is still in the table');
+
+        const res = await fetch(`${dash.url}/api/processes`);
+        assert(res.status === 200, `status ${res.status}`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const row = rows.find((r) => r['pid'] === unbrand(dead!.pid));
+        assert(row !== undefined, 'the dead process is in the list');
+        assert(
+          row!['outcomeLabel'] === 'exit 137 (signal:SIGKILL)',
+          `the row carries the ending, got ${String(row!['outcomeLabel'])}`,
+        );
+        // One rule, three views: the label is the one the shared rule prints.
+        assert(
+          row!['outcomeLabel'] === describeOutcome({
+            state: 'zombie',
+            exitCode: dead!.exitCode,
+            exitReason: dead!.exitReason,
+          }),
+          'the label follows the shared rule',
+        );
+
+        // And the page shows it — the label travels with the row, and the page
+        // prints what it is given.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        assert(html.includes('outcomeLabel'), 'the page prints the label it is given');
+        assert(
+          !html.includes('exitReason'),
+          'the page does not work the ending out for itself',
         );
       });
 

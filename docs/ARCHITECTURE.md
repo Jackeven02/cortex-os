@@ -1588,7 +1588,7 @@ caller falls back to the log.
 the state and nothing else: `blocked`, with no word about *what* the process
 was blocked on; and `running` for an agent four minutes into a model call,
 which is a fact about the scheduler and not about the agent. The table now has
-a **WAITING** column, and it says "a channel", "child 5", "a model call".
+a **NOTE** column, and it says "a channel", "child 5", "a model call".
 
 Two decisions make it fit rather than crowd the table:
 
@@ -1611,6 +1611,19 @@ answers* is shared too: the kernel's blocked reason wins when it has one — it
 knows *which* child — and the open call is used otherwise, which is how a
 driver call shows up at all, since the kernel does not park a process while
 its model call is in flight.
+
+**And the column says how a process ended.** A finished run and a crashed one
+read as the same word — `zombie` — in the table an operator reads first, so
+"did it finish, or did it crash?" needed a second command to answer, and the
+answer was in the row the whole time: `ProcessRow` has carried `exitCode` and
+`exitReason` from the start. The NOTE column says it now — `exit 1 (boom)` —
+and the column was **renamed** from `WAITING` because it stopped being only
+about waiting: a process that has ended is not waiting for anything.
+
+The wording is one function (`describeOutcome`, in
+`src/cli/process_outcome.ts`), so `cortex top`, `cortex ps` and the
+dashboard cannot drift apart — and an unknown code still prints as `?`,
+because `?` is a question and `0` would be an answer the kernel never gave.
 
 **And the table keeps its shape.** A table makes a promise: *the thing under
 STATE is the state*. That promise was broken by the simplest thing there is —
@@ -1731,7 +1744,7 @@ $ cortex ps
 2       1       blocker       blocked       0         all               31s       a channel — SIGTERM queued
 ```
 
-`cortex ps` puts it in the WAITING column, `cortex top` in its NOTE, and the
+`cortex ps` puts it in the NOTE column, `cortex top` in its NOTE, and the
 dashboard in the column it keeps for "where this process is". The wording
 comes from one function (`describePendingSignals`, in
 `src/cli/process_view.ts`), because a table, a tree and a page that each

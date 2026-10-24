@@ -129,3 +129,30 @@ export function processOutcome(
 export function formatOutcomeCode(exitCode: number | null): string {
   return exitCode === null ? '?' : String(exitCode);
 }
+
+/**
+ * How a process's ending is said out loud.
+ *
+ * **The ending is a fact the kernel has, and every view has to say it.**
+ *
+ * `cortex top` said it — `exit 1 (cannot read properties of undefined ...)` —
+ * and the two views an operator reads *first* did not. `cortex ps` and the
+ * dashboard's process table both showed the same word for a run that finished
+ * and a run that died: `zombie`. So "did it finish, or did it crash?" — the
+ * first question about an agent — needed a second command to answer, and the
+ * answer was sitting in the row the whole time (`ProcessRow` has carried
+ * `exitCode` and `exitReason` from the start).
+ *
+ * The wording lives here, next to the rules about unknown endings, because
+ * three views answer this question and they must not phrase it differently:
+ * an operator who reads "exit 1 (boom)" in the tree and "crashed" in the
+ * table has to work out whether those are the same thing.
+ *
+ * A process that has not ended has no ending to report, and this says
+ * nothing at all — the empty string is not "it ended cleanly".
+ */
+export function describeOutcome(row: OutcomeEntry): string {
+  if (row.state !== 'zombie') return '';
+  if (row.exitReason === null) return 'exited';
+  return `exit ${formatOutcomeCode(row.exitCode)} (${row.exitReason})`;
+}

@@ -6,10 +6,11 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { format } from 'node:util';
 import { asProcessId } from '../kernel/types.js';
-import type { BlockedReason, ProcessInfo, Signal, SyscallRecord } from '../kernel/types.js';
+import type { BlockedReason, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView } from '../cli/process_view.js';
+import { describeOutcome } from '../cli/process_outcome.js';
 import { usdToDollars } from '../money.js';
 import { frameName } from '../cli/frame_name.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
@@ -213,10 +214,14 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
   };
 
   if (options.processes !== undefined) {
-    return [...options.processes()].map((row) => withCapsLabel(withUsdDollars(withInside(withPendingLabel(row)))));
+    return [...options.processes()].map((row) =>
+      withOutcomeLabel(withCapsLabel(withUsdDollars(withInside(withPendingLabel(row))))),
+    );
   }
   const view = await readProcessView(dir, options.kernel);
-  return [...view.rows].map((row) => withCapsLabel(withUsdDollars(withInside(withPendingLabel(row)))));
+  return [...view.rows].map((row) =>
+    withOutcomeLabel(withCapsLabel(withUsdDollars(withInside(withPendingLabel(row))))),
+  );
 }
 
 /**
@@ -247,7 +252,7 @@ function withUsdDollars<T extends { budgetsSpent?: { usdSpent?: number } }>(
  *
  * The label travels with the row so the page never has to re-implement the
  * rule. Two views of the same fact must not be able to disagree: `cortex ps`
- * prints it in its WAITING column, `cortex top` in its NOTE, and the page
+ * prints it in its NOTE column, `cortex top` in its NOTE, and the page
  * prints it here — all from the same function.
  */
 function withPendingLabel<T extends { pendingSignals?: readonly Signal[] }>(
@@ -268,6 +273,24 @@ function withCapsLabel<T extends { capabilities?: readonly Capability[] }>(
   row: T,
 ): T & { capsLabel: string } {
   return { ...row, capsLabel: formatCaps(row.capabilities) };
+}
+
+/**
+ * Put the ending on the row, in the same words `cortex ps` and `cortex top`
+ * print.
+ *
+ * The page is the operator's window, and it used to show a finished run and a
+ * crashed one with the same word — `zombie` — so "did it finish, or did it
+ * die?" needed the trace view to answer. The kernel knows the code and the
+ * reason; the label carries them.
+ *
+ * The label travels with the row so the page never re-implements the rule: one
+ * function, three views.
+ */
+function withOutcomeLabel<T extends { state: ProcessState; exitCode: number | null; exitReason: string | null }>(
+  row: T,
+): T & { outcomeLabel: string } {
+  return { ...row, outcomeLabel: describeOutcome(row) };
 }
 
 /** Every write operation the dashboard knows how to perform. */

@@ -87,7 +87,7 @@ Pluggable backends. Each driver is independently testable.
 The user-facing surface. Should feel like a real OS shell.
 
 - [x] **#029** `cortex spawn` — start an agent, print PID → implemented (`--role`, `--task`, `--system`, `--module`; env-driven driver selection). Hardened this pass: `--module` spawns a user agent module; the previously-dead `--driver`/`--model`/`--max-tokens` now flow through `AgentSpec` into the prompt agent's `llm_call` and `--token-budget` becomes a real spawn budget; every spawned agent gets the three default memory regions (episodic/semantic/procedural) so `memory_write` does not trap ENOENT; and a reaped process's exit status is recovered from the `.crec` exit record instead of being hardcoded to `code 0: completed` (a failed run is no longer reported as success). **`cortex spawn --live` spawns into the running kernel** instead of booting a throwaway one: the agent is created by the daemon's kernel through the ordinary `spawn` syscall on the dispatcher (so the state gate, the capability gate and the recording path apply exactly as they do locally), it gets a real PID in the live process table, and the command that started it can exit while the agent keeps running. It is opt-in because the default `spawn` is a *runner* — one kernel per invocation, result printed, exit — and silently changing the lifetime of the most-used command is the kind of quiet semantic change this project does not make. Two things a live spawn does not carry, both printed in the command's own output: the agent's stdout belongs to the daemon, and the LLM driver (API key included) is read from the *daemon's* environment, not the shell's.
-- [x] **#030** `cortex ps` — list processes with state, tokens, age → implemented (table format with PID/PPID/ROLE/STATE/TOKENS/CAPS/AGE/WAITING; `--state`/`--role` filters). The table grew two columns since it was first written: **CAPS**, what the process was allowed to do, and **WAITING**, what it is waiting on (BACKLOG #070).
+- [x] **#030** `cortex ps` — list processes with state, tokens, age → implemented (table format with PID/PPID/ROLE/STATE/TOKENS/CAPS/AGE/NOTE; `--state`/`--role` filters). The table grew two columns since it was first written: **CAPS**, what the process was allowed to do, and **NOTE**, what it is waiting on — or, when it has ended, how it ended (BACKLOG #070, #089).
 - [x] **#031** `cortex attach` / `detach` — interactive session with a running agent
   - **v0 (this pass):** `attach <pid>` is a **read-only, disk-based follow-mode syscall trace** — `tail -f` on the process's `.crec`. It dumps every syscall the agent has made so far and, in follow mode (the default), polls the log every 250ms and prints new frames as another `cortex` invocation appends them; SIGINT / SIGTERM detach cleanly. It reuses the same `formatRecordLine` as `cortex trace`, so both commands print identical rows for the same file. Resolves a PID (via `CORTEX_HOME`) or a direct `.crec` path; `--once` for a one-shot dump; `--timeout-ms N` for headless / test use. 4 smoke checks cover `--once`-vs-`trace` row parity, follow-mode mid-window frame pickup, the missing-PID error, and the no-argument help path.
   - **The interactive send-half is now here.** `attach <pid> --interactive` delivers every line of stdin into the live agent, through the live kernel, while the trace keeps scrolling; Ctrl-D detaches. The deferral to #039 is discharged: the daemon keeps a kernel alive and publishes its endpoint (`<CORTEX_HOME>/kernel.json`), so there is finally a running process to pipe into. The read half is unchanged — `--interactive` adds the write half, it does not replace the trace.
@@ -763,6 +763,50 @@ The user-facing surface. Should feel like a real OS shell.
 
   Docs: ABI §4.1 (the rule, as a table); ARCHITECTURE §12.3; COOKBOOK and
   HACKING (both had the bug written down as a rule); CHANGELOG.
+
+- [x] **#089** A finished run and a crashed one looked the same → **fixed.**
+  `cortex ps` — the table an operator reads first — printed the state `zombie`
+  for a clean exit and for a crash alike, and the dashboard's process table
+  printed the same word. So *"did it finish, or did it crash?"* — the first
+  question about an agent — needed a second command to answer, and the answer
+  was in the row the whole time: `ProcessRow` has carried `exitCode` and
+  `exitReason` from the start. `cortex top` had it (`exit 1 (cannot read
+  properties of undefined (reading 'id'))`); the two views an operator reads
+  first did not.
+
+  **One wording, in one place** (`describeOutcome`, in
+  `src/cli/process_outcome.ts`): `exit 1 (boom)`. `cortex ps`, `cortex top` and
+  the dashboard all call it, so a table, a tree and a page cannot drift apart —
+  and an unknown code still prints `?`, because `?` is a question and `0` would
+  be an answer the kernel never gave.
+
+  **The last column of `cortex ps` was renamed `WAITING` → `NOTE`** — the
+  position did not move, and the seven columns before it are untouched. It
+  stopped being only about waiting: a process that has ended is not waiting for
+  anything. The cell says the **ending first** and the waiting second, because
+  a dead process is not waiting on a channel.
+
+  **The ending survives the reap.** A process that ended in an earlier run is
+  read from its exit record on disk, so the answer is there even after the
+  kernel is gone — the same durable answer `cortex top` already used.
+
+  **The dashboard gets the label from the server** (`outcomeLabel`, alongside
+  `capsLabel` / `pendingLabel` / `insideLabel`), and the page prints it — it
+  does not re-implement the rule, exactly as it already did for the capability
+  column.
+
+  **Four new smoke checks** (756 → 760), all reverse-verified: without the
+  ending in `cortex ps`, three fail; without the server's `outcomeLabel`, the
+  dashboard one fails; with the page computing the ending for itself, the
+  "the page prints the label it is given" check fails.
+
+  **One limit, stated rather than hidden:** the ending is the one the **kernel**
+  recorded. A process killed by a signal reads `exit 137 (signal:SIGKILL)`; a
+  process whose ending nobody ever saw reads `exited` — never a code that was
+  never given.
+
+  Docs: ARCHITECTURE (the column says how a process ended); PROCESS §7.2 and
+  INTEGRATIONS (the column's name); both READMEs; CHANGELOG.
 
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 

@@ -25,13 +25,13 @@ $ cortex spawn --role coder --task "fix issue #42"
 
 # Inspect the process tree
 $ cortex ps
-PID  PPID  ROLE            STATE    TOKENS  CAPS  AGE  WAITING
---------------------------------------------------------------
+PID  PPID  ROLE            STATE    TOKENS  CAPS  AGE  NOTE
+-----------------------------------------------------------
 1    -     init            running  0       all   18s
 2    1     holder          blocked  0       all   18s  a channel — SIGTERM queued
 3    1     planner         blocked  0       all   18s  child 6 — SIGCHLD queued
-4    3     coder:overview  zombie   0       all   18s
-5    3     coder:install   zombie   0       all   18s
+4    3     coder:overview  zombie   0       all   18s  exit 0 (coder overview complete)
+5    3     coder:install   zombie   0       all   18s  exit 0 (coder install complete)
 6    3     coder:api       blocked  0       all   18s  a timer
 
 # Same processes, as the tree they actually are — and what each is waiting

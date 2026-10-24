@@ -1546,6 +1546,46 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A finished run and a crashed one looked the same.** `cortex ps` printed the
+  state `zombie` for a clean exit and for a crash alike, and the dashboard's
+  process table printed the same word. `cortex top` said the truth —
+  `exit 1 (cannot read properties of undefined (reading 'id'))` — so *"did it
+  finish, or did it crash?"*, the first question about an agent, needed a
+  second command to answer, and the answer was in the row the whole time:
+  `ProcessRow` has carried `exitCode` and `exitReason` from the start.
+
+  **One wording, in one place.** `describeOutcome` (in
+  `src/cli/process_outcome.ts`) says `exit 1 (boom)`, and `cortex ps`,
+  `cortex top` and the dashboard all call it — a table, a tree and a page
+  cannot drift apart. An unknown code still prints `?`: `?` is a question, and
+  `0` would be an answer the kernel never gave.
+
+  **The last column of `cortex ps` was renamed `WAITING` → `NOTE`.** The
+  position did not move and the seven columns before it are untouched — a
+  script that reads the table by column number still reads the column it read
+  before. It stopped being only about waiting: a process that has ended is not
+  waiting for anything. The cell says the **ending first** and the waiting
+  second, because a dead process is not waiting on a channel.
+
+  **The ending survives the reap.** A process that ended in an earlier run is
+  read from its exit record on disk, so the answer is still there after the
+  kernel is gone — the same durable answer `cortex top` already used.
+
+  **The dashboard asks the server.** The row carries `outcomeLabel`, alongside
+  `capsLabel` / `pendingLabel` / `insideLabel`, and the page prints it — it
+  does not re-implement the rule, exactly as it already did for the capability
+  column.
+
+  **Four new smoke checks** (756 → 760), all reverse-verified: with the ending
+  taken out of `cortex ps`, three fail; with the server's `outcomeLabel`
+  removed, the dashboard check fails ("got undefined"); with the page working
+  the ending out for itself, the "the page prints the label it is given" check
+  fails.
+
+  No ABI change: `KERNEL_ABI_VERSION` stays `1.0.0`. The kernel already knew
+  the ending — this is a view catching up with a fact the kernel had, not a
+  change to what the kernel does.
+
 - **An agent could not spawn a child from a file path.** `AgentSpec.module` is
   documented as a **path or an import specifier** (ABI §4.1), and the ABI's own
   example is `agent: { module: './agents/researcher.js' }`. The CLI took that

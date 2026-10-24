@@ -21,6 +21,7 @@ import {
   type ProcessRow,
 } from '../process_view.js';
 import { describeWait, readOpenCalls, type OpenCall } from '../open_call.js';
+import { describeOutcome } from '../process_outcome.js';
 import { probeKernel } from '../kernel_client.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
 import { PROCESS_STATES } from '../../kernel/process_table.js';
@@ -65,7 +66,7 @@ const PS_COLUMNS: readonly ColumnSpec[] = [
   { header: 'TOKENS', max: longest(['0', '999', '999.9k', '999.9M']), gap: 2 },
   { header: 'CAPS', max: CAPS_MAX, gap: 2 },
   { header: 'AGE', max: 10, gap: 2 },
-  { header: 'WAITING', max: Number.POSITIVE_INFINITY, gap: 0 },
+  { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 0 },
 ];
 
 export async function cmdPs(args: string[]): Promise<number> {
@@ -91,13 +92,18 @@ OPTIONS
   -h, --help         Show this help
 
 COLUMNS
-  PID PPID ROLE STATE TOKENS CAPS AGE WAITING
+  PID PPID ROLE STATE TOKENS CAPS AGE NOTE
 
-  WAITING is what the process is waiting on — a channel, a child, a timer, a
-  model call. It is the one thing the state column cannot be: the kernel does
-  not park a process while its model call is in flight, so an agent that has
-  been inside one for four minutes reads as 'running', and 'running' is not
-  what the operator needs to know.
+  NOTE says what the process is doing. For a process that is still alive, it
+  says what it is waiting on — a channel, a child, a timer, a model call. It
+  is the one thing the state column cannot be: the kernel does not park a
+  process while its model call is in flight, so an agent that has been inside
+  one for four minutes reads as 'running', and 'running' is not what the
+  operator needs to know.
+
+  For a process that has ENDED, it says how it ended — 'exit 1 (boom)'. The
+  kernel knows the code and the reason, and 'zombie' on its own cannot tell a
+  finished run from a crash.
 
   It also says what is waiting for the process: a signal the kernel has queued
   for it ('SIGTERM queued') is not delivered until the process runs again, so
@@ -154,7 +160,22 @@ COLUMNS
    * wording is shared with `cortex top` (and the dashboard), so two views of
    * the same fact cannot say different things about it.
    */
-  const waitingFor = (p: ProcessRow): string => {
+  /**
+   * What the row says about the process's situation — what it is doing, or
+   * how it ended.
+   *
+   * Two facts, one cell, one column. A process that has **ended** says how
+   * ("exit 1 (boom)"), because the kernel knows the code and the reason and
+   * `zombie` on its own cannot tell a finished run from a crash. A process
+   * that is still alive says what it is waiting on.
+   *
+   * The ending comes first: a dead process is not waiting for anything, and
+   * its row used to be blank in the one column that could have said why it
+   * died.
+   */
+  const note = (p: ProcessRow): string => {
+    const ending = describeOutcome(p);
+    if (ending !== '') return ending;
     let wait = '';
     if (p.live) {
       const call = calls.get(p.pid);
@@ -187,7 +208,7 @@ COLUMNS
       formatTokens(p.budgetsSpent.tokensIn + p.budgetsSpent.tokensOut),
       formatCaps(p.capabilities),
       formatAge(ageMs),
-      waitingFor(p),
+      note(p),
     ];
   });
   const columns = sizeColumns(PS_COLUMNS, cells);
