@@ -305,6 +305,15 @@ import {
 } from '../src/cli/regions.js';
 import { cmdSpawn } from '../src/cli/commands/spawn.js';
 import { cmdRestore } from '../src/cli/commands/restore.js';
+import { cmdReplay } from '../src/cli/commands/replay.js';
+import { LogRecording, type ReplayMode, type ReplaySource } from '../src/kernel/replay.js';
+import {
+  compareCalls,
+  extractCalls,
+  formatDivergence,
+  type ComparedCall,
+} from '../src/cli/replay_core.js';
+import type { CortexContext, LLMResponse, Timestamp } from '../src/kernel/types.js';
 import { OutputCapture } from '../src/cli/output_capture.js';
 import { bootCliKernel } from '../src/cli/index.js';
 import { pathToFileURL } from 'node:url';
@@ -16543,6 +16552,448 @@ async function runTransportChecks(): Promise<void> {
   }
 }
 
+// =============================================================================
+// Replay — STATE.md §5.5: "you can always replay an agent's reasoning
+// deterministically"
+// =============================================================================
+
+/**
+ * The replay engine, made falsifiable.
+ *
+ * The claim is not "a replay exists" — it is four specific things:
+ *
+ *  1. the model's answer comes from the **recording**, not from the world;
+ *  2. so do the clock and the RNG, which are the two things that would
+ *     otherwise make two runs of the same code incomparable;
+ *  3. a replay does **not** need the model provider the original run used —
+ *     which is what makes a recording worth keeping;
+ *  4. and a replay that cannot answer says so, instead of quietly reaching
+ *     for the real world and pretending to be a faithful reproduction.
+ */
+async function runReplayChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-replay-'));
+  const kernels: Kernel[] = [];
+  const prevHome = process.env['CORTEX_HOME'];
+
+  /**
+   * A driver that always answers with the same text — so a replay's answer
+   * can be told apart from a live one.
+   */
+  const fixedDriver = (text: string): ILLMDriver => ({
+    name: 'fixed',
+    version: '1.0.0',
+    abiCompat: '*',
+    supportedModels: [],
+    call: async (): Promise<LLMResponse> => ({
+      text,
+      toolCalls: [],
+      finishReason: 'stop',
+      usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, usd: 0 },
+      model: 'fixed',
+      driverVersion: '1.0.0',
+    }),
+    close: async () => {},
+  });
+
+  /**
+   * A tool driver that answers with a fixed output — and counts how often it
+   * was actually run, because "a replay does not repeat a side effect" is a
+   * claim about the counter, not about the answer.
+   */
+  const fixedTool = (output: string, counter: { count: number }): IToolDriver => ({
+    name: 'fixed-tool',
+    version: '1.0.0',
+    abiCompat: '*',
+    listTools: async () => [
+      {
+        name: 'probe_tool',
+        description: 'a probe tool',
+        inputSchema: { type: 'object' },
+        reversibility: 'reversible',
+      },
+    ],
+    invoke: async () => {
+      counter.count += 1;
+      return { output, error: null, durationMs: 0, reversibility: 'reversible' };
+    },
+    close: async () => {},
+  });
+
+  /**
+   * The agent every replay check runs: the clock, the RNG, the model.
+   *
+   * `mode: 'twice'` asks for a second model call — more than the recording
+   * holds — which is how "the recording ran out" is provoked.
+   * `mode: 'tool'` calls a tool, which is how "a replay does not repeat a
+   * side effect" is provoked.
+   */
+  const agentLoader = async () =>
+    async (ctx: CortexContext, args: Record<string, unknown>): Promise<void> => {
+      const mode = typeof args['mode'] === 'string' ? args['mode'] : 'once';
+      ctx.now();
+      ctx.random();
+      await ctx.llm_call({ messages: [{ role: 'user', content: 'PROMPT' }] });
+      if (mode === 'twice') {
+        await ctx.llm_call({ messages: [{ role: 'user', content: 'PROMPT' }] });
+      }
+      if (mode === 'tool') {
+        await ctx.tool_call('probe_tool', { probe: true });
+      }
+      ctx.exit(0, 'done');
+    };
+
+  /**
+   * Boot a kernel, run the agent in it, and read back the calls it made.
+   */
+  const run = async (
+    dir: string,
+    opts: {
+      readonly mode?: string;
+      readonly answer?: string;
+      readonly withLLM?: boolean;
+      readonly replay?: { readonly source: ReplaySource; readonly mode?: ReplayMode };
+      readonly now?: () => Timestamp;
+      readonly random?: () => number;
+    },
+  ): Promise<{
+    readonly pid: number;
+    readonly calls: readonly ComparedCall[];
+    readonly toolCalls: number;
+  }> => {
+    const toolCounter = { count: 0 };
+    const kernel = await bootKernel({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      dir,
+      autoStart: true,
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+      ...(opts.random !== undefined ? { random: opts.random } : {}),
+      ...(opts.replay !== undefined ? { replay: opts.replay } : {}),
+      loadDrivers: async (reg) => {
+        if (opts.withLLM !== false) reg.registerLLM(fixedDriver(opts.answer ?? 'LIVE-ANSWER'));
+        await reg.registerTool(fixedTool('TOOL-OUTPUT', toolCounter));
+        reg.registerMemory(inmemMemory());
+      },
+      agentLoader,
+    });
+    kernels.push(kernel);
+    const pid = await kernel.spawn({
+      role: 'probe',
+      agent: { module: 'test:probe', args: { mode: opts.mode ?? 'once' } },
+    });
+    for (let i = 0; i < 500; i++) {
+      const entry = kernel.table.get(pid);
+      if (entry === undefined || entry.state === 'zombie' || entry.state === 'exiting') break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(crecPath(dir, pid))) records.push(r);
+    return { pid: unbrand(pid), calls: extractCalls(records), toolCalls: toolCounter.count };
+  };
+
+  /** The text a call's `llm_call` answer carries. */
+  const answeredWith = (call: ComparedCall | undefined): unknown =>
+    (call?.result as { text?: unknown } | undefined)?.text;
+
+  try {
+    // A live run, recorded.
+    const liveDir = join(tmp, 'live');
+    const live = await run(liveDir, { answer: 'LIVE-ANSWER' });
+
+    /**
+     * A fresh copy of the recording.
+     *
+     * A recording is consumed as it is served — the cursor never goes back —
+     * so every replay gets its own copy. (This is the `reset()` case: the
+     * engine offers it, and the checks here would rather read the file
+     * again, because that is what a second process would do.)
+     */
+    const recording = async (): Promise<LogRecording> =>
+      LogRecording.fromFile(crecPath(liveDir, asProcessId(live.pid)));
+
+    await checkAsync('a replay serves the model answer from the recording', async () => {
+      const replay = await run(join(tmp, 'replay-answer'), {
+        answer: 'WORLD-ANSWER',
+        replay: { source: await recording(), mode: 'strict' },
+      });
+      const call = replay.calls.find((c) => c.syscall === 'llm_call');
+      assert(call !== undefined, 'the replay made no llm_call');
+      assert(
+        answeredWith(call) === 'LIVE-ANSWER',
+        `the replay answered from the world: ${String(answeredWith(call))}`,
+      );
+    });
+
+    await checkAsync('a replay reproduces the recording it was given', async () => {
+      const replay = await run(join(tmp, 'replay-same'), {
+        answer: 'WORLD-ANSWER',
+        replay: { source: await recording(), mode: 'strict' },
+      });
+      const comparison = compareCalls(live.calls, replay.calls);
+      assert(
+        comparison.reproduced,
+        `the replay diverged at #${(comparison.divergence?.index ?? 0) + 1}`,
+      );
+      assert(comparison.originalCalls === comparison.replayCalls, 'the call counts differ');
+    });
+
+    await checkAsync('a replay serves the clock and the RNG from the recording', async () => {
+      const replay = await run(join(tmp, 'replay-clock'), {
+        answer: 'WORLD-ANSWER',
+        now: () => '2030-01-01T00:00:00.000Z' as Timestamp,
+        random: () => 0.5,
+        replay: { source: await recording(), mode: 'strict' },
+      });
+      const clock = replay.calls.find((c) => c.syscall === 'now');
+      const roll = replay.calls.find((c) => c.syscall === 'random');
+      assert(clock !== undefined, 'the replay made no now() call');
+      assert(roll !== undefined, 'the replay made no random() call');
+      assert(clock.result !== '2030-01-01T00:00:00.000Z', 'the replay read the real clock');
+      assert(roll.result !== 0.5, 'the replay drew from the real RNG');
+      const recordedClock = live.calls.find((c) => c.syscall === 'now');
+      assert(clock.result === recordedClock?.result, 'the clock is not the recorded one');
+    });
+
+    await checkAsync('a strict replay refuses to answer from the world', async () => {
+      const replay = await run(join(tmp, 'replay-strict'), {
+        mode: 'twice',
+        answer: 'WORLD-ANSWER',
+        replay: { source: await recording(), mode: 'strict' },
+      });
+      const trapped = replay.calls.find((c) => c.error !== undefined);
+      assert(trapped !== undefined, 'the strict replay did not fail');
+      assert(trapped.error?.errno === 'ERECORD', `wrong errno: ${trapped.error?.errno}`);
+      assert(trapped.syscall === 'llm_call', `wrong syscall: ${trapped.syscall}`);
+    });
+
+    await checkAsync('a cached replay falls through to the world', async () => {
+      const replay = await run(join(tmp, 'replay-cached'), {
+        mode: 'twice',
+        answer: 'WORLD-ANSWER',
+        replay: { source: await recording(), mode: 'cached' },
+      });
+      const calls = replay.calls.filter((c) => c.syscall === 'llm_call');
+      assert(calls.length === 2, `expected 2 llm_calls, got ${calls.length}`);
+      const second = calls[1]!;
+      assert(second.error === undefined, 'the cached replay still failed');
+      assert(
+        answeredWith(second) === 'WORLD-ANSWER',
+        `the cached replay did not reach the world: ${String(answeredWith(second))}`,
+      );
+    });
+
+    await checkAsync('a live replay ignores the recording', async () => {
+      const replay = await run(join(tmp, 'replay-live'), {
+        answer: 'WORLD-ANSWER',
+        replay: { source: await recording(), mode: 'live' },
+      });
+      const call = replay.calls.find((c) => c.syscall === 'llm_call');
+      assert(
+        answeredWith(call) === 'WORLD-ANSWER',
+        `a live replay still used the recording: ${String(answeredWith(call))}`,
+      );
+    });
+
+    await checkAsync('a replay needs no model provider', async () => {
+      const replay = await run(join(tmp, 'replay-nodriver'), {
+        withLLM: false,
+        replay: { source: await recording(), mode: 'strict' },
+      });
+      const call = replay.calls.find((c) => c.syscall === 'llm_call');
+      assert(
+        answeredWith(call) === 'LIVE-ANSWER',
+        `the replay needed a driver it does not have: ${String(answeredWith(call))}`,
+      );
+    });
+
+    await checkAsync('a replay does not repeat a side effect', async () => {
+      // A live run that really calls the tool.
+      const toolDir = join(tmp, 'live-tool');
+      const liveTool = await run(toolDir, { mode: 'tool', answer: 'LIVE-ANSWER' });
+      assert(liveTool.toolCalls === 1, `the live run called the tool ${liveTool.toolCalls} times`);
+      const toolRecording = await LogRecording.fromFile(crecPath(toolDir, asProcessId(liveTool.pid)));
+
+      // The replay: the tool's answer comes from the recording, and the tool
+      // itself is never run again.
+      const replay = await run(join(tmp, 'replay-tool'), {
+        mode: 'tool',
+        answer: 'WORLD-ANSWER',
+        replay: { source: toolRecording, mode: 'strict' },
+      });
+      assert(replay.toolCalls === 0, `the replay ran the tool ${replay.toolCalls} times`);
+      const call = replay.calls.find((c) => c.syscall === 'tool_call');
+      assert(call !== undefined, 'the replay made no tool_call');
+      const output = (call.result as { output?: unknown } | undefined)?.output;
+      assert(output === 'TOOL-OUTPUT', `the replay did not serve the recorded tool result: ${String(output)}`);
+    });
+
+    await checkAsync('a recording can be replayed more than once', async () => {
+      const source = await recording();
+      const first = await run(join(tmp, 'replay-twice-a'), {
+        answer: 'WORLD-ANSWER',
+        replay: { source, mode: 'strict' },
+      });
+      const second = await run(join(tmp, 'replay-twice-b'), {
+        answer: 'WORLD-ANSWER',
+        replay: { source, mode: 'strict' },
+      });
+      assert(
+        answeredWith(first.calls.find((c) => c.syscall === 'llm_call')) === 'LIVE-ANSWER',
+        'the first replay did not use the recording',
+      );
+      assert(
+        answeredWith(second.calls.find((c) => c.syscall === 'llm_call')) === undefined,
+        'the second replay reused a spent recording',
+      );
+      source.reset();
+      const third = await run(join(tmp, 'replay-twice-c'), {
+        answer: 'WORLD-ANSWER',
+        replay: { source, mode: 'strict' },
+      });
+      assert(
+        answeredWith(third.calls.find((c) => c.syscall === 'llm_call')) === 'LIVE-ANSWER',
+        'a rewound recording did not answer again',
+      );
+    });
+
+    await checkAsync('the comparison ignores the run-specific bookkeeping', async () => {
+      const a: ComparedCall[] = [
+        { syscall: 'now', result: 'T' },
+        { syscall: 'checkpoint', result: { chainId: 'a', byteSize: 10, syscallLogOffset: 100 } },
+        { syscall: 'recv', result: { from: 2, to: 2, body: 'hi', sentAt: 'T1' } },
+      ];
+      const b: ComparedCall[] = [
+        { syscall: 'now', result: 'T' },
+        { syscall: 'checkpoint', result: { chainId: 'b', byteSize: 99, syscallLogOffset: 400 } },
+        { syscall: 'recv', result: { from: 2, to: 2, body: 'hi', sentAt: 'T2' } },
+      ];
+      const comparison = compareCalls(a, b);
+      assert(comparison.reproduced, 'the bookkeeping was treated as a divergence');
+    });
+
+    await checkAsync('the comparison names the first divergence', async () => {
+      const a: ComparedCall[] = [
+        { syscall: 'now', result: 'T' },
+        {
+          syscall: 'llm_call',
+          args: { messages: [{ role: 'user', content: 'V1' }] },
+          result: { text: 'x' },
+        },
+      ];
+      const b: ComparedCall[] = [
+        { syscall: 'now', result: 'T' },
+        {
+          syscall: 'llm_call',
+          args: { messages: [{ role: 'user', content: 'V2' }] },
+          result: { text: 'x' },
+        },
+      ];
+      const comparison = compareCalls(a, b);
+      assert(!comparison.reproduced, 'the divergence was not found');
+      assert(comparison.divergence?.index === 1, `wrong index: ${comparison.divergence?.index}`);
+      const report = formatDivergence(comparison.divergence!);
+      assert(report.includes('messages[0].content'), `the report does not name the path: ${report}`);
+      assert(
+        report.includes('V1') && report.includes('V2'),
+        `the report does not show both values: ${report}`,
+      );
+    });
+
+    // --- the command --------------------------------------------------------
+
+    const home = join(tmp, 'home');
+    process.env['CORTEX_HOME'] = home;
+
+    const moduleV1 = join(tmp, 'agent-v1.ts');
+    const moduleV2 = join(tmp, 'agent-v2.ts');
+    const writeModule = (path: string, prompt: string): void => {
+      writeFileSync(
+        path,
+        `export default async function agent(ctx) {
+  ctx.now();
+  ctx.random();
+  await ctx.llm_call({ messages: [{ role: 'user', content: '${prompt}' }] });
+  ctx.exit(0, 'done');
+}
+`,
+        'utf8',
+      );
+    };
+    writeModule(moduleV1, 'PROMPT-V1');
+    writeModule(moduleV2, 'PROMPT-V2');
+
+    const capture = async (
+      runCommand: () => Promise<number>,
+    ): Promise<{ code: number; out: string; err: string }> => {
+      let out = '';
+      let err = '';
+      const prevWrite = process.stdout.write;
+      const prevErr = console.error;
+      process.stdout.write = ((chunk: unknown): boolean => {
+        out += String(chunk);
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      console.error = (...parts: unknown[]): void => {
+        err += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      try {
+        const code = await runCommand();
+        return { code, out, err };
+      } finally {
+        process.stdout.write = prevWrite;
+        console.error = prevErr;
+      }
+    };
+
+    let spawnedPid = 0;
+
+    await checkAsync('cortex replay reproduces a recorded run', async () => {
+      const spawned = await capture(() => cmdSpawn(['--role', 'probe', '--module', moduleV1]));
+      assert(spawned.code === 0, `spawn failed: ${spawned.out}${spawned.err}`);
+      const m = /\[pid (\d+)\]/.exec(spawned.out);
+      assert(m !== null, `no pid in the spawn output: ${spawned.out}`);
+      spawnedPid = Number(m![1]);
+      const replayed = await capture(() => cmdReplay([String(spawnedPid)]));
+      assert(replayed.code === 0, `the replay failed: ${replayed.out}${replayed.err}`);
+      assert(replayed.out.includes('REPRODUCED'), `the replay did not reproduce: ${replayed.out}`);
+    });
+
+    await checkAsync('cortex replay names the first divergence', async () => {
+      const spec = readSpec(home, asProcessId(spawnedPid));
+      assert(spec !== undefined, 'the spawned process has no spec');
+      // The agent's code changed: the spec now names a different module.
+      writeSpec(home, { ...spec, agent: { module: pathToFileURL(moduleV2).href } });
+      const replayed = await capture(() => cmdReplay([String(spawnedPid)]));
+      assert(replayed.code === 1, `the replay did not report a divergence: ${replayed.out}`);
+      assert(replayed.out.includes('DIVERGED'), `the replay did not say DIVERGED: ${replayed.out}`);
+      assert(replayed.out.includes('PROMPT-V2'), `the replay did not name the change: ${replayed.out}`);
+      assert(
+        replayed.out.includes('messages[0].content'),
+        `the replay did not say WHERE the change is: ${replayed.out}`,
+      );
+    });
+
+    await checkAsync('cortex replay refuses a process with no recording', async () => {
+      const replayed = await capture(() => cmdReplay(['999999']));
+      assert(replayed.code === 1, 'the replay accepted a process with no recording');
+      assert(replayed.err.includes('no recording'), `the message does not say so: ${replayed.err}`);
+    });
+  } finally {
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    for (const k of kernels) {
+      try {
+        await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
@@ -16580,6 +17031,7 @@ await runDaemonChecks();
 await runKernelHardeningChecks();
 await runTransportChecks();
 await runBootChecks();
+await runReplayChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

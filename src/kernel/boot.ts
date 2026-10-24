@@ -125,6 +125,8 @@ import {
   type CognitiveSnapshot,
   type CortexContext,
   type ForkOptions,
+  type ILLMDriver,
+  type IToolDriver,
   type LLMRequest,
   type LLMResponse,
   type MemoryQuery,
@@ -145,6 +147,7 @@ import {
   type SyscallRecord,
   type Timestamp,
   type ToolCallOptions,
+  type ToolDescriptor,
   type WaitOptions,
   type ToolResult,
   unbrand,
@@ -175,6 +178,7 @@ import {
   type SyscallName,
 } from './syscall_dispatcher.js';
 import { DriverRegistry } from './driver_registry.js';
+import { ReplayEngine, type ReplayMode, type ReplaySource } from './replay.js';
 
 // =============================================================================
 // §1. Agent surface
@@ -429,6 +433,25 @@ export interface KernelOptions {
   readonly setTimeoutFn?: (cb: () => void, ms: number) => unknown;
   readonly clearTimeoutFn?: (handle: unknown) => void;
 
+  /**
+   * Replay a recorded run.
+   *
+   * With a source, the kernel answers the model calls, the tool calls, the
+   * clock and the RNG **from the recording** instead of from the world: the
+   * agent's code runs again, and the run can be compared with what was
+   * recorded. That is the machinery behind STATE.md §5.5 ("you can always
+   * replay an agent's reasoning deterministically"), and behind the
+   * `replayMode` the ABI has always had a field for.
+   *
+   * Omitted means an ordinary live run.
+   */
+  readonly replay?: {
+    /** Where the recorded answers come from. */
+    readonly source: ReplaySource;
+    /** What to do with a call the recording does not have. Defaults to `strict`. */
+    readonly mode?: ReplayMode;
+  };
+
   /** Override agent loading (tests supply in-memory agents). */
   readonly agentLoader?: AgentLoader;
   /**
@@ -618,6 +641,45 @@ export class Kernel {
   #random: (opts?: RandomOptions) => number;
   #importModule: (specifier: string) => Promise<unknown>;
   #loadAgent: AgentLoader;
+  /**
+   * The replay engine, when this kernel is replaying a recording.
+   *
+   * It is what makes the model's answers, the tool results, the clock and the
+   * RNG come from the recording instead of from the world. `null` means an
+   * ordinary live run. See `kernel/replay.ts`.
+   */
+  #replay: ReplayEngine | null = null;
+
+  /**
+   * The LLM driver resolver the dispatcher uses.
+   *
+   * Live: the registry's own lookup, which traps `EDRIVER` when there is no
+   * such driver.
+   *
+   * Replaying: the same lookup, but a miss is **not** an error — the
+   * recording has the answer even when this host has never heard of the
+   * driver the original run used. That is what lets a run recorded against
+   * one model provider be replayed on a machine with none of its keys.
+   */
+  #resolveLLM = (name?: string): ILLMDriver => {
+    const replay = this.#replay;
+    if (replay === null) return this.registry.resolveLLM(name);
+    return replay.llmDriver(this.registry.tryResolveLLM(name), name);
+  };
+
+  /**
+   * The tool driver resolver the dispatcher uses.
+   *
+   * Same shape as the LLM one: live, a miss traps `ENOENT`; replaying, a
+   * miss is answered from the recording with a placeholder descriptor.
+   */
+  #resolveTool = (
+    name: string,
+  ): { readonly driver: IToolDriver; readonly descriptor: ToolDescriptor } | undefined => {
+    const replay = this.#replay;
+    if (replay === null) return this.registry.resolveTool(name);
+    return replay.toolDriver(this.registry.resolveTool(name), name);
+  };
 
   /** pid → built `CortexContext` (one proxy per process, reused across calls). */
   #contexts = new Map<number, CortexContext>();
@@ -665,6 +727,16 @@ export class Kernel {
     this.#random = opts.random ?? (() => Math.random());
     this.#importModule = opts.importModule ?? ((s: string) => import(s));
     this.#loadAgent = opts.agentLoader ?? ((spec) => this.#defaultLoadAgent(spec));
+
+    // --- replay engine (§5.5: a run can be replayed deterministically) ------
+    //
+    // The engine is built here, before the dispatcher, because the dispatcher
+    // takes its driver resolvers from here. A replay does not change what a
+    // syscall *is* — it changes where the answer comes from — so the
+    // dispatcher itself needs no replay-specific code at all.
+    if (opts.replay !== undefined) {
+      this.#replay = new ReplayEngine(opts.replay.source, opts.replay.mode ?? 'strict');
+    }
 
     // --- recorder factory (§8 step 3b: initialise recorder) -----------------
     const openRecorder: RecorderFactory =
@@ -901,8 +973,8 @@ export class Kernel {
       fork: this.fork,
       init: this.init,
       scheduler: this.scheduler,
-      resolveLLM: this.registry.llmResolver(),
-      resolveTool: this.registry.toolResolver(),
+      resolveLLM: this.#resolveLLM,
+      resolveTool: this.#resolveTool,
       ...(opts.random !== undefined ? { random: opts.random } : {}),
       ...(opts.nextCallId !== undefined ? { nextCallId: opts.nextCallId } : {}),
       ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
@@ -1287,7 +1359,14 @@ export class Kernel {
       sleep: (ms: number) => d.invoke(pid, 'sleep', ms),
       now: (): Timestamp => {
         this.#gateSync(pid, 'now');
-        const value = this.#now();
+        // A replay serves the **recorded** timestamp. The clock is one of the
+        // two things that would otherwise differ between two runs of the same
+        // code, and it is recorded with the exact value that was handed back
+        // — so serving it is what makes the two runs comparable at all.
+        // The kernel's own clock stays real: it is bookkeeping, not the
+        // agent's view of time.
+        const recorded = this.#replay?.syncValue('now');
+        const value = recorded !== undefined ? (recorded as Timestamp) : this.#now();
         // Record the exact value handed back — that is what makes a replay
         // able to serve the same timestamp even when the wall clock differs.
         d.noteSyncCall(pid, 'now', undefined, value);
@@ -1295,7 +1374,11 @@ export class Kernel {
       },
       random: (o?: RandomOptions): number => {
         this.#gateSync(pid, 'random');
-        const value = this.#random(o);
+        // The RNG is the other half of the same problem: two runs of the same
+        // code must draw the same numbers, or nothing after the draw can be
+        // compared. The recording has the exact value that was handed back.
+        const recorded = this.#replay?.syncValue('random');
+        const value = recorded !== undefined ? (recorded as number) : this.#random(o);
         d.noteSyncCall(pid, 'random', o, value);
         return value;
       },

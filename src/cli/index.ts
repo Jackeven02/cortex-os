@@ -45,6 +45,7 @@ import { inmemMemory } from '../drivers/memory/inmem.js';
 import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type MemoryRegionPolicy } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
 import { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir } from '../kernel/recorder.js';
+import { type ReplayMode, type ReplaySource } from '../kernel/replay.js';
 import { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, outputPath, readOutput, appendOutput, type ProcessMeta, type ProcessSpec, type OutputEntry } from './process_store.js';
 import { OutputCapture } from './output_capture.js';
 
@@ -65,6 +66,7 @@ import { cmdCheckpoint } from './commands/checkpoint.js';
 import { cmdRestore } from './commands/restore.js';
 import { cmdFork } from './commands/fork.js';
 import { cmdDiff } from './commands/diff.js';
+import { cmdReplay } from './commands/replay.js';
 import { cmdSend } from './commands/send.js';
 import { cmdLimit } from './commands/limit.js';
 import { cmdAudit } from './commands/audit.js';
@@ -124,6 +126,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdFork(rest);
       case 'diff':
         return await cmdDiff(rest);
+      case 'replay':
+        return await cmdReplay(rest);
       case 'send':
         return await cmdSend(rest);
       case 'limit':
@@ -385,6 +389,17 @@ export async function bootCliKernel(
     readonly forceLLM?: string;
     /** Reserved; advisory only for now. */
     readonly forceModel?: string;
+    /**
+     * Replay a recorded run instead of running live.
+     *
+     * The kernel then answers the model calls, the tool calls, the clock and
+     * the RNG from the recording — see `kernel/replay.ts`. `cortex replay`
+     * uses this; a host that embeds the kernel can use it directly.
+     */
+    readonly replay?: {
+      readonly source: ReplaySource;
+      readonly mode?: ReplayMode;
+    };
   } = {},
 ): Promise<Kernel> {
   ensureKernelDirs(dir);
@@ -430,6 +445,7 @@ export async function bootCliKernel(
     defaultMemory: DEFAULT_MEMORY_BACKING,
     defaultMemoryBacking: DEFAULT_MEMORY_BACKING,
     ...(opts.maxRegionEntries !== undefined ? { maxRegionEntries: opts.maxRegionEntries } : {}),
+    ...(opts.replay !== undefined ? { replay: opts.replay } : {}),
     autoStart: true,
     // The kernel's default restoreContext reads an in-memory per-PID map that
     // is empty in a fresh CLI invocation, so cross-invocation `cortex restore`

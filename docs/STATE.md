@@ -130,6 +130,11 @@ Cheap to add once cognitive fork works. Not in v0.
 
 **v0 ships cognitive fork and replay.** Sandbox fork and shadow process are post-v0.
 
+("Replay" here means re-running a *recorded* run against its recording — the
+deterministic replay of §5.5, `cortex replay`. It is not the "seek the
+syscall log to an offset and replay forward" of §4, which is what a restore
+does.)
+
 ---
 
 ## 4. Checkpoint format
@@ -247,6 +252,15 @@ We promise:
 - You can always replay an agent's reasoning deterministically.
 - You can always fork at any checkpointed point and explore an alternative future.
 - You can always know which actions were reversible and which were not.
+
+**The first one is now a command.** `cortex replay <pid>` re-runs a recorded
+agent with the world frozen — the model's answers, the tool results, the clock
+and the RNG all come from the recording — and compares the two runs, so the
+answer is "it behaved the same way" or "it first diverged *here*"
+(docs/ARCHITECTURE.md §4.12). Note what the promise does **not** say: a
+replay does not undo committed reality. A tool that already ran is not run
+again — the recorded result is served — because the promise is about the
+agent's reasoning, not about the world.
 
 We do not promise:
 - Undo of committed reality.

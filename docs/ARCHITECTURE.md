@@ -43,6 +43,8 @@ Every syscall produces a record. There is no "fast path" that skips the recorder
 
 If recording fails, the syscall fails with `ERECORD`. We would rather halt than produce a partial log.
 
+Two of the calls that are not syscalls are recorded too, with the exact value that was handed back: `ctx.now()` and `ctx.random()`. They are the two things that would otherwise make two runs of the same code incomparable, so a recording that did not carry them could not answer "did this agent behave the same way?". `replay.ts` (§4.12) is what reads them back.
+
 ### 2.4 Modules communicate through narrow interfaces
 
 Each module exposes a small TypeScript interface. Modules do not import each other's internals. The dependency graph is a DAG with the syscall dispatcher at the top.
@@ -106,7 +108,7 @@ All syscalls are async (ABI.md §2.2). The kernel uses Node's event loop. There 
               external world: LLM APIs, MCP servers, disk, network
 ```
 
-**Twelve kernel modules + one driver registry.** That is the whole v1 kernel:/nthe eleven in §4.1–§4.11, plus `wake_gate.ts`, which has no section of its own
+**Thirteen kernel modules + one driver registry.** That is the whole v1 kernel:/nthe twelve in §4.1–§4.12, plus `wake_gate.ts`, which has no section of its own
 because it is small and exists only to make §4.8's rule enforceable — it
 holds a woken process READY until the scheduler actually dispatches it.
 
@@ -395,6 +397,83 @@ interface DriverRegistry {
 
 **Version check.** On registration, driver's `abiCompat` is matched against kernel's ABI version (semver). Mismatch refuses registration.
 
+### 4.12 `replay.ts`
+
+**Responsibility.** Serve a recorded run back to an agent that is running
+again: the model's answers, the tool results, the clock and the RNG all come
+from the recording instead of from the world.
+
+**Public interface:**
+
+```typescript
+type ReplayMode = 'live' | 'cached' | 'strict';
+
+interface ReplaySource {
+  take(syscall: string): RecordedCall | undefined;
+}
+
+class LogRecording implements ReplaySource {
+  static fromFile(path: string): Promise<LogRecording>;
+  static fromRecords(records: readonly SyscallRecord[]): LogRecording;
+  readonly size: number;
+  readonly ordered: readonly RecordedCall[];
+  take(syscall: string): RecordedCall | undefined;
+  reset(): void;
+}
+
+class ReplayEngine {
+  constructor(source: ReplaySource, mode?: ReplayMode);
+  readonly mode: ReplayMode;
+  readonly source: ReplaySource;
+  syncValue(syscall: string): unknown | undefined;
+  llmDriver(real: ILLMDriver | undefined, name: string | undefined): ILLMDriver;
+  toolDriver(real: { driver: IToolDriver; descriptor: ToolDescriptor } | undefined, name: string): {
+    driver: IToolDriver;
+    descriptor: ToolDescriptor;
+  };
+}
+```
+
+**Internals.** The recording is indexed by syscall name, and each name's
+frames keep their order — so the Nth `llm_call` of a replay gets the Nth
+recorded `llm_call`. The `enter` frames are requests, not outcomes, so they
+are not served; the `__`-prefixed frames are the kernel's own bookkeeping, so
+they are not either.
+
+**What gets wrapped, and why that.** The *driver resolver* is what the replay
+replaces, not the dispatcher. A resolver answers "which driver handles this
+call?"; wrapping it changes **where the answer comes from** and nothing else,
+so no syscall changes its meaning and the dispatcher needs no replay-specific
+code at all. The clock and the RNG are served at the two places where the
+kernel hands them to an agent (`ctx.now()` / `ctx.random()`), because those
+are the only two calls that would otherwise make two runs of the same code
+incomparable.
+
+**A replay does not need the model provider the original run used.** A
+resolver that finds no driver still answers — with a recording-backed
+placeholder — because the recording *is* the answer. A run recorded against
+one provider can therefore be replayed on a machine that has never heard of
+that provider's API key. This is the difference between a recording that is
+merely archived and one that is usable.
+
+**The three modes.** `live` ignores the recording entirely. `cached` serves
+what the recording has and lets the world answer the rest. `strict` serves
+what the recording has and **fails** on the rest, with `ERECORD` — because a
+replay that quietly goes live looks like a faithful reproduction and is not
+one. `strict` is the default.
+
+**What a replay does not do.** It does not rewind the world. A tool that
+already ran did not run again: the recorded result is served, so a side
+effect is not repeated. That is the point (STATE.md §5), and it is also the
+honest boundary — a replay shows what the agent *would* do now, not what the
+world *would* answer now.
+
+**Where it is wired.** `KernelOptions.replay` (`{ source, mode? }`) turns it
+on; the kernel then wraps its own resolvers and serves the two synchronous
+calls. The host-facing surface is `cortex replay <pid>` (see §12.1) and
+`src/cli/replay_core.ts`, which turns two logs into one answer: did the
+replay reproduce the recording, and if not, **where** did it first go wrong?
+
 ---
 
 ## 5. The lifecycle of a syscall
@@ -656,6 +735,7 @@ src/
 │   ├── init.ts                       # §4.9
 │   ├── syscall_dispatcher.ts         # §4.10
 │   ├── driver_registry.ts            # §4.11
+│   ├── replay.ts                     # §4.12 — deterministic replay
 │   ├── boot.ts                       # §8 boot sequence
 │   └── wake_gate.ts                  # §4.8 — resume only on dispatch
 ├── drivers/
@@ -684,6 +764,7 @@ src/
 │   │   ├── recv.ts
 │   │   ├── limit.ts
 │   │   ├── diff.ts
+│   │   ├── replay.ts
 │   │   ├── daemon.ts
 │   │   └── audit.ts
 │   └── client.ts                     # talks to running kernel via socket
@@ -697,7 +778,7 @@ src/
 
 > **That estimate did not survive contact with the implementation, and the
 > promise behind it did.** The kernel is now ~6,800 lines of code (13,200
-> with the comments) across sixteen modules — the dispatcher alone is 1,400.
+> with the comments) across seventeen modules — the dispatcher alone is 1,400.
 > What the promise *was* about still holds: the kernel is under half the
 > codebase, with the CLI, the drivers, the dashboard and the integrations
 > together now slightly larger than it. MANIFESTO §II.3 states the current
@@ -1462,6 +1543,65 @@ it out loud. And `cortex ps` grew a **CAPS** column, because the question
 "what was this agent allowed to do?" used to have no answer in the CLI at
 all — a process that ran with no capabilities and one that ran with all of
 them looked identical from the outside.
+
+**And now the recording can be run again.** `cortex replay <pid>` re-runs a
+recorded agent with the world frozen — the model's answers, the tool results,
+the clock and the RNG all come from the recording — and then compares what
+happened with what was recorded:
+
+```console
+$ cortex replay 7
+replaying pid 7 (role: coder) from .cortex/processes/7/log.crec
+  mode: strict
+  recording: 41 recorded outcomes
+  replay home: .cortex/replays/7-1792814566250
+
+  recording: 23 calls
+  replay:    23 calls
+
+  REPRODUCED — the replay made the same calls, in the same order,
+  with the same outcomes.
+  replay log: .cortex/replays/7-1792814566250/processes/7/log.crec
+```
+
+And when the agent's code has changed since, it says **where**:
+
+```console
+$ cortex replay 7
+  ...
+  DIVERGED — the replay did not reproduce the recording.
+#3 changed
+    the request differs at request.messages[1].content
+      recorded: "summarise the diff"
+      replay:   "summarise the log"
+  replay log: .cortex/replays/7-1792814612296/processes/7/log.crec
+```
+
+Three things make that a real answer rather than a demo.
+
+**The replay does not need the model provider the original run used.** The
+recording *is* the answer, so a run recorded against one provider can be
+replayed on a machine that has never heard of that provider's API key. That
+is the difference between a recording that is merely archived and one that is
+usable.
+
+**The replay does not repeat a side effect.** A tool that already ran is not
+run again: the recorded result is served. A replay shows what the agent
+*would* do now, not what the world *would* answer now — and it says so.
+
+**A replay that cannot answer says so.** `strict` is the default mode, and in
+it a call the recording does not have is an error (`ERECORD`), not a silent
+fall-through to the live world: a replay that quietly goes live looks like a
+faithful reproduction and is not one. `cached` and `live` are there when the
+operator wants the other behaviour.
+
+The replay runs in a directory of its own (`<cortex home>/replays/<pid>-<n>`),
+because the recording is its *input* and must not be written over, and it is
+given the **same pid** as the original run, so the replay is the same run and
+not a similar one. The comparison itself is `src/cli/replay_core.ts`: the unit
+is a *call* (a request and its outcome together), and the comparison is
+positional, because a replay that inserted one extra call has already
+diverged — and the divergence is *there*.
 
 **Known limits (v0).**
 

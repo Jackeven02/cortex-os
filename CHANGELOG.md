@@ -42,6 +42,76 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex replay` — a recorded run can be run again.** STATE.md §5.5 has
+  promised this since the beginning: *"You can always replay an agent's
+  reasoning deterministically."* The recording was always written — every
+  syscall, with its arguments and its result, and the two calls that would
+  otherwise differ between two runs (the clock and the RNG) with the exact
+  value that was handed back. **Nothing ever read it back.** `replayMode`
+  existed in the types, `syscallLogOffset` existed in the checkpoint, the
+  mock driver was written to be replay-safe — and no code path used any of
+  it.
+
+  `cortex replay <pid>` re-runs a recorded agent with the **world frozen** —
+  the model's answers, the tool results, the clock and the RNG all come from
+  the recording — and then compares what happened with what was recorded:
+
+  ```console
+  $ cortex replay 7
+    recording: 23 calls
+    replay:    23 calls
+
+    REPRODUCED — the replay made the same calls, in the same order,
+    with the same outcomes.
+  ```
+
+  and when the agent's code has changed since, it says **where**:
+
+  ```console
+    DIVERGED — the replay did not reproduce the recording.
+  #3 changed
+      the request differs at request.messages[1].content
+        recorded: "summarise the diff"
+        replay:   "summarise the log"
+  ```
+
+  **The replay does not need the model provider the original run used.** The
+  resolver answers from the recording even when the host has no such driver
+  at all, so a run recorded against one provider can be replayed on a machine
+  that has never heard of that provider's API key. That is the difference
+  between a recording that is merely archived and one that is usable.
+
+  **A replay does not repeat a side effect.** A tool that already ran is not
+  run again: the recorded result is served. A replay shows what the agent
+  *would* do now, not what the world *would* answer now.
+
+  **A replay that cannot answer says so.** `strict` is the default: a call
+  the recording does not have is an error (`ERECORD`), not a silent fall-
+  through to the live world — a replay that quietly goes live looks like a
+  faithful reproduction and is not one. `cached` and `live` are there for the
+  operator who wants the other behaviour.
+
+  **The dispatcher did not change.** The replay replaces the *driver
+  resolver*, which changes where an answer comes from and nothing else, so
+  no syscall changed its meaning. **No ABI change**: no syscall, no argument,
+  no errno, no `ProcessInfo` field, no change to the `.crec` format.
+
+  **14 new smoke checks** (692 → 706), all fourteen reverse-verified: the
+  model answering from the world instead of the recording → "a replay serves
+  the model answer from the recording" fails; the clock and the RNG read live
+  → the clock/RNG check fails; `strict` falling through → "a strict replay
+  refuses to answer from the world" fails; `cached` refusing → "a cached
+  replay falls through to the world" fails; `live` consulting the recording →
+  "a live replay ignores the recording" fails; requiring a model provider →
+  "a replay needs no model provider" fails; the tool actually running again →
+  "a replay does not repeat a side effect" fails ("the replay ran the tool 1
+  times"); the bookkeeping no longer ignored → "the comparison ignores the
+  run-specific bookkeeping" fails; the request dropped from the comparison →
+  the two divergence checks fail; the CLI not handing the recording to the
+  kernel → both CLI checks fail; the report no longer naming the path → both
+  divergence checks fail; the "no recording" guard removed → "cortex replay
+  refuses a process with no recording" fails.
+
 - **The dashboard stopped paying for the whole history on every change.** The
   activity panel is built from the syscall logs — every `.crec` of every
   process — and it used to be **rebuilt from scratch on every change**: every

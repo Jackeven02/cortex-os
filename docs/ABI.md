@@ -485,6 +485,17 @@ Return a random number in `[0, 1)`. **In replay mode, returns the recorded value
 
 Agents that need true entropy (e.g. cryptographic) should call `tool_call('crypto.randomBytes', ...)` instead, which is explicitly non-replayable.
 
+**This is no longer a promise — it is an implementation.** "In replay mode"
+means the kernel was booted with a recording (`KernelOptions.replay`, see
+docs/ARCHITECTURE.md §4.12), and the two calls above serve the **recorded**
+values instead of the live ones. The same recording also answers the model's
+calls and the tool calls, and the replay command (`cortex replay <pid>`) runs
+the agent again and compares the two runs. **No ABI change was needed for
+any of it**: no syscall was added or renamed, no argument changed meaning,
+no errno contract moved, no `ProcessInfo` field appeared. The replay is a
+*mode of running* the same contract, not a new contract — which is exactly
+why the recording format (§6) could stay frozen.
+
 ### 4.7 Signals
 
 #### `on_signal(signal: Signal, handler: SignalHandler): void`

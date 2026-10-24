@@ -6,7 +6,7 @@ predict what it does. This guide is how to change it without breaking the
 contracts it is built on.
 
 Read in this order if you are new: **[MANIFESTO.md](../MANIFESTO.md)** (why),
-**[ARCHITECTURE.md](./ARCHITECTURE.md)** (the twelve kernel modules + the driver
+**[ARCHITECTURE.md](./ARCHITECTURE.md)** (the thirteen kernel modules + the driver
 registry), **[STATE.md](./STATE.md)** (the hard part: what state is), and
 **[ABI.md](./ABI.md)** (the syscall contract).
 
@@ -350,6 +350,7 @@ transition.
 | see whether a process is *stuck* | **`kernel.openCalls()`** — the call each process is inside, and since when |
 | ...and if you want the frames themselves | read its `.crec` and pair the `enter`/`exit` frames |
 | follow a log that is still being written | **`new LogTail(path)`** — `read()` returns only the frames written since the last call |
+| **re-run a recorded agent** | **`KernelOptions.replay`** — the model, the tools, the clock and the RNG answer from the recording |
 
 `KernelOptions.onProcessExit` is still worth wiring — it is how you persist
 your own metadata, and it fires at the same instant as `awaitExit` resolves.
@@ -467,6 +468,50 @@ down, a descriptor that is still there with nothing listening means it died,
 and a descriptor that answers means another kernel has taken over. What a
 host must *not* do is treat a dead connection as a finished watch — that is
 how "the kernel died" gets reported as "the agent exited cleanly".
+
+**And a host can replay a recorded run.** Boot the kernel with a recording
+and the world is frozen: the model's answers, the tool results, the clock and
+the RNG all come from the recording instead of from the world.
+
+```typescript
+import { LogRecording } from 'cortex-agent-os';
+import { bootKernel } from 'cortex-agent-os';
+
+const source = await LogRecording.fromFile('.cortex/processes/7/log.crec');
+
+const kernel = await bootKernel({
+  kernelAbiVersion: KERNEL_ABI_VERSION,
+  dir: '.cortex/replays/7',
+  replay: { source, mode: 'strict' },   // 'strict' | 'cached' | 'live'
+  loadDrivers: (registry) => registry.registerLLM(mockLLM()),
+  autoStart: true,
+});
+```
+
+Four things worth knowing before you rely on it.
+
+- **The recording answers even when you have no such driver.** The resolver
+  returns a recording-backed placeholder when the model provider the original
+  run used is not registered here — so a run recorded against one provider
+  replays on a machine with none of its API keys. Registering the driver
+  anyway is still right if you want `cached` mode to be able to fall through.
+- **`strict` is the default and it is the honest one.** A call the recording
+  does not have is an error (`ERECORD`), not a silent fall-through to the live
+  world: a replay that quietly goes live looks like a faithful reproduction
+  and is not one. Use `cached` when you *want* the fall-through, and say so.
+- **A recording is consumed as it is served.** The Nth `llm_call` of a replay
+  gets the Nth recorded `llm_call`, and the cursor never goes back. Call
+  `source.reset()` (or read the file again) to replay the same recording twice.
+- **A replay does not repeat a side effect.** A tool that already ran is not
+  run again — the recorded result is served. A replay shows what the agent
+  *would* do now, not what the world *would* answer now.
+
+The CLI does all of this and adds the comparison — `cortex replay <pid>`
+(`src/cli/commands/replay.ts`), with the comparison itself in
+`src/cli/replay_core.ts`: the unit is a *call* (a request and its outcome
+together), the comparison is positional, and the report names the path —
+"the request differs at request.messages[1].content". `extractCalls()` and
+`compareCalls()` are exported, so a host can do the same over its own logs.
 
 ### 7.3 What a host cannot do
 

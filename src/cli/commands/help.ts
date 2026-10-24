@@ -31,6 +31,7 @@ COMMANDS
   restore      Restore a process from a checkpoint
   fork         Clone a running process at its current state
   diff         Compare two forked branches' syscall logs
+  replay       Re-run a recorded agent and compare it with what was recorded
   attach       Follow a process's syscall stream (live, by push, with a kernel)
   send         Send an IPC message to a process or channel
   limit        Set or show resource budgets per process
@@ -59,6 +60,7 @@ EXAMPLES
   cortex restore --tag "before risky edit"
   cortex fork 1234
   cortex diff 1234 1240
+  cortex replay 1234
   cortex attach 1234
   cortex limit 1234 --tokens 10000
   cortex audit
