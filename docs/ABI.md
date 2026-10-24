@@ -496,6 +496,12 @@ no errno contract moved, no `ProcessInfo` field appeared. The replay is a
 *mode of running* the same contract, not a new contract — which is exactly
 why the recording format (§6) could stay frozen.
 
+**One recording per process.** A run of N processes is N recordings — a
+supervision tree is the normal shape of a real agent — so the recordings are
+keyed by pid and each process is served from **its own** history. This does
+not touch the contract either: the mapping from a process to its recording
+lives in the host's replay machinery, not in the syscall surface.
+
 ### 4.7 Signals
 
 #### `on_signal(signal: Signal, handler: SignalHandler): void`

@@ -419,13 +419,23 @@ class LogRecording implements ReplaySource {
   readonly ordered: readonly RecordedCall[];
   take(syscall: string): RecordedCall | undefined;
   reset(): void;
+  childPids(): readonly number[];
+}
+
+class ReplayRecordings {
+  static of(sources: ReadonlyMap<number, ReplaySource>): ReplayRecordings;
+  static fromDirectory(dir: string, rootPid: number): Promise<ReplayRecordings>;
+  sourceFor(pid: number): ReplaySource | undefined;
+  has(pid: number): boolean;
+  readonly pids: readonly number[];
 }
 
 class ReplayEngine {
-  constructor(source: ReplaySource, mode?: ReplayMode);
+  constructor(recordings: ReplayRecordings, mode?: ReplayMode);
+  readonly recordings: ReplayRecordings;
   readonly mode: ReplayMode;
-  readonly source: ReplaySource;
-  syncValue(syscall: string): unknown | undefined;
+  sourceFor(pid: number): ReplaySource | undefined;
+  syncValue(pid: number, syscall: string): unknown | undefined;
   llmDriver(real: ILLMDriver | undefined, name: string | undefined): ILLMDriver;
   toolDriver(real: { driver: IToolDriver; descriptor: ToolDescriptor } | undefined, name: string): {
     driver: IToolDriver;
@@ -433,6 +443,25 @@ class ReplayEngine {
   };
 }
 ```
+
+**One recording per process.** A process's whole footprint is one directory
+(`processes/<pid>/log.crec`), so a run of N processes is N recordings — and a
+supervision tree is the normal shape of a real agent. The recordings are
+therefore keyed by **pid**, and `ReplaySource` is deliberately *not* pid-aware:
+the mapping lives in `ReplayRecordings`. A source that could be asked about
+any process would make it far too easy to answer a child with its parent's
+history — and that failure is not a crash. The child would be handed the
+parent's answer and the parent would then find its own recording empty, so the
+replay would "work" and be wrong, which is the worst way to be wrong.
+
+**How the tree is found.** Nothing on disk records the shape of a run except
+the logs themselves: a `spawn` names its child in `pid`, a `fork` names it in
+`childPid`. `LogRecording.childPids()` reads those two links out, and
+`ReplayRecordings.fromDirectory()` walks them from the root, loading each
+process's own recording. A `restore` is **not** a link: it materialises a
+process from a snapshot, and that process's history starts at the snapshot
+rather than at the restorer (replaying a restore is a different problem, and
+it is not solved here).
 
 **Internals.** The recording is indexed by syscall name, and each name's
 frames keep their order — so the Nth `llm_call` of a replay gets the Nth
@@ -468,11 +497,12 @@ effect is not repeated. That is the point (STATE.md §5), and it is also the
 honest boundary — a replay shows what the agent *would* do now, not what the
 world *would* answer now.
 
-**Where it is wired.** `KernelOptions.replay` (`{ source, mode? }`) turns it
+**Where it is wired.** `KernelOptions.replay` (`{ recordings, mode? }`) turns it
 on; the kernel then wraps its own resolvers and serves the two synchronous
-calls. The host-facing surface is `cortex replay <pid>` (see §12.1) and
-`src/cli/replay_core.ts`, which turns two logs into one answer: did the
-replay reproduce the recording, and if not, **where** did it first go wrong?
+calls — from the recording that belongs to *that* process. The host-facing
+surface is `cortex replay <pid>` (see §12.1) and `src/cli/replay_core.ts`,
+which turns two logs into one answer: did the replay reproduce the recording,
+and if not, **where** did it first go wrong?
 
 ---
 
@@ -1553,15 +1583,15 @@ happened with what was recorded:
 $ cortex replay 7
 replaying pid 7 (role: coder) from .cortex/processes/7/log.crec
   mode: strict
-  recording: 41 recorded outcomes
+  recording: 2 process(es) — pid 7, pid 8
   replay home: .cortex/replays/7-1792814566250
 
-  recording: 23 calls
-  replay:    23 calls
+  pid 7: recording 23 call(s), replay 23 call(s)
+  pid 8: recording 4 call(s), replay 4 call(s)
 
-  REPRODUCED — the replay made the same calls, in the same order,
+  REPRODUCED — every process made the same calls, in the same order,
   with the same outcomes.
-  replay log: .cortex/replays/7-1792814566250/processes/7/log.crec
+  replay home: .cortex/replays/7-1792814566250
 ```
 
 And when the agent's code has changed since, it says **where**:
@@ -1569,15 +1599,39 @@ And when the agent's code has changed since, it says **where**:
 ```console
 $ cortex replay 7
   ...
-  DIVERGED — the replay did not reproduce the recording.
+  DIVERGED — pid 8 did not reproduce the recording.
 #3 changed
     the request differs at request.messages[1].content
       recorded: "summarise the diff"
       replay:   "summarise the log"
-  replay log: .cortex/replays/7-1792814612296/processes/7/log.crec
+  replay log: .cortex/replays/7-1792814612296/processes/8/log.crec
 ```
 
-Three things make that a real answer rather than a demo.
+**A run is a tree, and the replay replays the tree.** The example above has
+two processes in it: a supervisor and the child it started. Each process has
+its own recording, so each answers from **its own** history — and the report
+names the process that diverged, not just the run. A single shared source
+would let the child consume the parent's recorded model calls: the child would
+be handed the parent's answer, the parent would then find its own recording
+empty, and the replay would "work" and be wrong.
+
+Two things make that work, and both were found by running it rather than by
+reading it:
+
+- **The replayed process holds the authority the original held.** The spec
+  says `capabilities: null` (unnarrowed — it holds everything) and
+  `grantable: []`. Passing the `grantable` on its own says "it holds
+  nothing", and the kernel reads that as *exactly* nothing: the first
+  capability-gated syscall — a supervisor's `spawn` — traps `EPERM`, and the
+  replayed tree never gets off the ground. The replacement must be the same
+  process, not a weaker one (ABI.md §4.9). So the replay passes `capabilities`
+  and `grantable` **together or not at all**.
+- **The tree is found in the logs.** Nothing on disk records the shape of a
+  run except the recordings themselves: a `spawn` names its child in `pid`, a
+  `fork` names it in `childPid`. The replay walks those links from the root
+  and loads each process's own recording (§4.12).
+
+Three things make this a real answer rather than a demo.
 
 **The replay does not need the model provider the original run used.** The
 recording *is* the answer, so a run recorded against one provider can be
@@ -1598,10 +1652,24 @@ operator wants the other behaviour.
 The replay runs in a directory of its own (`<cortex home>/replays/<pid>-<n>`),
 because the recording is its *input* and must not be written over, and it is
 given the **same pid** as the original run, so the replay is the same run and
-not a similar one. The comparison itself is `src/cli/replay_core.ts`: the unit
-is a *call* (a request and its outcome together), and the comparison is
-positional, because a replay that inserted one extra call has already
-diverged — and the divergence is *there*.
+not a similar one — the children get the same pids too, and a pid that
+differs is a real difference in the shape of the run. The comparison itself is
+`src/cli/replay_core.ts`: the unit is a *call* (a request and its outcome
+together), and the comparison is positional, because a replay that inserted
+one extra call has already diverged — and the divergence is *there*.
+
+**Every process is compared on its own.** The tree is compared process by
+process, and each process's own log is compared with its own replay log. Four
+kinds of difference are noise rather than behaviour, and are ignored: a
+freshly minted identity (`chainId`), a position in a byte stream (`syscallLogOffset`,
+`syscallLogRange`), the size of an opaque blob (`byteSize`), and the replay's
+own wall clock (`reapedAt`, `sentAt`, `wallTimeMs`). Everything else is
+compared verbatim — including the tokens a child spent, which *are* behaviour.
+
+The report has to know that list. Saying "the outcome differs at
+`outcome.reapedAt`" about a field the comparison has already ruled out would
+contradict the verdict it is reporting: the two runs agree there, and the
+report would be telling the operator they do not.
 
 **Known limits (v0).**
 

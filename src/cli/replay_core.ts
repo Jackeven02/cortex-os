@@ -87,7 +87,8 @@ export interface ComparedCall {
 /**
  * The result fields that are ignored when two calls are compared.
  *
- * See the module doc for why each group is noise rather than behaviour.
+ * See the module doc for why each group is noise rather than behaviour. A
+ * dotted path reaches into a nested object (`budgetsSpent.wallTimeMs`).
  */
 export const IGNORED_RESULT_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
   // A fresh identity, a position in the log, and the size of a blob that
@@ -99,6 +100,11 @@ export const IGNORED_RESULT_FIELDS: Readonly<Record<string, readonly string[]>> 
   restore: ['pid'],
   // The moment the message was sent — the replay happens later, by design.
   recv: ['sentAt'],
+  // The moment the child was reaped, the byte range of its log, and the wall
+  // time it took: all three are the replay's own clock and the replay's own
+  // layout, not the child's behaviour. The *tokens* it spent are behaviour,
+  // and they are compared.
+  wait: ['reapedAt', 'syscallLogRange', 'budgetsSpent.wallTimeMs'],
 });
 
 /**
@@ -209,12 +215,34 @@ export function callSignature(call: ComparedCall): string {
 /** Remove the named fields from an object, if it is one. */
 function dropFields(value: unknown, fields: readonly string[]): unknown {
   if (fields.length === 0) return value;
+  return fields.reduce((acc, field) => dropPath(acc, field), value);
+}
+
+/**
+ * Remove one field, which may be a dotted path into a nested object.
+ *
+ * `budgetsSpent.wallTimeMs` is one field, two levels down — and it has to
+ * be dropped by path rather than by name, because `budgetsSpent.tokensIn` is
+ * behaviour and `budgetsSpent.wallTimeMs` is the replay's own clock.
+ */
+function dropPath(value: unknown, path: string): unknown {
+  const parts = path.split('.');
+  return dropAt(value, parts);
+}
+
+function dropAt(value: unknown, parts: readonly string[]): unknown {
+  if (parts.length === 0) return value;
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return value;
   const src = value as Record<string, unknown>;
+  const head = parts[0]!;
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(src)) {
-    if (fields.includes(key)) continue;
-    out[key] = src[key];
+    if (key !== head) {
+      out[key] = src[key];
+      continue;
+    }
+    if (parts.length === 1) continue; // this is the field: drop it
+    out[key] = dropAt(src[key], parts.slice(1));
   }
   return out;
 }
@@ -302,22 +330,55 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * Is this path one of the ignored ones?
+ *
+ * Only an **exact** match skips: an ignored path that is deeper than the
+ * path being looked at (`budgetsSpent.wallTimeMs` while looking at
+ * `budgetsSpent`) means "keep looking inside", not "skip the whole thing".
+ */
+function isIgnored(path: string, ignored: readonly string[]): boolean {
+  return ignored.includes(path);
+}
+
+/**
  * The first place two values differ, or `null` when they do not.
  *
  * `root` names the value being compared, so the path reads as a sentence:
  * `firstDifference(a, b, 'request')` reports `request.messages[1].content`.
+ *
+ * `ignored` names the paths that are **not** differences — the run-specific
+ * bookkeeping the comparison drops. Reporting one of those would be a lie:
+ * the comparison says the two runs agree there, and the report would say
+ * they differ.
  */
-export function firstDifference(recorded: unknown, replay: unknown, root: string): Difference | null {
+export function firstDifference(
+  recorded: unknown,
+  replay: unknown,
+  root: string,
+  ignored: readonly string[] = [],
+): Difference | null {
+  return walk(recorded, replay, '', root, ignored);
+}
+
+function walk(
+  recorded: unknown,
+  replay: unknown,
+  path: string,
+  root: string,
+  ignored: readonly string[],
+): Difference | null {
+  if (isIgnored(path, ignored)) return null;
+
   if (Array.isArray(recorded) && Array.isArray(replay)) {
     if (recorded.length !== replay.length) {
       return {
-        path: `${root} (${recorded.length} entries vs ${replay.length})`,
+        path: `${root}${path === '' ? '' : `.${path}`} (${recorded.length} entries vs ${replay.length})`,
         recorded: recorded.length,
         replay: replay.length,
       };
     }
     for (let i = 0; i < recorded.length; i++) {
-      const diff = firstDifference(recorded[i], replay[i], `${root}[${i}]`);
+      const diff = walk(recorded[i], replay[i], `${path}[${i}]`, root, ignored);
       if (diff !== null) return diff;
     }
     return null;
@@ -325,16 +386,22 @@ export function firstDifference(recorded: unknown, replay: unknown, root: string
   if (isPlainObject(recorded) && isPlainObject(replay)) {
     const keys = [...new Set([...Object.keys(recorded), ...Object.keys(replay)])].sort();
     for (const key of keys) {
+      const child = path === '' ? key : `${path}.${key}`;
       if (!(key in recorded) || !(key in replay)) {
-        return { path: `${root}.${key}`, recorded: recorded[key], replay: replay[key] };
+        if (isIgnored(child, ignored)) continue;
+        return {
+          path: `${root}.${child}`,
+          recorded: recorded[key],
+          replay: replay[key],
+        };
       }
-      const diff = firstDifference(recorded[key], replay[key], `${root}.${key}`);
+      const diff = walk(recorded[key], replay[key], child, root, ignored);
       if (diff !== null) return diff;
     }
     return null;
   }
   if (stableJson(recorded) !== stableJson(replay)) {
-    return { path: root, recorded, replay };
+    return { path: path === '' ? root : `${root}.${path}`, recorded, replay };
   }
   return null;
 }
@@ -373,13 +440,17 @@ export function formatDivergence(divergence: ReplayDivergence): string {
  */
 function describeChanged(original: ComparedCall, replay: ComparedCall): string {
   const lines: string[] = [];
+  // The report must not name a difference the comparison has already ruled
+  // out — saying "the outcome differs at outcome.reapedAt" when `reapedAt`
+  // is on the ignored list would contradict the verdict it is reporting.
+  const ignored = IGNORED_RESULT_FIELDS[original.syscall] ?? [];
   const request = firstDifference(original.args, replay.args, 'request');
   if (request !== null) {
     lines.push(`    the request differs at ${request.path}`);
     lines.push(`      recorded: ${brief(request.recorded)}`);
     lines.push(`      replay:   ${brief(request.replay)}`);
   }
-  const outcome = firstDifference(original.result, replay.result, 'outcome');
+  const outcome = firstDifference(original.result, replay.result, 'outcome', ignored);
   if (outcome !== null) {
     lines.push(`    the outcome differs at ${outcome.path}`);
     lines.push(`      recorded: ${brief(outcome.recorded)}`);

@@ -73,14 +73,17 @@ $ cortex send 1240 "try dynamic programming instead"
 # 对比两个分支，挑一个赢家
 $ cortex diff 1234 1240
 
-# 把录下来的 agent 再跑一遍，看它是不是还那样行事。
+# 把录下来的 agent（或者整棵监督树）再跑一遍，看它是不是还那样行事。
 # 模型、工具、时钟、随机数全部由录制作答，所以对比的是 agent 本身，不是世界。
+# 每个进程都由**自己**那份录制来作答。
 $ cortex replay 1234
-  recording: 23 calls
-  replay:    23 calls
-  REPRODUCED — the replay made the same calls, in the same order,
+  recording: 2 process(es) — pid 1234, pid 1235
+  pid 1234: recording 23 call(s), replay 23 call(s)
+  pid 1235: recording 4 call(s), replay 4 call(s)
+  REPRODUCED — every process made the same calls, in the same order,
   with the same outcomes.
-# （如果 agent 的代码变了，它会指出**在哪里**变的：
+# （如果 agent 的代码变了，它会指出**在哪里**变的，以及**是哪个进程**变的：
+#  DIVERGED — pid 1235 did not reproduce the recording.
 #  #3 changed
 #      the request differs at request.messages[1].content
 #        recorded: "summarise the diff"
@@ -199,7 +202,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 706 项断言，0 失败
+npx tsx scripts/smoke.ts                # 713 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。

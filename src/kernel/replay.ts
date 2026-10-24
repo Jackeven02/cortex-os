@@ -23,6 +23,18 @@
  * behaves the way it did; if they do not, the first divergence is the answer
  * to "what changed?".
  *
+ * ## One recording per process
+ *
+ * A process's whole footprint is one directory (`processes/<pid>/log.crec`),
+ * so a run of N processes is N recordings — and a supervision tree is the
+ * normal shape of a real agent. **The recordings are therefore keyed by
+ * pid**: a child answers from *its own* history, not from its parent's.
+ *
+ * That is not a detail. A single shared source would let a child consume
+ * its parent's recorded model calls — the child would be handed the parent's
+ * answer, and the parent would then find its own recording empty. The
+ * replay would "work" and be wrong, which is the worst way to be wrong.
+ *
  * ## The modes
  *
  * - `live` — the recording is not consulted. The ordinary run.
@@ -65,15 +77,17 @@
  * @module kernel/replay
  */
 
+import { existsSync } from 'node:fs';
+
 import { CortexError, type Errno } from './errors.js';
-import { readRecords } from './recorder.js';
+import { readRecords, existingCrecPath } from './recorder.js';
+import { asProcessId, unbrand, type ProcessId, type SyscallRecord } from './types.js';
 import type {
   DriverContext,
   ILLMDriver,
   IToolDriver,
   LLMRequest,
   LLMResponse,
-  SyscallRecord,
   ToolDescriptor,
   ToolInvokeContext,
   ToolResult,
@@ -106,7 +120,11 @@ export interface RecordedCall {
  *
  * It is an interface so that a replay is not tied to a file: a host can
  * replay from a recording on disk, from one it kept in memory, or from
- * somewhere else entirely.
+ * somewhere else entirely. It is deliberately **not** pid-aware: the
+ * mapping from a process to its recording belongs to whoever holds the
+ * recordings (`ReplayRecordings`), and a source that could be asked about
+ * any process would make it far too easy to answer a child with its
+ * parent's history.
  */
 export interface ReplaySource {
   /**
@@ -175,19 +193,6 @@ export class LogRecording implements ReplaySource {
     return this.#ordered.length;
   }
 
-  /**
-   * Rewind every cursor, so the recording can be replayed again.
-   *
-   * A recording is consumed as it is served: the Nth `llm_call` of a replay
-   * gets the Nth recorded `llm_call`, and the cursor never goes back. A host
-   * that wants to replay the same recording twice — two modes, two variants,
-   * a test that runs the same case again — rewinds it here rather than
-   * reading the file twice.
-   */
-  reset(): void {
-    this.#cursor.clear();
-  }
-
   /** The recorded outcomes, in the order the log has them. */
   get ordered(): readonly RecordedCall[] {
     return this.#ordered;
@@ -206,6 +211,111 @@ export class LogRecording implements ReplaySource {
     if (at >= bucket.length) return undefined;
     this.#cursor.set(syscall, at + 1);
     return bucket[at];
+  }
+
+  /**
+   * Rewind every cursor, so the recording can be replayed again.
+   *
+   * A recording is consumed as it is served: the Nth `llm_call` of a replay
+   * gets the Nth recorded `llm_call`, and the cursor never goes back. A host
+   * that wants to replay the same recording twice — two modes, two variants,
+   * a test that runs the same case again — rewinds it here rather than
+   * reading the file twice.
+   */
+  reset(): void {
+    this.#cursor.clear();
+  }
+
+  /**
+   * The processes this process started.
+   *
+   * A `spawn` names its child in its result, and a `fork` names its child in
+   * `childPid`. Those two links are how a recording says "this is a tree",
+   * and they are how the tree is discovered: nothing else on disk records
+   * the shape of the run.
+   *
+   * A `restore` is **not** a link: it materialises a process from a
+   * snapshot, and that process's own history starts at the snapshot rather
+   * than at the restorer. (Replaying a restore is a different problem, and
+   * it is not solved here.)
+   */
+  childPids(): readonly number[] {
+    const children: number[] = [];
+    for (const call of this.#ordered) {
+      if (call.syscall === 'spawn') {
+        const pid = (call.result as { pid?: unknown } | undefined)?.pid;
+        if (typeof pid === 'number') children.push(pid);
+        continue;
+      }
+      if (call.syscall === 'fork') {
+        const pid = (call.result as { childPid?: unknown } | undefined)?.childPid;
+        if (typeof pid === 'number') children.push(pid);
+      }
+    }
+    return children;
+  }
+}
+
+/**
+ * The recordings of a run, one per process.
+ *
+ * The tree is discovered from the recordings themselves: a process's log
+ * names the processes it started, and those logs live in the same
+ * directory. So `fromDirectory` walks the tree from a root and loads each
+ * process's own recording.
+ */
+export class ReplayRecordings {
+  /** pid → that process's recording. */
+  readonly #sources = new Map<number, ReplaySource>();
+
+  private constructor(sources: ReadonlyMap<number, ReplaySource>) {
+    this.#sources = new Map(sources);
+  }
+
+  /** Recordings a host already has in hand. */
+  static of(sources: ReadonlyMap<number, ReplaySource>): ReplayRecordings {
+    return new ReplayRecordings(sources);
+  }
+
+  /**
+   * Load the recordings of the tree rooted at `rootPid`.
+   *
+   * The tree is walked through the logs: each process's recording names the
+   * processes it started, and each of those has a recording of its own in
+   * the same directory. A process whose log is missing is simply not in the
+   * tree — the replay of it will say so rather than answer from somewhere
+   * else.
+   */
+  static async fromDirectory(dir: string, rootPid: number): Promise<ReplayRecordings> {
+    const sources = new Map<number, ReplaySource>();
+    const queue: number[] = [rootPid];
+    const seen = new Set<number>();
+    while (queue.length > 0) {
+      const pid = queue.shift()!;
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+      const path = existingCrecPath(dir, asProcessId(pid));
+      if (path === '' || !existsSync(path)) continue;
+      const recording = await LogRecording.fromFile(path);
+      sources.set(pid, recording);
+      for (const child of recording.childPids()) queue.push(child);
+    }
+    return new ReplayRecordings(sources);
+  }
+
+  /** The recording that serves `pid`, if the tree has one. */
+  sourceFor(pid: number): ReplaySource | undefined {
+    return this.#sources.get(pid);
+  }
+
+  /** Whether the tree has a recording for `pid`. */
+  has(pid: number): boolean {
+    return this.#sources.has(pid);
+  }
+
+  /** The pids the tree covers, in ascending order. */
+  get pids(): readonly number[] {
+    return [...this.#sources.keys()].sort((a, b) => a - b);
   }
 }
 
@@ -232,6 +342,21 @@ function recordingExhausted(syscall: string): CortexError {
   return new CortexError('ERECORD', 'replay', {
     message: `${RECORDING_EXHAUSTED_MARKER}${syscall} for this point of the run`,
     details: { syscall },
+  });
+}
+
+/**
+ * The error a strict replay raises when a process has no recording at all.
+ *
+ * A different thing from "the recording ran out": the run has a history
+ * for some processes and not for this one, which means the replay cannot
+ * say anything about it — and answering from *another* process's history
+ * would be worse than saying nothing.
+ */
+function noRecording(pid: number): CortexError {
+  return new CortexError('ERECORD', 'replay', {
+    message: `${RECORDING_EXHAUSTED_MARKER}recording for pid ${pid}`,
+    details: { pid },
   });
 }
 
@@ -263,6 +388,14 @@ function replayError(
 }
 
 /**
+ * Where a process's recording comes from.
+ *
+ * `undefined` means "this process has no recording" — a different thing
+ * from "the recording has nothing left for this call".
+ */
+export type ReplaySourceResolver = (pid: number) => ReplaySource | undefined;
+
+/**
  * Wrap an LLM driver so that it answers from the recording.
  *
  * The wrapper is deliberately thin: it changes *where the answer comes from*
@@ -271,7 +404,7 @@ function replayError(
  */
 export function recordedLLMDriver(
   driver: ILLMDriver,
-  source: ReplaySource,
+  resolve: ReplaySourceResolver,
   mode: ReplayMode,
 ): ILLMDriver {
   return {
@@ -281,6 +414,11 @@ export function recordedLLMDriver(
     supportedModels: driver.supportedModels,
     call: async (req: LLMRequest, ctx: DriverContext): Promise<LLMResponse> => {
       if (mode === 'live') return driver.call(req, ctx);
+      const source = resolve(unbrandPid(ctx.pid));
+      if (source === undefined) {
+        if (mode === 'strict') throw noRecording(unbrandPid(ctx.pid));
+        return driver.call(req, ctx);
+      }
       const recorded = source.take('llm_call');
       if (recorded === undefined) {
         if (mode === 'strict') throw recordingExhausted('llm_call');
@@ -303,7 +441,7 @@ export function recordedLLMDriver(
  */
 export function recordedToolDriver(
   driver: IToolDriver,
-  source: ReplaySource,
+  resolve: ReplaySourceResolver,
   mode: ReplayMode,
 ): IToolDriver {
   return {
@@ -314,6 +452,11 @@ export function recordedToolDriver(
     listTools: () => driver.listTools(),
     invoke: async (name: string, args: unknown, ctx: ToolInvokeContext): Promise<ToolResult> => {
       if (mode === 'live') return driver.invoke(name, args, ctx);
+      const source = resolve(unbrandPid(ctx.pid));
+      if (source === undefined) {
+        if (mode === 'strict') throw noRecording(unbrandPid(ctx.pid));
+        return driver.invoke(name, args, ctx);
+      }
       const recorded = source.take('tool_call');
       if (recorded === undefined) {
         if (mode === 'strict') throw recordingExhausted('tool_call');
@@ -387,8 +530,13 @@ function placeholderTool(name: string): { driver: IToolDriver; descriptor: ToolD
   };
 }
 
+/** The pid behind a branded process id. */
+function unbrandPid(pid: ProcessId): number {
+  return unbrand(pid);
+}
+
 /**
- * The replay engine: the recording, the mode, and the rules about them.
+ * The replay engine: the recordings, the mode, and the rules about them.
  *
  * The kernel owns one of these when `KernelOptions.replay` is set, and the
  * CLI owns one when it is building a replay kernel. Everything that consults
@@ -396,15 +544,20 @@ function placeholderTool(name: string): { driver: IToolDriver; descriptor: ToolD
  * place.
  */
 export class ReplayEngine {
-  /** Where the answers come from. */
-  readonly source: ReplaySource;
+  /** The recordings, one per process. */
+  readonly recordings: ReplayRecordings;
 
   /** What to do with a call the recording does not have. */
   readonly mode: ReplayMode;
 
-  constructor(source: ReplaySource, mode: ReplayMode = 'strict') {
-    this.source = source;
+  constructor(recordings: ReplayRecordings, mode: ReplayMode = 'strict') {
+    this.recordings = recordings;
     this.mode = mode;
+  }
+
+  /** The recording that serves `pid`, if the tree has one. */
+  sourceFor(pid: number): ReplaySource | undefined {
+    return this.recordings.sourceFor(pid);
   }
 
   /**
@@ -417,9 +570,14 @@ export class ReplayEngine {
    * mode allows the world to answer instead. In `strict` mode that is an
    * error: a replay that quietly reads the real clock is not a replay.
    */
-  syncValue(syscall: string): unknown | undefined {
+  syncValue(pid: number, syscall: string): unknown | undefined {
     if (this.mode === 'live') return undefined;
-    const recorded = this.source.take(syscall);
+    const source = this.sourceFor(pid);
+    if (source === undefined) {
+      if (this.mode === 'strict') throw noRecording(pid);
+      return undefined;
+    }
+    const recorded = source.take(syscall);
     if (recorded === undefined) {
       if (this.mode === 'strict') throw recordingExhausted(syscall);
       return undefined;
@@ -451,7 +609,11 @@ export class ReplayEngine {
     // unregister and re-register a driver while the kernel runs, and a cache
     // would keep handing out the driver that was there before — a stale
     // answer to a question that no longer has the same answer.
-    return recordedLLMDriver(real ?? placeholderLLM(name), this.source, this.mode);
+    return recordedLLMDriver(
+      real ?? placeholderLLM(name),
+      (pid) => this.sourceFor(pid),
+      this.mode,
+    );
   }
 
   /**
@@ -469,7 +631,7 @@ export class ReplayEngine {
     // the kernel runs, and a cached wrapper would keep the old one.
     const base = real ?? placeholderTool(name);
     return {
-      driver: recordedToolDriver(base.driver, this.source, this.mode),
+      driver: recordedToolDriver(base.driver, (pid) => this.sourceFor(pid), this.mode),
       descriptor: base.descriptor,
     };
   }

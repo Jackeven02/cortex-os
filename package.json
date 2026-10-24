@@ -30,6 +30,10 @@
       "types": "./dist/drivers/index.d.ts",
       "import": "./dist/drivers/index.js"
     },
+    "./replay": {
+      "types": "./dist/cli/replay_core.d.ts",
+      "import": "./dist/cli/replay_core.js"
+    },
     "./integrations/langchain": {
       "types": "./dist/integrations/langchain.d.ts",
       "import": "./dist/integrations/langchain.js"

@@ -45,7 +45,7 @@ import { inmemMemory } from '../drivers/memory/inmem.js';
 import { asProcessId, unbrand, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type MemoryRegionPolicy } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
 import { crecPath, existingCrecPath, legacyCrecPath, processDir, checkpointsDir } from '../kernel/recorder.js';
-import { type ReplayMode, type ReplaySource } from '../kernel/replay.js';
+import { type ReplayMode, type ReplayRecordings } from '../kernel/replay.js';
 import { readAllMetas, readMeta, writeMeta, readSpec, writeSpec, maxPidOnDisk, readExitRecord, outputPath, readOutput, appendOutput, type ProcessMeta, type ProcessSpec, type OutputEntry } from './process_store.js';
 import { OutputCapture } from './output_capture.js';
 
@@ -397,7 +397,7 @@ export async function bootCliKernel(
      * uses this; a host that embeds the kernel can use it directly.
      */
     readonly replay?: {
-      readonly source: ReplaySource;
+      readonly recordings: ReplayRecordings;
       readonly mode?: ReplayMode;
     };
   } = {},

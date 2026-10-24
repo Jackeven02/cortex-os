@@ -58,22 +58,59 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
   ```console
   $ cortex replay 7
-    recording: 23 calls
-    replay:    23 calls
+    recording: 2 process(es) — pid 7, pid 8
 
-    REPRODUCED — the replay made the same calls, in the same order,
+    pid 7: recording 23 call(s), replay 23 call(s)
+    pid 8: recording 4 call(s), replay 4 call(s)
+
+    REPRODUCED — every process made the same calls, in the same order,
     with the same outcomes.
   ```
 
   and when the agent's code has changed since, it says **where**:
 
   ```console
-    DIVERGED — the replay did not reproduce the recording.
+    DIVERGED — pid 8 did not reproduce the recording.
   #3 changed
       the request differs at request.messages[1].content
         recorded: "summarise the diff"
         replay:   "summarise the log"
   ```
+
+  **And a run is a tree.** A real run is a supervisor and the children it
+  started, and every process has its own recording — so every process answers
+  from **its own** history, and the report names the process that diverged.
+  A single shared recording would let the child consume the parent's recorded
+  model calls: the child would be handed the parent's answer, the parent would
+  then find its own recording empty, and the replay would "work" and be wrong.
+  That is not a crash you would notice; it is a wrong answer you would trust.
+
+  **The shape of the run is found in the logs.** Nothing on disk records it
+  except the recordings themselves: a `spawn` names its child in `pid`, a
+  `fork` names it in `childPid`. The replay walks those links from the root
+  and loads each process's own recording. A `restore` is **not** a link — it
+  materialises a process from a snapshot, and that process's history starts at
+  the snapshot rather than at the restorer.
+
+  **The replayed process holds the authority the original held.** This one
+  was found by running a tree, not by reading it. The spec says
+  `capabilities: null` (unnarrowed — it holds everything) and `grantable: []`,
+  and the kernel reads an omitted `grantable` exactly like an omitted
+  `capabilities`: *"nobody said anything, so it holds everything"*. Passing
+  the `grantable` on its own therefore says *"it holds nothing"*, and the
+  first capability-gated syscall — a supervisor's `spawn` — traps `EPERM`.
+  The replayed tree never got off the ground. So the replay passes
+  `capabilities` and `grantable` **together or not at all**, and the
+  replacement is the same process, not a weaker one (ABI.md §4.9).
+
+  **The comparison ignores the replay's own clock — and the report has to
+  know that.** A `wait` reports when the child was reaped, where its log
+  sat, and how long it took; all three are the replay's own bookkeeping and
+  all three differ every single run, so they are not compared. But a report
+  that said *"the outcome differs at `outcome.reapedAt`"* about a field the
+  comparison had already ruled out would contradict the verdict it was
+  reporting: the two runs agree there. The report now carries the same ignore
+  list the comparison uses.
 
   **The replay does not need the model provider the original run used.** The
   resolver answers from the recording even when the host has no such driver
@@ -94,9 +131,21 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   **The dispatcher did not change.** The replay replaces the *driver
   resolver*, which changes where an answer comes from and nothing else, so
   no syscall changed its meaning. **No ABI change**: no syscall, no argument,
-  no errno, no `ProcessInfo` field, no change to the `.crec` format.
+  no errno, no `ProcessInfo` field, no change to the `.crec` format. The
+  host-facing option changed shape (`KernelOptions.replay` now takes the
+  tree's recordings rather than one source), which breaks nobody: the whole
+  replay engine is newer than the last tag.
 
-  **14 new smoke checks** (692 → 706), all fourteen reverse-verified: the
+  **And the engine is importable.** `LogRecording`, `ReplayRecordings` and
+  `ReplayEngine` are part of the package's public surface
+  (`cortex-agent-os`, `cortex-agent-os/kernel`), and the comparison core is
+  at `cortex-agent-os/replay`. It was not: the replay module was never
+  re-exported, so the example in HACKING.md — the one that tells a host how
+  to replay a run — was an example that did not compile. A document that
+  promises an import the package does not have is worse than no document,
+  because it is believed until it is tried.
+
+  **21 new smoke checks** (692 → 713), all twenty-one reverse-verified: the
   model answering from the world instead of the recording → "a replay serves
   the model answer from the recording" fails; the clock and the RNG read live
   → the clock/RNG check fails; `strict` falling through → "a strict replay
@@ -110,7 +159,18 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   the two divergence checks fail; the CLI not handing the recording to the
   kernel → both CLI checks fail; the report no longer naming the path → both
   divergence checks fail; the "no recording" guard removed → "cortex replay
-  refuses a process with no recording" fails.
+  refuses a process with no recording" fails; the tree's shape not read out
+  of the recording → "a recording knows the processes it started" fails; the
+  per-process recordings collapsed into one → "a replay serves each process
+  from its own recording" fails (the child answered with the parent's
+  answer); the `wait` clock compared again → "the comparison ignores the
+  replay's own clock" fails; the report naming an ignored field → "the
+  report does not name a difference the comparison ignored" fails; the
+  permission fix reverted → "cortex replay reproduces a supervision tree"
+  fails (the supervisor's `spawn` traps `EPERM`); the tree not compared
+  process by process → "cortex replay says which process diverged" fails;
+  the replay engine dropped from the public surface → "the replay engine is
+  part of the public surface" fails.
 
 - **The dashboard stopped paying for the whole history on every change.** The
   activity panel is built from the syscall logs — every `.crec` of every

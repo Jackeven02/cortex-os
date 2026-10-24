@@ -262,6 +262,13 @@ replay does not undo committed reality. A tool that already ran is not run
 again — the recorded result is served — because the promise is about the
 agent's reasoning, not about the world.
 
+**And it holds for a whole tree.** A run is usually a supervisor and its
+children, and each process has its own recording — so each one answers from
+**its own** history, and the report says *which* process diverged. That is the
+honest form of the promise: "the agent's reasoning" means every agent's
+reasoning, and a child that answered from its parent's recording would be
+reproducing something that never happened.
+
 We do not promise:
 - Undo of committed reality.
 - Distributed transaction semantics over external services.

@@ -178,7 +178,7 @@ import {
   type SyscallName,
 } from './syscall_dispatcher.js';
 import { DriverRegistry } from './driver_registry.js';
-import { ReplayEngine, type ReplayMode, type ReplaySource } from './replay.js';
+import { ReplayEngine, type ReplayMode, type ReplayRecordings } from './replay.js';
 
 // =============================================================================
 // §1. Agent surface
@@ -446,8 +446,16 @@ export interface KernelOptions {
    * Omitted means an ordinary live run.
    */
   readonly replay?: {
-    /** Where the recorded answers come from. */
-    readonly source: ReplaySource;
+    /**
+     * The recorded answers, one recording per process.
+     *
+     * A run of N processes is N recordings — a supervision tree is the normal
+     * shape of a real agent — so the mapping from a process to its own
+     * history lives here. A child that answered from its parent's recording
+     * would be handed the parent's answer, and the parent would then find
+     * its own recording empty.
+     */
+    readonly recordings: ReplayRecordings;
     /** What to do with a call the recording does not have. Defaults to `strict`. */
     readonly mode?: ReplayMode;
   };
@@ -735,7 +743,7 @@ export class Kernel {
     // syscall *is* — it changes where the answer comes from — so the
     // dispatcher itself needs no replay-specific code at all.
     if (opts.replay !== undefined) {
-      this.#replay = new ReplayEngine(opts.replay.source, opts.replay.mode ?? 'strict');
+      this.#replay = new ReplayEngine(opts.replay.recordings, opts.replay.mode ?? 'strict');
     }
 
     // --- recorder factory (§8 step 3b: initialise recorder) -----------------
@@ -1365,7 +1373,7 @@ export class Kernel {
         // — so serving it is what makes the two runs comparable at all.
         // The kernel's own clock stays real: it is bookkeeping, not the
         // agent's view of time.
-        const recorded = this.#replay?.syncValue('now');
+        const recorded = this.#replay?.syncValue(unbrand(pid), 'now');
         const value = recorded !== undefined ? (recorded as Timestamp) : this.#now();
         // Record the exact value handed back — that is what makes a replay
         // able to serve the same timestamp even when the wall clock differs.
@@ -1377,7 +1385,7 @@ export class Kernel {
         // The RNG is the other half of the same problem: two runs of the same
         // code must draw the same numbers, or nothing after the draw can be
         // compared. The recording has the exact value that was handed back.
-        const recorded = this.#replay?.syncValue('random');
+        const recorded = this.#replay?.syncValue(unbrand(pid), 'random');
         const value = recorded !== undefined ? (recorded as number) : this.#random(o);
         d.noteSyncCall(pid, 'random', o, value);
         return value;

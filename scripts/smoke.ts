@@ -306,10 +306,11 @@ import {
 import { cmdSpawn } from '../src/cli/commands/spawn.js';
 import { cmdRestore } from '../src/cli/commands/restore.js';
 import { cmdReplay } from '../src/cli/commands/replay.js';
-import { LogRecording, type ReplayMode, type ReplaySource } from '../src/kernel/replay.js';
+import { LogRecording, ReplayRecordings, type ReplayMode, type ReplaySource } from '../src/kernel/replay.js';
 import {
   compareCalls,
   extractCalls,
+  firstDifference,
   formatDivergence,
   type ComparedCall,
 } from '../src/cli/replay_core.js';
@@ -16623,16 +16624,45 @@ async function runReplayChecks(): Promise<void> {
   });
 
   /**
+   * The pids the tree agents started, so a check can find a child's log.
+   */
+  const treeChildren: number[] = [];
+
+  /**
    * The agent every replay check runs: the clock, the RNG, the model.
    *
    * `mode: 'twice'` asks for a second model call — more than the recording
    * holds — which is how "the recording ran out" is provoked.
    * `mode: 'tool'` calls a tool, which is how "a replay does not repeat a
    * side effect" is provoked.
+   *
+   * `mode: 'tree'` is a **supervision tree**: the parent starts a child,
+   * waits for it, and then talks to the model itself. Both processes call
+   * the model, which is what makes "each process answers from its own
+   * recording" observable — with one shared recording the child would be
+   * handed the parent's answer.
    */
   const agentLoader = async () =>
     async (ctx: CortexContext, args: Record<string, unknown>): Promise<void> => {
       const mode = typeof args['mode'] === 'string' ? args['mode'] : 'once';
+
+      if (mode === 'tree') {
+        const child = await ctx.spawn({
+          role: 'leaf',
+          agent: { module: 'test:probe', args: { mode: 'child' } },
+        });
+        treeChildren.push(unbrand(child.pid));
+        await ctx.wait(child.pid);
+        await ctx.llm_call({ messages: [{ role: 'user', content: 'PARENT-PROMPT' }] });
+        ctx.exit(0, 'tree done');
+        return;
+      }
+      if (mode === 'child') {
+        await ctx.llm_call({ messages: [{ role: 'user', content: 'CHILD-PROMPT' }] });
+        ctx.exit(0, 'child done');
+        return;
+      }
+
       ctx.now();
       ctx.random();
       await ctx.llm_call({ messages: [{ role: 'user', content: 'PROMPT' }] });
@@ -16646,6 +16676,43 @@ async function runReplayChecks(): Promise<void> {
     };
 
   /**
+   * One recorded frame — the shape a `.crec` file holds.
+   *
+   * Hand-made frames are how a check builds a recording it can reason
+   * about: a tree that was never run, a call that never happened.
+   */
+  const frame = (pid: number, syscall: string, result: unknown): SyscallRecord => ({
+    byteOffset: asSyscallOffset(8),
+    timestamp: '2026-01-01T00:00:00.000Z' as Timestamp,
+    pid: asProcessId(pid),
+    syscall,
+    callId: `${syscall}-${pid}`,
+    phase: 'exit',
+    result,
+    stateBefore: 'running',
+    stateAfter: 'running',
+    reversibility: 'reversible',
+    kernelAbiVersion: KERNEL_ABI_VERSION,
+  });
+
+  /** A recorded model answer. */
+  const llmAnswer = (text: string): unknown => ({
+    text,
+    toolCalls: [],
+    finishReason: 'stop',
+    usage: { inputTokens: 1, outputTokens: 1, cachedTokens: 0, usd: 0 },
+    model: 'recorded',
+    driverVersion: '1.0.0',
+  });
+
+  /** The calls a `.crec` file holds. */
+  const readCalls = async (path: string): Promise<ComparedCall[]> => {
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(path)) records.push(r);
+    return extractCalls(records);
+  };
+
+  /**
    * Boot a kernel, run the agent in it, and read back the calls it made.
    */
   const run = async (
@@ -16654,7 +16721,18 @@ async function runReplayChecks(): Promise<void> {
       readonly mode?: string;
       readonly answer?: string;
       readonly withLLM?: boolean;
-      readonly replay?: { readonly source: ReplaySource; readonly mode?: ReplayMode };
+      readonly replay?: {
+        readonly recordings: ReplayRecordings;
+        readonly mode?: ReplayMode;
+        /**
+         * The pid the replayed process gets — the original's.
+         *
+         * A pid that differs is a real difference in the shape of the run
+         * (a child's pid is in its parent's `spawn` result), so the replay
+         * is given the original's pid.
+         */
+        readonly rootPid?: number;
+      };
       readonly now?: () => Timestamp;
       readonly random?: () => number;
     },
@@ -16670,7 +16748,14 @@ async function runReplayChecks(): Promise<void> {
       autoStart: true,
       ...(opts.now !== undefined ? { now: opts.now } : {}),
       ...(opts.random !== undefined ? { random: opts.random } : {}),
-      ...(opts.replay !== undefined ? { replay: opts.replay } : {}),
+      ...(opts.replay !== undefined
+        ? {
+            replay: {
+              recordings: opts.replay.recordings,
+              mode: opts.replay.mode ?? 'strict',
+            },
+          }
+        : {}),
       loadDrivers: async (reg) => {
         if (opts.withLLM !== false) reg.registerLLM(fixedDriver(opts.answer ?? 'LIVE-ANSWER'));
         await reg.registerTool(fixedTool('TOOL-OUTPUT', toolCounter));
@@ -16679,6 +16764,9 @@ async function runReplayChecks(): Promise<void> {
       agentLoader,
     });
     kernels.push(kernel);
+    if (opts.replay?.rootPid !== undefined) {
+      kernel.table.advancePidCounterTo(opts.replay.rootPid);
+    }
     const pid = await kernel.spawn({
       role: 'probe',
       agent: { module: 'test:probe', args: { mode: opts.mode ?? 'once' } },
@@ -16713,10 +16801,32 @@ async function runReplayChecks(): Promise<void> {
     const recording = async (): Promise<LogRecording> =>
       LogRecording.fromFile(crecPath(liveDir, asProcessId(live.pid)));
 
+    /**
+     * A replay of one process's recording.
+     *
+     * The recordings are keyed by pid: a run of N processes is N recordings,
+     * and a replay has to know *which* process a recording belongs to —
+     * otherwise a child answers from its parent's history, and the replay
+     * "works" and is wrong.
+     */
+    const replayOf = (
+      pid: number,
+      source: ReplaySource,
+      mode: ReplayMode = 'strict',
+    ): {
+      readonly recordings: ReplayRecordings;
+      readonly mode: ReplayMode;
+      readonly rootPid: number;
+    } => ({
+      recordings: ReplayRecordings.of(new Map([[pid, source]])),
+      mode,
+      rootPid: pid,
+    });
+
     await checkAsync('a replay serves the model answer from the recording', async () => {
       const replay = await run(join(tmp, 'replay-answer'), {
         answer: 'WORLD-ANSWER',
-        replay: { source: await recording(), mode: 'strict' },
+        replay: replayOf(live.pid, await recording()),
       });
       const call = replay.calls.find((c) => c.syscall === 'llm_call');
       assert(call !== undefined, 'the replay made no llm_call');
@@ -16729,7 +16839,7 @@ async function runReplayChecks(): Promise<void> {
     await checkAsync('a replay reproduces the recording it was given', async () => {
       const replay = await run(join(tmp, 'replay-same'), {
         answer: 'WORLD-ANSWER',
-        replay: { source: await recording(), mode: 'strict' },
+        replay: replayOf(live.pid, await recording()),
       });
       const comparison = compareCalls(live.calls, replay.calls);
       assert(
@@ -16744,7 +16854,7 @@ async function runReplayChecks(): Promise<void> {
         answer: 'WORLD-ANSWER',
         now: () => '2030-01-01T00:00:00.000Z' as Timestamp,
         random: () => 0.5,
-        replay: { source: await recording(), mode: 'strict' },
+        replay: replayOf(live.pid, await recording()),
       });
       const clock = replay.calls.find((c) => c.syscall === 'now');
       const roll = replay.calls.find((c) => c.syscall === 'random');
@@ -16760,7 +16870,7 @@ async function runReplayChecks(): Promise<void> {
       const replay = await run(join(tmp, 'replay-strict'), {
         mode: 'twice',
         answer: 'WORLD-ANSWER',
-        replay: { source: await recording(), mode: 'strict' },
+        replay: replayOf(live.pid, await recording()),
       });
       const trapped = replay.calls.find((c) => c.error !== undefined);
       assert(trapped !== undefined, 'the strict replay did not fail');
@@ -16772,7 +16882,7 @@ async function runReplayChecks(): Promise<void> {
       const replay = await run(join(tmp, 'replay-cached'), {
         mode: 'twice',
         answer: 'WORLD-ANSWER',
-        replay: { source: await recording(), mode: 'cached' },
+        replay: replayOf(live.pid, await recording(), 'cached'),
       });
       const calls = replay.calls.filter((c) => c.syscall === 'llm_call');
       assert(calls.length === 2, `expected 2 llm_calls, got ${calls.length}`);
@@ -16787,7 +16897,7 @@ async function runReplayChecks(): Promise<void> {
     await checkAsync('a live replay ignores the recording', async () => {
       const replay = await run(join(tmp, 'replay-live'), {
         answer: 'WORLD-ANSWER',
-        replay: { source: await recording(), mode: 'live' },
+        replay: replayOf(live.pid, await recording(), 'live'),
       });
       const call = replay.calls.find((c) => c.syscall === 'llm_call');
       assert(
@@ -16799,7 +16909,7 @@ async function runReplayChecks(): Promise<void> {
     await checkAsync('a replay needs no model provider', async () => {
       const replay = await run(join(tmp, 'replay-nodriver'), {
         withLLM: false,
-        replay: { source: await recording(), mode: 'strict' },
+        replay: replayOf(live.pid, await recording()),
       });
       const call = replay.calls.find((c) => c.syscall === 'llm_call');
       assert(
@@ -16820,7 +16930,7 @@ async function runReplayChecks(): Promise<void> {
       const replay = await run(join(tmp, 'replay-tool'), {
         mode: 'tool',
         answer: 'WORLD-ANSWER',
-        replay: { source: toolRecording, mode: 'strict' },
+        replay: replayOf(liveTool.pid, toolRecording),
       });
       assert(replay.toolCalls === 0, `the replay ran the tool ${replay.toolCalls} times`);
       const call = replay.calls.find((c) => c.syscall === 'tool_call');
@@ -16833,11 +16943,11 @@ async function runReplayChecks(): Promise<void> {
       const source = await recording();
       const first = await run(join(tmp, 'replay-twice-a'), {
         answer: 'WORLD-ANSWER',
-        replay: { source, mode: 'strict' },
+        replay: replayOf(live.pid, source),
       });
       const second = await run(join(tmp, 'replay-twice-b'), {
         answer: 'WORLD-ANSWER',
-        replay: { source, mode: 'strict' },
+        replay: replayOf(live.pid, source),
       });
       assert(
         answeredWith(first.calls.find((c) => c.syscall === 'llm_call')) === 'LIVE-ANSWER',
@@ -16850,7 +16960,7 @@ async function runReplayChecks(): Promise<void> {
       source.reset();
       const third = await run(join(tmp, 'replay-twice-c'), {
         answer: 'WORLD-ANSWER',
-        replay: { source, mode: 'strict' },
+        replay: replayOf(live.pid, source),
       });
       assert(
         answeredWith(third.calls.find((c) => c.syscall === 'llm_call')) === 'LIVE-ANSWER',
@@ -16898,6 +17008,131 @@ async function runReplayChecks(): Promise<void> {
       assert(
         report.includes('V1') && report.includes('V2'),
         `the report does not show both values: ${report}`,
+      );
+    });
+
+    // --- the tree -----------------------------------------------------------
+
+    await checkAsync('a recording knows the processes it started', async () => {
+      // `spawn` names its child in `pid`; `fork` names it in `childPid`.
+      // Those two links are the only place the shape of a run is written
+      // down — so they are how the tree is discovered.
+      const recording = LogRecording.fromRecords([
+        frame(2, 'spawn', { pid: 3 }),
+        frame(2, 'fork', { childPid: 4, childChainId: 'c1', sharedCausalPast: 12, irreversibleInPast: false }),
+      ]);
+      const children = recording.childPids();
+      assert(children.length === 2, `expected 2 children, got ${children.length}`);
+      assert(children[0] === 3, `wrong first child: ${children[0]}`);
+      assert(children[1] === 4, `wrong second child: ${children[1]}`);
+    });
+
+    await checkAsync('a replay serves each process from its own recording', async () => {
+      // Two recordings, one per process. The world would answer something
+      // else entirely — a replay that answers from the world is not a
+      // replay.
+      const parent = LogRecording.fromRecords([frame(2, 'llm_call', llmAnswer('PARENT-ANSWER'))]);
+      const child = LogRecording.fromRecords([frame(3, 'llm_call', llmAnswer('CHILD-ANSWER'))]);
+      const treeDir = join(tmp, 'replay-tree');
+      await run(treeDir, {
+        mode: 'tree',
+        answer: 'WORLD-ANSWER',
+        replay: {
+          recordings: ReplayRecordings.of(new Map([[2, parent], [3, child]])),
+          mode: 'strict',
+          rootPid: 2,
+        },
+      });
+
+      const childPid = treeChildren[treeChildren.length - 1]!;
+      assert(childPid === 3, `the child got pid ${childPid}, expected 3`);
+      const childCalls = await readCalls(crecPath(treeDir, asProcessId(childPid)));
+      const childAnswer = (
+        childCalls.find((c) => c.syscall === 'llm_call')?.result as { text?: unknown } | undefined
+      )?.text;
+      assert(
+        childAnswer === 'CHILD-ANSWER',
+        `the child answered ${String(childAnswer)} — it did not answer from its own recording`,
+      );
+    });
+
+    await checkAsync("the comparison ignores the replay's own clock", async () => {
+      // A `wait` reports three things that are the replay's own: when the
+      // child was reaped, where its log sat, and how long it took. None of
+      // them is the child's behaviour — and all three differ every run.
+      const waited = (reapedAt: string, wallTimeMs: number, range: readonly number[]) => ({
+        syscall: 'wait',
+        result: {
+          pid: 3,
+          exitCode: 0,
+          reapedAt,
+          exitReason: 'done',
+          budgetsSpent: {
+            tokensIn: 10,
+            tokensOut: 5,
+            tokensCached: 0,
+            usdSpent: 0.01,
+            wallTimeMs,
+            syscallCount: 4,
+          },
+          syscallLogRange: range,
+        },
+      });
+      const comparison = compareCalls(
+        [waited('2026-01-01T00:00:00.000Z', 120, [0, 100])],
+        [waited('2026-06-01T00:00:00.000Z', 9876, [0, 250])],
+      );
+      assert(comparison.reproduced, "the replay's own clock was treated as a divergence");
+    });
+
+    await checkAsync('the report does not name a difference the comparison ignored', async () => {
+      // Only the ignored field differs: there is no difference to report.
+      assert(
+        firstDifference(
+          { exitCode: 0, reapedAt: 'T1' },
+          { exitCode: 0, reapedAt: 'T2' },
+          'outcome',
+          ['reapedAt'],
+        ) === null,
+        'the ignored field was named as a difference',
+      );
+
+      // A real difference is still found — and it is not the ignored one.
+      const recorded = { exitCode: 0, reapedAt: 'T1', budgetsSpent: { tokensIn: 10, wallTimeMs: 120 } };
+      const replay = { exitCode: 0, reapedAt: 'T2', budgetsSpent: { tokensIn: 10, wallTimeMs: 9876 } };
+      const real = firstDifference(recorded, replay, 'outcome', ['reapedAt']);
+      assert(real !== null, 'the real difference was missed');
+      assert(real.path === 'outcome.budgetsSpent.wallTimeMs', `wrong path: ${real.path}`);
+
+      // The nested ignore works the same way.
+      assert(
+        firstDifference(
+          { exitCode: 0, budgetsSpent: { tokensIn: 10, wallTimeMs: 120 } },
+          { exitCode: 0, budgetsSpent: { tokensIn: 10, wallTimeMs: 9876 } },
+          'outcome',
+          ['budgetsSpent.wallTimeMs'],
+        ) === null,
+        'the ignored nested field was named as a difference',
+      );
+    });
+
+    await checkAsync('the replay engine is part of the public surface', async () => {
+      // HACKING.md tells a host to `import { LogRecording, ReplayRecordings }
+      // from 'cortex-agent-os'`. If the kernel's public surface stops
+      // exporting them, that example becomes a lie — and a compile error for
+      // the person who follows it.
+      //
+      // The import is dynamic on purpose: a static one would fail to load
+      // the whole suite when the export went missing, and a suite that
+      // cannot start is not a check that failed.
+      const publicSurface = await import('../src/index.js');
+      assert(
+        typeof publicSurface.LogRecording === 'function',
+        'LogRecording is not exported from the public surface',
+      );
+      assert(
+        typeof publicSurface.ReplayRecordings === 'function',
+        'ReplayRecordings is not exported from the public surface',
       );
     });
 
@@ -16979,6 +17214,86 @@ async function runReplayChecks(): Promise<void> {
       const replayed = await capture(() => cmdReplay(['999999']));
       assert(replayed.code === 1, 'the replay accepted a process with no recording');
       assert(replayed.err.includes('no recording'), `the message does not say so: ${replayed.err}`);
+    });
+
+    // --- the command, on a tree ---------------------------------------------
+    //
+    // A real run is a tree: a supervisor starts children, and every process
+    // has its own recording. So the command has to replay the whole tree,
+    // each process from its OWN history, and say which process diverged.
+    //
+    // The child's prompt is read from a file at *call* time. The module
+    // loader caches modules, so a prompt written into the module would be
+    // the same in the recording and in the replay — and the divergence
+    // would never happen.
+
+    const treePromptFile = join(tmp, 'tree-prompt.txt');
+    const treeChildModule = join(tmp, 'tree-child.ts');
+    const treeParentModule = join(tmp, 'tree-parent.ts');
+
+    writeFileSync(
+      treeChildModule,
+      `import { readFileSync } from 'node:fs';
+
+export default async function agent(ctx) {
+  const prompt = readFileSync(${JSON.stringify(treePromptFile)}, 'utf8').trim();
+  await ctx.llm_call({ messages: [{ role: 'user', content: prompt }] });
+  ctx.exit(0, 'child done');
+}
+`,
+      'utf8',
+    );
+
+    writeFileSync(
+      treeParentModule,
+      `export default async function agent(ctx) {
+  const child = await ctx.spawn({
+    role: 'leaf',
+    agent: { module: ${JSON.stringify(pathToFileURL(treeChildModule).href)} },
+  });
+  await ctx.wait(child.pid);
+  await ctx.llm_call({ messages: [{ role: 'user', content: 'PARENT-PROMPT' }] });
+  ctx.exit(0, 'parent done');
+}
+`,
+      'utf8',
+    );
+
+    writeFileSync(treePromptFile, 'CHILD-PROMPT-V1\n', 'utf8');
+
+    let treeRoot = 0;
+
+    await checkAsync('cortex replay reproduces a supervision tree', async () => {
+      const spawned = await capture(() => cmdSpawn(['--role', 'sup', '--module', treeParentModule]));
+      assert(spawned.code === 0, `spawn failed: ${spawned.out}${spawned.err}`);
+      const m = /\[pid (\d+)\]/.exec(spawned.out);
+      assert(m !== null, `no pid in the spawn output: ${spawned.out}`);
+      treeRoot = Number(m![1]);
+      const replayed = await capture(() => cmdReplay([String(treeRoot)]));
+      assert(replayed.code === 0, `the replay failed: ${replayed.out}${replayed.err}`);
+      assert(replayed.out.includes('REPRODUCED'), `the replay did not reproduce: ${replayed.out}`);
+      assert(
+        replayed.out.includes(`pid ${treeRoot + 1}`),
+        `the child was not replayed: ${replayed.out}`,
+      );
+    });
+
+    await checkAsync('cortex replay says which process diverged', async () => {
+      // The child's prompt changed. The module is cached, so the change has
+      // to live in something read at call time.
+      writeFileSync(treePromptFile, 'CHILD-PROMPT-V2\n', 'utf8');
+      const replayed = await capture(() => cmdReplay([String(treeRoot)]));
+      assert(replayed.code === 1, `the replay did not report a divergence: ${replayed.out}`);
+      assert(replayed.out.includes('DIVERGED'), `the replay did not say DIVERGED: ${replayed.out}`);
+      assert(
+        replayed.out.includes(`pid ${treeRoot + 1}`),
+        `the report does not name the child: ${replayed.out}`,
+      );
+      assert(replayed.out.includes('CHILD-PROMPT-V2'), `the report does not name the change: ${replayed.out}`);
+      assert(
+        !replayed.out.includes(`pid ${treeRoot} did not reproduce`),
+        `the parent was blamed for the child's change: ${replayed.out}`,
+      );
     });
   } finally {
     if (prevHome === undefined) delete process.env['CORTEX_HOME'];

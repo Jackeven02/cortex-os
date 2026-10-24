@@ -474,7 +474,7 @@ and the world is frozen: the model's answers, the tool results, the clock and
 the RNG all come from the recording instead of from the world.
 
 ```typescript
-import { LogRecording } from 'cortex-agent-os';
+import { LogRecording, ReplayRecordings } from 'cortex-agent-os';
 import { bootKernel } from 'cortex-agent-os';
 
 const source = await LogRecording.fromFile('.cortex/processes/7/log.crec');
@@ -482,13 +482,18 @@ const source = await LogRecording.fromFile('.cortex/processes/7/log.crec');
 const kernel = await bootKernel({
   kernelAbiVersion: KERNEL_ABI_VERSION,
   dir: '.cortex/replays/7',
-  replay: { source, mode: 'strict' },   // 'strict' | 'cached' | 'live'
+  // The recordings are keyed by pid: a run of N processes is N recordings,
+  // and each process must answer from its OWN history.
+  replay: {
+    recordings: ReplayRecordings.of(new Map([[7, source]])),
+    mode: 'strict',          // 'strict' | 'cached' | 'live'
+  },
   loadDrivers: (registry) => registry.registerLLM(mockLLM()),
   autoStart: true,
 });
 ```
 
-Four things worth knowing before you rely on it.
+Five things worth knowing before you rely on it.
 
 - **The recording answers even when you have no such driver.** The resolver
   returns a recording-backed placeholder when the model provider the original
@@ -505,13 +510,26 @@ Four things worth knowing before you rely on it.
 - **A replay does not repeat a side effect.** A tool that already ran is not
   run again — the recorded result is served. A replay shows what the agent
   *would* do now, not what the world *would* answer now.
+- **One recording per process, and the pid is the key.** A run of N processes
+  is N recordings — a supervision tree is the normal shape of a real agent —
+  so the mapping from a process to its history lives in `ReplayRecordings`,
+  not in the source. A source that could be asked about any process would
+  make it far too easy to answer a child with its parent's history: the
+  child would be handed the parent's answer and the parent would then find
+  its own recording empty. The replay would "work" and be wrong, which is the
+  worst way to be wrong. If the tree is on disk, `ReplayRecordings.fromDirectory(dir, rootPid)`
+  walks it for you — the shape of the run is in the logs (`spawn` names its
+  child in `pid`, `fork` in `childPid`).
 
 The CLI does all of this and adds the comparison — `cortex replay <pid>`
 (`src/cli/commands/replay.ts`), with the comparison itself in
 `src/cli/replay_core.ts`: the unit is a *call* (a request and its outcome
 together), the comparison is positional, and the report names the path —
 "the request differs at request.messages[1].content". `extractCalls()` and
-`compareCalls()` are exported, so a host can do the same over its own logs.
+`compareCalls()` are exported (`import { extractCalls, compareCalls } from
+'cortex-agent-os/replay';`), so a host can do the same over its own logs.
+The CLI compares **the whole tree**, process by process, and says which
+process diverged.
 
 ### 7.3 What a host cannot do
 

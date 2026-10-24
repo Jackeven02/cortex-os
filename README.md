@@ -73,15 +73,19 @@ $ cortex send 1240 "try dynamic programming instead"
 # Compare the two branches and pick a winner
 $ cortex diff 1234 1240
 
-# Re-run a recorded agent and see whether it still behaves the same way.
-# The model, the tools, the clock and the RNG all answer from the recording,
-# so the comparison is about the agent, not about the world.
+# Re-run a recorded agent — or a whole supervision tree — and see whether it
+# still behaves the same way. The model, the tools, the clock and the RNG all
+# answer from the recording, so the comparison is about the agent, not about
+# the world. Every process answers from its OWN recording.
 $ cortex replay 1234
-  recording: 23 calls
-  replay:    23 calls
-  REPRODUCED — the replay made the same calls, in the same order,
+  recording: 2 process(es) — pid 1234, pid 1235
+  pid 1234: recording 23 call(s), replay 23 call(s)
+  pid 1235: recording 4 call(s), replay 4 call(s)
+  REPRODUCED — every process made the same calls, in the same order,
   with the same outcomes.
-# (and when the agent's code has changed since, it says where:
+# (and when the agent's code has changed since, it says where — and which
+#  process changed:
+#  DIVERGED — pid 1235 did not reproduce the recording.
 #  #3 changed
 #      the request differs at request.messages[1].content
 #        recorded: "summarise the diff"
@@ -206,7 +210,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 706 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 713 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

@@ -132,6 +132,45 @@ The user-facing surface. Should feel like a real OS shell.
 
 - [x] **#072** Nothing could read a recording back → **fixed.** STATE.md §5.5 has promised since the beginning that *"you can always replay an agent's reasoning deterministically"*, and ABI.md §4.3 says the recording is *"the foundation of deterministic replay"*. The recording was always written — every syscall with its arguments and its result, and the two calls that would otherwise differ between two runs, the clock and the RNG, with the exact value that was handed back. **But nothing ever read it back.** `replayMode` existed in `RestoreOptions` and was only copied into the restore frame's args; `syscallLogOffset` existed in the checkpoint; the mock driver was written to be replay-safe. Three preparations for an engine that was never built. **`cortex replay <pid>` is the engine.** It re-runs a recorded agent with the **world frozen** — the model's answers, the tool results, the clock and the RNG all come from the recording — and then compares what happened with what was recorded, so the answer is not "it ran" but "it ran the same way, or it first diverged *here*". **The recording answers even when this host has no such driver**: the resolver returns a recording-backed placeholder when the model provider the original run used is not registered here, so a run recorded against one provider can be replayed on a machine that has never heard of that provider's API key — which is the difference between a recording that is merely archived and one that is usable. **And a replay does not repeat a side effect**: a tool that already ran is not run again, the recorded result is served, because a replay shows what the agent *would* do now, not what the world *would* answer now. **A replay that cannot answer says so**: `strict` is the default mode, and in it a call the recording does not have is an error (`ERECORD`), not a silent fall-through to the live world — a replay that quietly goes live looks like a faithful reproduction and is not one, and the failure is reported as *"the recording ran out at call #4"* rather than as a divergence that reads like the agent changed its mind. **The dispatcher did not change**: the replay replaces the *driver resolver*, which changes where an answer comes from and nothing else, so no syscall changed its meaning — and the comparison is positional rather than an LCS, because a replay that inserted one extra call has already diverged and the divergence is *there*. The unit of comparison is a *call* (a request and its outcome together), not a frame, and the report names the path: "the request differs at request.messages[1].content". 14 new smoke checks (692 → 706), all fourteen reverse-verified: the model answering from the world → "a replay serves the model answer from the recording" fails; the clock and the RNG read live → the clock/RNG check fails; `strict` falling through → "a strict replay refuses to answer from the world" fails; `cached` refusing → "a cached replay falls through to the world" fails; `live` consulting the recording → "a live replay ignores the recording" fails; requiring a model provider → "a replay needs no model provider" fails; the tool actually running again → "a replay does not repeat a side effect" fails ("the replay ran the tool 1 times"); the run-specific bookkeeping no longer ignored → "the comparison ignores the run-specific bookkeeping" fails; the request dropped from the comparison → both divergence checks fail; the CLI not handing the recording to the kernel → both CLI checks fail; the report no longer naming the path → both divergence checks fail; the "no recording" guard removed → "cortex replay refuses a process with no recording" fails. No ABI change: no syscall, no argument, no errno, no `ProcessInfo` field, and the `.crec` format is untouched — the replay reads the log and does not write it.
 
+- [x] **#073** A replay replayed one process and called it a run → **fixed.** #072
+  built the engine, and the first thing anybody does with it is start a
+  supervisor — and a supervisor is not a process, it is a **tree**. The engine
+  was holding one recording for the whole run, so the child's model call was
+  served from the **parent's** recording: the child was handed the parent's
+  answer, and the parent then found its own recording empty. Nothing crashed.
+  The replay "worked" and was wrong, which is the worst way to be wrong. **A
+  run is N recordings, and they are keyed by pid.** The mapping from a process
+  to its history now lives in `ReplayRecordings`, and `ReplaySource` is
+  deliberately *not* pid-aware — a source that could be asked about any
+  process would make it far too easy to answer a child with its parent's
+  history. **The shape of the run is found in the logs**, because nothing else
+  records it: a `spawn` names its child in `pid`, a `fork` names it in
+  `childPid`, and the replay walks those links from the root, loading each
+  process's own recording. **And the replayed tree only got off the ground
+  after a second fix.** The spec says `capabilities: null` (unnarrowed — it
+  holds everything) and `grantable: []`, and the kernel reads an omitted
+  `grantable` exactly like an omitted `capabilities`: *"nobody said anything,
+  so it holds everything"*. Passing the `grantable` on its own therefore said
+  *"it holds nothing"*, and the supervisor's first capability-gated syscall —
+  `spawn` — trapped `EPERM`. The replayed process was **weaker than the
+  original**, which is the opposite of what a replay is for. So `capabilities`
+  and `grantable` now go together or not at all. **The report names the
+  process that diverged**, not just the run, and it does not name a field the
+  comparison has already ruled out: saying *"the outcome differs at
+  `outcome.reapedAt`"* about a field on the ignore list would contradict the
+  verdict it is reporting. **Seven new smoke checks** (706 → 713), all seven
+  reverse-verified: the tree's shape not read out of the recording → "a
+  recording knows the processes it started" fails; the per-process recordings
+  collapsed into one → "a replay serves each process from its own recording"
+  fails (the child answered with the parent's answer); the `wait` clock
+  compared again → "the comparison ignores the replay's own clock" fails; the
+  report naming an ignored field → "the report does not name a difference the
+  comparison ignored" fails; the permission fix reverted → "cortex replay
+  reproduces a supervision tree" fails; the tree not compared process by
+  process → "cortex replay says which process diverged" fails; the replay
+  engine dropped from the public surface → "the replay engine is part of the
+  public surface" fails.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---
@@ -166,7 +205,7 @@ Three demos that prove the abstraction matters. Each one becomes a GIF in the RE
 ## Phase 5 — Polish & launch
 
 - [x] **#044** Landing page (`cortex.sh` or similar — domain to be checked)
-  - Built as **`docs/index.html`** — a single self-contained, dependency-free page (no CDN, no build step) so it is servable directly by **GitHub Pages from `/docs`** with zero configuration. Sections: hero + an animated replay of the Demo B reboot transcript; the "function vs process" contrast that is the whole thesis; a primitive grid for the sixteen CLI verbs; the three killer demos with links to their live replays (`demo-a/b/c.html`); a quickstart (clone → offline mock → supervision tree) beside a real agent snippet; and an honest status panel (13 modules / 24 syscalls / 7 drivers / 706 smoke checks) with the v0 caveats stated plainly. A custom domain (`cortex.sh`) is still to be decided/registered — the page works on `github.io` today.
+  - Built as **`docs/index.html`** — a single self-contained, dependency-free page (no CDN, no build step) so it is servable directly by **GitHub Pages from `/docs`** with zero configuration. Sections: hero + an animated replay of the Demo B reboot transcript; the "function vs process" contrast that is the whole thesis; a primitive grid for the sixteen CLI verbs; the three killer demos with links to their live replays (`demo-a/b/c.html`); a quickstart (clone → offline mock → supervision tree) beside a real agent snippet; and an honest status panel (13 modules / 24 syscalls / 7 drivers / 713 smoke checks) with the v0 caveats stated plainly. A custom domain (`cortex.sh`) is still to be decided/registered — the page works on `github.io` today.
 - [x] **#045** `docs/HACKING.md` — how to contribute, how to write a driver
   - Covers: dev setup (`tsc` + `tsx scripts/smoke.ts`, with an explicit note that `npm test` is *not* the suite and `tests/` is intentionally empty); project layout; the "documents are the contract" rule; the four coding conventions (branded ids, `exactOptionalPropertyTypes` conditional-spread, errno errors / `ProcessExitSignal`, zero runtime deps); how to write each of the three drivers (`ILLMDriver`/`IToolDriver`/`IMemoryDriver`) with a minimal echo-driver example and the reversibility/forkable discipline; how to write an agent + the four gotchas (absolute module path, per-process memory regions, fork/restore re-runs from the top, `--driver` only applies to prompt agents); **how to write a host** (§7 — the one that keeps costing people time: a host is *not* in the process tree, so the `wait` syscall is unavailable to it and `Kernel.awaitExit` is the way to wait; plus the host API quick-reference and what a host cannot do); how to add a syscall (the five files to touch together); and the testing/submitting conventions. Grounded in the real interfaces, not invented.
 - [x] **#046** `docs/COOKBOOK.md` — common patterns (supervision, pipelines, daemons, fork-and-compare)
