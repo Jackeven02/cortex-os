@@ -53,9 +53,11 @@ $ cortex top --stall-after 30000
 # 跟随一个正在跑的 agent 的 syscall 流（有内核时是推送）
 $ cortex attach 1234
 # attach .cortex/processes/1234/log.crec (live — frames by push from the kernel)
-14:23:01 1234  __state     exit  idempotent
-14:23:01 1234  memory_read  exit  idempotent
-14:23:04 1234  llm_call     exit  reversible
+time          pid     syscall                              phase  duration   reversibility
+------------------------------------------------------------------------------------------
+14:23:01.402  1234   __state:new->ready                   exit   -          idempotent
+14:23:01.402  1234   llm_call                             exit   2523ms     reversible
+14:23:04.115  1234   memory_read                          exit   -          idempotent
 # pid 1234 exited with code 0 (completed)
 # detached
 # （有活内核时：cortex attach 1234 --interactive
@@ -91,9 +93,16 @@ $ cortex replay 1234
 
 # 追踪每一次 syscall
 $ cortex trace 1234
-14:23:01 llm_call(prompt=..., tools=[grep,edit]) -> "I'll search..."
-14:23:04 tool_call(grep, "TypeError") -> "src/foo.ts:42"
-14:23:06 llm_call(...) -> "Found it, editing now"
+# tracing .cortex/processes/1234/log.crec
+time          pid     syscall                              phase  duration   reversibility
+------------------------------------------------------------------------------------------
+14:23:01.402  1234   llm_call                             exit   2523ms     reversible
+14:23:04.115  1234   tool_call                            exit   -          irreversible
+14:23:06.221  1234   __state:running->exiting             exit   -          idempotent
+# 3 record(s)
+# （内核自己的帧也有名字：__init:restart、__state:new->ready、
+#  __sched:parked、__signal:SIGTERM(queued) —— 所以 init 的日志读起来
+#  就是它本来该是的监督日志）
 
 # 读回一个进程**打印**过的东西
 # （按进程分别保存，不再混进 daemon 的 stdout —— stdout 和 stderr 分开标注）
@@ -125,8 +134,10 @@ pid 1234 exited with code 0 (finished the task)
 # 实时盯着内核 —— 每一条 syscall 帧，发生了就推过来。
 # 和 `cortex trace` 读到的是同一批帧，只是推过来而不是轮询。
 $ cortex watch --pid 1234
-19:50:09.072  1234    sleep            exit    2523ms    idempotent
-19:50:09.077  1234    exit             enter   -         irreversible
+time          pid     syscall                              phase  duration   reversibility
+------------------------------------------------------------------------------------------
+19:50:09.072  1234   sleep                                exit   2523ms     idempotent
+19:50:09.077  1234   exit                                 enter  -          irreversible
 # pid 1234 exited with code 3 (probe finished on purpose)
 
 # 监督一个活着的 agent：卡住就杀掉，再换一个新的上来。
@@ -202,7 +213,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 724 项断言，0 失败
+npx tsx scripts/smoke.ts                # 727 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。

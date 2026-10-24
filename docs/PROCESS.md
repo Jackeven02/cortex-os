@@ -570,6 +570,15 @@ Every decision is reported, including the one that says nothing will happen:
 a daemon that exits cleanly under a `never` policy is gone for good, and that
 is exactly what the operator has to be told.
 
+**And the journal is readable.** Init's own log is the *durable* record of
+those decisions — it survives the shell that was watching. It used to be
+unreadable in practice: every frame in it was called `__init`, so the log of
+a supervisor that restarted three times read as three identical lines, and
+the action that distinguished them was buried in `args`. The frames now
+carry their action in the view (`__init:restart`, `__init:restart-gave-up`,
+`__init:reap`), so `cortex trace 1` is a readable supervision journal
+(ABI.md §6.1 for the naming rule).
+
 ### 9.2 Supervision
 
 Cortex does not bake supervision into the kernel. Supervision is a **user-space pattern** built from kernel primitives:

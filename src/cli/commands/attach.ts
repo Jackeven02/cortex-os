@@ -67,7 +67,7 @@ import {
 import { decode } from 'cborg';
 import { unbrand, asProcessId, type SyscallRecord } from '../../kernel/types.js';
 import { CortexError, isCortexError } from '../../kernel/errors.js';
-import { formatRecordLine } from './trace.js';
+import { formatRecordLine, TRACE_HEADER, TRACE_RULE } from './trace.js';
 import { KernelCommandError, probeKernel, type KernelClient } from '../kernel_client.js';
 
 /** How often follow-mode re-reads the log file, in ms. */
@@ -301,8 +301,8 @@ EXAMPLES
   const live = follow && client !== undefined && kernelHasIt;
 
   console.log(`# attach ${crecFile}${live ? ' (live — frames by push from the kernel)' : follow ? ' (follow-mode)' : ' (once)'}`);
-  console.log('time                  pid    syscall           phase   duration  reversibility');
-  console.log('-'.repeat(85));
+  console.log(TRACE_HEADER);
+  console.log(TRACE_RULE);
 
   if (!follow) {
     try {

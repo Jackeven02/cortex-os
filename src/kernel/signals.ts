@@ -189,12 +189,20 @@ export function exitCodeForSignal(sig: Signal): number {
  * Outcome of a single `send()` call. Returned to the sender so supervisors
  * and CLI tools can report what happened (delivered now vs queued vs
  * dropped). Recorded in the `__signal` log entry as well.
+ *
+ * The list is exported so the CLI can size its columns to the longest outcome
+ * rather than guess at it; the type is derived from it, so the two cannot
+ * drift apart.
  */
-export type DeliveryOutcome =
-  | 'delivered'   // default action ran or handler invoked synchronously
-  | 'queued'      // appended to pendingSignals; will fire on next RUNNING
-  | 'dropped'     // disposition was 'ignore', or signal was no-op for state
-  | 'failed';     // a handler threw; details in the `__signal` record
+export const DELIVERY_OUTCOMES = [
+  'delivered',   // default action ran or handler invoked synchronously
+  'queued',      // appended to pendingSignals; will fire on next RUNNING
+  'dropped',     // disposition was 'ignore', or signal was no-op for state
+  'failed',      // a handler threw; details in the `__signal` record
+] as const;
+
+/** The outcome of one signal delivery. */
+export type DeliveryOutcome = (typeof DELIVERY_OUTCOMES)[number];
 
 /**
  * Optional invoker for `handler` dispositions. The dispatcher (#014) wires

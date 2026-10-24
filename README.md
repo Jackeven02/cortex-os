@@ -93,9 +93,16 @@ $ cortex replay 1234
 
 # Trace every syscall
 $ cortex trace 1234
-14:23:01 llm_call(prompt=..., tools=[grep,edit]) -> "I'll search..."
-14:23:04 tool_call(grep, "TypeError") -> "src/foo.ts:42"
-14:23:06 llm_call(...) -> "Found it, editing now"
+# tracing .cortex/processes/1234/log.crec
+time          pid     syscall                              phase  duration   reversibility
+------------------------------------------------------------------------------------------
+14:23:01.402  1234   llm_call                             exit   2523ms     reversible
+14:23:04.115  1234   tool_call                            exit   -          irreversible
+14:23:06.221  1234   __state:running->exiting             exit   -          idempotent
+# 3 record(s)
+# (the kernel's own frames are named too: __init:restart, __state:new->ready,
+#  __sched:parked, __signal:SIGTERM(queued) — so init's log reads as the
+#  supervision journal it is)
 
 # Read back what a process printed (kept per process, not mixed into the
 # daemon's stdout — stdout and stderr are tagged separately)
@@ -210,7 +217,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 724 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 727 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

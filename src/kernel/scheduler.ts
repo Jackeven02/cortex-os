@@ -136,6 +136,29 @@ export type DispatchReason =
   | 'parked';
 
 /**
+ * Every action the scheduler records in a `__sched` frame.
+ *
+ * `DispatchReason` plus `idle` (the "nothing was runnable" outcome). The list
+ * is exported so the CLI can size its columns to the longest action instead of
+ * guessing at it, and it is the source of truth the type is checked against.
+ */
+export const DISPATCH_ACTIONS = [
+  'yielded',
+  'blocked',
+  'sigxcpu',
+  'signal',
+  'exited',
+  'detached',
+  'parked',
+  'idle',
+] as const satisfies readonly (DispatchReason | 'idle')[];
+
+/** Compile-time proof that the list and the union cannot drift apart. */
+type UnlistedDispatchAction = Exclude<DispatchReason | 'idle', (typeof DISPATCH_ACTIONS)[number]>;
+const _everyDispatchActionIsListed: UnlistedDispatchAction extends never ? true : never = true;
+void _everyDispatchActionIsListed;
+
+/**
  * Outcome of a single `tick()`. Either nothing was runnable (`dispatched:
  * null`) or exactly one process was dispatched and ran a quantum.
  */

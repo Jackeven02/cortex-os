@@ -105,6 +105,31 @@ export const MAX_BACKOFF_EXPONENT = 16;
 export const DEFAULT_RESTART_WINDOW_MS = 60_000;
 
 /**
+ * The supervision actions init records in its own log.
+ *
+ * Every `__init` frame carries one of these as its `action`, and the action is
+ * the whole content of the frame: `restart` is not the same event as
+ * `restart-gave-up`, and a supervision journal that cannot tell them apart is
+ * a journal of nothing (docs/PROCESS.md §9.1, docs/ABI.md §6.1).
+ *
+ * The list is exported so the CLI can size its columns to the longest action
+ * rather than guess at it, and the type keeps `#record` from being called with
+ * an action that is not on the list — so the list cannot drift from what is
+ * actually recorded.
+ */
+export const INIT_ACTIONS = [
+  'boot',
+  'register-daemon',
+  'reap',
+  'restart',
+  'restart-gave-up',
+  'shutdown',
+] as const;
+
+/** One of the supervision actions init records. */
+export type InitAction = (typeof INIT_ACTIONS)[number];
+
+/**
  * Default number of restarts inside the window that constitutes a "storm"
  * (docs/PROCESS.md §4.2: "a process restarted 100 times in a minute"). When
  * exceeded, init raises an alarm and gives up on that daemon rather than
@@ -953,7 +978,7 @@ export class InitProcess {
    * the supervision journal. (The reaped child's recorder is closed by
    * `reap()`, so writing there would race the close.)
    */
-  async #record(action: string, details: Record<string, unknown>): Promise<void> {
+  async #record(action: InitAction, details: Record<string, unknown>): Promise<void> {
     const recorder = this.#table.recorderFor(PID_INIT);
     if (recorder === null) return;
 

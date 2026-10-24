@@ -141,14 +141,14 @@ PID     PPID    ROLE          STATE         TOKENS    CAPS              AGE
 2       1       demo          zombie        0         all               5s
 
 $ cortex trace 2
-time                  pid    syscall           phase   duration  reversibility
--------------------------------------------------------------------------------------
-09:12:05.117  2      __state          exit    -         idempotent
-09:12:05.132  2      __state          exit    -         idempotent
-09:12:05.151  2      on_signal        exit    -         reversible
-09:12:05.314  2      memory_write     enter   -         reversible
-09:12:05.315  2      memory_write     exit    1ms       reversible
-09:12:05.315  2      exit             enter   -         irreversible
+time          pid     syscall                              phase  duration   reversibility
+------------------------------------------------------------------------------------------
+09:12:05.117  2       __state:new->ready                   exit   -          idempotent
+09:12:05.132  2       __state:ready->running               exit   -          idempotent
+09:12:05.151  2       on_signal                            exit   -          reversible
+09:12:05.314  2       memory_write                         enter  -          reversible
+09:12:05.315  2       memory_write                         exit   1ms        reversible
+09:12:05.315  2       exit                                 enter  -          irreversible
 ```
 
 | What you get | How |

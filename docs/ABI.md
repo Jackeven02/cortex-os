@@ -711,6 +711,47 @@ Two records per syscall (enter + exit/trap). This is what allows the recording t
 
 The byte offsets are what `checkpoint.syscallLogOffset` references (STATE.md §4).
 
+### 6.1 The kernel's own frames
+
+Four entries in the record stream are not agent-facing calls but the kernel's
+own bookkeeping. The double underscore marks them as kernel-internal:
+agents cannot invoke them, and a replay engine treats them as scheduler /
+signal events rather than user syscalls.
+
+| recorded `syscall` | written by | what its `args` carry |
+|---|---|---|
+| `__state` | the process table | `from`, `to`, and the trigger that caused the transition |
+| `__init` | init | `action` — `boot`, `register-daemon`, `reap`, `restart`, `restart-gave-up`, `shutdown` — plus the action's details |
+| `__sched` | the scheduler | `action`, plus `nice` / `blockedOn` where they apply |
+| `__signal` | the signal manager | `signal`, `signalNumber`, `outcome` (`delivered` / `queued` / `dropped` / `failed`), `from` |
+
+The **recorded** names are part of the frozen format: the name on disk is
+the name on disk, and changing it would be a major bump.
+
+What a CLI *shows* is a separate matter — a **view**. `cortex trace`,
+`cortex attach` and `cortex watch` render these frames with the part that
+distinguishes them, so a reader can tell a restart from a give-up without
+opening the file:
+
+```
+__init:restart-gave-up
+__state:new->ready
+__sched:dispatch
+__signal:SIGTERM(delivered)
+```
+
+Rendering a record under a longer name is not a change to the record
+(§11) — the same `.crec` file is byte-for-byte identical either way.
+
+The **vocabularies** those names are built from are exported at runtime, so
+there is exactly one home for each of them and a view can size itself against
+them rather than guess: `PROCESS_STATES` (the process table),
+`ALL_SIGNALS` and `DELIVERY_OUTCOMES` (the signal manager),
+`INIT_ACTIONS` (init) and `DISPATCH_ACTIONS` (the scheduler). A new state,
+signal, delivery outcome or supervision action widens whatever depends on it
+by itself — including the syscall column of the trace table, whose width is
+computed from these lists rather than typed by hand.
+
 ---
 
 ## 7. Driver interfaces

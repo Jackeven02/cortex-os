@@ -260,6 +260,53 @@ The user-facing surface. Should feel like a real OS shell.
   contract changed — this is the host's side of the kernel, which ABI.md §11
   says is not part of the frozen contract.
 
+- [x] **#077** The kernel's own frames were anonymous, and the table's header
+  had drifted → **fixed.** Two faults in the same table, and the second one was
+  hiding the first.
+
+  The visible one: the kernel's bookkeeping frames were recorded under
+  placeholder names — `__state`, `__init`, `__sched`, `__signal` — and
+  **shown** under them. The part that distinguishes each frame (the
+  supervision action, the state transition, the signal and what became of it)
+  was in the frame's `args`, and the view never looked there, so a log full of
+  them read as a column of identical words. That hurt most in **init's own
+  log, which is the supervision journal**: #076 made init *report* its
+  decisions, and this makes the record *readable*. `cortex trace 1` now shows
+  `__init:register-daemon`, `__init:restart`, `__init:restart-gave-up` and
+  `__state:new->ready` instead of four identical `__init` lines.
+
+  The one hiding it: **the header was a hand-typed string** and it had
+  drifted — its `phase` sat five columns to the right of where the rows
+  printed theirs, and the rule under it was longer than the header it ruled.
+  `trace`, `attach` and `watch` each carried their own hand-written header.
+  The header and the rule are now generated from the same column
+  specification the rows use, in one place shared by all three.
+
+  **And the syscall column's width is derived, not typed.** Naming the frames
+  made them longer (`__state:checkpointing->checkpointing` is 36 characters),
+  and a width that is a guess is a width that is wrong eventually — one
+  character too many and every column after it slid right, so the row stopped
+  lining up with the heading above it. The width is now computed from the
+  kernel's own value domains, and the three vocabularies that were only
+  implicit (`INIT_ACTIONS`, `DISPATCH_ACTIONS`, `DELIVERY_OUTCOMES`) became
+  exported runtime lists, so a new state, signal or supervision action widens
+  the column by itself. A name that genuinely cannot fit is cut **and marked**
+  (`…`).
+
+  **Nothing on disk changed** — the recorded name is still `__init`, because
+  the `.crec` format is frozen (ABI.md §6) and rendering a record under a
+  longer name is a *view*, which ABI.md §11 says is not an ABI change. The
+  rule is now written down in ABI.md §6.1. **Three new smoke checks**
+  (724 → 727), all reverse-verified: the frame name falling back to the bare
+  placeholder → "the trace names the kernel's own frames" fails ("the journal
+  frame lost its action"); the header reverting to a hand-typed string →
+  "the trace table lines up" fails ("the phase column is off: header 47, row
+  48"); the derived width replaced by the old hand-typed one → "the trace
+  table holds its widest frame" fails ("the syscall column is 26 wide and the
+  widest frame name is 36"), and dropping the cut-and-mark → the same check
+  fails on the alignment instead ("the phase column is off: header 59, row
+  62").
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

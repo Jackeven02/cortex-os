@@ -243,7 +243,7 @@ import {
 } from '../src/cli/diff_core.js';
 
 import { cmdDiff } from '../src/cli/commands/diff.js';
-import { cmdTrace } from '../src/cli/commands/trace.js';
+import { cmdTrace, TRACE_SYSCALL_WIDTH } from '../src/cli/commands/trace.js';
 import { cmdLogs, alreadyShown } from '../src/cli/commands/logs.js';
 import { cmdMemory } from '../src/cli/commands/memory.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
@@ -11318,6 +11318,245 @@ async function runDiffChecks(): Promise<void> {
     } finally {
       console.log = prevLog;
       console.error = prevErr;
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync("the trace names the kernel's own frames", async () => {
+    // Every internal frame used to print as the same anonymous word, so a log
+    // full of them said nothing at all: ten rows reading `__init` told an
+    // operator that ten things happened and not what they were. That mattered
+    // most for init's log, which is the supervision journal — the durable
+    // record of every restart decision the kernel made.
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-trace-names-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(2), syscall: '__init',
+        callId: 'i1', phase: 'exit', args: { action: 'register-daemon', daemonId: 2 },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(2), syscall: '__state',
+        callId: 's1', phase: 'exit', args: { from: 'new', to: 'ready', trigger: 'test' },
+        stateBefore: 'new', stateAfter: 'ready', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:02.000Z', pid: asProcessId(2), syscall: '__signal',
+        callId: 'g1', phase: 'exit', args: { signal: 'SIGTERM', outcome: 'queued' },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      console.error = (): void => {};
+      try {
+        const code = await cmdTrace(['2']);
+        assert(code === 0, `trace exit 0, got ${code}`);
+      } finally {
+        console.log = prevLog;
+        console.error = prevErr;
+      }
+
+      assert(
+        out.includes('__init:register-daemon'),
+        `the journal frame lost its action: ${out}`,
+      );
+      assert(out.includes('__state:new->ready'), `the transition was lost: ${out}`);
+      assert(
+        out.includes('__signal:SIGTERM(queued)'),
+        `the signal lost its outcome: ${out}`,
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('the trace table lines up', async () => {
+    // The header used to be a hand-typed string, and it had drifted: its
+    // "phase" sat five columns to the right of where the rows printed theirs,
+    // and the rule under it was longer than the header it ruled. Reading a
+    // row meant counting characters. Now both come from one column list.
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-trace-cols-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(2), syscall: 'now',
+        callId: 'n1', phase: 'exit', result: 1,
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      console.error = (): void => {};
+      try {
+        const code = await cmdTrace(['2']);
+        assert(code === 0, `trace exit 0, got ${code}`);
+      } finally {
+        console.log = prevLog;
+        console.error = prevErr;
+      }
+
+      const lines = out.split('\n');
+      const header = lines.find((l) => l.startsWith('time'));
+      const row = recordLines(out)[0];
+      assert(header !== undefined, `no header row: ${out}`);
+      assert(row !== undefined, `no record rows: ${out}`);
+      assert(
+        header!.indexOf('phase') === row!.indexOf('exit'),
+        `the phase column is off: header ${header!.indexOf('phase')}, row ${row!.indexOf('exit')}`,
+      );
+      assert(
+        header!.indexOf('reversibility') === row!.indexOf('idempotent'),
+        `the reversibility column is off: header ${header!.indexOf('reversibility')}, row ${row!.indexOf('idempotent')}`,
+      );
+      const rule = lines.find((l) => /^-+$/.test(l));
+      assert(rule !== undefined, 'no rule under the header');
+      assert(
+        rule!.length === header!.length,
+        `the rule is ${rule!.length} wide and the header is ${header!.length}`,
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('the trace table holds its widest frame', async () => {
+    // A column width that is a guess is a width that is wrong eventually. The
+    // widest name the kernel can produce is `__state:checkpointing->checkpointing`
+    // (36 characters); one character more and every column after it slides
+    // right, so the row stops lining up with the heading above it and the
+    // reader cannot tell which column they are looking at.
+    //
+    // The width is derived from the kernel's own value domains, so this check
+    // is really checking that the derivation is still true — and that a name
+    // that *cannot* fit (a driver with a very long syscall name) is cut and
+    // marked rather than silently dropping its tail.
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-trace-wide-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(2), syscall: '__state',
+        callId: 'w1', phase: 'exit',
+        args: { from: 'checkpointing', to: 'checkpointing', trigger: 'test' },
+        stateBefore: 'checkpointing', stateAfter: 'checkpointing', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(2), syscall: '__signal',
+        callId: 'w2', phase: 'exit', args: { signal: 'SIGTERM', outcome: 'delivered' },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:02.000Z', pid: asProcessId(2),
+        syscall: 'acme_extremely_long_driver_syscall_name',
+        callId: 'w3', phase: 'exit', result: 1,
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      console.error = (): void => {};
+      try {
+        const code = await cmdTrace(['2']);
+        assert(code === 0, `trace exit 0, got ${code}`);
+      } finally {
+        console.log = prevLog;
+        console.error = prevErr;
+      }
+
+      const lines = out.split('\n');
+      const header = lines.find((l) => l.startsWith('time'));
+      const rows = recordLines(out);
+      assert(header !== undefined, `no header row: ${out}`);
+      assert(rows.length === 3, `expected 3 record rows, got ${rows.length}: ${out}`);
+
+      // The widest name the kernel can produce still fits.
+      assert(
+        TRACE_SYSCALL_WIDTH >= '__state:checkpointing->checkpointing'.length,
+        `the syscall column is ${TRACE_SYSCALL_WIDTH} wide and the widest frame name is ` +
+          `${'__state:checkpointing->checkpointing'.length}`,
+      );
+
+      // Every row lines up with the header — including the widest frame, and
+      // including the name that had to be cut.
+      for (const row of rows) {
+        assert(
+          header!.indexOf('phase') === row.indexOf('exit'),
+          `the phase column is off: header ${header!.indexOf('phase')}, row ${row.indexOf('exit')} — ${row}`,
+        );
+        assert(
+          header!.indexOf('reversibility') === row.indexOf('idempotent'),
+          `the reversibility column is off in: ${row}`,
+        );
+      }
+
+      // The widest frame is shown whole.
+      assert(
+        out.includes('__state:checkpointing->checkpointing'),
+        `the widest frame was cut: ${out}`,
+      );
+
+      // A name that cannot fit is cut *and marked* — a fact that does not fit
+      // must not lose its tail silently.
+      const longName = 'acme_extremely_long_driver_syscall_name';
+      const expectedCut = `${longName.slice(0, TRACE_SYSCALL_WIDTH - 1)}…`;
+      assert(
+        out.includes(expectedCut),
+        `the long name was not marked as cut: expected '${expectedCut}' in ${out}`,
+      );
+    } finally {
       if (prevHome === undefined) delete process.env['CORTEX_HOME'];
       else process.env['CORTEX_HOME'] = prevHome;
       rmSync(tmp, { recursive: true, force: true });

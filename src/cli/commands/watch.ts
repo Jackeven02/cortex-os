@@ -49,7 +49,7 @@ import { parseArgs } from 'node:util';
 
 import { defaultKernelDir } from '../index.js';
 import { explainKernelGone, KernelCommandError, probeKernel } from '../kernel_client.js';
-import { formatRecordLine } from './trace.js';
+import { formatRecordLine, TRACE_HEADER, TRACE_RULE } from './trace.js';
 import type { SyscallRecord } from '../../kernel/types.js';
 
 /** The shape of an event frame's payload, as it arrives over the wire. */
@@ -165,8 +165,8 @@ export async function cmdWatch(args: string[]): Promise<number> {
         if (event.kind === 'record') {
           if (!headerPrinted) {
             headerPrinted = true;
-            console.log('time                  pid    syscall           phase   duration  reversibility');
-            console.log('-'.repeat(85));
+            console.log(TRACE_HEADER);
+            console.log(TRACE_RULE);
           }
           if (event.record !== undefined) {
             console.log(formatRecordLine(event.record as SyscallRecord));

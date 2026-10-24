@@ -1139,19 +1139,67 @@ view of it.
 ```console
 $ cortex watch --pid 1234
 # watching the kernel event stream (Ctrl-C to stop)
-time                  pid    syscall           phase   duration  reversibility
--------------------------------------------------------------------------------------
-19:50:09.072  1234    __sched          exit    -         idempotent
-19:50:09.072  1234    sleep            exit    2523ms    idempotent
-19:50:09.073  1234    memory_write     enter   -         reversible
-19:50:09.074  1234    memory_read      exit    0ms       idempotent
-19:50:09.077  1234    exit             enter   -         irreversible
+time          pid     syscall                              phase  duration   reversibility
+------------------------------------------------------------------------------------------
+19:50:09.072  1234    __sched:dispatch                     exit   -          idempotent
+19:50:09.072  1234    sleep                                exit   2523ms     idempotent
+19:50:09.073  1234    memory_write                         enter  -          reversible
+19:50:09.074  1234    memory_read                          exit   0ms        idempotent
+19:50:09.077  1234    exit                                 enter  -          irreversible
 # pid 1234 exited with code 3 (probe finished on purpose)
 ```
 
 The `record` lines are printed in the same layout as `cortex trace`, so the
 two can be read side by side — and they *are* the same frames, which is the
 point.
+
+**And the kernel's own frames got names.** Four syscalls are not really
+syscalls — they are the kernel's bookkeeping, and their names say so:
+`__state`, `__init`, `__sched`, `__signal`. They were recorded with a
+placeholder name and *shown* with it, so a log full of them read as a
+column of `__init`: ten rows saying "ten things happened" and nothing
+about what they were.
+
+That hurt most in **init's log, which is the supervision journal**. It is
+the durable record of every restart decision the kernel made — the one
+place the answer to *"what did the supervisor do?"* is kept — and the
+decision was sitting in the frame's `action`, where no reader was looking.
+Reading init's log meant counting identical lines.
+
+So the *view* now carries the distinguishing part:
+
+| frame | shown as | tells you |
+|---|---|---|
+| `__init` | `__init:restart-gave-up` | which supervision action was taken |
+| `__sched` | `__sched:dispatch` | which scheduling action was taken |
+| `__state` | `__state:new->ready` | the transition, not just "a transition" |
+| `__signal` | `__signal:SIGTERM(delivered)` | which signal, and what became of it |
+
+The **recorded** syscall name is untouched — the `.crec` format is frozen
+(ABI.md §6), and this is a view of a log, not a change to the log. A
+`__init` record on disk still says `__init`; `cortex trace`, `cortex
+attach` and `cortex watch` render it as `__init:restart`.
+
+The same fix removed a second failure that had been hiding in plain sight:
+the table's **header** was a hand-typed string. It had drifted — its
+`phase` sat five columns to the right of where the rows printed theirs,
+and the rule under it was longer than the header it ruled. The header and
+the rule are now **generated from the same column specification the rows
+use**, in one place shared by all three commands, so a row cannot land
+under the wrong heading again.
+
+And the **width of the syscall column is derived, not typed**. Naming the
+frames made them longer — `__state:checkpointing->checkpointing` is 36
+characters — and a column whose width is a guess is a column that is wrong
+eventually: one character too many and every column after it slid right,
+so the row stopped lining up with the heading above it and the reader could
+no longer tell which column they were looking at. The width is now computed
+from the kernel's own value domains (`PROCESS_STATES`, `ALL_SIGNALS`,
+`DELIVERY_OUTCOMES`, `INIT_ACTIONS`, `DISPATCH_ACTIONS`), so a new state,
+signal or supervision action widens the column by itself. A name that
+genuinely cannot fit — a driver registering a very long syscall name — is
+**cut and marked** (`…`): a fact that does not fit must not lose its tail
+silently.
 
 **And it made the shell a supervisor.** A stream is only half a story. Until
 something *acts* on it, the operator is still the one who has to be there —
@@ -1474,9 +1522,9 @@ when the agent ends:
 ```console
 $ cortex attach 5 --follow
 # attach .cortex/processes/5/log.crec (live — frames by push from the kernel)
-time                  pid    syscall           phase   duration  reversibility
--------------------------------------------------------------------------------------
-22:04:08.838  5      __signal         exit    -         idempotent
+time          pid     syscall                              phase  duration   reversibility
+------------------------------------------------------------------------------------------
+22:04:08.838  5       __signal:SIGTERM(delivered)          exit   -          idempotent
 # pid 5 exited with code 143 (signal:SIGTERM)
 # detached
 ```

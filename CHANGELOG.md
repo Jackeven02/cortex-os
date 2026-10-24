@@ -630,9 +630,9 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   ```console
   $ cortex attach 5 --follow
   # attach .cortex/processes/5/log.crec (live — frames by push from the kernel)
-  time                  pid    syscall           phase   duration  reversibility
-  -------------------------------------------------------------------------------------
-  22:04:08.838  5      __signal         exit    -         idempotent
+  time          pid     syscall                              phase  duration   reversibility
+  ------------------------------------------------------------------------------------------
+  22:04:08.838  5       __signal:SIGTERM(delivered)          exit   -          idempotent
   # pid 5 exited with code 143 (signal:SIGTERM)
   # detached
   ```
@@ -872,12 +872,12 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   ```console
   $ cortex watch --pid 1234
   # watching the kernel event stream (Ctrl-C to stop)
-  time                  pid    syscall           phase   duration  reversibility
-  -------------------------------------------------------------------------------------
-  19:50:09.072  1234    sleep            exit    2523ms    idempotent
-  19:50:09.073  1234    memory_write     enter   -         reversible
-  19:50:09.074  1234    memory_read      exit    0ms       idempotent
-  19:50:09.077  1234    exit             enter   -         irreversible
+  time          pid     syscall                              phase  duration   reversibility
+  ------------------------------------------------------------------------------------------
+  19:50:09.072  1234    sleep                                exit   2523ms     idempotent
+  19:50:09.073  1234    memory_write                         enter  -          reversible
+  19:50:09.074  1234    memory_read                          exit   0ms        idempotent
+  19:50:09.077  1234    exit                                 enter  -          irreversible
   # pid 1234 exited with code 3 (probe finished on purpose)
   ```
 
@@ -1476,11 +1476,12 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   LangGraph run sitting next to kernel-spawned agents:
 
   ```
-  time                  pid    syscall           phase   duration  reversibility
-  04:29:42.948  9001   langchain        enter   -         idempotent
-  04:29:42.960  9001   langchain        exit    12ms      idempotent
-  04:29:42.962  9001   tool_call        enter   -         irreversible
-  04:29:42.964  9001   tool_call        exit    2ms       irreversible
+  time          pid     syscall                              phase  duration   reversibility
+  ------------------------------------------------------------------------------------------
+  04:29:42.948  9001    langchain                            enter  -          idempotent
+  04:29:42.960  9001    langchain                            exit   12ms       idempotent
+  04:29:42.962  9001    tool_call                            enter  -          irreversible
+  04:29:42.964  9001    tool_call                            exit   2ms        irreversible
   ```
 
   Both sinks are written when `crec` is active: the jsonl file survives a
@@ -2085,6 +2086,80 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
   The timeout summary also states the code it is about to return, rather than
   leaving the reader to infer it.
+
+- **The kernel's own frames were anonymous, and the table's header had
+  drifted.** Two faults in the same table, and the second one was hiding the
+  first.
+
+  The fault that was visible: the kernel's own bookkeeping frames were
+  recorded under placeholder names — `__state`, `__init`, `__sched`,
+  `__signal` — and **shown** under them. The part that distinguishes each
+  frame (the supervision action, the state transition, the signal and what
+  became of it) was in the frame's `args`, and the view never looked there.
+  So a log full of them read as a column of identical words.
+
+  That hurt most in **init's own log, which is the supervision journal** — the
+  durable record of every restart decision the kernel made, and the one place
+  the answer to *"what did the supervisor do?"* is kept. The previous release
+  made init *report* its decisions; this one makes the record *readable*:
+
+  ```console
+  $ cortex trace 1
+  # tracing .cortex/processes/1/log.crec
+  time          pid     syscall                              phase  duration   reversibility
+  ------------------------------------------------------------------------------------------
+  07:35:48.829  1       __state:new->ready                   exit   -          idempotent
+  07:35:48.833  1       __state:ready->running               exit   -          idempotent
+  07:35:48.859  1       __init:register-daemon               exit   -          idempotent
+  ...
+  07:35:49.961  1       __init:restart                       exit   -          idempotent
+  07:35:52.007  1       __init:restart-gave-up               exit   -          idempotent
+  # 11 record(s)
+  ```
+
+  Before, those lines were lines reading `__init`.
+
+  The fault that was hiding it: **the header was a hand-typed string**, and it
+  had drifted. Its `phase` sat five columns to the right of where the rows
+  printed theirs, and the rule under it was longer than the header it ruled —
+  so reading a row meant counting characters to find out which column it was
+  in. Three commands (`trace`, `attach`, `watch`) each carried their own
+  hand-written header, so they had drifted apart from each other too.
+
+  The header and the rule are now **generated from the same column
+  specification the rows use**, in one place shared by all three commands. A
+  row cannot land under the wrong heading again, and the three commands
+  cannot disagree about the layout.
+
+  **And the width of the syscall column is derived, not typed.** Naming the
+  frames made them longer — `__state:checkpointing->checkpointing` is 36
+  characters — and a column that is a guess is a column that is wrong
+  eventually: one character too many and every column after it slid right, so
+  the row stopped lining up with the heading above it and the reader could no
+  longer tell which column they were looking at. The width is now computed
+  from the kernel's own value domains (`PROCESS_STATES`, `ALL_SIGNALS`,
+  `DELIVERY_OUTCOMES`, `INIT_ACTIONS`, `DISPATCH_ACTIONS` — the last three
+  are new runtime lists, so the vocabulary has exactly one home), which means
+  a new state, signal or supervision action widens the column by itself.
+  A name that genuinely cannot fit — a driver registering a very long syscall
+  name — is **cut and marked** (`…`), because a fact that does not fit must
+  not lose its tail silently.
+
+  **Nothing on disk changed.** The recorded syscall name is still `__init`:
+  the `.crec` format is frozen (ABI.md §6), and rendering a record under a
+  longer name is a *view*, which ABI.md §11 says is not an ABI change. The
+  naming rule is now written down — ABI.md §6.1 lists the four internal
+  frames and what their `args` carry.
+
+  **Three new smoke checks** (724 → 727), each one reverse-verified: the frame
+  name falling back to the bare placeholder → "the trace names the kernel's
+  own frames" fails ("the journal frame lost its action"); the header
+  reverting to a hand-typed string → "the trace table lines up" fails ("the
+  phase column is off: header 47, row 48"); the derived width replaced by the
+  old hand-typed one → "the trace table holds its widest frame" fails ("the
+  syscall column is 26 wide and the widest frame name is 36"), and dropping
+  the cut-and-mark → the same check fails on the alignment instead ("the phase
+  column is off: header 59, row 62").
 
 ### Documentation
 
