@@ -27,32 +27,38 @@ $ cortex spawn --role coder --task "fix issue #42"
 $ cortex ps
 PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE
 ---------------------------------------------------------------
-1    -     init            running  0 of ∞      all   18s
-2    1     holder          blocked  0 of 20.0k  all   18s  a channel — SIGTERM queued
-3    1     planner         blocked  0 of ∞      all   18s  child 6 — SIGCHLD queued
-4    3     coder:overview  zombie   0 of ∞      all   18s  exit 0 (coder overview complete)
-5    3     coder:install   zombie   0 of ∞      all   18s  exit 0 (coder install complete)
-6    3     coder:api       blocked  0 of ∞      all   18s  a timer
+1    -     init            running  0 of ∞      all   19s
+2    1     holder          blocked  0 of 20.0k  all   19s  a channel — SIGTERM queued
+3    1     planner         blocked  0 of ∞      all   19s  child 6 — SIGCHLD queued
+4    3     coder:overview  zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)
+5    3     coder:install   zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)
+6    3     coder:api       blocked  0 of ∞      all   19s  a timer
 
 # Same processes, as the tree they actually are — and what each is waiting
-# on, and for how long
+# on, and for how long. AGE is how long each one has lived: the two that
+# finished show the lifetime the kernel recorded for them (2s), and it stops
+# growing there — the running ones are still aging (19s).
 $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
 0 tokens · $0.000000 spent · home .cortex
 
-      PID  ROLE            STATE    TOKENS      USD                    NOTE
----------------------------------------------------------------------------
-      1    init            running  0 of ∞      $0.000000 of ∞         1 syscall
-├─    2    holder          blocked  0 of 20.0k  $0.000000 of $1.000000  waiting on a channel for 18.7s — SIGTERM queued
-└─    3    planner         blocked  0 of ∞      $0.000000 of ∞         waiting on child 6 for 18.7s — SIGCHLD queued
-   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞         exit 0 (coder overview complete)
-   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞         exit 0 (coder install complete)
-   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞         waiting on a timer for 18.6s
+      PID  ROLE            STATE    TOKENS      USD                     AGE  NOTE
+---------------------------------------------------------------------------------
+      1    init            running  0 of ∞      $0.000000 of ∞          19s  3 syscalls
+├─    2    holder          blocked  0 of 20.0k  $0.000000 of $1.000000  19s  waiting on a channel for 18.8s — SIGTERM queued
+└─    3    planner         blocked  0 of ∞      $0.000000 of ∞          19s  waiting on child 6 for 18.8s — SIGCHLD queued
+   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞          2s   exit 137 (signal:SIGKILL)
+   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞          2s   exit 137 (signal:SIGKILL)
+   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞          19s  waiting on a timer for 18.8s
 
-# ...and the one that is stuck, with the command to act on it
-$ cortex top --stall-after 30000
-# pid 6 has been inside recv for 880154ms — over your 30000ms threshold.
-#   cortex supervise 6 --kill-after 30000
+trace one:   cortex trace <pid>      follow one:  cortex attach <pid>
+
+# ...and the ones that are stuck, with the command to act on them
+$ cortex top --stall-after 5000
+# pid 2 has been inside recv for 18830ms — over your 5000ms threshold.
+#   cortex supervise 2 --kill-after 5000
+# pid 3 has been inside wait for 18821ms — over your 5000ms threshold.
+#   cortex supervise 3 --kill-after 5000
 
 # What may this agent spend, in total — and how much of that is left
 # (a running agent's budget lives in the kernel, so this needs a live kernel:
@@ -252,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 794 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 798 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -382,6 +388,8 @@ Read-only by default. With a live kernel in the directory (`cortex daemon run`),
 **And the window shows what the agent knows.** The process dialog had one view of a process — the syscall timeline, which is what it *did*. An agent's memory is what it *knows*, and nothing in the window said a word about it. Now it has two views: click a process, switch to **记忆**, and the window lists its memory regions — name, kind, backing, access mode, entries, writes, ceiling, and the other processes bound to the same region — and clicking a region shows what is inside it: the keys, the values, and when each was written.
 
 It says the same words `cortex memory` says (`read-write`, `read-only`, `∞`, `3 (read-only)`), because the wording lives in one module and each view only chooses how it prints a number. The memory is fetched when you open the panel, not on every refresh of the process table, and without a live kernel the panel says so rather than showing an empty region — a region's contents live in the kernel that owns them, and there is no on-disk copy to read instead.
+
+**And the window says how long each process lived.** Its process table showed the *start time* and nothing else — and a start time is not a duration: for a process that died an hour ago it says nothing at all about how long it lived. There is a **存活时长** column beside it now, and the number is the same one `cortex ps` and `cortex top` print, because the rule lives in one place. A running process is aging, so its number keeps counting up; a finished one is not, so it shows the lifetime the kernel recorded and stops there.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

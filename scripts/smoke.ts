@@ -15638,17 +15638,20 @@ async function runSuperviseChecks(): Promise<void> {
       // supervisor that decides on a timer is late by up to a tick, and a
       // tick is a quarter of a second of the agent's life nobody was
       // watching.
+      // The subscription opens **before** the process is spawned: the kernel
+      // pushes an event to the subscribers it has *now*, and this agent fails
+      // immediately — a subscription that opened after the spawn could miss the
+      // very event it is waiting for, and the check would then be reporting on
+      // its own timing rather than on the behaviour. (It is the same rule the
+      // supervisor itself follows: subscribe first, then read the state.)
+      const exits = new Map<number, number>();
+      const off = kernel.subscribe((event) => {
+        if (event.kind === 'process-exit') exits.set(event.pid, Date.now());
+      });
+
       const pid = await kernel.spawn({
         role: 'reactor',
         agent: { module: 'test:fail', args: { mode: 'fail' } },
-      });
-
-      // The kernel's own moment of the ending — not the supervisor's.
-      let exitedAt: number | undefined;
-      const off = kernel.subscribe((event) => {
-        if (event.kind === 'process-exit' && event.pid === unbrand(pid)) {
-          exitedAt = Date.now();
-        }
       });
 
       const result = await capture(() =>
@@ -15660,6 +15663,7 @@ async function runSuperviseChecks(): Promise<void> {
         result.out.includes(`pid ${unbrand(pid)} exited with code 1`),
         `the ending was reported, got: ${result.out}`,
       );
+      const exitedAt = exits.get(unbrand(pid));
       assert(exitedAt !== undefined, 'the kernel reported the ending');
       const reactedAt = result.marks.find((m) => m.text.includes('exited with code'))?.at;
       assert(reactedAt !== undefined, `the supervisor's line was written, got: ${result.out}`);
@@ -16170,6 +16174,25 @@ function topRow(out: string, pid: number): string {
 }
 
 /**
+ * The cell in one column of one row of `cortex top`'s tree.
+ *
+ * The column is found by its **position** in the header — the header and the
+ * rows are rendered from one column list, so their offsets line up — and the
+ * cell is the text at that offset. Looking the column up by name in the row
+ * would find a *value* that happens to be spelled like the header, and a row
+ * whose value is `41s` would answer a question about a column called `41s`.
+ */
+function topCell(out: string, pid: number, column: string): string {
+  const header = out.split('\n').find((l) => l.includes('PID') && l.includes('ROLE'));
+  if (header === undefined) return '';
+  const at = header.indexOf(column);
+  if (at < 0) return '';
+  const row = topRow(out, pid);
+  if (row === '') return '';
+  return row.slice(at).trim().split(/\s{2,}/)[0] ?? '';
+}
+
+/**
  * The row a process is on, in `cortex ps`'s output.
  *
  * The table is indented by nothing and starts with the pid, so the first
@@ -16595,6 +16618,104 @@ async function runTopChecks(): Promise<void> {
       const line = psRow(result.out, 98);
       assert(line !== '', `the process is listed, got: ${result.out}`);
       assert(line.includes('41s'), `it shows the lifetime, got: ${line}`);
+    });
+
+    await checkAsync('cortex top says how long a process lived', async () => {
+      // The tree said what a process was *doing* and never how long it had
+      // been doing it. `cortex ps` had an AGE column; the tree — the view an
+      // operator watches — did not, and a view that cannot say how long a
+      // thing has been going cannot answer "is it stuck?".
+      const result = await capture(() => cmdTop([]));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const row = topRow(result.out, unbrand(wedged));
+      assert(row !== '', `the process is in the tree, got: ${result.out}`);
+      const age = topCell(result.out, unbrand(wedged), 'AGE');
+      assert(age !== '', `the tree has an AGE column, got: ${result.out}`);
+      assert(
+        /^\d+(?:\.\d+)?(?:ms|s|m|h)$/.test(age),
+        `the age is a duration, got: ${age}`,
+      );
+    });
+
+    await checkAsync('cortex top shows a finished process its lifetime, not an age that keeps growing', async () => {
+      // The same rule `cortex ps` follows, in the tree: a finished process is
+      // not aging, it is over. The number the kernel recorded for it is how
+      // long it really lived, and it stops growing there — a row that counted
+      // from its start would read "7100.0h" the next day, which is a number
+      // about the record and not about the process.
+      writeMeta(tmp, {
+        pid: 97,
+        ppid: 1,
+        pgid: 97,
+        role: 'over',
+        state: 'zombie',
+        exitCode: 0,
+        exitReason: 'completed',
+        startedAt: '2026-01-01T00:00:00.000Z',
+        lastTransitionAt: '2026-01-01T00:00:41.000Z',
+        budgetsSpent: {
+          tokensIn: 0,
+          tokensOut: 0,
+          tokensCached: 0,
+          usdSpent: 0,
+          wallTimeMs: 41000,
+          syscallCount: 3,
+        },
+        budgetsRemaining: { tokens: -1, usd: -1, wallTimeMs: -1 },
+        agent: { module: 'file:///nowhere.ts' },
+        capabilities: [],
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+
+      const result = await capture(() => cmdTop([]));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const age = topCell(result.out, 97, 'AGE');
+      assert(age === '41s', `it shows the lifetime, got: ${age}`);
+    });
+
+    await checkAsync('the dashboard says how long each process lived', async () => {
+      // The window showed the *start time* and nothing else — and a start time
+      // is not a duration. For a process that died an hour ago it says nothing
+      // at all about how long it lived, and the start time keeps saying
+      // "yesterday" for as long as the record is on disk.
+      //
+      // The process is the one the check above wrote: a finished one, with a
+      // lifetime the kernel recorded.
+      const dash = await startDashboard({ dir: tmp, port: 0 });
+      try {
+        const res = await fetch(`${dash.url}/api/processes`);
+        assert(res.status === 200, `status ${res.status}`);
+        const rows = (await res.json()) as { pid: number; ageLabel?: string }[];
+        const row = rows.find((r) => r.pid === 97);
+        assert(row !== undefined, `the process is listed, got: ${JSON.stringify(rows)}`);
+        assert(
+          row!.ageLabel === '41s',
+          `the row says the lifetime, got ${row!.ageLabel}`,
+        );
+      } finally {
+        await dash.close();
+      }
+    });
+
+    await checkAsync('the page has a column for how long a process lived', async () => {
+      // The label travels with the row so the page never re-implements the
+      // rule — the page is a static file and cannot import it.
+      const dash = await startDashboard({ dir: tmp, port: 0 });
+      try {
+        const html = await (await fetch(`${dash.url}/`)).text();
+        assert(html.includes('存活时长'), 'the page names the column');
+        assert(html.includes('ageLabel'), 'the page reads the label the server sent');
+        // And the column is not empty: the **cell** renders it. The tree puts
+        // the same label in a span, so only the cell says that the *table*
+        // has it — a page that named the column and never filled it would pass
+        // a check that only looked for the name.
+        assert(
+          /<td[^>]*>\$\{esc\(processAgeLabel\(process\)\)\}<\/td>/.test(html),
+          'the process table renders the age',
+        );
+      } finally {
+        await dash.close();
+      }
     });
 
     await checkAsync('cortex ps says when a process has run out of budget', async () => {
@@ -17209,14 +17330,14 @@ async function runTopChecks(): Promise<void> {
       assert(result.code === 0, `exit 0, got ${result.code}`);
       // The labels the help describes, taken from the text itself.
       const named = [...result.out.matchAll(/^ {2}([A-Z][A-Z]+)\s{2,}/gm)].map((m) => m[1]!);
-      const real = ['PID', 'ROLE', 'STATE', 'TOKENS', 'USD', 'NOTE'];
+      const real = ['PID', 'ROLE', 'STATE', 'TOKENS', 'USD', 'AGE', 'NOTE'];
       for (const name of named) {
         assert(
           real.includes(name),
           `the help describes a column the table does not have: ${name}`,
         );
       }
-      for (const name of ['STATE', 'TOKENS', 'USD', 'NOTE']) {
+      for (const name of ['STATE', 'TOKENS', 'USD', 'AGE', 'NOTE']) {
         assert(
           named.includes(name),
           `the help does not describe the ${name} column, got: ${result.out}`,

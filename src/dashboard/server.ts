@@ -9,7 +9,7 @@ import { asProcessId } from '../kernel/types.js';
 import type { BlockedReason, BudgetLimits, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
-import { formatCaps, describePendingSignals, readProcessView } from '../cli/process_view.js';
+import { formatCaps, describePendingSignals, readProcessView, formatAge, processAge, type AgeFacts } from '../cli/process_view.js';
 import { describeOutcome } from '../cli/process_outcome.js';
 import { describeBudget, formatTokenBudget } from '../cli/process_budget.js';
 import { usdToDollars } from '../money.js';
@@ -218,12 +218,18 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
 
   if (options.processes !== undefined) {
     return [...options.processes()].map((row) =>
-      withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withTokenLabel(withInside(withPendingLabel(row))))))),
+      withAgeLabel(
+        withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withTokenLabel(withInside(withPendingLabel(row))))))),
+        now,
+      ),
     );
   }
   const view = await readProcessView(dir, options.kernel);
   return [...view.rows].map((row) =>
-    withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withTokenLabel(withInside(withPendingLabel(row))))))),
+    withAgeLabel(
+      withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withTokenLabel(withInside(withPendingLabel(row))))))),
+      now,
+    ),
   );
 }
 
@@ -320,6 +326,32 @@ function withPendingLabel<T extends { pendingSignals?: readonly Signal[] }>(
   row: T,
 ): T & { pendingLabel: string } {
   return { ...row, pendingLabel: describePendingSignals('', row.pendingSignals) };
+}
+
+/**
+ * Put the lifetime on the row, in the same words `cortex ps` prints.
+ *
+ * The window showed the **start time** and nothing else — and a start time is
+ * not a duration. It says when a process began, which for a process that died
+ * an hour ago says nothing at all about how long it lived; the number the
+ * operator wants is the other one.
+ *
+ * And the number is not the same for every row: a running process is aging
+ * right now, so its age is the time since it started, while a **finished**
+ * process is not aging — it lived for a while and then it was over, and the
+ * kernel recorded how long that was. So the label stops growing at the moment
+ * the process ended, which is the only thing that makes it a lifetime rather
+ * than a timestamp in disguise.
+ *
+ * The label travels with the row so the page never has to re-implement the
+ * rule: `cortex ps` prints it in its AGE column, `cortex top` in its own, and
+ * the page prints it here — all from the same function.
+ */
+function withAgeLabel<T extends AgeFacts>(
+  row: T,
+  now: number,
+): T & { ageLabel: string } {
+  return { ...row, ageLabel: formatAge(processAge(row, now)) };
 }
 
 /**

@@ -1228,6 +1228,63 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE §4.5 (the window says it too) and the views narrative;
   STATE §2.3 (the window sees the same memory the CLI sees); CHANGELOG.
 
+- [x] **#101** Two of the three process views could not say how long a process
+  lived → **fixed.** `cortex ps` had an `AGE` column, and the rule behind it
+  was right: a running process is aging, so its age is the time since it
+  started; a finished process is not aging, it is over, and the kernel
+  recorded how long it really lived. The other two views could not say it at
+  all.
+
+  **`cortex top`'s tree said what a process was *doing* and never how long it
+  had been doing it** — and a view that cannot say how long a thing has been
+  going cannot answer "is it stuck?". The operator's window was worse: its
+  process table showed the **start time** and nothing else, and a start time
+  is not a duration. For a process that died an hour ago it says nothing
+  about how long it lived, and it keeps saying "yesterday" for as long as the
+  record is on disk.
+
+  **So the number and the wording moved to one place** (`processAge` and
+  `formatAge`, in `src/cli/process_view.ts`), and all three views read it:
+  `cortex ps` in its `AGE` column, `cortex top` in its own, and the
+  dashboard's process table in a **存活时长** column beside the start time.
+  The page is a static file and cannot import the rule, so the server
+  computes the label and hands it down — the same way the token label and the
+  budget label travel.
+
+  **One table shows both branches of the rule at once:**
+
+  ```
+        PID  ROLE            STATE    TOKENS      USD                     AGE  NOTE
+  ------------------------------------------------------------------------------
+        1    init            running  0 of ∞      $0.000000 of ∞          19s  3 syscalls
+     ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞          2s   exit 137 (signal:SIGKILL)
+     └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞          19s  waiting on a timer for 18.8s
+  ```
+
+  **4 new smoke checks** (794 → 798), reverse-verified: with `cortex top`'s
+  age column removed, its two checks fail; with the server withholding
+  `ageLabel`, the dashboard check fails; with the page not rendering the
+  cell, the page check fails; and with the lifetime rule broken — a finished
+  process counting on from its start — three checks fail at once, and all
+  three views print `7125.9h` where the lifetime is `41s`.
+
+  **A flake fixed on the way.** "cortex supervise reacts to the ending as it
+  happens" opened its subscription *after* the process was spawned, and the
+  kernel pushes an event to the subscribers it has *now* — so a process that
+  died in between was missed by the very subscription waiting for it. It
+  failed about once in a full run, under load. The subscription now opens
+  first, which is the rule the supervisor itself follows.
+
+  **The README's `cortex top` example is a real run again.** It had drifted:
+  the tree it showed was composed, and it was missing the command's own
+  footer. It is now captured from a real kernel — six processes, a queued
+  `SIGTERM`, a queued `SIGCHLD`, two finished children and one still running
+  — and the finished children show their lifetime (`2s`) beside the running
+  ones' age (`19s`), which is the rule this issue is about.
+
+  Docs: ARCHITECTURE (the other two views say it too); STATE §2.4 (how long
+  a process lived is a fact the operator can see); CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

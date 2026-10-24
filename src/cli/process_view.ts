@@ -98,6 +98,21 @@ export function describePendingSignals(
 }
 
 /**
+ * The facts a duration needs.
+ *
+ * How long a process lived is three facts: when it started, whether it is
+ * still running, and how much wall time the kernel charged it. Both row
+ * shapes the views read carry exactly these — the CLI's `ProcessRow` and the
+ * kernel's own `ProcessInfo` — so the rule can be stated once and used by
+ * both, and a third view that grows one cannot miss it.
+ */
+export interface AgeFacts {
+  readonly state: ProcessState;
+  readonly startedAt: string;
+  readonly budgetsSpent: { readonly wallTimeMs: number };
+}
+
+/**
  * How long a process has been alive.
  *
  * A running process is aging right now, so its age is the time since it
@@ -111,11 +126,32 @@ export function describePendingSignals(
  * A record written before the kernel charged the wall clock carries no
  * lifetime, and falls back to the age.
  */
-export function processAge(row: ProcessRow, now: number): number {
+export function processAge(row: AgeFacts, now: number): number {
   const ended = row.state === 'zombie' || row.state === 'exiting';
   if (ended && row.budgetsSpent.wallTimeMs > 0) return row.budgetsSpent.wallTimeMs;
   if (row.startedAt === '—') return 0;
   return now - new Date(row.startedAt).getTime();
+}
+
+/**
+ * How long a process lived, as the views print it.
+ *
+ * The same wording in every view that shows a process: the CLI's `cortex ps`
+ * and `cortex top` and the dashboard's process table all read it from here, so
+ * a duration cannot be `18s` in one view and `18 seconds` in another.
+ *
+ * The unit follows the size of the number, because a duration has to be
+ * readable at a glance and `18000ms` is not: under a second it says
+ * milliseconds, under a minute seconds, under an hour minutes, and after that
+ * hours with one decimal — which is the precision a human reading "how long
+ * has this been running" wants, and the precision the kernel's own wall clock
+ * is charged at.
+ */
+export function formatAge(ms: number): string {
+  if (ms < 0 || ms < 1000) return `${Math.max(ms, 0)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(0)}s`;
+  if (ms < 3_600_000) return `${(ms / 60_000).toFixed(0)}m`;
+  return `${(ms / 3_600_000).toFixed(1)}h`;
 }
 
 /**

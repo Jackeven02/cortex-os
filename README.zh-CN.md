@@ -27,32 +27,38 @@ $ cortex spawn --role coder --task "fix issue #42"
 $ cortex ps
 PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE
 ---------------------------------------------------------------
-1    -     init            running  0 of ∞      all   18s
-2    1     holder          blocked  0 of 20.0k  all   18s  a channel — SIGTERM queued
-3    1     planner         blocked  0 of ∞      all   18s  child 6 — SIGCHLD queued
-4    3     coder:overview  zombie   0 of ∞      all   18s  exit 0 (coder overview complete)
-5    3     coder:install   zombie   0 of ∞      all   18s  exit 0 (coder install complete)
-6    3     coder:api       blocked  0 of ∞      all   18s  a timer
+1    -     init            running  0 of ∞      all   19s
+2    1     holder          blocked  0 of 20.0k  all   19s  a channel — SIGTERM queued
+3    1     planner         blocked  0 of ∞      all   19s  child 6 — SIGCHLD queued
+4    3     coder:overview  zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)
+5    3     coder:install   zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)
+6    3     coder:api       blocked  0 of ∞      all   19s  a timer
 
 # 同样这些进程，但按它们真实的父子关系画成树，
-# 并标出各自在等什么、已经等了多久
+# 并标出各自在等什么、已经等了多久。
+# AGE 是每个进程活了多久：已经结束的两个显示内核记下的
+# 存活时长（2s），而且到那里就不再增长；还在跑的两个仍在变老（19s）。
 $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
 0 tokens · $0.000000 spent · home .cortex
 
-      PID  ROLE            STATE    TOKENS      USD                    NOTE
----------------------------------------------------------------------------
-      1    init            running  0 of ∞      $0.000000 of ∞         1 syscall
-├─    2    holder          blocked  0 of 20.0k  $0.000000 of $1.000000  waiting on a channel for 18.7s — SIGTERM queued
-└─    3    planner         blocked  0 of ∞      $0.000000 of ∞         waiting on child 6 for 18.7s — SIGCHLD queued
-   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞         exit 0 (coder overview complete)
-   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞         exit 0 (coder install complete)
-   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞         waiting on a timer for 18.6s
+      PID  ROLE            STATE    TOKENS      USD                     AGE  NOTE
+---------------------------------------------------------------------------------
+      1    init            running  0 of ∞      $0.000000 of ∞          19s  3 syscalls
+├─    2    holder          blocked  0 of 20.0k  $0.000000 of $1.000000  19s  waiting on a channel for 18.8s — SIGTERM queued
+└─    3    planner         blocked  0 of ∞      $0.000000 of ∞          19s  waiting on child 6 for 18.8s — SIGCHLD queued
+   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞          2s   exit 137 (signal:SIGKILL)
+   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞          2s   exit 137 (signal:SIGKILL)
+   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞          19s  waiting on a timer for 18.8s
 
-# ...以及卡住的那一个，顺带把该跑的命令给你
-$ cortex top --stall-after 30000
-# pid 6 has been inside recv for 880154ms — over your 30000ms threshold.
-#   cortex supervise 6 --kill-after 30000
+trace one:   cortex trace <pid>      follow one:  cortex attach <pid>
+
+# ...以及卡住的那几个，顺带把该跑的命令给你
+$ cortex top --stall-after 5000
+# pid 2 has been inside recv for 18830ms — over your 5000ms threshold.
+#   cortex supervise 2 --kill-after 5000
+# pid 3 has been inside wait for 18821ms — over your 5000ms threshold.
+#   cortex supervise 3 --kill-after 5000
 
 # 这个 agent 一共可以花多少，以及还剩多少
 # （运行中 agent 的预算在内核里，所以这需要活内核：`cortex daemon run`；
@@ -243,7 +249,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 794 项断言，0 失败
+npx tsx scripts/smoke.ts                # 798 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -370,6 +376,8 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 **而且大屏看得见 agent 知道什么。** 进程弹窗原本只有一个视图——Syscall 时间线，那是它**做了什么**。agent 的记忆是它**知道什么**，而窗口里对此一个字都没有。现在有两个视图：点一个进程，切到 **记忆**，大屏会列出它的记忆区——名字、类型、存储、访问模式、条目、写入、上限，以及和它绑在同一个区上的其他进程——再点一个区，就能看见里面装了什么：键、值，以及每条是什么时候写的。
 
 它用的词和 `cortex memory` 一样（`read-write`、`read-only`、`∞`、`3 (read-only)`），因为措辞只在一处，每个视图只管自己怎么印数字。记忆是你打开面板时才取的，不是每次刷新进程表都去取一遍；没有活内核时，面板会直接说需要活内核，而不是给你看一个空区——区里的内容住在拥有它的内核里，盘上没有副本可读。
+
+**而且大屏说得出每个进程活了多久。** 它的进程表原来只有启动时间——而启动时间不是时长：一个一小时前就死掉的进程，它什么也没说。现在旁边多了一列 **存活时长**，数字和 `cortex ps`、`cortex top` 印的完全一样，因为规则只在一处。还在跑的进程仍在变老，数字一直往上走；已经结束的那个不再变老，它显示内核记下的存活时长，就停在那里。
 
 三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
 

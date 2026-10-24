@@ -50,6 +50,8 @@ import { defaultKernelDir } from '../index.js';
 import {
   readProcessView,
   describePendingSignals,
+  formatAge,
+  processAge,
   type ProcessRow,
   type ProcessView,
 } from '../process_view.js';
@@ -137,6 +139,7 @@ const TOP_COLUMNS: readonly ColumnSpec[] = [
   { header: 'STATE', max: longest(PROCESS_STATES), gap: 2 },
   { header: 'TOKENS', max: TOKENS_MAX, gap: 2 },
   { header: 'USD', max: USD_MAX, gap: 2 },
+  { header: 'AGE', max: 10, gap: 2 },
   { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 0 },
 ];
 
@@ -416,6 +419,11 @@ function cellsFor(
     m.state,
     formatTokenBudget({ spent: m.budgetsSpent, remaining: m.budgetsRemaining }),
     formatUsdBudget({ spent: m.budgetsSpent, remaining: m.budgetsRemaining }),
+    // How long the process lived — the same number and the same words
+    // `cortex ps` prints, and the same rule: a finished process shows the
+    // lifetime the kernel recorded, not the time since it started, which
+    // keeps growing for as long as the record is on disk.
+    formatAge(processAge(m, now)),
     note,
   ];
 }
@@ -445,6 +453,9 @@ its own process table is merged in, so running agents appear in the tree too.
             out of its cache: '1.2k (300 cached) of 10k'
   USD       what that spend cost in money, at six decimals, and the money
             budget it is measured against: '$0.000027 of $1.000000'
+  AGE       how long the process has been alive. A process that has finished
+            is not aging any more: the column shows the lifetime the kernel
+            recorded for it, and stops growing there
   NOTE      what the process is waiting for: a channel (recv), a timer
             (sleep), a child (wait), a model call (llm_call), a tool call
             (tool_call). It also says what is queued for it: a signal the

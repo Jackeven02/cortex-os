@@ -1692,6 +1692,29 @@ lifetime (`processAge`, in `src/cli/process_view.ts`); a record written
 before the kernel charged the wall clock carries no lifetime and falls back
 to the age.
 
+**And the other two views say it too.** That rule was real, and it lived in
+one view. `cortex top`'s tree said what a process was *doing* and never how
+long it had been doing it, and the operator's window said the same: its
+process table showed the **start time** and nothing else — and a start time
+is not a duration. For a process that died an hour ago it says nothing at
+all about how long it lived, and it keeps saying "yesterday" for as long as
+the record is on disk.
+
+So the number and the wording moved to one place (`processAge` and
+`formatAge`, in `src/cli/process_view.ts`), and all three views read it:
+`cortex ps` in its `AGE` column, `cortex top` in its own, and the dashboard's
+process table in a **存活时长** column — beside the start time, because the
+two are different facts and an operator wants both. The page is a static file
+and cannot import the rule, so the server computes the label and hands it
+down, the same way the token label and the budget label travel.
+
+And the rule is the same rule everywhere, and it is the rule that makes the
+number true: a **running** process is aging, so the number is the time since
+it started; a **finished** one is not, so the number is the lifetime the
+kernel recorded, and it stops growing there. One table shows both branches
+at once — two finished processes at `2s` beside three running ones at `19s`,
+and the finished ones do not creep up while the others do.
+
 **And the table keeps its shape.** A table makes a promise: *the thing under
 STATE is the state*. That promise was broken by the simplest thing there is —
 `String(value).padEnd(width)`, which **does not cut**: a value longer than the

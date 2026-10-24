@@ -16,6 +16,7 @@ import { defaultKernelDir } from '../index.js';
 import {
   formatCaps,
   describePendingSignals,
+  formatAge,
   processAge,
   readProcessView,
   type ProcessRow,
@@ -124,6 +125,12 @@ COLUMNS
   another, and the two need very different answers; ∞ means the budget has
   no ceiling. The cached tokens are part of that spend, not extra ones —
   they were read from the cache, and they are billed at the cache price.
+
+  AGE is how long the process lived. A process that is still alive is aging,
+  so this is the time since it started. A process that has ENDED is not aging:
+  the kernel recorded how long it really lived, and that is what the column
+  shows — it stops growing at the moment the process ended, instead of
+  counting the days its record has been sitting on disk.
 
   NOTE says what the process is doing. For a process that is still alive, it
   says what it is waiting on — a channel, a child, a timer, a model call. It
@@ -255,11 +262,4 @@ COLUMNS
   }
 
   return 0;
-}
-
-function formatAge(ms: number): string {
-  if (ms < 0 || ms < 1000) return `${Math.max(ms, 0)}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(0)}s`;
-  if (ms < 3_600_000) return `${(ms / 60_000).toFixed(0)}m`;
-  return `${(ms / 3_600_000).toFixed(1)}h`;
 }
