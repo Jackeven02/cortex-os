@@ -1898,6 +1898,28 @@ tool would be `idempotent`, and the friendlier guess is the one tag nobody can
 act on. A retrieval is a read, so it is `reversible`; everything else is
 `idempotent`.
 
+**And the two event shapes are made one.** The event table merges two
+sources: the kernel's `.crec` frames and the LangChain callback log. They
+arrived speaking different vocabularies — a kernel frame names a call's
+counters `tokensIn` / `tokensOut` (the dashboard's names), a callback line
+names them `inputTokens` / `outputTokens` (the integration's names, which
+are the ABI's own). The page read one set, so the other half of the feed
+said `—` about calls that had spent tokens: **the numbers were on disk, under
+the other name.**
+
+So the shapes are made one in the **server**, where the conversion lives
+(`toCallbackEvent`, beside `toActivityEvent` in `src/dashboard/event_store.ts`),
+and the page reads one set of names for a call's counters whichever log the
+event came from. The `type` stays the callback's own (`llm.end`, `tool.end`) —
+a callback event is not a syscall frame, and the row says which one it is —
+and so does every other fact the line reported.
+
+**And the two paths that answer the feed must answer it the same way.** The
+feed is read once and then followed; a window that reaches past what the
+store kept is answered from the disk instead. Both read the callback log, so
+both convert it — with the **same** function, so a line read into the store
+and the same line read from the disk are one event and not two.
+
 **And the window says what the agent knows.** The window could show what an
 agent **did** — the event table, the syscall timeline — and nothing about what
 it **knows**. For an agent the knowledge is the point: the event table says

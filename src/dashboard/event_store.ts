@@ -62,14 +62,36 @@ export interface TimeRange {
 /**
  * One event in the dashboard's activity panel.
  *
- * Derived from a syscall frame — the same frame the `.crec` log holds.
+ * Derived from a syscall frame — the same frame the `.crec` log holds — or
+ * from a LangChain callback line. **Both sources produce this one shape**,
+ * so the page reads one set of names for a call's counters no matter which
+ * log the event came from.
  */
 export interface ActivityEvent {
   type: string;
   at: string;
-  runId: string;
-  pid: number;
-  name: string;
+  /**
+   * The id the source gave the call.
+   *
+   * A syscall frame's `callId`; a callback's `runId`. Absent when the
+   * source named the call nothing.
+   */
+  runId?: string;
+  /**
+   * The process the event belongs to.
+   *
+   * Absent for a callback that named no process — the `jsonl` sink has
+   * nothing to attach to (INTEGRATIONS.md §"Two sinks"). A pid nobody
+   * reported is not pid zero.
+   */
+  pid?: number;
+  /**
+   * What the event is about: a syscall name, a tool name, a run name.
+   *
+   * Absent for an event that named nothing; the page falls back to the run
+   * id.
+   */
+  name?: string;
   durationMs?: number;
   error?: string;
   errorMessage?: string;
@@ -103,6 +125,8 @@ export interface ActivityEvent {
    * the tag. It does not mean "reversible".
    */
   reversibility?: Reversibility;
+  /** The run this one hangs off, when the source said so. */
+  parentRunId?: string;
   audit?: Record<string, unknown>;
 }
 
@@ -167,6 +191,68 @@ export function toActivityEvent(record: SyscallRecord, pid: number): ActivityEve
     // (ABI.md §4.1), and the trace prints it — so the window prints it too.
     ...(record.reversibility !== undefined ? { reversibility: record.reversibility } : {}),
     ...(audit !== undefined ? { audit } : {}),
+  };
+}
+
+/**
+ * A counter the line reported, or nothing at all.
+ *
+ * A counter nobody reported is not a counter of zero: it stays absent, so a
+ * view that prints it as `0` would be claiming something nobody said.
+ */
+function countOf(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Turn a LangChain callback line into an activity event — or `undefined` when
+ * the line is not an event.
+ *
+ * The callback log is the **integration's** trail, and it names a call's
+ * counters the way the integration names them: `inputTokens` /
+ * `outputTokens`. The dashboard names them `tokensIn` / `tokensOut` — the
+ * names every kernel frame already arrives under, and the names the page
+ * reads. Two event shapes merged without being made one is how a call's
+ * tokens went missing from half the feed: the numbers were on disk, under
+ * the other name.
+ *
+ * So the two shapes are made one **here**, and the page reads one set of
+ * names. The `type` stays the callback's own (`llm.end`, `tool.end`, …): a
+ * callback event is not a syscall frame, and the row says which one it is.
+ */
+export function toCallbackEvent(raw: unknown): ActivityEvent | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const line = raw as Record<string, unknown>;
+  const type = typeof line['type'] === 'string' ? line['type'] : '';
+  if (type === '') return undefined;
+  const at = typeof line['at'] === 'string' ? line['at'] : '';
+  // An event with no moment cannot be ordered in the feed, and the store
+  // already dropped those — so the disk path drops them too, rather than the
+  // two paths answering differently about the same line.
+  if (!Number.isFinite(Date.parse(at))) return undefined;
+  const runId = typeof line['runId'] === 'string' ? line['runId'] : undefined;
+  const pid = countOf(line['pid']);
+  const name = typeof line['name'] === 'string' ? line['name'] : undefined;
+  const parentRunId = typeof line['parentRunId'] === 'string' ? line['parentRunId'] : undefined;
+  const durationMs = countOf(line['durationMs']);
+  const error = typeof line['error'] === 'string' ? line['error'] : undefined;
+  const tokensIn = countOf(line['inputTokens']);
+  const tokensOut = countOf(line['outputTokens']);
+  const reversibility = line['reversibility'];
+  return {
+    type,
+    at,
+    ...(runId !== undefined ? { runId } : {}),
+    ...(pid !== undefined ? { pid } : {}),
+    ...(name !== undefined ? { name } : {}),
+    ...(parentRunId !== undefined ? { parentRunId } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(error !== undefined ? { error } : {}),
+    ...(tokensIn !== undefined ? { tokensIn } : {}),
+    ...(tokensOut !== undefined ? { tokensOut } : {}),
+    ...(reversibility === 'reversible' || reversibility === 'idempotent' || reversibility === 'irreversible'
+      ? { reversibility }
+      : {}),
   };
 }
 
@@ -242,7 +328,7 @@ export class ActivityStore {
   #syscalls: Timed<ActivityEvent>[] = [];
 
   /** The LangChain callback events, newest first. */
-  #callbacks: Timed<unknown>[] = [];
+  #callbacks: Timed<ActivityEvent>[] = [];
 
   /** The cursor into the LangChain callback log. */
   #callbacksTail: JsonlTail = { offset: 0, carry: '' };
@@ -409,14 +495,16 @@ export class ActivityStore {
       // The last piece is either an empty string (the file ended with a
       // newline) or a line the writer has not finished yet.
       const carry = parts.pop() ?? '';
-      const fresh: Timed<unknown>[] = [];
+      const fresh: Timed<ActivityEvent>[] = [];
       for (const line of parts) {
         if (line.length === 0) continue;
         try {
-          const parsed = JSON.parse(line) as { at?: string };
-          const at = Date.parse(String(parsed.at ?? ''));
-          if (!Number.isFinite(at)) continue;
-          fresh.push({ at, value: parsed });
+          // One conversion for the callback shape, shared with the disk
+          // path in the server — so a line read here and the same line read
+          // from disk cannot become two different events.
+          const event = toCallbackEvent(JSON.parse(line) as unknown);
+          if (event === undefined) continue;
+          fresh.push({ at: Date.parse(event.at), value: event });
         } catch {
           continue;
         }

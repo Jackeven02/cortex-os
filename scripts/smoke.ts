@@ -201,7 +201,7 @@ import {
   type TapCallInfo,
 } from '../src/integrations/llm_tap.js';
 import { startDashboard } from '../src/dashboard/server.js';
-import { ActivityStore, toActivityEvent } from '../src/dashboard/event_store.js';
+import { ActivityStore, MAX_EVENTS, toActivityEvent, toCallbackEvent } from '../src/dashboard/event_store.js';
 import { writeMeta, readMeta, writeExitRecord, writeProcessView, type ProcessMeta } from '../src/cli/process_store.js';
 import { formatDollars, usdToDollars } from '../src/money.js';
 
@@ -10369,8 +10369,10 @@ async function runDashboardChecks(): Promise<void> {
     await writeFile(
       join(tmp, 'integrations', 'langchain', 'events.jsonl'),
       // The tag the LangChain handler now writes on every event it emits —
-      // the same word the `.crec` frame of the same call carries.
-      `${JSON.stringify({ type: 'llm.end', at: '2026-09-28T00:00:04.000Z', runId: 'lc-1', name: 'ChatOpenAI', pid: 2, durationMs: 50, reversibility: 'idempotent' })}\n`,
+      // the same word the `.crec` frame of the same call carries — and the
+      // counters under the **integration's** names, which is what the
+      // callback log really says.
+      `${JSON.stringify({ type: 'llm.end', at: '2026-09-28T00:00:04.000Z', runId: 'lc-1', name: 'ChatOpenAI', pid: 2, durationMs: 50, inputTokens: 900, outputTokens: 40, reversibility: 'idempotent' })}\n`,
       'utf8',
     );
     // Seed one checkpoint file named like the kernel writes them:
@@ -10433,6 +10435,123 @@ async function runDashboardChecks(): Promise<void> {
           callback!['reversibility'] === 'idempotent',
           `the callback says the same, got ${String(callback!['reversibility'])}`,
         );
+      });
+
+      await checkAsync('the dashboard says what a LangChain call spent', async () => {
+        // The event table merges two sources, and the two used to name a
+        // call's counters differently: the kernel's frames arrive as
+        // `tokensIn` / `tokensOut` (the page's names), the callback log as
+        // `inputTokens` / `outputTokens` (the integration's names). The
+        // numbers were on disk — the jsonl line says `inputTokens: 900` —
+        // and the page looked for the other name, so half the feed said
+        // `—` about a call that had spent tokens.
+        const res = await fetch(`${dash.url}/api/events?limit=50`);
+        assert(res.status === 200, `status ${res.status}`);
+        const events = (await res.json()) as Array<Record<string, unknown>>;
+        const callback = events.find((e) => e['type'] === 'llm.end');
+        assert(callback !== undefined, 'the LangChain event is in the feed');
+        assert(
+          callback!['tokensIn'] === 900 && callback!['tokensOut'] === 40,
+          `the callback's tokens arrive under the dashboard's names, got ${String(callback!['tokensIn'])}/${String(callback!['tokensOut'])}`,
+        );
+        // One name for one number: the integration's names are not carried
+        // alongside, or the page would have two ways to read one fact.
+        assert(
+          callback!['inputTokens'] === undefined && callback!['outputTokens'] === undefined,
+          `the old names are not carried alongside, got ${JSON.stringify(callback)}`,
+        );
+        // And the facts the line did report are still there.
+        assert(
+          callback!['runId'] === 'lc-1' && callback!['name'] === 'ChatOpenAI' && callback!['pid'] === 2,
+          'the callback keeps its own facts',
+        );
+        assert(callback!['durationMs'] === 50, 'and how long it took');
+        assert(callback!['reversibility'] === 'idempotent', 'and the tag it was given');
+      });
+
+      await checkAsync('the two event shapes are made one', async () => {
+        // The conversion is one function, so the same line read from the
+        // store and the same line read from disk are one event.
+        const event = toCallbackEvent({
+          type: 'tool.end', at: '2026-09-28T00:00:04.000Z', runId: 'lc-2', parentRunId: 'lc-1',
+          name: 'send_email', pid: 2, durationMs: 1500, inputTokens: 900, outputTokens: 40,
+          reversibility: 'irreversible',
+        });
+        assert(event !== undefined, 'a callback line becomes an event');
+        assert(event!['type'] === 'tool.end', 'the callback keeps its own type');
+        assert(event!['parentRunId'] === 'lc-1', 'and the run it hangs off');
+        assert(event!['tokensIn'] === 900 && event!['tokensOut'] === 40, 'and its counters under the dashboard names');
+        // A line that is not an event is not an event: no type, or no
+        // moment to order it by.
+        assert(toCallbackEvent({ at: '2026-09-28T00:00:04.000Z' }) === undefined, 'a line without a type is not an event');
+        assert(toCallbackEvent({ type: 'llm.end' }) === undefined, 'a line without a moment is not an event');
+        assert(toCallbackEvent({ type: 'llm.end', at: 'not a date' }) === undefined, 'and neither is one with a broken moment');
+      });
+
+      await checkAsync('the page shows what a LangChain call spent', async () => {
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        // The page reads the dashboard's names — and only those. A page that
+        // learned to read the integration's names as well would have two
+        // rules for one fact, which is the thing this fixes.
+        assert(!html.includes('inputTokens'), 'the page does not read the integration’s names');
+        const row = renderDashboardEventRow(html, {
+          type: 'llm.end',
+          name: 'ChatOpenAI',
+          pid: 2,
+          durationMs: 640,
+          tokensIn: 900,
+          tokensOut: 40,
+        });
+        assert(row.includes('900 in / 40 out'), `the row says the tokens, got: ${row}`);
+      });
+
+      await checkAsync('the disk path says the same thing as the store', async () => {
+        // The feed answers from the store when the store covers the window,
+        // and from the disk when it does not — and a window that reaches
+        // past what the store kept is answered from the disk. The two
+        // answers must be the same events, or the same call would be
+        // described differently depending on how old it is.
+        //
+        // So the store is made to drop something: it keeps the newest
+        // MAX_EVENTS of each kind, and a callback log with one line more
+        // than that has to fall back to the disk.
+        const bigDir = join(tmp, 'big-feed');
+        await mkdir(join(bigDir, 'integrations', 'langchain'), { recursive: true });
+        const lines: string[] = [];
+        for (let i = 0; i <= MAX_EVENTS; i += 1) {
+          lines.push(JSON.stringify({
+            type: 'llm.end',
+            at: new Date(Date.UTC(2026, 0, 1, 0, 0, 0) + i * 1000).toISOString(),
+            runId: `lc-${i}`,
+            name: 'ChatOpenAI',
+            pid: 2,
+            inputTokens: 100 + i,
+            outputTokens: 10,
+          }));
+        }
+        await writeFile(
+          join(bigDir, 'integrations', 'langchain', 'events.jsonl'),
+          `${lines.join('\n')}\n`,
+          'utf8',
+        );
+        const bigDash = await startDashboard({ dir: bigDir, port: 0 });
+        try {
+          const res = await fetch(
+            `${bigDash.url}/api/events?from=${encodeURIComponent('2026-01-01T00:00:00.000Z')}&limit=5`,
+          );
+          assert(res.status === 200, `status ${res.status}`);
+          const events = (await res.json()) as Array<Record<string, unknown>>;
+          assert(events.length === 5, `the disk path answers, got ${events.length}`);
+          const newest = events[0]!;
+          assert(
+            newest['tokensIn'] !== undefined && newest['tokensOut'] !== undefined,
+            `the disk path speaks the same shape, got ${JSON.stringify(newest)}`,
+          );
+          assert(newest['inputTokens'] === undefined, 'and only that shape');
+        } finally {
+          await bigDash.close();
+        }
       });
 
       await checkAsync('the page shows which calls can be undone', async () => {

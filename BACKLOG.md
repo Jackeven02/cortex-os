@@ -1355,32 +1355,48 @@ The user-facing surface. Should feel like a real OS shell.
   (the tag is a fact the operator can see); INTEGRATIONS (both sinks, and
   `/api/events`); CHANGELOG.
 
-- [ ] **#104** The event table shows no tokens for a LangChain call →
-  **open.** The dashboard's event table merges two sources: the kernel's own
+- [x] **#104** The event table shows no tokens for a LangChain call →
+  **fixed.** The dashboard's event table merges two sources: the kernel's own
   `.crec` frames and the LangChain callback log. The kernel's frames carry
   the counters under the dashboard's names (`tokensIn` / `tokensOut` /
   `tokensCached`), so the page's one helper (`callSummary`) reads them and
-  prints `1,200 in / 80 out (900 cached)`. The **LangChain events arrive
-  raw** — the server hands the parsed jsonl line through untouched — and that
-  sink writes its own names (`inputTokens` / `outputTokens`, in
+  prints `1,200 in / 80 out (900 cached)`. The **LangChain events arrived
+  raw** — the server handed the parsed jsonl line through untouched — and
+  that sink writes its own names (`inputTokens` / `outputTokens`, in
   `src/integrations/langchain.ts`). So a model call made through the LangChain
-  callback shows `—` in the **TOKEN / 模型** column, while the kernel's own
-  `llm_call` right beside it shows the tokens. Seen in a real browser run of
+  callback showed `—` in the **TOKEN / 模型** column, while the kernel's own
+  `llm_call` right beside it showed the tokens. Seen in a real browser run of
   #103's seed: `模型 · end` (`ChatOpenAI`) printed `—` and `模型 · call`
   (`llm_call`) printed `1,200 in / 80 out (900 cached) · gpt-4o-mini`.
 
-  **It is a shape mismatch, not a missing fact.** The numbers are on disk —
-  the jsonl line says `inputTokens: 900, outputTokens: 40`. The fix has to
-  decide *where* the two shapes become one: the **server** normalizes the
-  callback events into the dashboard's shape before handing them over (one
-  conversion point, the way `toActivityEvent` does it for the syscall
-  frames), or the **page** reads both names (two rules in the one place the
-  project keeps rules out of). The server is the better answer — the rule
-  that says "a call's tokens are read with `callUsage`" should also say which
-  *name* they arrive under — but it changes the shape `/api/events` hands
-  out, and a consumer reading `inputTokens` today would notice. **And the
-  price stays absent either way**: a callback reports tokens, not dollars, so
-  that cell keeps saying `—` unless the integration starts carrying a price.
+  **It was a shape mismatch, not a missing fact.** The numbers were on disk —
+  the jsonl line said `inputTokens: 900, outputTokens: 40`. The two shapes
+  are made one **in the server**, where the conversion belongs
+  (`toCallbackEvent`, beside `toActivityEvent`, in
+  `src/dashboard/event_store.ts`), so the page reads one set of names
+  whichever log the event came from. The old names are **not** carried
+  alongside: one number, one name — otherwise the page would have two ways to
+  read the same fact. The callback's own `type` survives (`llm.end`,
+  `tool.end`), because a callback event is not a syscall frame and the row
+  says which one it is, and so does every other fact the line reported.
+
+  **And the two paths that answer the feed answer it the same way.** The feed
+  is read once and then followed; a window that reaches past what the store
+  kept is answered from the disk instead. Both read the callback log, so both
+  convert it — with the **same** function. A line read into the store and the
+  same line read from the disk are one event, not two, and the same call
+  cannot be described differently depending on how old it is.
+
+  **4 new smoke checks** (805 → 809), reverse-verified: with the counters not
+  renamed, the three server-side checks fail ("got undefined/undefined")
+  while the page check still passes — it never depended on the server; with
+  the page reading the integration's names, the page check fails (and three
+  existing ones with it); and with the disk path handing over the raw line,
+  **only** the disk-path check fails.
+
+  Docs: ARCHITECTURE (the two event shapes are made one); STATE §2.4 (a
+  call's counters have one name in every view); INTEGRATIONS (`/api/events`
+  hands out one shape); CHANGELOG.
 
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 

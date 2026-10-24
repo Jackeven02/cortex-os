@@ -249,7 +249,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 805 项断言，0 失败
+npx tsx scripts/smoke.ts                # 809 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -382,6 +382,8 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 **而且大屏说得出每个进程花了多少钱——不只是 token。** 钱原来只住在预算面板里，而那个面板是**按角色**汇总的：三个叫 `coder` 的 agent 变成一行一个数字，所以你看得见谁花了 token，却看不见谁花了钱。现在进程表在 token 旁边多了一格 **USD**，用的是和 `cortex top` 一样的措辞（`$0.000250 of $1.000000`），一笔花费因此能对上花它的那个人。
 
 **而且大屏说得出哪些调用可以撤销。** 内核给每一帧都打了标签——要撤销它需要做什么：`reversible`、`idempotent`、`irreversible`——而这个标签不是装饰：正是它让 `forkable` 区域里的不可撤销调用陷进 `EREVERSIBLE`，也正是 `cortex audit` 读它、用来把那些从未声明过标签的工具揪出来。事件表原来把它丢了，于是一次刷了信用卡的工具调用看起来和一次读取一模一样。现在多了一列 **可逆性**，位置在耗时和花费之间，用的词和 `cortex trace` 印的完全一样——Syscall 时间线也这么说。
+
+**而且大屏说得出 LangChain 调用花了多少 token。** 事件表把两个来源合在一起——内核的 syscall 帧和 LangChain 回调日志——而两者原来给「一次调用读了多少 token」起的名字并不一样（`tokensIn`/`tokensOut` 对 `inputTokens`/`outputTokens`）。窗口只认其中一套，于是有一半的行对明明花了 token 的调用印着 `—`：数字就在盘上，只是写着另一个名字。现在两种来源在服务端合成一种形状，所以不管事件来自哪个日志，token 都显示得出来。
 
 三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
 

@@ -21,6 +21,7 @@ import {
   ActivityStore,
   safeErrorMessage,
   toActivityEvent,
+  toCallbackEvent,
   type ActivityEvent,
 } from './event_store.js';
 import type { KernelCommand } from '../cli/kernel_protocol.js';
@@ -117,8 +118,11 @@ async function readEvents(dir: string, range: TimeRange): Promise<unknown[]> {
   for await (const line of input) {
     if (line.length === 0) continue;
     try {
-      const event = JSON.parse(line) as { at?: string };
-      if (filtering && !(typeof event.at === 'string' && inRange(Date.parse(event.at), range))) continue;
+      // The same conversion the store uses, so a callback line read from
+      // disk and the same line read into the store are one event, not two.
+      const event = toCallbackEvent(JSON.parse(line) as unknown);
+      if (event === undefined) continue;
+      if (filtering && !inRange(Date.parse(event.at), range)) continue;
       rows.push(event);
       if (rows.length > MAX_SCAN) rows.shift();
     } catch {
@@ -839,7 +843,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
               const converted = toDashboardEvent(event.record as SyscallRecord, event.pid ?? 0);
               if (converted === undefined) return;
               // A frame that was already in the history is not new.
-              if (seeded.has(converted.runId)) return;
+              if (converted.runId !== undefined && seeded.has(converted.runId)) return;
               recent = [converted, ...recent].slice(0, limit);
               send('events', recent);
               return;

@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 805 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 809 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -394,6 +394,8 @@ It says the same words `cortex memory` says (`read-write`, `read-only`, `∞`, `
 **And the window says what each process spent, in money as well as tokens.** The money used to live only in the budget panel, and that panel rolls it up **by role** — three agents called `coder` became one line with one number on it, so you could see which agent spent the tokens and not which one spent the money. The process table carries a **USD** cell beside the tokens now, in the same words `cortex top` prints (`$0.000250 of $1.000000`), so a cost can be matched to the process that paid it.
 
 **And the window says which calls can be undone.** The kernel tags every frame with what it would take to undo it — `reversible`, `idempotent`, `irreversible` — and the tag is not decoration: it is what traps an irreversible call inside a `forkable` region, and what `cortex audit` reads to surface the tools that never declared one. The event table dropped it, so a tool call that charged a credit card read exactly like a read. There is a **可逆性** column now, between the duration and the cost, in the same words `cortex trace` prints — and the syscall timeline says it too.
+
+**And the window says what a LangChain call spent.** The event table merges two sources — the kernel's syscall frames and the LangChain callback log — and the two used to name a call's tokens differently (`tokensIn`/`tokensOut` against `inputTokens`/`outputTokens`). The window read one set, so half its rows said `—` about calls that had spent tokens: the numbers were on disk, under the other name. Both sources now come out in one shape, so the tokens show up whichever log the event came from.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

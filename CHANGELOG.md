@@ -1546,6 +1546,37 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **Half the event table said `—` about calls that had spent tokens.** The
+  dashboard's event table merges two sources — the kernel's `.crec` frames and
+  the LangChain callback log — and the two arrived speaking different
+  vocabularies. A kernel frame names a call's counters `tokensIn` /
+  `tokensOut` (the dashboard's names); a callback line names them
+  `inputTokens` / `outputTokens` (the integration's names, which are the
+  ABI's own). The page read one set of names, so the other half of the feed
+  printed `—` in the **TOKEN / 模型** column: **the numbers were on disk,
+  under the other name.**
+
+  The two shapes are made one **in the server**, where the conversion
+  belongs (`toCallbackEvent`, beside `toActivityEvent` in
+  `src/dashboard/event_store.ts`), and the page reads one set of names
+  whichever log the event came from. The old names are not carried
+  alongside: one number, one name. The callback's own `type` survives
+  (`llm.end`, `tool.end`) — a callback event is not a syscall frame — and so
+  does every other fact the line reported.
+
+  **And the two paths that answer the feed answer it the same way.** The feed
+  is read once and then followed, and a window that reaches past what the
+  store kept is answered from the disk instead — so both read the callback
+  log, and both convert it with the **same** function. A line read into the
+  store and the same line read from the disk are one event, not two.
+
+  4 new smoke checks (805 → 809), reverse-verified: with the counters not
+  renamed, the three server-side checks fail ("got undefined/undefined")
+  while the page check still passes — it never depended on the server; with
+  the page reading the integration's names, the page check fails (and three
+  existing ones with it); and with the disk path handing over the raw line,
+  **only** the disk-path check fails.
+
 - **The window could not say which calls could be undone.** The kernel tags
   every frame with what it would take to undo it — `reversible`, `idempotent`,
   `irreversible` (ABI.md §4.1) — and the tag is not decoration: it traps an
