@@ -1033,6 +1033,12 @@ kills a process the operator's view calls healthy is worse than either
 command existing. `cortex top --stall-after 30000` marks what is over the
 operator's own threshold and hands over the command to act on it.
 
+That module is also where the **words** live: what a process is "waiting on"
+(`a channel`, `a timer`, `a child`, `a model call`) and how long it has been
+waiting. The dashboard prints the same words, because it is a second view of
+the same fact, and two views of one fact must not be able to phrase it
+differently.
+
 The reading is also the only way to see a stall in a **driver call**. The
 kernel does not park a process while its LLM call is in flight (PROCESS.md
 §3.7), so such a process is `running`, not `blocked`, and the process table
@@ -1092,6 +1098,30 @@ And the **footer says which way the page is being refreshed**: "live push
 every 3 seconds (the live connection is unavailable)" when it is not. The
 page used to claim "auto-refresh · every 3 seconds" whatever it was doing —
 and in the live case it was not polling every 3 seconds at all.
+
+**And the dashboard says what each agent is inside.** The page is the
+operator's window, and it had the same blind spot as the process table
+itself: an agent that was four minutes into a model call read as
+`running`, and an agent parked on a channel read as `blocked` — the
+process table cannot tell a listener waiting for a message from an agent
+that will never be answered, and it cannot see a driver call at all,
+because the kernel does not park a process while its LLM call is in flight
+(BACKLOG #060).
+
+So the dashboard asks the kernel, the same way `cortex top` does, and the
+row carries the answer as `insideLabel` — "waiting on a channel for 1m2s".
+The wording comes from **one function**, shared with `cortex top`
+(`src/cli/open_call.ts`), because an operator who reads "waiting on a
+channel" in one view and something else in the other has to work out
+whether those are the same thing. The page prints the label it is given and
+does not re-implement the rule, for the same reason it does not re-implement
+the capability rule.
+
+And the column appears **only when the kernel can answer**. The label's
+presence is the signal: a row with no label at all means the kernel did not
+answer — it is too old to know the command, or there is no kernel — and a
+column of blanks would claim that nothing is inside a call, which is a
+different fact from "nothing is inside a call".
 
 **And the dashboard learned to stop.** An open event stream is a connection
 that never ends by itself, and `server.close()` waits for it. The dashboard's

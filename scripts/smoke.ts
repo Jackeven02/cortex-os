@@ -14515,6 +14515,24 @@ async function runDashboardLiveChecks(): Promise<void> {
 
     const dash = await startDashboard({ dir: tmp, port: 0, kernel: client! });
     try {
+      /** Run a command with its stdout captured. */
+      const capture = async (
+        run: () => Promise<number>,
+      ): Promise<{ code: number; out: string }> => {
+        let out = '';
+        const prevWrite = process.stdout.write;
+        process.stdout.write = ((chunk: unknown): boolean => {
+          out += String(chunk);
+          return true;
+        }) as unknown as typeof process.stdout.write;
+        try {
+          const code = await run();
+          return { code, out };
+        } finally {
+          process.stdout.write = prevWrite;
+        }
+      };
+
       await checkAsync('the dashboard shows the processes that are running', async () => {
         const pid = await kernel.spawn({
           role: 'live-one',
@@ -14531,6 +14549,70 @@ async function runDashboardLiveChecks(): Promise<void> {
         assert(row !== undefined, `the running process is in the list, got: ${JSON.stringify(rows.map((r) => r['pid']))}`);
         assert(row!['role'] === 'live-one', `it is the process we spawned, got ${String(row!['role'])}`);
         assert(row!['live'] === true, `it is marked live, got ${String(row!['live'])}`);
+      });
+
+      await checkAsync('the dashboard says what each agent is inside', async () => {
+        // The operator's window used to say "blocked" and nothing else — and a
+        // process inside a model call is not even blocked, so the window said
+        // "running" for an agent that had been in the same call for four
+        // minutes. The kernel knows; the dashboard asks.
+        const pid = await kernel.spawn({
+          role: 'inside-one',
+          agent: { module: 'test:live', args: { mode: 'alive' } },
+        });
+        // Let it get inside its `recv` before the dashboard reads.
+        await new Promise((resolve) => setTimeout(resolve, 80));
+
+        const res = await fetch(`${dash.url}/api/processes`);
+        assert(res.status === 200, `status ${res.status}`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const row = rows.find((r) => r['pid'] === unbrand(pid));
+        assert(row !== undefined, 'the process is in the list');
+
+        const label = row!['insideLabel'];
+        assert(
+          typeof label === 'string',
+          `the row says what the agent is inside, got ${String(label)}`,
+        );
+        assert(
+          label.includes('waiting on a channel'),
+          `it says the agent is waiting on a channel, got ${label}`,
+        );
+        assert(
+          / for \d/.test(label),
+          `it says for how long, got ${label}`,
+        );
+      });
+
+      await checkAsync('the dashboard and cortex top phrase the wait the same way', async () => {
+        // Two views, one rule. An operator who reads "waiting on a channel" in
+        // one and something else in the other has to work out whether those
+        // are the same thing — so the wording comes from one function, and
+        // the two views must not drift apart.
+        //
+        // Only the *wording* is compared: the age is a reading of the clock,
+        // and the two views read it a moment apart.
+        const pid = await kernel.spawn({
+          role: 'inside-two',
+          agent: { module: 'test:live', args: { mode: 'alive' } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 80));
+
+        const res = await fetch(`${dash.url}/api/processes`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const row = rows.find((r) => r['pid'] === unbrand(pid));
+        const label = String(row?.['insideLabel'] ?? '');
+        assert(label !== '', `the dashboard has a label, got ${JSON.stringify(row)}`);
+        const phrase = label.split(' for ')[0] ?? '';
+
+        const top = await capture(() => cmdTop([]));
+        const line =
+          top.out.split('\n').find((l) => new RegExp(`^[^\\w]*${unbrand(pid)}\\s`).test(l)) ?? '';
+        assert(line !== '', `cortex top shows the process, got: ${top.out}`);
+        assert(
+          line.includes(phrase),
+          `the two views say the same thing, dashboard="${label}" top="${line.trim()}"`,
+        );
       });
 
       await checkAsync('the dashboard pushes live events instead of re-reading', async () => {
@@ -14733,6 +14815,16 @@ async function runDashboardLiveChecks(): Promise<void> {
         assert(
           !html.includes('capabilities.join'),
           'the page does not format capabilities itself',
+        );
+        // The "inside" column is the same story: the server asks the kernel
+        // which call each agent is in, and the page prints what it is given.
+        // A page that worked the wording out for itself would be a second
+        // rule — and the two would drift.
+        assert(html.includes('insideLabel'), 'the page prints the inside label it is given');
+        assert(html.includes('insideHead'), 'the page has a column to put it in');
+        assert(
+          !html.includes('waiting on a channel'),
+          'the page does not phrase the wait itself',
         );
         // The footer says which way the page is being refreshed.
         assert(html.includes('实时推送'), 'the footer names the live mode');

@@ -42,6 +42,47 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The dashboard says what each agent is inside.** The page is the operator's
+  window, and it was blind to the one fact an operator of an agent OS most
+  wants: an agent that is four minutes into a model call read as `running`,
+  and an agent parked on a channel read as `blocked` — the process table
+  cannot tell a listener waiting for a message from an agent that will never
+  be answered, and it cannot see a driver call at all, because the kernel does
+  not park a process while its LLM call is in flight (BACKLOG #060).
+
+  The kernel knows: it writes every syscall as an `enter` frame and its
+  partner, and it knows which pairs are still open. The dashboard asks it —
+  the same way `cortex top` does — and the row carries the answer as
+  `insideLabel`: "waiting on a channel for 1m2s". The supervision tree shows
+  it too, and the page's filter matches it, so an operator can search
+  "model call" to find the agent that is stuck.
+
+  **The wording is one function, not two.** `src/cli/open_call.ts` now holds
+  the *words* as well as the reading: what a process is waiting on (`a
+  channel`, `a timer`, `a child`, `a model call`) and how long it has been
+  waiting. `cortex top` and the dashboard both call it, so an operator who
+  reads "waiting on a channel" in one view and something else in the other
+  does not have to work out whether those are the same thing. The page prints
+  the label it is given and does not re-implement the rule — the same
+  discipline the capability column already follows.
+
+  **And the column appears only when the kernel can answer.** The label's
+  *presence* is the signal: a row with no label at all means the kernel did
+  not answer (it is too old to know the command, or there is no kernel), and
+  a column of blanks would claim that nothing is inside a call — a different
+  fact from "nothing is inside a call".
+
+  **2 new smoke checks** (681 → 683) and an existing one extended, all
+  reverse-verified: the dashboard stopping to ask the kernel → "the dashboard
+  says what each agent is inside" fails; the dashboard phrasing the wait in
+  its own words → "the dashboard and cortex top phrase the wait the same
+  way" fails; and the page working the wording out for itself → "the page
+  does not re-implement what it is shown" fails.
+
+  No ABI change: this round adds no syscall, no transport command, and no
+  field to `ProcessInfo` — the dashboard asks the kernel a question the
+  kernel could already answer.
+
 - **The host stopped rebuilding what the kernel already knew.** `cortex top` and
   `cortex supervise` both answer one question — *which call is this process
   inside, and for how long?* — and they used to answer it by reading the

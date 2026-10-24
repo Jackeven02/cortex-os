@@ -104,6 +104,8 @@
     tbody tr:hover { background: #f8f9fc; }
     .pid-cell { color: #53627a; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
     .caps-cell { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 9px; color: #667181; }
+    .inside-cell { max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: #5b6577; }
+    th[hidden] { display: none; }
     .role-cell { color: #273244; font-size: 11px; font-weight: 570; }
     .role-wrap { display: flex; align-items: center; gap: 8px; }
     .role-avatar { display: grid; width: 23px; height: 23px; place-items: center; border: 1px solid #e1e6f3; border-radius: 6px; background: #f1f4ff; color: #4b5fb6; font-size: 9px; font-weight: 700; }
@@ -139,6 +141,7 @@
     .tree-role { color: #273244; font-size: 11px; font-weight: 570; }
     .tree-pid { color: #53627a; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
     .tree-meta { margin-left: auto; display: flex; align-items: center; gap: 10px; color: #77808e; font-size: 9px; }
+    .tree-inside { color: #5b6577; font-size: 9px; }
     .budgets-panel { margin-bottom: 14px; }
     .budget-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 14px 16px 10px; }
     .budget-stat { padding: 10px 12px; border: 1px solid #eef0f3; border-radius: 8px; background: var(--surface-soft); }
@@ -218,9 +221,9 @@
 
         <div class="columns">
           <section class="panel" id="processes">
-            <div class="panel-head"><div><div class="panel-title">Agent 进程 <span class="nav-count" id="processCountLabel"></span></div><div class="panel-note">进程状态与最近资源使用</div></div><div class="table-tools"><div class="view-toggle"><button id="viewTable" class="active" type="button">表格</button><button id="viewTree" type="button">监督树</button></div><input class="search" id="processSearch" type="search" placeholder="筛选进程…" aria-label="筛选进程"><button class="icon-button" id="processRefresh" title="刷新进程">↻</button></div></div>
+            <div class="panel-head"><div><div class="panel-title">Agent 进程 <span class="nav-count" id="processCountLabel"></span></div><div class="panel-note">进程状态、最近资源使用 · 停在哪个调用</div></div><div class="table-tools"><div class="view-toggle"><button id="viewTable" class="active" type="button">表格</button><button id="viewTree" type="button">监督树</button></div><input class="search" id="processSearch" type="search" placeholder="筛选进程…" aria-label="筛选进程"><button class="icon-button" id="processRefresh" title="刷新进程">↻</button></div></div>
             <div class="spawn-bar" id="spawnBar" hidden><input type="text" id="spawnRole" placeholder="角色（必填，如 coder）" aria-label="角色"><input type="text" id="spawnModule" placeholder="模块路径（可选，如 ./examples/hello.js）" aria-label="模块路径"><input type="text" id="spawnTask" placeholder="任务（可选）" aria-label="任务"><button class="button" id="spawnGo" type="button">启动机器人</button></div>
-            <div id="processTableWrap" class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th>PID</th><th>PPID</th><th>Token</th><th>权限</th><th>启动时间</th><th></th></tr></thead><tbody id="processRows"><tr><td colspan="8" class="empty">正在读取进程…</td></tr></tbody></table></div>
+            <div id="processTableWrap" class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th id="insideHead" hidden>停在</th><th>PID</th><th>PPID</th><th>Token</th><th>权限</th><th>启动时间</th><th></th></tr></thead><tbody id="processRows"><tr><td colspan="8" class="empty">正在读取进程…</td></tr></tbody></table></div>
             <div id="processTreeWrap" class="tree-wrap" hidden><div id="processTree"></div></div>
           </section>
 
@@ -275,19 +278,34 @@
     // What this agent was allowed to do. The label comes from the server,
     // which uses the same rule `cortex ps` prints — one rule, two views.
     const processCaps = (process) => String(process.capsLabel ?? '—');
+    // **What this agent is inside, and for how long.** The label comes from
+    // the server, which asks the kernel — the kernel knows, and the log
+    // would have to be read to find out. The wording is the same wording
+    // `cortex top` prints, from the same function: one rule, two views.
+    //
+    // The label's *presence* is the signal. A row with no label at all means
+    // the kernel did not answer (it is too old to know the command, or there
+    // is no kernel), and the column is then hidden rather than filled with
+    // blanks — a column of blanks would claim that nothing is inside a call.
+    const processInside = (process) => (typeof process.insideLabel === 'string' ? process.insideLabel : '');
+    let insideKnown = false;
     let processData = [];
     let eventData = [];
 
     function renderProcesses() {
       const query = $('processSearch').value.trim().toLowerCase();
-      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)}`.toLowerCase().includes(query));
+      insideKnown = processData.some((process) => typeof process.insideLabel === 'string');
+      $('insideHead').hidden = !insideKnown;
+      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)} ${processInside(process)}`.toLowerCase().includes(query));
       $('processRows').innerHTML = visible.length ? visible.map((process) => {
         const initial = String(process.role ?? '?').slice(0, 1).toUpperCase();
         const time = fmtLocal(process.startedAt);
         const canKill = opsList.includes('kill') && process.state !== 'zombie' && process.state !== 'exiting';
         const opsCell = canKill ? `<td><button class="text-button" data-kill="${esc(process.pid)}">停止</button></td>` : '<td></td>';
-        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td><td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td>${opsCell}</tr>`;
-      }).join('') : `<tr><td colspan="8" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
+        const inside = processInside(process);
+        const insideCell = insideKnown ? `<td class="inside-cell" title="${esc(inside)}">${esc(inside || '—')}</td>` : '';
+        return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td>${insideCell}<td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td>${opsCell}</tr>`;
+      }).join('') : `<tr><td colspan="${insideKnown ? 9 : 8}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
       $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
       $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
     }
@@ -343,7 +361,7 @@
           roots.push(process);
         }
       }
-      const matches = (process) => `${process.pid} ${process.role} ${process.state}`.toLowerCase().includes(query);
+      const matches = (process) => `${process.pid} ${process.role} ${process.state} ${processInside(process)}`.toLowerCase().includes(query);
       const keep = (process) => !query || matches(process) || (kids.get(process.pid) ?? []).some(keep);
       const byPid = (a, b) => a.pid - b.pid;
       roots.sort(byPid);
@@ -351,7 +369,9 @@
       const renderNode = (process, depth) => {
         const tokens = processTokens(process);
         const children = (kids.get(process.pid) ?? []).map((child) => renderNode(child, depth + 1)).join('');
-        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${tokens.toLocaleString()} tok</span></span></div>${children}`;
+        const inside = processInside(process);
+        const insideSpan = inside ? `<span class="tree-inside">${esc(inside)}</span>` : '';
+        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${tokens.toLocaleString()} tok</span>${insideSpan}</span></div>${children}`;
       };
       const visible = roots.filter(keep);
       $('processTree').innerHTML = visible.length ? visible.map((process) => renderNode(process, 0)).join('') : `<div class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，监督树会显示在这里。'}</div>`;

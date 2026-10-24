@@ -42,7 +42,7 @@
 import { existsSync } from 'node:fs';
 
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
-import { asProcessId } from '../kernel/types.js';
+import { asProcessId, unbrand, type BlockedReason } from '../kernel/types.js';
 import type { KernelCommand } from './kernel_protocol.js';
 
 /** A syscall call that has started and has not yet finished. */
@@ -111,6 +111,97 @@ export function isDeclaredWait(call: OpenCall): boolean {
 export function isStalled(call: OpenCall, now: number, thresholdMs: number): boolean {
   if (isDeclaredWait(call)) return false;
   return now - call.since > thresholdMs;
+}
+
+// =============================================================================
+// §3 The words
+// =============================================================================
+
+/**
+ * Syscall names an operator would rather read as English.
+ *
+ * These are the calls that *wait*. The rest are named as they are, because
+ * "inside spawn" is more use to a reader than an invented phrase for it.
+ */
+const FRIENDLY_CALLS: Readonly<Record<string, string>> = {
+  recv: 'a channel',
+  sleep: 'a timer',
+  wait: 'a child',
+  llm_call: 'a model call',
+  tool_call: 'a tool call',
+  memory_read: 'memory',
+  memory_write: 'memory',
+};
+
+/**
+ * Render a `BlockedReason` in words.
+ *
+ * The kernel's own reason is used when there is one — it knows *which*
+ * child, after all. Otherwise the call's own name is used, which is how a
+ * model call shows up: the kernel does not park a process while its LLM call
+ * is in flight, so there is no blocked reason for it.
+ */
+export function describeBlocked(blockedOn: BlockedReason | undefined | null): string {
+  if (blockedOn === undefined || blockedOn === null) return 'something';
+  switch (blockedOn.kind) {
+    case 'wait':
+      return `child ${String(unbrand(blockedOn.pid))}`;
+    case 'recv':
+      return 'a channel';
+    case 'sleep':
+      return 'a timer';
+    case 'llm':
+      return 'a model call';
+    case 'tool':
+      return 'a tool call';
+    case 'budget':
+      return 'its budget';
+    case 'lock':
+      return `lock ${blockedOn.resource}`;
+  }
+}
+
+/**
+ * What a process is waiting for, in words.
+ *
+ * The blocked reason wins when the kernel has one; otherwise the call's own
+ * name is used, which is how a model call shows up.
+ */
+export function describeCall(syscall: string, blockedOn?: BlockedReason | null): string {
+  if (blockedOn !== undefined && blockedOn !== null) {
+    return `waiting on ${describeBlocked(blockedOn)}`;
+  }
+  const friendly = FRIENDLY_CALLS[syscall];
+  if (friendly !== undefined) return `waiting on ${friendly}`;
+  return `inside ${syscall}`;
+}
+
+/**
+ * A duration, in the same shape `cortex ps` prints an age in.
+ */
+export function formatDuration(ms: number): string {
+  if (ms < 0) return '0ms';
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+  return `${(ms / 3_600_000).toFixed(1)}h`;
+}
+
+/**
+ * The whole answer, in one line: what the process is inside, and for how long.
+ *
+ * This is the sentence `cortex top` prints in its WAITING column and the
+ * dashboard prints in its "inside" column, and it is one function because two
+ * views of the same fact must not be able to phrase it differently — an
+ * operator who reads "waiting on a model call" in the tree and "llm_call" in
+ * the table has to work out whether those are the same thing.
+ */
+export function formatOpenCall(
+  call: OpenCall,
+  blockedOn: BlockedReason | undefined | null,
+  now: number,
+): string {
+  return `${describeCall(call.syscall, blockedOn)} for ${formatDuration(now - call.since)}`;
 }
 
 /**

@@ -52,6 +52,8 @@ import {
   isStalled,
   readOpenCall,
   readOpenCallsFromKernel,
+  describeBlocked,
+  formatOpenCall,
   type OpenCall,
 } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
@@ -335,8 +337,7 @@ function lineFor(
   if (m.state === 'zombie') {
     note = m.exitReason === null ? 'exited' : `exit ${m.exitCode ?? 0} (${m.exitReason})`;
   } else if (call !== undefined) {
-    const ms = now - call.since;
-    note = `${describeCall(m, call.syscall)} for ${formatDuration(ms)}`;
+    note = formatOpenCall(call, m.blockedOn, now);
     if (stallAfterMs !== null && isStalled(call, now, stallAfterMs)) {
       note += ' — stuck';
     }
@@ -347,72 +348,6 @@ function lineFor(
     note = `${n} syscall${n === 1 ? '' : 's'}`;
   }
   return `${pid}${role}${state}${spend}${usd}${note}`;
-}
-
-/**
- * What a process is waiting for, in words.
- *
- * The blocked reason is used when the kernel has one — it knows *which*
- * child, after all. Otherwise the call's own name is used, which is how a
- * model call shows up: the kernel does not park a process while its LLM call
- * is in flight, so there is no blocked reason for it.
- */
-function describeCall(m: ProcessRow, syscall: string): string {
-  if (m.blockedOn !== undefined && m.blockedOn !== null) {
-    return `waiting on ${describeBlocked(m.blockedOn)}`;
-  }
-  const friendly = FRIENDLY_CALLS[syscall];
-  if (friendly !== undefined) return `waiting on ${friendly}`;
-  return `inside ${syscall}`;
-}
-
-/**
- * Syscall names an operator would rather read as English.
- *
- * These are the calls that *wait*. The rest are named as they are, because
- * "inside spawn" is more use to a reader than an invented phrase for it.
- */
-const FRIENDLY_CALLS: Readonly<Record<string, string>> = {
-  recv: 'a channel',
-  sleep: 'a timer',
-  wait: 'a child',
-  llm_call: 'a model call',
-  tool_call: 'a tool call',
-  memory_read: 'memory',
-  memory_write: 'memory',
-};
-
-/** Render a `BlockedReason` without importing the kernel type. */
-function describeBlocked(blockedOn: ProcessRow['blockedOn']): string {
-  if (blockedOn === undefined || blockedOn === null) return 'something';
-  const kind = (blockedOn as { kind?: string }).kind ?? 'something';
-  switch (kind) {
-    case 'wait':
-      return `child ${String((blockedOn as { pid?: unknown }).pid ?? '?')}`;
-    case 'recv':
-      return 'a channel';
-    case 'sleep':
-      return 'a timer';
-    case 'llm':
-      return 'a model call';
-    case 'tool':
-      return 'a tool call';
-    case 'budget':
-      return 'its budget';
-    case 'lock':
-      return `lock ${String((blockedOn as { resource?: unknown }).resource ?? '?')}`;
-    default:
-      return kind;
-  }
-}
-
-/** A duration, in the same shape `cortex ps` prints an age in. */
-function formatDuration(ms: number): string {
-  if (ms < 0) return '0ms';
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
-  return `${(ms / 3_600_000).toFixed(1)}h`;
 }
 
 function formatTokens(n: number): string {

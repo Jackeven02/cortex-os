@@ -6,10 +6,11 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { format } from 'node:util';
 import { asProcessId } from '../kernel/types.js';
-import type { ProcessInfo, SyscallRecord } from '../kernel/types.js';
+import type { BlockedReason, ProcessInfo, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
 import { formatCaps, readProcessView } from '../cli/process_view.js';
+import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
 import type { KernelCommand } from '../cli/kernel_protocol.js';
 import type { Capability } from '../kernel/types.js';
 
@@ -230,9 +231,36 @@ const byNewest = (a: unknown, b: unknown): number =>
  * agent that is actually working.
  */
 async function listProcesses(dir: string, options: DashboardOptions): Promise<unknown[]> {
-  if (options.processes !== undefined) return [...options.processes()].map(withCapsLabel);
+  // **What each agent is inside**, which the kernel knows and the log would
+  // have to be read to find out. The log grows for as long as the agent
+  // runs, and this table is re-read several times a second, so asking is
+  // the only affordable way.
+  //
+  // The wording is the *same* wording `cortex top` prints, from the same
+  // function: an operator who reads "waiting on a model call" in the tree
+  // and something else in the table has to work out whether those are the
+  // same thing.
+  const calls = await readOpenCallsFromKernel(options.kernel);
+  const now = Date.now();
+  const withInside = <T extends { pid: number; blockedOn?: BlockedReason | null }>(
+    row: T,
+  ): T & { insideLabel?: string } => {
+    // No answer from the kernel means **no field at all**, not an empty
+    // one: the page shows the column only when the information is there,
+    // and a column of blanks would claim that nothing is inside a call.
+    if (calls === undefined) return row;
+    const call = calls.get(row.pid);
+    return {
+      ...row,
+      insideLabel: call === undefined ? '' : formatOpenCall(call, row.blockedOn, now),
+    };
+  };
+
+  if (options.processes !== undefined) {
+    return [...options.processes()].map((row) => withCapsLabel(withInside(row)));
+  }
   const view = await readProcessView(dir, options.kernel);
-  return [...view.rows].map(withCapsLabel);
+  return [...view.rows].map((row) => withCapsLabel(withInside(row)));
 }
 
 /**
