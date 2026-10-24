@@ -47,7 +47,7 @@
 import { parseArgs } from 'node:util';
 
 import { defaultKernelDir } from '../index.js';
-import { readProcessView, type ProcessRow, type ProcessView } from '../process_view.js';
+import { readProcessView, describePendingSignals, type ProcessRow, type ProcessView } from '../process_view.js';
 import {
   isStalled,
   readOpenCalls,
@@ -314,7 +314,11 @@ function lineFor(
     const n = m.budgetsSpent.syscallCount;
     note = `${n} syscall${n === 1 ? '' : 's'}`;
   }
-  return `${pid}${role}${state}${spend}${usd}${note}`;
+  // A signal the kernel has queued for this process, if any. It is not
+  // delivered until the process runs again, so it belongs with the note that
+  // says why the process is not running — and the wording is the same one
+  // `cortex ps` uses, so the two views cannot disagree.
+  return `${pid}${role}${state}${spend}${usd}${describePendingSignals(note, m.pendingSignals)}`;
 }
 
 function formatTokens(n: number): string {
@@ -347,6 +351,9 @@ its own process table is merged in, so running agents appear in the tree too.
   WAITING   a channel (recv), a timer (sleep), a child (wait),
             a model call (llm_call), a tool call (tool_call)
   SPEND     tokens in+out, then USD
+  NOTE      also says what is waiting for the process: a signal the kernel has
+            queued for it ('SIGTERM queued') is not delivered until the
+            process runs again
 
 NOTES
   "Waiting" and "stuck" are different, and only one of them is in the process

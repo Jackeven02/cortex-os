@@ -436,6 +436,33 @@ not going to see it") and escalates at once instead of waiting out a grace
 period for a signal that will never be delivered. This is a known sharp edge
 of the queuing rule, tracked in BACKLOG.md.
 
+**And the operator's views say so.** The queue is the kernel's own, and the
+kernel sends it in every process record it hands out — but the views used to
+drop it. So `cortex ps` printed the *same row* before and after a `cortex
+kill` on a wedged agent: the operator asked a process to die, and the
+process list said nothing about it. The only place that mentioned the signal
+was the command that had just run.
+
+Now the queued signals are part of what a view says about a process, in the
+kernel's own word (`queued`), and in the same words everywhere:
+
+```console
+$ cortex ps
+PID     PPID    ROLE          STATE         TOKENS    CAPS              AGE       WAITING
+-----------------------------------------------------------------------------------------
+2       1       blocker       blocked       0         all               31s       a channel — SIGTERM queued
+
+$ cortex top
+   PID  ROLE            STATE     TOKENS  USD      NOTE
+-------------------------------------------------------
+└─ 2    blocker         blocked   0       $0.0000  waiting on a channel for 31.6s — SIGTERM queued
+```
+
+`cortex ps` puts it in the WAITING column, `cortex top` in its NOTE, and the
+dashboard in the column it keeps for "where this process is". One rule, three
+views: the wording comes from one function (`describePendingSignals`), so a
+table, a tree and a page cannot drift apart.
+
 ### 7.3 Group signals
 
 `kill(-pgid, sig)` delivers the signal to every member of the group. This is the standard way to terminate a whole subtree.

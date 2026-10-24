@@ -13,7 +13,7 @@
 
 import { parseArgs } from 'node:util';
 import { defaultKernelDir } from '../index.js';
-import { formatCaps, readProcessView, type ProcessRow } from '../process_view.js';
+import { formatCaps, describePendingSignals, readProcessView, type ProcessRow } from '../process_view.js';
 import { describeWait, readOpenCalls, type OpenCall } from '../open_call.js';
 import { probeKernel } from '../kernel_client.js';
 
@@ -48,6 +48,11 @@ COLUMNS
   been inside one for four minutes reads as 'running', and 'running' is not
   what the operator needs to know.
 
+  It also says what is waiting for the process: a signal the kernel has queued
+  for it ('SIGTERM queued') is not delivered until the process runs again, so
+  a 'cortex kill' on a wedged agent leaves a signal in the queue and the row
+  says so.
+
   Where the answer comes from: with a live kernel, from the kernel; without
   one, from the process's log. The two give the same words.
 `);
@@ -80,7 +85,8 @@ COLUMNS
   });
 
   /**
-   * What a live process is waiting on.
+   * What a row says about what the process is waiting for — and about what is
+   * waiting for *it*.
    *
    * Two sources, one rule. The kernel's **blocked reason** wins when it has
    * one — it knows *which* child, after all — and the open call is used
@@ -90,13 +96,23 @@ COLUMNS
    *
    * A process that is not live is not waiting for anything, whatever its log
    * says: a dead process's last frame is history, not a wait.
+   *
+   * The **queued signals** are the other half of the sentence, and they are
+   * the kernel's own: a `cortex kill` on a blocked agent does not deliver
+   * anything, it queues a SIGTERM for a wake-up that may never come. The
+   * wording is shared with `cortex top` (and the dashboard), so two views of
+   * the same fact cannot say different things about it.
    */
   const waitingFor = (p: ProcessRow): string => {
-    if (!p.live) return '';
-    const call = calls.get(p.pid);
-    const blocked = p.blockedOn !== undefined && p.blockedOn !== null;
-    if (call === undefined && !blocked) return '';
-    return describeWait(call?.syscall ?? '', p.blockedOn);
+    let wait = '';
+    if (p.live) {
+      const call = calls.get(p.pid);
+      const blocked = p.blockedOn !== undefined && p.blockedOn !== null;
+      if (call !== undefined || blocked) {
+        wait = describeWait(call?.syscall ?? '', p.blockedOn);
+      }
+    }
+    return describePendingSignals(wait, p.pendingSignals);
   };
 
   if (filtered.length === 0) {

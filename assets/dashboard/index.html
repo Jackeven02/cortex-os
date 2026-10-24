@@ -288,24 +288,38 @@
     // is no kernel), and the column is then hidden rather than filled with
     // blanks — a column of blanks would claim that nothing is inside a call.
     const processInside = (process) => (typeof process.insideLabel === 'string' ? process.insideLabel : '');
+    // **The signals the kernel has queued for this process.** A signal aimed
+    // at a process that is not running waits in its queue until the process
+    // runs again, so a row that says "blocked" and nothing else hides the
+    // fact that this one has already been asked to die. The label comes from
+    // the server, in the same words `cortex ps` prints — one rule, three
+    // views.
+    const processPending = (process) => (typeof process.pendingLabel === 'string' ? process.pendingLabel : '');
     let insideKnown = false;
+    let pendingKnown = false;
     let processData = [];
     let eventData = [];
 
     function renderProcesses() {
       const query = $('processSearch').value.trim().toLowerCase();
       insideKnown = processData.some((process) => typeof process.insideLabel === 'string');
-      $('insideHead').hidden = !insideKnown;
-      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)} ${processInside(process)}`.toLowerCase().includes(query));
+      pendingKnown = processData.some((process) => processPending(process) !== '');
+      // The column is hidden when there is nothing at all to put in it: a
+      // column of blanks would claim that nothing is inside a call and that
+      // no signal is waiting.
+      $('insideHead').hidden = !(insideKnown || pendingKnown);
+      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)} ${processInside(process)} ${processPending(process)}`.toLowerCase().includes(query));
       $('processRows').innerHTML = visible.length ? visible.map((process) => {
         const initial = String(process.role ?? '?').slice(0, 1).toUpperCase();
         const time = fmtLocal(process.startedAt);
         const canKill = opsList.includes('kill') && process.state !== 'zombie' && process.state !== 'exiting';
         const opsCell = canKill ? `<td><button class="text-button" data-kill="${esc(process.pid)}">停止</button></td>` : '<td></td>';
         const inside = processInside(process);
-        const insideCell = insideKnown ? `<td class="inside-cell" title="${esc(inside)}">${esc(inside || '—')}</td>` : '';
+        const pending = processPending(process);
+        const detail = inside && pending ? `${inside} — ${pending}` : (inside || pending);
+        const insideCell = (insideKnown || pendingKnown) ? `<td class="inside-cell" title="${esc(detail)}">${esc(detail || '—')}</td>` : '';
         return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td>${insideCell}<td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${processTokens(process).toLocaleString()}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td>${opsCell}</tr>`;
-      }).join('') : `<tr><td colspan="${insideKnown ? 9 : 8}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
+      }).join('') : `<tr><td colspan="${insideKnown || pendingKnown ? 9 : 8}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
       $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
       $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
     }
@@ -361,7 +375,7 @@
           roots.push(process);
         }
       }
-      const matches = (process) => `${process.pid} ${process.role} ${process.state} ${processInside(process)}`.toLowerCase().includes(query);
+      const matches = (process) => `${process.pid} ${process.role} ${process.state} ${processInside(process)} ${processPending(process)}`.toLowerCase().includes(query);
       const keep = (process) => !query || matches(process) || (kids.get(process.pid) ?? []).some(keep);
       const byPid = (a, b) => a.pid - b.pid;
       roots.sort(byPid);
@@ -370,7 +384,9 @@
         const tokens = processTokens(process);
         const children = (kids.get(process.pid) ?? []).map((child) => renderNode(child, depth + 1)).join('');
         const inside = processInside(process);
-        const insideSpan = inside ? `<span class="tree-inside">${esc(inside)}</span>` : '';
+        const pending = processPending(process);
+        const detail = inside && pending ? `${inside} — ${pending}` : (inside || pending);
+        const insideSpan = detail ? `<span class="tree-inside">${esc(detail)}</span>` : '';
         return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${tokens.toLocaleString()} tok</span>${insideSpan}</span></div>${children}`;
       };
       const visible = roots.filter(keep);

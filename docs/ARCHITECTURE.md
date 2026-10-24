@@ -1476,6 +1476,28 @@ wait for, so it escalates to `SIGKILL` at once instead of burning the grace
 period. The alternative — waiting out a grace period for a signal that will
 never be seen — is how a supervisor ends up waiting on a corpse.
 
+**And the queue is on the row.** The kernel owns the pending queue and sends
+it in every process record it hands out — and the views used to drop it, so
+`cortex ps` printed the *same row* before and after a `cortex kill` on a
+wedged agent. The operator asked a process to die; the process list said
+nothing about it; and the only place that mentioned the signal was the
+command that had just run. A fact the kernel is holding, in a queue, on the
+behalf of an operator who is waiting to see it — and no view of it.
+
+So the queued signals are part of what a view says about a process, in the
+kernel's own word:
+
+```console
+$ cortex ps
+2       1       blocker       blocked       0         all               31s       a channel — SIGTERM queued
+```
+
+`cortex ps` puts it in the WAITING column, `cortex top` in its NOTE, and the
+dashboard in the column it keeps for "where this process is". The wording
+comes from one function (`describePendingSignals`, in
+`src/cli/process_view.ts`), because a table, a tree and a page that each
+phrased it for themselves would be three rules — and three rules drift.
+
 **A stream needs an ending.** A subscriber is watching something that can
 leave. The kernel can be stopped, and it can crash — and when it does, the
 socket closes and the stream stops without saying a word. That silence is

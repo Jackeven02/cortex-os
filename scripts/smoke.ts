@@ -14882,6 +14882,52 @@ async function runTopChecks(): Promise<void> {
       assert(line.includes('a channel'), `it says what it is waiting on, got: ${line}`);
     });
 
+    await checkAsync('cortex ps says which signals are queued for a process', async () => {
+      // A signal aimed at a process that is not running does not arrive: it
+      // waits in the process's pending queue until the process runs again
+      // (docs/PROCESS.md §7.2). The kernel knows this — it owns the queue,
+      // and it sends the list in every process record — and the views used to
+      // drop it. So `cortex ps` printed the *same row* before and after a
+      // `cortex kill` on a blocked agent: the operator asked a wedged process
+      // to die, and the process list said nothing about it.
+      //
+      // A second wedged process, so this does not disturb the one the other
+      // checks are about.
+      const doomed = await kernel.spawn({
+        role: 'doomed',
+        agent: { module: 'test:wedged', args: { mode: 'wedged' } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 400));
+
+      const before = await capture(() => cmdPs([]));
+      assert(
+        !psRow(before.out, unbrand(doomed)).includes('queued'),
+        `nothing is queued to begin with, got: ${before.out}`,
+      );
+
+      // The same path `cortex kill` takes: init signals the process, and
+      // because it is blocked rather than running, the signal waits.
+      await kernel.dispatcher.invoke(asProcessId(1), 'kill', doomed, 'SIGTERM');
+
+      const result = await capture(() => cmdPs([]));
+      assert(result.code === 0, `exit 0, got ${result.code}`);
+      const line = psRow(result.out, unbrand(doomed));
+      assert(line !== '', `the process is listed, got: ${result.out}`);
+      assert(
+        line.includes('SIGTERM queued'),
+        `the queued signal is said out loud, got: ${line}`,
+      );
+
+      // And the tree says it in the same words — one rule, two views.
+      const top = await capture(() => cmdTop([]));
+      const topLine = topRow(top.out, unbrand(doomed));
+      assert(topLine !== '', `cortex top shows the process, got: ${top.out}`);
+      assert(
+        topLine.includes('SIGTERM queued'),
+        `cortex top says it too, got: ${topLine}`,
+      );
+    });
+
     await checkAsync('cortex ps and cortex top use the same words for the same wait', async () => {
       // One rule, two views. `ps` prints the noun ("a model call"); `top`
       // prints the sentence ("waiting on a model call for 12.3s"). Phrased
@@ -15351,6 +15397,34 @@ async function runDashboardLiveChecks(): Promise<void> {
         );
       });
 
+      await checkAsync('the dashboard says which signals are queued for a process', async () => {
+        // A signal aimed at a process that is not running waits in its queue
+        // until the process runs again (docs/PROCESS.md §7.2). The kernel owns
+        // that queue and sends it in every process record — and the window
+        // used to drop it, so a row said "blocked" and nothing about the
+        // SIGTERM sitting in the queue, waiting for a wake-up that may never
+        // come.
+        const pid = await kernel.spawn({
+          role: 'doomed-one',
+          agent: { module: 'test:live', args: { mode: 'alive' } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 80));
+
+        // The same path `cortex kill` takes: init signals the process, and
+        // because it is blocked rather than running, the signal waits.
+        await kernel.dispatcher.invoke(asProcessId(1), 'kill', pid, 'SIGTERM');
+
+        const res = await fetch(`${dash.url}/api/processes`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const row = rows.find((r) => r['pid'] === unbrand(pid));
+        assert(row !== undefined, 'the process is in the list');
+        const label = String(row!['pendingLabel'] ?? '');
+        assert(
+          label.includes('SIGTERM queued'),
+          `the queued signal is said out loud, got ${JSON.stringify(row)}`,
+        );
+      });
+
       await checkAsync('the dashboard pushes live events instead of re-reading', async () => {
         const res = await fetch(`${dash.url}/api/stream?limit=50`);
         assert(res.status === 200, `status ${res.status}`);
@@ -15561,6 +15635,14 @@ async function runDashboardLiveChecks(): Promise<void> {
         assert(
           !html.includes('waiting on a channel'),
           'the page does not phrase the wait itself',
+        );
+        // The queued signals are the same story: the server owns the wording
+        // (it is the same function `cortex ps` and `cortex top` use), and the
+        // page prints what it is given.
+        assert(html.includes('pendingLabel'), 'the page prints the pending-signal label it is given');
+        assert(
+          !html.includes('SIGTERM queued'),
+          'the page does not phrase the queued signal itself',
         );
         // The footer says which way the page is being refreshed.
         assert(html.includes('实时推送'), 'the footer names the live mode');

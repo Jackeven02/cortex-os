@@ -38,6 +38,7 @@ import {
   type BudgetLimits,
   type Capability,
   type ProcessState,
+  type Signal,
 } from '../kernel/types.js';
 
 /**
@@ -58,6 +59,42 @@ export function formatCaps(caps: readonly Capability[] | undefined): string {
   if (caps.length === 0) return 'none';
   if (caps.length === CAPABILITIES.length) return 'all';
   return caps.join(',');
+}
+
+/**
+ * The signals the kernel has **queued** for a process, said out loud.
+ *
+ * A signal aimed at a process that is not running does not arrive: it waits in
+ * the process's pending queue until the process is RUNNING again
+ * (docs/PROCESS.md §7.2). The kernel knows this — the queue is its own, and
+ * the transport already sends it in every process record.
+ *
+ * The views used to drop it. So `cortex ps` printed the *same row* before and
+ * after `cortex kill` on a blocked agent: the operator asked a wedged process
+ * to die, and the process list said nothing at all about it. The signal was
+ * queued, waiting for a wake-up that may never come, and the only place that
+ * said so was the command that had just run.
+ *
+ * "queued" is the kernel's own word for it — the `__signal` record's
+ * `outcome`, and what `cortex kill` prints — so the view uses it too.
+ *
+ * It lives here, and not in one command, because two views answer the same
+ * question — `cortex ps` prints it in its WAITING column, `cortex top` in its
+ * NOTE — and they must not be able to disagree about what is waiting for what.
+ *
+ * @param text What the view already says about the process. Empty when it says
+ *   nothing, which happens for a process that is stopped rather than waiting.
+ * @param pending The signals the kernel has queued. `undefined` means the
+ *   kernel did not say — an older kernel, or no kernel at all — which is not
+ *   the same as "nothing is queued", and is rendered as nothing either way.
+ */
+export function describePendingSignals(
+  text: string,
+  pending: readonly Signal[] | undefined,
+): string {
+  if (pending === undefined || pending.length === 0) return text;
+  const queued = `${pending.join(',')} queued`;
+  return text === '' ? queued : `${text} — ${queued}`;
 }
 
 /**
@@ -103,6 +140,16 @@ export interface ProcessRow {
    * silence into a claim.
    */
   readonly capabilities?: readonly Capability[];
+  /**
+   * The signals the kernel has queued for this process.
+   *
+   * A signal aimed at a process that is not running waits in its queue until
+   * the process runs again (docs/PROCESS.md §7.2) — so this list is the
+   * operator's answer to "did my `kill` land?". Absent means *not reported*:
+   * the kernel did not say, because there is no kernel, or it is too old to
+   * know. It does **not** mean "nothing is queued".
+   */
+  readonly pendingSignals?: readonly Signal[];
   /**
    * Whether the kernel still has this process.
    *
@@ -166,6 +213,14 @@ interface LiveProcessInfo {
   readonly exitReason: string | null;
   /** What it holds right now (docs/ABI.md §4.9). */
   readonly capabilities: readonly Capability[];
+  /**
+   * The signals the kernel has queued for it.
+   *
+   * Optional, because the transport's answer is the kernel's own process
+   * record and a kernel too old to carry the field simply does not have it.
+   * Absent is *not reported*; it never means "nothing queued".
+   */
+  readonly pendingSignals?: readonly Signal[];
 }
 
 function rowFromMeta(meta: ProcessMeta): ProcessRow {
@@ -202,6 +257,7 @@ function rowFromLive(info: LiveProcessInfo): ProcessRow {
     budgetsRemaining: info.budgetsRemaining,
     blockedOn: info.blockedOn,
     capabilities: info.capabilities,
+    ...(info.pendingSignals !== undefined ? { pendingSignals: info.pendingSignals } : {}),
     live: true,
   };
 }

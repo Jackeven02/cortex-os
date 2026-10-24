@@ -6,10 +6,10 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { format } from 'node:util';
 import { asProcessId } from '../kernel/types.js';
-import type { BlockedReason, ProcessInfo, SyscallRecord } from '../kernel/types.js';
+import type { BlockedReason, ProcessInfo, Signal, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readAllMetas, listProcDirs } from '../cli/process_store.js';
-import { formatCaps, readProcessView } from '../cli/process_view.js';
+import { formatCaps, describePendingSignals, readProcessView } from '../cli/process_view.js';
 import { formatOpenCall, readOpenCallsFromKernel } from '../cli/open_call.js';
 import {
   ActivityStore,
@@ -211,10 +211,29 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
   };
 
   if (options.processes !== undefined) {
-    return [...options.processes()].map((row) => withCapsLabel(withInside(row)));
+    return [...options.processes()].map((row) => withCapsLabel(withInside(withPendingLabel(row))));
   }
   const view = await readProcessView(dir, options.kernel);
-  return [...view.rows].map((row) => withCapsLabel(withInside(row)));
+  return [...view.rows].map((row) => withCapsLabel(withInside(withPendingLabel(row))));
+}
+
+/**
+ * Put the queued signals on the row, in the same words `cortex ps` prints.
+ *
+ * A signal aimed at a process that is not running waits in its queue until
+ * the process runs again — so a row that says "blocked" and nothing else
+ * hides the fact that the operator already asked this one to die, and that
+ * the request is sitting in a queue waiting for a wake-up that may never come.
+ *
+ * The label travels with the row so the page never has to re-implement the
+ * rule. Two views of the same fact must not be able to disagree: `cortex ps`
+ * prints it in its WAITING column, `cortex top` in its NOTE, and the page
+ * prints it here — all from the same function.
+ */
+function withPendingLabel<T extends { pendingSignals?: readonly Signal[] }>(
+  row: T,
+): T & { pendingLabel: string } {
+  return { ...row, pendingLabel: describePendingSignals('', row.pendingSignals) };
 }
 
 /**

@@ -2161,6 +2161,67 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   the cut-and-mark → the same check fails on the alignment instead ("the phase
   column is off: header 59, row 62").
 
+- **A signal the kernel had queued was nobody's business but the kernel's.**
+  A signal aimed at a process that is *not running* is not delivered: it waits
+  in the process's pending queue until the process runs again (PROCESS.md
+  §7.2). The kernel owns that queue, and it sends it in every process record
+  it hands out — `pendingSignals: ["SIGTERM"]` was in the transport's
+  answer the whole time.
+
+  **The views dropped it.** So `cortex ps` printed the *same row* before and
+  after a `cortex kill` on a wedged agent:
+
+  ```console
+  $ cortex kill 2
+  sent SIGTERM to pid 2 → queued
+
+  $ cortex ps
+  PID     PPID    ROLE          STATE         TOKENS    CAPS              AGE       WAITING
+  -----------------------------------------------------------------------------------------
+  2       1       blocker       blocked       0         all               31s       a channel
+  ```
+
+  The operator asked a wedged process to die; the process list said nothing
+  about it; and the only place that mentioned the signal was the command
+  that had just run. A fact the kernel is holding, in a queue, on behalf of
+  an operator who is waiting to see it — and no view of it. (This is also
+  the sharp edge of the queuing rule: a process stuck in a `recv` with no
+  timeout may never wake, so the SIGTERM may sit in the queue forever.)
+
+  The queued signals are now part of what a view says about a process, in
+  the kernel's own word (`queued` — the `__signal` record's `outcome`, and
+  what `cortex kill` prints):
+
+  ```console
+  $ cortex ps
+  2       1       blocker       blocked       0         all               31s       a channel — SIGTERM queued
+
+  $ cortex top
+  └─ 2    blocker         blocked   0       $0.0000  waiting on a channel for 31.6s — SIGTERM queued
+  ```
+
+  `cortex ps` puts it in the WAITING column, `cortex top` in its NOTE, and
+  the dashboard in the column it keeps for "where this process is". **One
+  rule, three views**: the wording comes from a single function
+  (`describePendingSignals`), so a table, a tree and a page cannot drift
+  apart — and the page prints the label it is given rather than re-implementing
+  the rule.
+
+  The CLI's process view now carries the field, and it carries it honestly:
+  **absent** means "the kernel did not say" (no kernel, or one too old to
+  know), which is not the same as "nothing is queued" — so a row that says
+  nothing about signals says nothing about them.
+
+  **Two new smoke checks** (727 → 729), each one reverse-verified: the
+  field dropped between the kernel's answer and the process row → "cortex ps
+  says which signals are queued for a process" fails ("the queued signal is
+  said out loud, got: … a channel"); `cortex top` not using the shared rule
+  → the same check fails on the tree instead ("cortex top says it too, got:
+  … waiting on a channel for 396ms"); and the dashboard not labelling the
+  row → "the dashboard says which signals are queued for a process" fails
+  (and the failure shows the row still carrying `"pendingSignals":["SIGTERM"]`
+  — the kernel told the dashboard, and nobody turned it into words).
+
 ### Documentation
 
 - **The kernel-size claim was off by more than half.** MANIFESTO §II.3

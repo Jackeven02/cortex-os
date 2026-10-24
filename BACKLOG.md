@@ -307,6 +307,36 @@ The user-facing surface. Should feel like a real OS shell.
   fails on the alignment instead ("the phase column is off: header 59, row
   62").
 
+- [x] **#078** A signal the kernel had queued was nobody's business but the
+  kernel's → **fixed.** A signal aimed at a process that is *not running* is
+  not delivered: it waits in the process's pending queue until the process
+  runs again (PROCESS.md §7.2). The kernel owns that queue and sends it in
+  every process record — `pendingSignals: ["SIGTERM"]` was in the
+  transport's answer the whole time. **The views dropped it.** A real run of
+  `cortex kill` on a wedged agent printed the *same row* before and after:
+  the operator asked a process to die, the process list said nothing about
+  it, and the only place that mentioned the signal was the command that had
+  just run.
+
+  The queued signals are now part of what a view says about a process, in
+  the kernel's own word (`queued`): `cortex ps` puts it in the WAITING
+  column, `cortex top` in its NOTE, and the dashboard in the column it keeps
+  for "where this process is". **One rule, three views** — the wording comes
+  from a single function (`describePendingSignals`), so a table, a tree and a
+  page cannot drift apart. The CLI's process view carries the field
+  honestly too: *absent* means "the kernel did not say", which is not the
+  same as "nothing is queued".
+
+  **Two new smoke checks** (727 → 729), all reverse-verified: the field
+  dropped between the kernel's answer and the process row → "cortex ps says
+  which signals are queued for a process" fails ("the queued signal is said
+  out loud, got: … a channel"); `cortex top` not using the shared rule → the
+  same check fails on the tree instead ("cortex top says it too, got: …
+  waiting on a channel for 396ms"); the dashboard not labelling the row →
+  "the dashboard says which signals are queued for a process" fails (and the
+  failure shows the row still carrying `"pendingSignals":["SIGTERM"]` — the
+  kernel told the dashboard, and nobody turned it into words).
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---
