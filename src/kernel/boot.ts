@@ -317,6 +317,13 @@ interface ExitWaiter {
  * - `record` — a syscall frame was appended to a process's `.crec` log. This
  *   is the live equivalent of `cortex trace`: the same `SyscallRecord`, with
  *   the same `byteOffset`, the instant it lands on disk.
+ * - `output` — a line a process printed was appended to its captured
+ *   output. The kernel does not know what a process *said* — the host's
+ *   capture does — so the host hands the line over and the kernel relays it
+ *   (the same shape as a `record` event: a fact about a process, reported
+ *   the moment it happens). The `byteOffset` is where the line sits in the
+ *   process's `output.log`, which is what lets a follower stitch the file
+ *   and the stream without printing a line twice.
  *
  * ## What they are not
  *
@@ -347,7 +354,30 @@ export type KernelEvent =
       readonly kind: 'record';
       readonly pid: number;
       readonly record: SyscallRecord;
+    }
+  | {
+      readonly kind: 'output';
+      readonly pid: number;
+      /** Where the line sits in the process's captured output, in bytes. */
+      readonly byteOffset: number;
+      readonly line: ProcessOutputLine;
     };
+
+/**
+ * One line a process printed, as the host's capture saw it.
+ *
+ * The `stream` tag is the host's — the kernel carries it without
+ * interpreting it, exactly as it carries a syscall frame without
+ * interpreting the syscall.
+ */
+export interface ProcessOutputLine {
+  /** ISO-8601 timestamp of the moment the line was completed. */
+  readonly at: string;
+  /** Which stream the line came from. */
+  readonly stream: string;
+  /** The line itself, without its trailing newline. */
+  readonly text: string;
+}
 
 /** A host watching the kernel's events. */
 export type KernelEventListener = (event: KernelEvent) => void;
@@ -1137,6 +1167,26 @@ export class Kernel {
     return () => {
       this.#listeners.delete(listener);
     };
+  }
+
+  /**
+   * Report a line a process printed.
+   *
+   * The kernel does not know what a process *said* — it knows which process
+   * a body belongs to, and the host's capture knows the rest. So the host
+   * hands the line over and the kernel does what it does with every other
+   * fact: reports it, to whoever is watching, the moment it happens.
+   *
+   * The `byteOffset` is where the line sits in the process's captured output.
+   * It is what lets a follower stitch the file and the stream together: a
+   * line whose offset is already behind the follower's read position was
+   * printed by the file read, and must not be printed again.
+   *
+   * Nothing is recorded and nothing is decided — this is a fact, not a
+   * command. A host that never publishes anything never sees these events.
+   */
+  publishOutput(pid: number, line: ProcessOutputLine, byteOffset: number): void {
+    this.#emit({ kind: 'output', pid, byteOffset, line });
   }
 
   /**

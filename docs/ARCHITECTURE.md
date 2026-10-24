@@ -812,7 +812,8 @@ Now every process's printed output is captured to `processes/<pid>/output.log`
 and `cortex logs <pid>` reads it back. It is a disk read, like `cortex trace`,
 so it works for a process that has already exited and for one whose kernel is
 gone; `cortex logs <pid> --follow` tails it, so an operator can watch a live
-agent work without attaching a debugger to it.
+agent work without attaching a debugger to it — by push when a live kernel is
+holding the process, and by polling the file when it is not.
 
 The mechanism is deliberately thin, because the kernel still does not know what
 a process said. It reports which process a body belongs to
@@ -823,6 +824,13 @@ the body — so a line printed three seconds later by an agent that was parked o
 `process.stdout.write` rather than on `console.log`, so the captured text is
 exactly what Node formatted, and the original write still happens: the output
 still goes to the daemon's stdout, and now it is also addressable.
+
+The tap does not let go of the stream. `write` is installed as an *accessor*,
+so anything that replaces it later — a logger, a reporter, a test harness — is
+re-wrapped instead of switching the capture off. The failure it prevents is
+the worst kind: the agent would keep printing to the terminal, the log would
+quietly stop growing, and every `cortex logs` would answer with a file that is
+missing exactly the lines that mattered.
 
 **And it made the memory addressable.** The other half of "why did the agent
 do that?", and the half the syscall log cannot answer. ABI.md §4.4 records a
@@ -1145,6 +1153,50 @@ exited or another kernel owns it — the file path is used, exactly as before.
 The header says which one is running, because "it is following something" and
 "it is following something *now*" are different promises.
 
+**And `cortex logs --follow` stopped polling.** The last poller left. It
+followed a process's printed output the way it had always been followed: by
+re-reading `output.log` every 250 ms and printing whatever was new — so a line
+showed up a quarter of a second after the agent printed it, and the operator
+could not tell "the agent is quiet" from "the follower has not looked yet".
+
+The lines come by push now, over the same transport stream `cortex attach`
+uses. The kernel still does not know what a process *said* — it never will;
+it relays what the host hands it, in the same shape as a record event, and the
+host is the one that knows how to read a stream. Measured on the same live
+agent, the median lag fell from **217 ms to 1 ms**.
+
+The file and the stream are stitched the way `cortex attach` stitches them:
+the subscription opens **before** the history is read, and the lines are
+joined by their byte offset in `output.log` — a line the file already showed
+is not shown twice, and a line printed while the history was being read is
+printed once, from the stream.
+
+And the follow ends with the process, because the kernel says when a process
+ends and how it ended:
+
+```console
+$ cortex logs 7 --follow
+# following pid 7 (live — lines by push from the kernel)
+2026-10-23T23:40:44.314Z | out | patient line 0
+2026-10-23T23:40:44.714Z | out | patient line 1
+...
+# pid 7 exited with code 5 (the printing is done)
+```
+
+Nothing about that ending is guessed. The follower is told the process is
+over because the kernel saw it happen, and it reports the real exit code.
+
+When there is nothing to push from, the file path is used — and the command
+**says which one is running and why**: no live kernel, a kernel that is not
+answering, or a kernel that no longer holds this process. A follower that
+quietly changed its behaviour would be one the operator could not trust, and
+"the lines still arrive" is exactly the kind of half-truth this project keeps
+fighting.
+
+The probe that decides is **bounded**: a kernel that accepts the connection
+and then never answers is reported as unreachable, instead of hanging the
+command that asked. A liveness check that can hang is not a liveness check.
+
 **And the replacement was the same agent.** `cortex supervise --restart` puts a
 fresh agent in a dead one's place, rebuilt from the spec that was persisted
 when it was born (`processes/<pid>/spec.json`). That spec carried the role,
@@ -1224,11 +1276,18 @@ them looked identical from the outside.
   (PROCESS.md §8.2); nothing short of real isolation would catch that.
 - `cortex attach` follows the `.crec` file on disk when there is no live
   kernel (which the daemon writes to), and takes the frames by push when
-  there is one; `cortex logs --follow` has the same shape as the file
-  follower: it polls `output.log` every 250 ms — the kernel does not know
-  what a process *said*, so there is nothing for it to push. Both work
-  without a live kernel, which is why they keep that shape; `cortex watch`
-  and a live `cortex attach` are the live ones.
+  there is one; `cortex logs --follow` has the same shape: it takes the
+  printed lines by push when a live kernel holds the process, and reads
+  `output.log` every 250 ms when it does not. The kernel does not interpret
+  what a process said — it relays the lines the host hands it — so the host
+  is the one that has to be there. Both work without a live kernel, which is
+  why they keep that shape.
+- `cortex logs --follow` does not *retry* the push. A kernel that fails a
+  probe is treated as gone for the rest of the follow: the lines keep coming
+  from the file, at a quarter of a second's delay, and the header says so.
+  A follow that upgraded itself back to the live path mid-flight would need
+  a second stitch — the file's offset and the stream's offset — and the
+  value of the push path is that there is exactly one stitch.
 - **Memory inspection needs the live kernel.** `cortex memory <pid>` reads a
   process's memory regions through the transport, because a region's contents
   live in the memory driver — with the default `inmem` backing, in the kernel

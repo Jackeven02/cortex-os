@@ -364,12 +364,41 @@ export async function probeKernel(
 
   const client = new KernelClient(endpoint, socket);
   try {
-    await client.request('ping');
+    // A liveness probe must be **bounded**. A kernel that accepts the
+    // connection and then never answers — wedged, busy, half-dead — would
+    // otherwise hang the command that asked, with nothing on the screen to
+    // say why. `openSocket` bounds the connect; this bounds the answer.
+    await withTimeout(
+      client.request('ping'),
+      timeoutMs,
+      `the kernel did not answer within ${timeoutMs} ms`,
+    );
   } catch (err) {
     client.close();
     return { kind: 'stale', endpoint, reason: (err as Error).message };
   }
   return { kind: 'live', client };
+}
+
+/**
+ * Wait for `work`, but not forever.
+ *
+ * The timer is unreferenced: a pending timeout must never be the reason a
+ * process stays alive.
+ */
+async function withTimeout<T>(work: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** Open a TCP socket to the endpoint, failing fast on refusal. */

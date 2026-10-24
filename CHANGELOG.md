@@ -42,6 +42,61 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`cortex logs --follow` streams by push — and ends when the agent ends.**
+  The last poller in the CLI. It followed a process's printed output by
+  re-reading `output.log` every 250 ms and printing whatever was new, so a line
+  showed up a quarter of a second after the agent printed it — and "the agent is
+  quiet" was indistinguishable from "the follower has not looked yet".
+
+  The lines come **by push** now, over the same transport stream `cortex attach`
+  uses. The kernel still does not know what a process *said* — it never will; it
+  relays what the host hands it, in the same shape as a record event, and the
+  host is the one that knows how to read a stream. Measured on the same live
+  agent, the median lag fell from **217 ms to 1 ms**.
+
+  ```console
+  $ cortex logs 7 --follow
+  # following pid 7 (live — lines by push from the kernel)
+  2026-10-23T23:40:44.314Z | out | patient line 0
+  2026-10-23T23:40:44.714Z | out | patient line 1
+  ...
+  # pid 7 exited with code 5 (the printing is done)
+  ```
+
+  **The follow ends by itself**, with the **real** exit code: the kernel says
+  when a process ends and how it ended, so the follower never has to guess when
+  the printing is done.
+
+  **The file and the stream are stitched.** The history comes from
+  `output.log`, the lines after it come from the stream, and the two are joined
+  by the line's byte offset in that file — a line the file already showed is
+  not shown twice, and a line printed while the history was being read is
+  printed once, from the stream. The subscription opens *before* the history is
+  read, so nothing is lost in between.
+
+  **And the fallback says what it is.** Without a live kernel — or for a
+  process the kernel does not hold — the file path is used, and the command
+  names the reason (no live kernel, the kernel is not answering, the kernel no
+  longer holds this pid) and says that the lines are being read every 250 ms. A
+  follower that quietly changed its behaviour would be one the operator could
+  not trust.
+
+  **`cortex watch` can ask for the lines** (`--events output`), but does not by
+  default: a syscall frame and a printed line are different kinds of fact, and
+  mixing them by default would bury the frames.
+
+  **5 smoke checks** (663 → 668), all five reverse-verified: dropping the
+  capture→kernel hand-off → not one line is pushed; weakening the offset dedupe
+  → a line the file already showed is shown again; dropping the tap's
+  self-repair → a third party that replaces `stdout.write` silences the
+  capture; forcing the file path → the follow reads the file and says so; and
+  removing the exit event → the follow waits out its timeout instead of ending
+  with the process.
+
+  No ABI change: `KERNEL_ABI_VERSION` stays 1.0.0, and this is a client of the
+  same `subscribe` command `cortex watch` uses — the kernel gained one event
+  kind (`output`), not a new command.
+
 - **A replacement is the same agent — not a stronger one.** `cortex supervise
   <pid> --restart` rebuilds a dead agent from the spec that was persisted when
   it was born, and that spec carried the role, the module and the memory
@@ -1038,6 +1093,35 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **The output capture could be switched off without a word.** The tap that
+  copies an agent's printed lines into `output.log` was installed by
+  replacing `process.stdout.write`. That worked — until anything else
+  replaced it too. A logger, a reporter, a test harness: any of them could
+  take the stream over, and the capture would die **silently**. The agent
+  would keep printing to the terminal, the log would quietly stop growing, and
+  every `cortex logs` would answer with a file that was missing exactly the
+  lines that mattered. Nothing in the system would have said so.
+
+  The tap is now installed as an **accessor**, so a replacement is re-wrapped
+  on the spot instead of switching the capture off. This was not
+  hypothetical: the project's own smoke suite replaced `stdout.write` to
+  capture a command's output, and the follow stopped receiving the lines it
+  was supposed to relay — which is how the bug was found.
+
+- **The liveness probe could hang forever.** `probeKernel` bounded the
+  *connect* to the kernel but not the answer: a kernel that accepted the
+  connection and then never replied left the command waiting with no output
+  and no way out. A liveness check that can hang is not a liveness check, so
+  the ping is bounded now, and a kernel that does not answer is reported as
+  unreachable.
+
+- **The follow's fallback was invisible.** When `cortex logs --follow` could
+  not push — no live kernel, a kernel that was not answering, a kernel that no
+  longer held the process — it fell back to reading the file every 250 ms and
+  said nothing. The lines still arrived, so it looked like it was working; it
+  was just a quarter of a second late, and the operator had no way to tell.
+  The header now names the reason and says which path is running.
 
 - **The CLI lied when the kernel went away.** Three commands watch a live
   kernel, and all three had a different way of failing when that kernel died

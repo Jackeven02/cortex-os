@@ -327,6 +327,7 @@ const KNOWN_EVENT_KINDS: ReadonlySet<string> = new Set([
   'process-start',
   'process-exit',
   'record',
+  'output',
 ]);
 
 /**

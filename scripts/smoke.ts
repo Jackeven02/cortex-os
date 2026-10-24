@@ -242,7 +242,7 @@ import {
 
 import { cmdDiff } from '../src/cli/commands/diff.js';
 import { cmdTrace } from '../src/cli/commands/trace.js';
-import { cmdLogs } from '../src/cli/commands/logs.js';
+import { cmdLogs, alreadyShown } from '../src/cli/commands/logs.js';
 import { cmdMemory } from '../src/cli/commands/memory.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
@@ -301,6 +301,7 @@ import {
 } from '../src/cli/regions.js';
 import { cmdSpawn } from '../src/cli/commands/spawn.js';
 import { cmdRestore } from '../src/cli/commands/restore.js';
+import { OutputCapture } from '../src/cli/output_capture.js';
 import { bootCliKernel } from '../src/cli/index.js';
 import { pathToFileURL } from 'node:url';
 import { resolveModulePath } from '../src/cli/module_path.js';
@@ -11995,6 +11996,292 @@ async function runOutputCaptureChecks(): Promise<void> {
 }
 
 // =============================================================================
+// Live output by push checks
+// =============================================================================
+
+/**
+ * `cortex logs --follow` used to be the last poller in the CLI.
+ *
+ * The file it tails is written by the *host* — the kernel does not know what
+ * a process said — so there was nothing for the kernel to push, and the
+ * command read the file every 250 ms. That is a latency tax (measured: a
+ * median of 155 ms behind the line, and two seconds in the worst case) and
+ * it never ends: the follow ran until the operator interrupted it, long
+ * after the agent it was watching had finished.
+ *
+ * The kernel now relays what a process printed — the same shape as a
+ * `record` event: a fact about a process, reported the moment it happens —
+ * and the command stitches the file and the stream by the line's byte
+ * offset, exactly as `cortex attach` stitches the syscall log and its
+ * stream.
+ */
+async function runOutputPushChecks(): Promise<void> {
+  const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { pathToFileURL } = await import('node:url');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-outputpush-'));
+  const servers: { close: () => Promise<void> }[] = [];
+
+  const prevHome = process.env['CORTEX_HOME'];
+  const prevLog = console.log;
+  const prevErr = console.error;
+
+  // An agent that prints a few lines and then ends on its own.
+  //
+  // It waits before its **first** line on purpose. A follower that is attached
+  // only after the agent started would see the early lines in the file and
+  // could not tell them apart from the ones that arrived by push — so the
+  // delay makes the difference observable: every line this agent prints is
+  // printed after the follower is watching, and can only have reached it
+  // through the push.
+  const modulePath = join(tmp, 'chatty-agent.ts');
+  writeFileSync(
+    modulePath,
+    'export default async function chattyAgent(ctx: any): Promise<void> {\n' +
+      '  await ctx.sleep(500);\n' +
+      '  for (let i = 0; i < 8; i += 1) {\n' +
+      '    console.log(`chat ${i}`);\n' +
+      '    await ctx.sleep(100);\n' +
+      '  }\n' +
+      "  ctx.exit(7, 'done on purpose');\n" +
+      '}\n',
+    'utf8',
+  );
+
+  /**
+   * Capture what a command writes to stdout and stderr.
+   *
+   * The agent lives in this same process, so its own `console.log` also goes
+   * to stdout — and a follower that printed nothing would still look like one
+   * that printed everything. The checks below therefore count the *formatted*
+   * line (the follower prints `<time> | out | chat 3`) and never the bare
+   * text, which only the agent writes.
+   */
+  const captureStdout = async (
+    run: () => Promise<number>,
+  ): Promise<{ code: number; out: string; err: string }> => {
+    let out = '';
+    let err = '';
+    const prevWrite = process.stdout.write;
+    const prevErrWrite = process.stderr.write;
+    process.stdout.write = ((chunk: unknown): boolean => {
+      out += String(chunk);
+      return true;
+    }) as unknown as typeof process.stdout.write;
+    process.stderr.write = ((chunk: unknown): boolean => {
+      err += String(chunk);
+      return true;
+    }) as unknown as typeof process.stderr.write;
+    try {
+      const code = await run();
+      return { code, out, err };
+    } finally {
+      process.stdout.write = prevWrite;
+      process.stderr.write = prevErrWrite;
+    }
+  };
+
+  try {
+    await checkAsync('a live kernel pushes the lines a process printed', async () => {
+      const kernel = await bootCliKernel(tmp);
+      const server = await startKernelServer(kernel, { log: () => {} });
+      servers.push(server);
+      writeEndpoint(tmp, server.endpoint);
+      process.env['CORTEX_HOME'] = tmp;
+
+      const pid = unbrand(
+        await kernel.spawn({
+          role: 'chatty',
+          agent: { module: pathToFileURL(modulePath).href },
+        }),
+      );
+
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `the kernel is reachable, got ${probe.kind}`);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+
+      const pushed: { text: string; offset: number }[] = [];
+      const unsubscribe = await client!.subscribe((raw) => {
+        const event = raw as {
+          kind?: string;
+          pid?: number;
+          byteOffset?: number;
+          line?: { text?: string };
+        };
+        if (event.kind !== 'output' || event.pid !== pid) return;
+        pushed.push({ text: event.line?.text ?? '', offset: event.byteOffset ?? -1 });
+      }, { pid, kinds: ['output'] });
+
+      const deadline = Date.now() + 5000;
+      while (pushed.length < 8 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      unsubscribe();
+      client!.close();
+
+      assert(pushed.length === 8, `every printed line was pushed, got ${pushed.length}`);
+      assert(pushed[0]!.text === 'chat 0', `the first line is the first line, got: ${pushed[0]!.text}`);
+      // The offset is where the *entry* sits in the output file — the
+      // timestamp first, then the stream, then the text. That is what lets a
+      // follower join the file and the stream without showing a line twice,
+      // so it has to be the real offset.
+      const file = readOutput(tmp, asProcessId(pid)) ?? '';
+      const firstLine = file.split('\n')[0] ?? '';
+      assert(
+        pushed[0]!.offset === 0,
+        `the first entry starts at the beginning of the file, got ${pushed[0]!.offset}`,
+      );
+      assert(
+        pushed[1]!.offset === Buffer.byteLength(firstLine) + 1,
+        `the second entry starts where the first one ends, got ${pushed[1]!.offset}`,
+      );
+      await kernel.shutdown();
+    });
+
+    await checkAsync('cortex logs --follow streams the lines and ends when the process ends', async () => {
+      const kernel = await bootCliKernel(tmp);
+      const server = await startKernelServer(kernel, { log: () => {} });
+      servers.push(server);
+      writeEndpoint(tmp, server.endpoint);
+      process.env['CORTEX_HOME'] = tmp;
+
+      const pid = unbrand(
+        await kernel.spawn({
+          role: 'chatty',
+          agent: { module: pathToFileURL(modulePath).href },
+        }),
+      );
+      // The agent keeps printing while the follow runs — those lines can
+      // only reach the follower by push.
+
+      const started = Date.now();
+      const result = await captureStdout(() =>
+        cmdLogs([String(pid), '--follow', '--timeout-ms', '10000']),
+      );
+      const elapsed = Date.now() - started;
+
+      assert(result.code === 0, `the follow ended cleanly, got ${result.code}`);
+      // The follower took the push path — it says so, and it must not have
+      // silently fallen back to polling the file.
+      assert(
+        result.err.includes('push'),
+        `the follow announced that the lines come by push, got: ${result.err}`,
+      );
+      // Every line exactly once: the history read and the stream overlap,
+      // and the byte offset is what keeps them from being shown twice.
+      // The marker is the *formatted* line, so the agent's own printing (which
+      // goes to the same stdout) cannot be mistaken for the follower's work.
+      for (let i = 0; i < 8; i += 1) {
+        const marker = `| out | chat ${i}`;
+        const occurrences = result.out.split(marker).length - 1;
+        assert(occurrences === 1, `chat ${i} was shown ${occurrences} times, got: ${result.out}`);
+      }
+      // The follow ends **by itself** — the agent exits after its lines, and
+      // the follow must end with it rather than waiting for a Ctrl-C that
+      // never comes. (The timeout is ten seconds; ending well inside it is
+      // the proof.) And it reports *how* the process ended.
+      assert(elapsed < 5000, `the follow ended with the process, took ${elapsed}ms`);
+      assert(
+        result.err.includes(`# pid ${pid} exited with code 7`),
+        `the follow reported the real exit code, got: ${result.err}`,
+      );
+      await kernel.shutdown();
+    });
+
+    await checkAsync('a pushed line the file already showed is not shown again', async () => {
+      // The rule that joins the file and the stream: a line that *starts*
+      // before the read position was in the file when it was read, so it was
+      // already shown. The window where the two overlap is narrow by nature,
+      // so the rule is pinned here rather than left to a race.
+      assert(alreadyShown(0, 100), 'a line at the very start was already shown');
+      assert(alreadyShown(99, 100), 'a line just before the read position was already shown');
+      assert(!alreadyShown(100, 100), 'a line exactly at the read position is new');
+      assert(!alreadyShown(101, 100), 'a line after the read position is new');
+      assert(!alreadyShown(-1, 100), 'a line with no offset is not silently dropped');
+    });
+
+    await checkAsync('cortex logs --follow still works without a live kernel', async () => {
+      // Its own home, with no kernel endpoint published in it — so there is
+      // nothing to push from and the file follower takes over.
+      const soloDir = join(tmp, 'solo');
+      const kernel = await bootCliKernel(soloDir);
+      try {
+        const pid = unbrand(
+          await kernel.spawn({
+            role: 'chatty',
+            agent: { module: pathToFileURL(modulePath).href },
+          }),
+        );
+        // Let it print and end, with no kernel to push anything. The agent
+        // waits half a second before its first line, so this has to outlast
+        // that or there is nothing to show.
+        await new Promise((r) => setTimeout(r, 1500));
+        process.env['CORTEX_HOME'] = soloDir;
+        const result = await captureStdout(() =>
+          cmdLogs([String(pid), '--follow', '--timeout-ms', '300']),
+        );
+        process.env['CORTEX_HOME'] = tmp;
+        assert(result.code === 0, `the follow detached cleanly, got ${result.code}`);
+        // The formatted line — the agent's own stdout would not carry the
+        // stream tag, so this can only be the follower's work.
+        assert(
+          result.out.includes('| out | chat 0'),
+          `the lines were still shown, got: ${result.out}`,
+        );
+      } finally {
+        await kernel.shutdown();
+      }
+    });
+
+    await checkAsync('the capture survives someone else replacing stdout.write', async () => {
+      // Anything that installs its own writer — a logger, a reporter, a test
+      // harness — must not switch the capture off. The failure it prevents is
+      // the silent kind: the agent keeps printing to the terminal, the log
+      // stops growing, and `cortex logs` answers with a file that is missing
+      // exactly the lines that mattered.
+      const captureDir = join(tmp, 'tap');
+      const capture = new OutputCapture(captureDir);
+      const pid = asProcessId(4242);
+
+      const prevWrite = process.stdout.write;
+      // A third party takes the stream over. It does not call the old writer
+      // back — it simply owns the stream now.
+      process.stdout.write = ((chunk: unknown): boolean => {
+        void chunk;
+        return true;
+      }) as unknown as typeof process.stdout.write;
+      try {
+        await capture.scope(pid, async () => {
+          console.log('a line that must be recorded');
+        });
+      } finally {
+        process.stdout.write = prevWrite;
+      }
+
+      const text = readOutput(captureDir, pid) ?? '';
+      assert(
+        text.includes('a line that must be recorded'),
+        `the line was still recorded, got: ${text}`,
+      );
+    });
+  } finally {
+    console.log = prevLog;
+    console.error = prevErr;
+    for (const server of servers) {
+      try {
+        await server.close();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = prevHome;
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
 // Live-process memory inspection checks
 // =============================================================================
 
@@ -15190,6 +15477,7 @@ await runSqliteChecks();
 runRegionsChecks();
 await runCliChecks();
 await runOutputCaptureChecks();
+await runOutputPushChecks();
 await runMemoryInspectChecks();
 await runHostWaitChecks();
 await runEventStreamChecks();

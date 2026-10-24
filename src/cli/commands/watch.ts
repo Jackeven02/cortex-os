@@ -31,6 +31,10 @@
  *   column layout, at the same `byteOffset` the file now holds.
  * - **`process-start`** — a process was born.
  * - **`process-exit`** — a process ended, with its **real** exit code.
+ * - **`output`** — a line a process printed. It is *not* shown by default:
+ *   an agent that prints a lot would drown the syscall frames, and this
+ *   command is about what the kernel *did*. Ask for it with
+ *   `--events output` when that is what you are watching for.
  *
  * Usage:
  *   cortex watch                          everything the kernel reports
@@ -53,6 +57,7 @@ interface WireEvent {
   readonly kind: string;
   readonly pid: number;
   readonly record?: unknown;
+  readonly line?: { readonly at: string; readonly stream: string; readonly text: string };
   readonly exitCode?: number | null;
   readonly exitReason?: string | null;
   readonly ppid?: number | null;
@@ -60,7 +65,16 @@ interface WireEvent {
 }
 
 /** The event kinds a subscriber may ask for, in the order we document them. */
-const EVENT_KINDS = ['record', 'process-start', 'process-exit'] as const;
+const EVENT_KINDS = ['record', 'process-start', 'process-exit', 'output'] as const;
+
+/**
+ * The kinds this command shows when the operator does not say.
+ *
+ * `output` is deliberately not among them: an agent that prints a lot would
+ * drown the syscall frames, and `cortex watch` is about what the kernel
+ * *did*. `--events output` asks for it explicitly.
+ */
+const DEFAULT_EVENT_KINDS = ['record', 'process-start', 'process-exit'] as const;
 
 export async function cmdWatch(args: string[]): Promise<number> {
   const { values } = parseArgs({
@@ -163,7 +177,10 @@ export async function cmdWatch(args: string[]): Promise<number> {
       },
       {
         ...(pid !== undefined ? { pid } : {}),
-        ...(kinds !== undefined ? { kinds } : {}),
+        // The default is spelled out rather than left to "everything the
+        // kernel reports": the kernel also reports what a process *printed*,
+        // and this command is about what it did.
+        kinds: kinds !== undefined ? kinds : [...DEFAULT_EVENT_KINDS],
       },
     );
   } catch (err) {
@@ -229,6 +246,12 @@ function formatEventLine(event: WireEvent): string {
     if (code === null) return `# pid ${event.pid} exited abnormally${reason}`;
     return `# pid ${event.pid} exited with code ${code}${reason}`;
   }
+  if (event.kind === 'output') {
+    const line = event.line;
+    const stream = line?.stream ?? 'out';
+    const text = line?.text ?? '';
+    return `# pid ${event.pid} printed (${stream}): ${text}`;
+  }
   return `# ${event.kind} (pid ${event.pid})`;
 }
 
@@ -243,7 +266,7 @@ USAGE
 OPTIONS
   --pid N            Only events for this process
   --events LIST      Comma-separated kinds: ${EVENT_KINDS.join(', ')}
-                     (default: all of them)
+                     (default: ${DEFAULT_EVENT_KINDS.join(', ')})
   --timeout-ms N     Stop after N ms (default 0 = wait for Ctrl-C)
   -h, --help         Show this help
 

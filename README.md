@@ -84,7 +84,8 @@ $ cortex trace 1234
 $ cortex logs 1234
 2026-10-23T14:23:01.402Z | out | [coder] starting on issue #42
 2026-10-23T14:23:06.115Z | err | [coder] grep timed out, retrying
-# (--tail 20 for the last 20 lines; --follow to watch a live agent print)
+# (--tail 20 for the last 20 lines; --follow streams a live agent's lines by
+#  push, and ends by itself when the agent ends)
 
 # Read back what a running process KNOWS — its memory regions.
 # The syscall log stores a hash of a memory value, not the value, so
@@ -191,7 +192,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 663 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 668 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

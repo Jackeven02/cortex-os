@@ -343,21 +343,55 @@ export function readSpec(dir: string, pid: ProcessId): ProcessSpec | undefined {
 }
 
 /**
+ * The on-disk form of one captured line.
+ *
+ * One format, two users: the file that holds the line, and the follower
+ * that prints it while it streams. If the two formatted it differently, the
+ * same line would look like two lines — so they share this.
+ *
+ * The stream tag is typed loosely on purpose: the file's own entries are
+ * `'out' | 'err'`, but a line that arrives over the wire carries whatever
+ * the host that captured it said, and printing it is better than dropping
+ * it.
+ */
+export function formatOutputEntry(entry: {
+  readonly at: string;
+  readonly stream: string;
+  readonly text: string;
+}): string {
+  return `${entry.at} | ${entry.stream} | ${entry.text}\n`;
+}
+
+/**
  * Append one captured line to a process's `output.log`.
  *
  * Appends are synchronous on purpose: the daemon that owns the live agent can
  * be killed at any moment, and an asynchronous write would lose exactly the
  * lines that were printed just before it died — which is when you want them
  * most.
+ *
+ * Returns the **byte offset the line was written at**. That is what lets a
+ * follower stitch the file and the live stream together: a line that is
+ * already behind the follower's read position was printed by the file read,
+ * and must not be printed twice.
  */
-export function appendOutput(dir: string, pid: ProcessId, entry: OutputEntry): void {
+export function appendOutput(dir: string, pid: ProcessId, entry: OutputEntry): number {
   const path = outputPath(dir, pid);
   try {
     mkdirSync(dirname(path), { recursive: true });
   } catch {
     // Best-effort: the append below reports the real failure.
   }
-  appendFileSync(path, `${entry.at} | ${entry.stream} | ${entry.text}\n`, 'utf8');
+  // The offset is the file's size before the append. One process writes one
+  // file, so nothing else can move it in between.
+  let offset = 0;
+  try {
+    offset = statSync(path).size;
+  } catch {
+    offset = 0;
+  }
+  appendFileSync(path, formatOutputEntry(entry), 'utf8');
+  return offset;
 }
 
 export function deleteMeta(dir: string, pid: ProcessId): void {

@@ -106,6 +106,16 @@ Things that look like syscalls but aren't:
   already in the `.crec`, at the offsets they occupy there, and the process
   lifecycle facts are the same ones the log and the process table already
   hold. Subscribing records nothing.
+- **Relaying what a host captured is not a syscall either.** A host that
+  captured a process's printed lines can hand them to the kernel
+  (`Kernel.publishOutput`), and the kernel relays them to subscribers as
+  `output` events — so a follower can watch an agent print *live* instead of
+  re-reading the file every 250 ms. The rule is the one above, applied to the
+  captured output instead of the causal history: the event is a **view** of
+  what the host already wrote to `processes/<pid>/output.log`, at the byte
+  offset it occupies there. The kernel does not interpret the line (it does
+  not interpret the syscall frame either), the `.crec` is unchanged, and a
+  replay still does not reproduce printed output — it never did (§2).
 
 This last point is important. Cortex cannot record what it does not see. If your agent does `fetch(...)` directly, the recording has a hole in it and replay will diverge.
 

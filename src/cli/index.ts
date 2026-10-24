@@ -407,7 +407,17 @@ export async function bootCliKernel(
   // printed it. The kernel does not know what a process said — it only knows
   // which process a body belongs to — so the CLI supplies the scope and owns
   // the on-disk layout (`processes/<pid>/output.log`).
-  const capture = new OutputCapture(dir);
+  //
+  // The captured lines are also handed to the kernel, which relays them on
+  // its event stream: that is what lets an operator *follow* an agent's
+  // output live instead of polling the file for it. The sink goes through a
+  // holder because the capture is built before the kernel exists — a line
+  // printed in that window is still written to the file, it just has no
+  // stream to be pushed on yet.
+  let publishOutput: ((pid: number, entry: OutputEntry, byteOffset: number) => void) | undefined;
+  const capture = new OutputCapture(dir, (pid, entry, byteOffset) => {
+    publishOutput?.(pid, entry, byteOffset);
+  });
   const kernel = await bootKernel({
     kernelAbiVersion: KERNEL_ABI_VERSION,
     dir,
@@ -518,6 +528,12 @@ export async function bootCliKernel(
       capture.scope(pid, body),
   });
   self = kernel;
+  // The kernel is here now, so the captured lines have somewhere to go: the
+  // kernel relays them on its event stream, and a follower sees an agent's
+  // output as it is printed.
+  publishOutput = (pid, entry, byteOffset) => {
+    kernel.publishOutput(pid, entry, byteOffset);
+  };
   // Seed the PID counter past anything already persisted, so this invocation
   // never reuses a PID (which would collide on <pid>.crec / <pid>.meta.json —
   // most visibly when `restore` re-mints the suspended original's PID).

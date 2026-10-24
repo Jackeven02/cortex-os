@@ -45,6 +45,15 @@
  * that writes to `process.stdout` directly, or a wrapped child process whose
  * output is piped through.
  *
+ * ## The tap does not let go
+ *
+ * `write` is installed as an accessor, so a later replacement — a logger, a
+ * reporter, a test harness — is re-wrapped instead of switching the capture
+ * off. The failure it prevents is the worst kind: the agent would keep
+ * printing to the terminal, the log would quietly stop growing, and every
+ * `cortex logs` would answer with a file that is missing exactly the lines
+ * that mattered.
+ *
  * @module cli/output_capture
  */
 
@@ -52,7 +61,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { StringDecoder } from 'node:string_decoder';
 
 import { asProcessId, unbrand, type ProcessId } from '../kernel/types.js';
-import { appendOutput } from './process_store.js';
+import { appendOutput, type OutputEntry } from './process_store.js';
 
 /** Which standard stream a captured line came from. */
 export type OutputStream = 'out' | 'err';
@@ -70,6 +79,8 @@ interface CaptureScope {
   readonly dir: string;
   readonly pending: Record<OutputStream, string>;
   readonly decoders: Record<OutputStream, StringDecoder>;
+  /** Where a captured line is handed, so a follower can see it live. */
+  readonly sink: OutputSink | undefined;
 }
 
 /**
@@ -85,6 +96,16 @@ const scopeStorage = new AsyncLocalStorage<CaptureScope>();
 let tapInstalled = false;
 
 /**
+ * Called for every captured line, with the byte offset it was written at.
+ *
+ * The kernel's live event stream is the only thing that can hand a line to
+ * an operator who is following a process *right now* — the file alone only
+ * answers "what did it say" after the fact, to whoever comes looking. The
+ * offset is what lets the two agree on which lines have already been seen.
+ */
+export type OutputSink = (pid: number, entry: OutputEntry, byteOffset: number) => void;
+
+/**
  * Capture what an agent body prints, attributing it to the process that
  * printed it.
  *
@@ -93,9 +114,11 @@ let tapInstalled = false;
  */
 export class OutputCapture {
   readonly #dir: string;
+  readonly #sink: OutputSink | undefined;
 
-  constructor(dir: string) {
+  constructor(dir: string, sink?: OutputSink) {
     this.#dir = dir;
+    this.#sink = sink;
     installTap();
   }
 
@@ -112,6 +135,7 @@ export class OutputCapture {
       dir: this.#dir,
       pending: { out: '', err: '' },
       decoders: { out: new StringDecoder('utf8'), err: new StringDecoder('utf8') },
+      sink: this.#sink,
     };
     return scopeStorage.run(scope, async () => {
       try {
@@ -137,28 +161,63 @@ function installTap(): void {
 }
 
 /**
+ * The wrappers this module installed.
+ *
+ * A restore — `stream.write = theWrapperWeInstalledEarlier` — must not wrap
+ * the wrapper again: the line would be captured twice, and the operator would
+ * see it twice in the log.
+ */
+const tappedWrites = new WeakSet<Function>();
+
+/**
  * Wrap one stream's `write` so that anything written inside an agent body is
  * copied into that body's log.
  *
  * The original `write` is still called, with the original arguments, and its
  * return value is passed back untouched. The only difference is that the text
  * is also copied — so this changes where output *is*, never what it is.
+ *
+ * ## The tap survives being replaced
+ *
+ * `write` is installed as an **accessor**, not as a plain assignment. Anything
+ * that replaces `stream.write` later — a logger, a reporter, a test harness —
+ * would otherwise silently switch the capture off: the agent would keep
+ * printing to the terminal, the log would stop growing, and nothing would say
+ * so. With the accessor, a replacement is re-wrapped on the spot, so the tap
+ * keeps its hold on the stream no matter who comes after it.
  */
 function patchStream(stream: NodeJS.WriteStream, tag: OutputStream): void {
-  const original = stream.write;
-  const patched = function (this: unknown, ...args: unknown[]): boolean {
-    const scope = scopeStorage.getStore();
-    if (scope !== undefined) {
-      try {
-        capture(scope, tag, args[0]);
-      } catch {
-        // A capture failure must never break the agent that printed. The
-        // write still happens below.
+  const real = stream.write;
+
+  const wrap = (next: typeof stream.write): typeof stream.write => {
+    if (typeof next !== 'function') return next;
+    // Our own wrapper coming back (a restore) — leave it alone.
+    if (tappedWrites.has(next)) return next;
+    const wrapped = function (this: unknown, ...args: unknown[]): boolean {
+      const scope = scopeStorage.getStore();
+      if (scope !== undefined) {
+        try {
+          capture(scope, tag, args[0]);
+        } catch {
+          // A capture failure must never break the agent that printed. The
+          // write still happens below.
+        }
       }
-    }
-    return (original as (...a: unknown[]) => boolean).apply(stream, args);
+      return (next as (...a: unknown[]) => boolean).apply(stream, args);
+    };
+    tappedWrites.add(wrapped);
+    return wrapped;
   };
-  (stream as unknown as { write: unknown }).write = patched;
+
+  let current = wrap(real);
+  Object.defineProperty(stream, 'write', {
+    configurable: true,
+    enumerable: false,
+    get: () => current,
+    set: (next: typeof stream.write) => {
+      current = wrap(next);
+    },
+  });
 }
 
 /**
@@ -201,15 +260,25 @@ function capture(scope: CaptureScope, tag: OutputStream, chunk: unknown): void {
  * and the log should say so.
  */
 function emit(scope: CaptureScope, tag: OutputStream, text: string): void {
+  const entry: OutputEntry = {
+    at: new Date().toISOString(),
+    stream: tag,
+    text,
+  };
+  let offset: number;
   try {
-    appendOutput(scope.dir, asProcessId(scope.pid), {
-      at: new Date().toISOString(),
-      stream: tag,
-      text,
-    });
+    offset = appendOutput(scope.dir, asProcessId(scope.pid), entry);
   } catch {
     // Best-effort: the agent's output is still going to the real stdout, so
     // a failed capture costs the operator the log, not the run.
+    return;
+  }
+  // The line is on disk; now let whoever is watching see it. A failure here
+  // must not break the agent that printed.
+  try {
+    scope.sink?.(scope.pid, entry, offset);
+  } catch {
+    /* a broken watcher must not break the agent */
   }
 }
 
