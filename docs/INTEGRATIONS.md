@@ -249,6 +249,38 @@ place (`dollarsToMicrodollars`, in `src/cli/process_budget.ts`), and the
 summary line prints the tap's own dollars — the same money, in the unit the
 operator reads.
 
+### The frame is an `llm_call` frame, so it is shaped like one
+
+The tap's frames go into the same `.crec` a driver call goes into, under the
+same syscall name. ABI.md §4.3 says what an `llm_call` result looks like, and
+the usage lives under `usage` — which is where every reader looks: the
+dashboard's event table, the trace view.
+
+The tap used to write its usage **flat**, so every one of those readers saw a
+tapped call with a model and nothing else:
+
+```json
+{"usd":0.000026625,"model":"gpt-4o-mini","httpStatus":200,"inputTokens":100,"cachedTokens":5,"outputTokens":20}
+```
+
+The summary line knew what the call cost. The operator's window did not — it
+showed the model and no tokens, no cost. The tap now writes `usage` where the
+ABI says it is:
+
+```json
+{"model":"gpt-4o-mini","usage":{"inputTokens":100,"outputTokens":20,"cachedTokens":5,"usd":0.000026625},"httpStatus":200,...}
+```
+
+The flat fields stay in the frame as well. The `.crec` format is frozen, so a
+log written by this build has to stay readable by an older `cortex wrap`,
+whose `readTapSpend` knows only the flat shape; and `readTapSpend` reads
+**both**, so a log already on a disk still adds up.
+
+What the tap still does not record is the **text** — no prompt, no
+completion. That is deliberate (a log is something people paste into bug
+reports), and it is why a tapped frame is not a complete `LLMResponse`: it
+carries the usage, the model and the status, and no words.
+
 This is also why `llmTapStats()` and `readTapSpend()` are not redundant: the first answers "how much has this process spent" from *inside* the tapped process, the second answers "how much did that process spend" from *outside*, after it exited. Only the second vantage point exists for a supervisor, a dashboard or `cortex ps`.
 
 ### What checkpoint means here
@@ -290,7 +322,7 @@ The process rows also say **what each agent is inside** — "waiting on a channe
 
 Updates are pushed over Server-Sent Events at `GET /api/stream` (file-watch based, 15s heartbeat); the UI falls back to polling automatically when SSE is unavailable.
 
-The event table includes model name and token usage from completed LLM calls, plus sanitized, length-limited syscall error summaries. Prompts, model responses, and ordinary syscall arguments/results are not returned by these views. For MCP tools, use `CORTEX_MCP_DEFAULT_REVERSIBILITY` to set the conservative default (`irreversible`, `reversible`, or `idempotent`) and `CORTEX_MCP_REVERSIBILITY` to provide per-tool JSON overrides, for example `{"search":"idempotent","create_order":"irreversible"}`. Declaring a default is explicit metadata; without it, unannotated tools remain visible to `cortex audit`.
+The event table includes model name and token usage from completed LLM calls — including the calls the fetch tap recorded, which are `llm_call` frames in the same log — plus sanitized, length-limited syscall error summaries. Prompts, model responses, and ordinary syscall arguments/results are not returned by these views. For MCP tools, use `CORTEX_MCP_DEFAULT_REVERSIBILITY` to set the conservative default (`irreversible`, `reversible`, or `idempotent`) and `CORTEX_MCP_REVERSIBILITY` to provide per-tool JSON overrides, for example `{"search":"idempotent","create_order":"irreversible"}`. Declaring a default is explicit metadata; without it, unannotated tools remain visible to `cortex audit`.
 
 The API is available at:
 

@@ -1339,6 +1339,48 @@ conversion (`toDashboardEvent`): a frame pushed over the wire and the same
 frame read off disk are the same object. That is the rule the whole project
 follows — two views of the same fact must not be able to disagree.
 
+**And a frame that says a fact in the wrong place is a fact nobody sees.** The
+conversion reads an `llm_call` result's usage from `usage`, because that is
+where ABI.md §4.3 puts it and where every other reader looks. The fetch tap
+wrote its usage **flat**, so every ABI-shaped reader — the event table, the
+trace view — saw a tapped call with a model and nothing else: no tokens, no
+cost. The summary line knew what the call cost, because it read the flat
+fields. One call, two answers, and the operator's window was the one missing.
+
+The fix was not to teach every reader about a second shape: that is a tax on
+every reader that will ever be written. It was to make the tap write the
+shape the ABI already specifies — and to keep the flat fields as well, because
+the `.crec` format is frozen and a log written by this build has to stay
+readable by an older `cortex wrap`. The reader (`readTapSpend`) takes both
+shapes; the frame carries one.
+
+**And a row that is parsed wrong is a row that was never read.** The event
+table's "Token / 模型" cell carried its price in a `title` attribute whose value
+was a nested template literal:
+
+```html
+<td title="${event.usd === undefined ? '' : `$${Number(event.usd).toFixed(6)}`"}">
+```
+
+The nested template ends with a backtick *and* a quote, so the attribute came
+out one quote too long. The HTML parser then read the **rest of the row** as
+that attribute's value: the browser showed six cells where the header has
+seven, the time landed under "Token / 模型", and the tokens and the cost never
+reached the screen.
+
+This is the one bug in this project that **looks correct everywhere but the
+browser** — the template renders seven cells in Node, so a unit test that
+rendered it would have passed. It was in the page since v1.2.0 and nobody saw
+it, because the only place it shows up is the operator's window, and the
+operator's window is looked at, not read.
+
+So the rule the page now follows: **an HTML attribute never holds a template
+literal.** A value is computed in JavaScript, escaped once, and dropped in.
+And the row's shape is now held by a check that renders a row with the page's
+*own* code — its escaper, its labels, its clock, pulled out of the served
+page — and asserts that every tag closes its own quotes and that the row has
+one cell per header column.
+
 The process list, meanwhile, is the *same view* `cortex ps` shows: one
 module (`src/cli/process_view.ts`) answers for both, and it takes the
 connection it is given rather than opening its own — the dashboard holds one

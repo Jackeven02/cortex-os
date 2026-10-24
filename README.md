@@ -240,7 +240,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 740 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 744 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -356,6 +356,8 @@ $ cortex dashboard --ops spawn,kill,restore   # allow those three from the UI
 Read-only by default. With a live kernel in the directory (`cortex daemon run`), the dashboard **watches that kernel**: the processes that are *running* appear in the list — a running process has no `meta.json` yet, so a disk-only view would show a directory of corpses — and the event stream arrives by push, as the kernel writes it. Without one it does what any viewer of a filesystem can do: it reads `.cortex/processes/<pid>/meta.json`, decodes the `.crec` syscall logs (including the logs of processes that are still running), lists checkpoints, and renders the tree. `restore` is a pure disk write, which is why it works even in v0's no-daemon model.
 
 **And the money in it is the money the CLI prints.** The cost panel reads the kernel's microdollar counter, converts it once on the server, and shows dollars — so a process that spent `$0.0034` reads as `$0.0034` here *and* in `cortex top`, instead of one view saying `$3400` and the other saying `$0.0034`.
+
+**And the event table shows what a call cost.** `cortex wrap --tap` records the model's own HTTP calls into the same log a driver call goes into, so those calls show up in the event table too — with their tokens and their price, written in the ABI's `usage` shape, the same shape every other reader of an `llm_call` frame looks in.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

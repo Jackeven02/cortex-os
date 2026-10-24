@@ -355,7 +355,14 @@
         const auditTitle = audit ? JSON.stringify(audit) : '';
         const tokenSummary = event.tokensIn === undefined && event.tokensOut === undefined ? (event.model ?? '—') : `${Number(event.tokensIn ?? 0).toLocaleString()} in / ${Number(event.tokensOut ?? 0).toLocaleString()} out${event.model ? ` · ${event.model}` : ''}`;
         const errorSummary = event.errorMessage ? `${event.error ?? '错误'}: ${event.errorMessage}` : (event.error ?? '—');
-        return `<tr><td><span class="event-kind ${kind}">${label} · ${esc(String(event.type ?? '').split('.').at(-1))}</span></td><td class="event-name" title="${esc(auditTitle)}">${esc(event.name ?? event.runId ?? '—')}${auditText ? ` · ${esc(auditText)}` : ''}</td><td class="pid-cell">${esc(event.pid ?? '—')}</td><td class="duration">${event.durationMs === undefined ? '—' : `${esc(event.durationMs)} ms`}</td><td title="${event.usd === undefined ? '' : `$${Number(event.usd).toFixed(6)}"`}>${esc(tokenSummary)}</td><td class="event-time">${esc(time)}</td><td title="${esc(errorSummary)}">${esc(errorSummary)}</td></tr>`;
+        // The cost, as a string, computed **here** — not as a template literal
+        // dropped into an HTML attribute. A nested template inside `title="…"`
+        // put a stray quote in the attribute, and the HTML parser then read
+        // the rest of the row as the attribute's value: the "Token / 模型"
+        // column showed the *time*, every cell after it shifted one column
+        // left, and the tokens and the cost never reached the screen at all.
+        const costLabel = event.usd === undefined ? '' : `$${Number(event.usd).toFixed(6)}`;
+        return `<tr><td><span class="event-kind ${kind}">${label} · ${esc(String(event.type ?? '').split('.').at(-1))}</span></td><td class="event-name" title="${esc(auditTitle)}">${esc(event.name ?? event.runId ?? '—')}${auditText ? ` · ${esc(auditText)}` : ''}</td><td class="pid-cell">${esc(event.pid ?? '—')}</td><td class="duration">${event.durationMs === undefined ? '—' : `${esc(event.durationMs)} ms`}</td><td class="cost-cell" title="${esc(costLabel)}">${esc(tokenSummary)}</td><td class="event-time">${esc(time)}</td><td title="${esc(errorSummary)}">${esc(errorSummary)}</td></tr>`;
       }).join('') : '<tr><td colspan="7" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr>';
     }
 

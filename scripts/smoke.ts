@@ -9279,6 +9279,66 @@ async function runLLMTapChecks(): Promise<void> {
       assert(spend.usd > 0, 'and a non-zero price');
     });
 
+    await checkAsync("a tapped call is recorded in the ABI's shape", async () => {
+      // ABI.md §4.3: the result of an `llm_call` is an `LLMResponse`, and its
+      // usage lives under `usage`. The tap wrote it flat — so every reader
+      // that follows the ABI (the dashboard's event table, the trace view)
+      // saw a tapped call with a model and nothing else, while the same
+      // frames read by `readTapSpend` had the tokens and the price. One
+      // call, two answers.
+      globalThis.fetch = (async () =>
+        new Response(
+          JSON.stringify({
+            model: 'gpt-4o-mini',
+            usage: { prompt_tokens: 100, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 8 } },
+            choices: [{ message: { content: 'x' } }],
+          }),
+          { status: 200 },
+        )) as unknown as typeof globalThis.fetch;
+      const uninstall = await tapFetch({ dir: tmp, pid: 7022 });
+      await fetch('https://api.openai.com/v1/chat/completions', { method: 'POST', body: '{}' });
+      await uninstall();
+
+      const frames = await readTap(tmp, 7022);
+      const exit = frames.find((f) => f.phase === 'exit');
+      assert(exit !== undefined, 'the call was recorded');
+      const result = exit!.result as
+        | { usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; usd?: number } }
+        | undefined;
+      assert(result?.usage !== undefined, "the frame carries the ABI's usage");
+      assert(result?.usage?.inputTokens === 100, `100 in, got ${String(result?.usage?.inputTokens)}`);
+      assert(result?.usage?.outputTokens === 20, `20 out, got ${String(result?.usage?.outputTokens)}`);
+      assert(result?.usage?.cachedTokens === 8, `8 cached, got ${String(result?.usage?.cachedTokens)}`);
+      assert((result?.usage?.usd ?? 0) > 0, 'and a price');
+    });
+
+    await checkAsync('readTapSpend still adds up a log written before the ABI shape', async () => {
+      // The `.crec` format is frozen, and a log written by an older build is
+      // still on disk with its usage flat. The reader has to take both
+      // shapes, or every log already on a disk stops adding up.
+      const rec = await Recorder.open({ pid: asProcessId(7023), dir: join(tmp, 'processes', '7023') });
+      await rec.append({
+        timestamp: '2026-09-28T00:00:02.000Z' as never,
+        pid: asProcessId(7023),
+        syscall: 'llm_call',
+        callId: 'old-1',
+        phase: 'exit',
+        stateBefore: 'running',
+        stateAfter: 'running',
+        reversibility: 'reversible',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        result: { model: 'gpt-4o-mini', inputTokens: 100, outputTokens: 20, cachedTokens: 5, usd: 0.000026625 },
+      });
+      await rec.close();
+
+      const spend = await readTapSpend(tmp, 7023);
+      assert(spend.calls === 1, `one call, got ${spend.calls}`);
+      assert(spend.inputTokens === 100, `100 in, got ${spend.inputTokens}`);
+      assert(spend.outputTokens === 20, `20 out, got ${spend.outputTokens}`);
+      assert(spend.cachedTokens === 5, `5 cached, got ${spend.cachedTokens}`);
+      assert(spend.usd > 0, 'and a price');
+    });
+
     await checkAsync('readTapSpend counts a failed call separately and still bills it', async () => {
       globalThis.fetch = (async () => new Response('nope', { status: 500 })) as unknown as typeof globalThis.fetch;
       const uninstall = await tapFetch({ dir: tmp, pid: 7021 });
@@ -9696,6 +9756,33 @@ async function runWrapChecks(): Promise<void> {
         console.log = prevLog;
       }
       assert(out.includes(expected), `cortex limit shows ${expected}, got: ${out}`);
+    });
+
+    await checkAsync('the dashboard shows what a tapped call cost', async () => {
+      // The same frames, read by the operator's window. A tapped call used
+      // to show its model and nothing else — no tokens, no cost — because
+      // the tap wrote its usage in a shape the ABI-shaped readers did not
+      // look in. The summary line knew what it cost; the window did not.
+      assert(tapHome !== '', 'the tapped run left a record to read');
+      const dash = await startDashboard({ dir: tapHome, port: 0 });
+      try {
+        const res = await fetch(`${dash.url}/api/events?limit=50`);
+        const events = (await res.json()) as Array<Record<string, unknown>>;
+        // The event table is a per-call feed: two calls, two events.
+        const calls = events.filter((e) => e['type'] === 'llm.call');
+        assert(calls.length === 2, `two tapped calls in the event table, got ${calls.length}`);
+        const tokensIn = calls.reduce((n, e) => n + Number(e['tokensIn'] ?? 0), 0);
+        const tokensOut = calls.reduce((n, e) => n + Number(e['tokensOut'] ?? 0), 0);
+        const usd = calls.reduce((n, e) => n + Number(e['usd'] ?? 0), 0);
+        assert(tokensIn === 200, `200 in, got ${tokensIn}`);
+        assert(tokensOut === 40, `40 out, got ${tokensOut}`);
+        assert(usd > 0, `and a price, got ${usd}`);
+        // And every one of them carries its own numbers — a call with a model
+        // and nothing else is the bug.
+        assert(calls.every((e) => e['tokensIn'] !== undefined && e['usd'] !== undefined), 'each call shows its own usage');
+      } finally {
+        await dash.close();
+      }
       await rm(tapHome, { recursive: true, force: true });
     });
 
@@ -9898,6 +9985,74 @@ async function runWrapChecks(): Promise<void> {
 // Dashboard server checks
 // =============================================================================
 
+type PageFn = (...args: unknown[]) => unknown;
+
+/**
+ * One of the dashboard page's own helpers, pulled out of the served asset
+ * and evaluated. The page is one file of inline script; a check that wants
+ * to exercise *it* has to take the code from the page, not from a copy
+ * that can drift away from what ships.
+ */
+function pageFunction(html: string, name: 'esc' | 'eventLabel' | 'fmtLocal'): PageFn {
+  const header = name === 'esc' ? 'const esc = (value) =>' : `function ${name}(`;
+  const at = html.indexOf(header);
+  assert(at >= 0, `the page still defines ${name}`);
+  let src: string;
+  if (name === 'esc') {
+    const end = html.indexOf(';\n', at);
+    assert(end > at, 'the page still defines esc');
+    src = html.slice(at, end + 1);
+  } else {
+    const open = html.indexOf('{', at);
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < html.length; i += 1) {
+      if (html[i] === '{') depth += 1;
+      else if (html[i] === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+    assert(close > open, `the page's ${name}() never closes`);
+    src = html.slice(at, close + 1);
+  }
+  return new Function(src + '\nreturn ' + name + ';')() as PageFn;
+}
+
+/** Render one event row the way the dashboard page renders it. */
+function renderDashboardEventRow(html: string, event: Record<string, unknown>): string {
+  const esc = pageFunction(html, 'esc');
+  const eventLabel = pageFunction(html, 'eventLabel');
+  const fmtLocal = pageFunction(html, 'fmtLocal');
+  const at = html.indexOf('rows.map((event) => {');
+  assert(at >= 0, 'the page still renders event rows');
+  const open = html.indexOf('{', at);
+  let depth = 0;
+  let close = -1;
+  for (let i = open; i < html.length; i += 1) {
+    if (html[i] === '{') depth += 1;
+    else if (html[i] === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        close = i;
+        break;
+      }
+    }
+  }
+  assert(close > open, "the page's event row template never closes");
+  const body = html.slice(open + 1, close);
+  const fn = new Function('event', 'esc', 'eventLabel', 'fmtLocal', body) as (
+    e: Record<string, unknown>,
+    escFn: PageFn,
+    labelFn: PageFn,
+    timeFn: PageFn,
+  ) => string;
+  return fn(event, esc, eventLabel, fmtLocal);
+}
+
 async function runDashboardChecks(): Promise<void> {
   const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
@@ -10075,6 +10230,55 @@ async function runDashboardChecks(): Promise<void> {
         const html = await res.text();
         assert(html.includes('usdSpentDollars'), 'the page reads the dollar value');
         assert(!html.includes('spent.usdSpent'), 'the page never adds up the raw microdollars');
+      });
+
+      await checkAsync('the event row keeps the shape of the table', async () => {
+        // The row template built the "Token / 模型" cell's tooltip with a
+        // nested template literal — `title="${event.usd === undefined ? '' :
+        // `$${…}`}"`. The stray quote made the HTML parser read the rest of
+        // the row as that attribute's value: the browser showed six cells
+        // where the header has seven, every cell after it was shifted a
+        // column left, and the "Token / 模型" column showed the *time*.
+        // The facts were on the page. They were not on the screen.
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+
+        // The header is the contract: one cell per column, in order.
+        const tableAt = html.indexOf('<table class="event-table">');
+        assert(tableAt >= 0, 'the event table is still there');
+        const headRow = html.slice(tableAt, html.indexOf('</tr>', tableAt));
+        const columns = (headRow.match(/<th\b/g) ?? []).length;
+        assert(columns === 7, `the event table has seven columns, got ${columns}`);
+
+        // Render one row with the page's own code.
+        const row = renderDashboardEventRow(html, {
+          type: 'llm.call',
+          name: 'llm_call',
+          pid: 2,
+          durationMs: 34,
+          model: 'gpt-4o-mini',
+          tokensIn: 100,
+          tokensOut: 20,
+          usd: 0.000026625,
+          at: '2026-10-24T11:19:05.171Z',
+        });
+
+        // Every tag closes its own quotes. A stray quote inside an attribute
+        // is exactly what makes the HTML parser swallow the rest of the row.
+        for (const tag of row.match(/<[^>]*>/g) ?? []) {
+          const quotes = (tag.match(/"/g) ?? []).length;
+          assert(quotes % 2 === 0, `every tag closes its own quotes: ${tag}`);
+        }
+
+        // One cell per column.
+        const cells = (row.match(/<td\b/g) ?? []).length;
+        assert(cells === columns, `the row has ${columns} cells, got ${cells}`);
+
+        // And the fact the column exists for is on it: the tokens, the model,
+        // the price.
+        assert(row.includes('100 in / 20 out'), `the row shows its tokens, got: ${row}`);
+        assert(row.includes('gpt-4o-mini'), `the row shows its model, got: ${row}`);
+        assert(row.includes('$0.000027'), `the row shows its cost, got: ${row}`);
       });
 
       await checkAsync('dashboard serves the supervision tree and budget panels', async () => {

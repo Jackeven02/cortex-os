@@ -1546,6 +1546,86 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A tapped model call showed its model and nothing else.** The fetch tap
+  writes `llm_call` frames into the same `.crec` a driver call goes into,
+  under the same syscall name — but it wrote the result **flat**:
+
+  ```json
+  {"usd":0.000026625,"model":"gpt-4o-mini","httpStatus":200,"inputTokens":100,"cachedTokens":5,"outputTokens":20}
+  ```
+
+  ABI.md §4.3 says the result of an `llm_call` is an `LLMResponse`, whose
+  usage lives under `usage` — and that is where every reader looks. So the
+  dashboard's event table, and the trace view, showed a tapped call with a
+  model and **no tokens and no cost**. The summary line knew what the call
+  cost, because it read the flat fields. One call, two answers, and the
+  operator's window was the one missing.
+
+  The tap now writes `usage` where the ABI says it is:
+
+  ```json
+  {"model":"gpt-4o-mini","usage":{"inputTokens":100,"outputTokens":20,"cachedTokens":5,"usd":0.000026625},"httpStatus":200,...}
+  ```
+
+  The flat fields stay in the frame, because the `.crec` format is frozen: a
+  log written by this build has to stay readable by an older `cortex wrap`,
+  whose `readTapSpend` knows only the flat shape. `readTapSpend` reads
+  **both**, so a log already on a disk still adds up.
+
+  **Three new smoke checks** — plus the row-shape one below, 740 → 744
+  overall — each reverse-verified: the tap
+  writes flat again → "a tapped call is recorded in the ABI's shape" fails
+  ("the frame carries the ABI's usage") and "the dashboard shows what a
+  tapped call cost" fails ("200 in, got 0"); the reader stops accepting the
+  old shape → "readTapSpend still adds up a log written before the ABI shape"
+  fails ("100 in, got 0").
+
+  Same frame, same fields, more data: no syscall, no `.crec`/`.csnap` format
+  change, nothing in the ABI frozen at `1.0.0` touched.
+
+- **The event table's "Token / 模型" column showed the time, and every cell
+  after it was a column out of place.** The row template built that cell's
+  tooltip with a nested template literal:
+
+  ```html
+  <td title="${event.usd === undefined ? '' : `$${Number(event.usd).toFixed(6)}`"}">
+  ```
+
+  The nested template ends with a backtick *and* a quote, so the attribute
+  came out as `title="$0.000027""` — one quote too many. The HTML parser
+  then read **the rest of the row** as that attribute's value, and the
+  browser showed six cells where the header has seven:
+
+  ```
+  类型        名称       PID   耗时   TOKEN / 模型      时间        错误
+  模型 · call  llm_call   2     28 ms  10/24 19:17:30   —           —
+  ```
+
+  The time landed under "Token / 模型", the row ran out of columns, and the
+  tokens and the cost never reached the screen. This was in the page since
+  v1.2.0 and nobody saw it, because **the template is fine in Node** — it
+  renders seven cells there. It was the browser's parser that disagreed, and
+  the only way to see that was to look at the page.
+
+  The cost is now computed **before** the template, and the attribute gets a
+  plain string:
+
+  ```js
+  const costLabel = event.usd === undefined ? '' : `$${Number(event.usd).toFixed(6)}`;
+  ...
+  <td class="cost-cell" title="${esc(costLabel)}">${esc(tokenSummary)}</td>
+  ```
+
+  A **fourth** smoke check holds the row's shape. It renders a row with the
+  page's *own* code — its escaper, its labels, its clock, pulled out of the
+  served page — and asserts that every tag closes its own quotes, that the
+  row has one cell per header column, and that the tokens, the model and the
+  price are on it. Reverse-verified: with the old template back in place it
+  fails on the stray quote (`<td class="cost-cell" title="$0.000027"">`).
+
+  The rule it writes down: **an HTML attribute never holds a template
+  literal.** A value is computed in JS, escaped once, and dropped in.
+
 - **The operator's window priced money a million times too high, and `cortex wrap`
   priced it a million times too low.** `budgetsSpent.usdSpent` is in
   **microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4) — and

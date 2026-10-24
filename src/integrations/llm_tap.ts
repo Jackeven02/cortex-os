@@ -439,6 +439,23 @@ export async function tapFetch(options: LLMTapOptions): Promise<() => Promise<vo
     await write(response.ok ? 'exit' : 'trap', {
       result: {
         model,
+        // ABI.md §4.3: the result of an `llm_call` is an `LLMResponse`, and
+        // its usage lives under `usage`. The tap writes that shape, so every
+        // reader that follows the ABI — the dashboard's event table, the
+        // trace view — sees a tapped call's tokens and cost. Before this, the
+        // tap wrote them flat and every ABI-shaped reader saw a call with a
+        // model and nothing else.
+        //
+        // The frame also keeps the flat mirror: a log written by this build
+        // is still read by an older `cortex wrap`, whose `readTapSpend`
+        // knows only the flat shape. The `.crec` format is frozen, so the
+        // addition has to be additive.
+        usage: {
+          inputTokens: usage?.inputTokens ?? 0,
+          outputTokens: usage?.outputTokens ?? 0,
+          cachedTokens: usage?.cachedTokens ?? 0,
+          usd,
+        },
         ...(usage !== undefined
           ? { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens }
           : {}),
@@ -589,7 +606,11 @@ export async function readTapSpend(dir: string, pid: number): Promise<TapSpend> 
       if (result === undefined || result === null) continue;
 
       const read = (key: string): number => {
-        const n = Number(result[key]);
+        // ABI.md §4.3 puts the usage under `usage`; a log written before the
+        // tap adopted that shape has it flat. Both are read, so an old log
+        // still adds up — and the ABI's shape wins when a frame has both.
+        const nested = (result as { usage?: Record<string, unknown> } | undefined)?.usage;
+        const n = Number(nested?.[key] ?? result[key]);
         return Number.isFinite(n) ? n : 0;
       };
 

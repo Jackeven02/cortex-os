@@ -531,8 +531,8 @@ The user-facing surface. Should feel like a real OS shell.
   conversion point), INTEGRATIONS (the tap's dollars, the budget's
   microdollars, and the boundary where they meet).
 
-- [ ] **#083** A tapped `llm_call` frame does not carry the ABI's `usage`
-  shape. The tap writes its result flat —
+- [x] **#083** A tapped `llm_call` frame does not carry the ABI's `usage`
+  shape → **fixed.** The tap writes its result flat —
   `{ model, inputTokens, outputTokens, cachedTokens, usd, httpStatus }` — while
   ABI.md's `llm_call` result is
   `{ text, toolCalls, finishReason, usage: { inputTokens, outputTokens,
@@ -545,10 +545,71 @@ The user-facing surface. Should feel like a real OS shell.
   - Anything else that reads an `llm_call` result by the ABI's shape sees
     nothing for a tapped call.
 
-  The fix is to make the tap write the ABI's shape (and keep
-  `readTapSpend` reading both shapes, so old logs still add up). Not done
-  yet: changing what the tap writes to a log is a bigger step than changing
-  a view, and it deserves its own pass with its own reverse-verification.
+  **Found by running it, not by reading it.** A real tapped run, with the
+  frame read back off the disk:
+
+  ```
+  result={"usd":0.000026625,"model":"gpt-4o-mini","httpStatus":200,
+          "inputTokens":100,"cachedTokens":5,"outputTokens":20}
+
+  llm.call {"type":"llm.call","model":"gpt-4o-mini"}     ← no tokens, no cost
+  ```
+
+  while the same run's summary line said `tokens: 120 (in 100, out 20)` and
+  `tap: 1 llm call ($0.000027)`.
+
+  The fix was **not** to teach every reader about a second shape — that is a
+  tax on every reader that will ever be written, and the ABI already says
+  where the usage lives. The tap now writes `usage` where ABI.md §4.3 puts
+  it, and **keeps the flat fields as well**: the `.crec` format is frozen, so
+  a log written by this build has to stay readable by an older `cortex wrap`,
+  whose reader knows only the flat shape. `readTapSpend` reads **both**, so a
+  log already on a disk still adds up.
+
+  What the tap still does not record is the **text** — no prompt, no
+  completion. That is deliberate (a log is something people paste into bug
+  reports), and it is why a tapped frame is not a *complete* `LLMResponse`:
+  it carries the usage, the model and the status, and no words.
+
+  **Three new smoke checks** (740 → 743 with these; 744 with the row-shape one
+  below), all reverse-verified: the tap
+  writes flat again → "a tapped call is recorded in the ABI's shape" fails
+  ("the frame carries the ABI's usage") and "the dashboard shows what a
+  tapped call cost" fails ("200 in, got 0"); the reader stops accepting the
+  old shape → "readTapSpend still adds up a log written before the ABI shape"
+  fails ("100 in, got 0").
+
+  Docs: ABI.md §4.3 (the shape of that result is part of the contract),
+  ARCHITECTURE (a frame that says a fact in the wrong place is a fact nobody
+  sees), INTEGRATIONS (the frame is an `llm_call` frame, so it is shaped like
+  one).
+
+- [x] **#084** The event table's "Token / 模型" column shows the time, and
+  every cell after it is a column out of place → **fixed.** Found while
+  verifying #083: the row template built that cell's tooltip with a nested
+  template literal,
+
+  ```html
+  <td title="${event.usd === undefined ? '' : `$${Number(event.usd).toFixed(6)}`"}">
+  ```
+
+  whose extra quote made the HTML parser read **the rest of the row** as the
+  attribute's value. The browser showed six cells where the header has seven;
+  the time landed under "Token / 模型". It was in the page since v1.2.0 and
+  nobody saw it, because the template renders seven cells *in Node* — it was
+  the browser's parser that disagreed, and the only way to see that was to
+  look at the page.
+
+  The value is now computed before the template and the attribute gets a
+  plain string, and a **fourth** smoke check holds the row's shape: it renders
+  a row with the page's own code (its escaper, its labels, its clock, pulled
+  out of the served page) and asserts that every tag closes its own quotes,
+  that the row has one cell per header column, and that the tokens, the model
+  and the price are on it. Reverse-verified: with the old template back it
+  fails on the stray quote (`<td class="cost-cell" title="$0.000027"">`).
+
+  The rule it writes down: **an HTML attribute never holds a template
+  literal.** A value is computed in JS, escaped once, and dropped in.
 
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 

@@ -370,6 +370,24 @@ interface LLMResponse {
 }
 ```
 
+**The shape of that result is part of the contract.** Every reader of the
+frame — the dashboard's event table, the trace view, `cortex diff` — reads the
+usage from `usage`. A frame that writes it anywhere else is a frame those
+readers cannot see.
+
+That is not a theoretical concern. The **fetch tap**
+([INTEGRATIONS.md](./INTEGRATIONS.md)) writes `llm_call` frames into the same
+`.crec` a driver call goes into, and it used to write its usage **flat** —
+`{ model, inputTokens, outputTokens, cachedTokens, usd }` — so every
+ABI-shaped reader saw a tapped call with a model and nothing else: no tokens,
+no cost. The summary line knew what the call cost; the operator's window did
+not.
+
+The tap now writes `usage` where this section says it is, and **keeps the flat
+fields as well**: the `.crec` format is frozen, so a log written by this build
+is still read by an older `cortex wrap`, whose reader knows only the flat
+shape. The addition is additive — same frame, same fields, more data.
+
 #### `tool_call(name: string, args: unknown, opts?: ToolCallOptions): Promise<ToolResult>`
 
 Invoke a tool by name. Tools are provided by `IToolDriver` implementations (typically MCP servers).
