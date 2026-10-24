@@ -58,6 +58,7 @@
  */
 
 import {
+  type BudgetKind,
   type BudgetLimits,
   type ProcessId,
   type ProcessState,
@@ -157,6 +158,22 @@ export const DISPATCH_ACTIONS = [
 type UnlistedDispatchAction = Exclude<DispatchReason | 'idle', (typeof DISPATCH_ACTIONS)[number]>;
 const _everyDispatchActionIsListed: UnlistedDispatchAction extends never ? true : never = true;
 void _everyDispatchActionIsListed;
+
+/**
+ * Why a dispatched process was gone by the time the scheduler looked again.
+ *
+ * Two ways, and they are different stories: the process vanished before its
+ * quantum ran (`vanished-after-dispatch`), or it vanished while its quantum
+ * was running (`reaped-during-quantum`). The scheduler records which, and a
+ * view that drops it leaves a reader with "the process ended" and no reason.
+ *
+ * Exported as a list so a view can size its column to the widest name the
+ * kernel can produce.
+ */
+export const DISPATCH_EXITS = ['vanished-after-dispatch', 'reaped-during-quantum'] as const;
+
+/** Why a dispatched process was gone. */
+export type DispatchExit = (typeof DISPATCH_EXITS)[number];
 
 /**
  * Outcome of a single `tick()`. Either nothing was runnable (`dispatched:
@@ -499,7 +516,8 @@ export class Scheduler {
 
     let entry = this.#table.get(pid);
     if (entry === undefined) {
-      await this.#recordSched(pid, 'exited', { reason: 'vanished-after-dispatch' });
+      const reason: DispatchExit = 'vanished-after-dispatch';
+      await this.#recordSched(pid, 'exited', { reason });
       return { dispatched: pid, reason: 'exited' };
     }
     if (entry.state !== 'running') {
@@ -524,7 +542,8 @@ export class Scheduler {
 
     entry = this.#table.get(pid);
     if (entry === undefined) {
-      await this.#recordSched(pid, 'exited', { reason: 'reaped-during-quantum' });
+      const reason: DispatchExit = 'reaped-during-quantum';
+      await this.#recordSched(pid, 'exited', { reason });
       return { dispatched: pid, reason: 'exited' };
     }
 
@@ -684,7 +703,7 @@ export class Scheduler {
    */
   async #fireSigxcpu(
     pid: ProcessId,
-    kind: 'tokens' | 'usd' | 'wallTime',
+    kind: BudgetKind,
     phase: 'pre-dispatch' | 'post-quantum',
   ): Promise<void> {
     // signals.send records the delivery as __signal; we add the scheduling

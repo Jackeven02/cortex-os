@@ -120,7 +120,7 @@ time          pid     syscall                                                   
 # 3 record(s)
 # (the kernel's own frames are named too — and they say *why*:
 #  __state:running->blocked(recv), __state:new->ready(spawn),
-#  __init:restart-gave-up, __sched:parked, __signal:SIGTERM(queued) — so a log
+#  __init:restart-gave-up, __sched:parked(recv), __signal:SIGTERM(queued) — so a log
 #  reads as the story it is, not a row of anonymous placeholders)
 
 # Read back what a process printed (kept per process, not mixed into the
@@ -240,7 +240,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 746 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 748 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the

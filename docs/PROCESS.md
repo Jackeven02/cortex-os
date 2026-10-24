@@ -419,7 +419,7 @@ Cortex signals are Unix-shaped but with agent-specific semantics.
 | `SIGUSR1` | 10 | ignore | **"Reflect."** Write a self-summary to memory. Agent-specific. |
 | `SIGUSR2` | 30 | checkpoint | **"Checkpoint now."** Kernel writes snapshot. Agent-specific. |
 | `SIGCHLD` | 19 | ignore | Sent to parent when child changes state (RUNNING → ZOMBIE, etc). |
-| `SIGXCPU` | 24 | stop | **Budget exceeded** (tokens or USD). Default: STOPPED until supervisor decides. |
+| `SIGXCPU` | 24 | stop | **Budget exceeded** (tokens, USD, or wall time). Default: STOPPED until supervisor decides. |
 | `SIGXFSZ` | 25 | terminate | Memory region exceeded its size limit. |
 | `SIGSYS` | 31 | terminate | Bad syscall — driver rejected, permission denied, malformed args. |
 | `SIGPIPE` | 13 | ignore | IPC channel closed by peer. |
@@ -568,6 +568,14 @@ Budgets decrement on every relevant syscall. When exhausted:
 - A counter hits zero → `SIGXCPU` fires
 - Default disposition: STOPPED
 - Supervisor may: increase budget, terminate, fork a fresh attempt
+
+**And the log says which counter hit zero.** "Your agent was stopped" and
+"your agent ran out of tokens" are different facts, and only one of them tells
+the operator what to change — the budget, or the code that spends it. The
+scheduler records which one, and the trace renders it in the frame's own name:
+`__sched:sigxcpu(tokens)`. The budget kind is a closed vocabulary
+(`BudgetKind`: `tokens`, `usd`, `wallTime`), so a frame cannot say anything
+else (ABI.md §6.1).
 
 Budgets are inherited on `spawn()` (default: half of parent's remaining), reset on `fork()` (default; see STATE.md §2.4), preserved on `checkpoint()`/`restore()`.
 

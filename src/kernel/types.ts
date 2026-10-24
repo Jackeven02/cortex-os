@@ -350,6 +350,43 @@ export type BlockedReason =
   | { readonly kind: 'budget'; readonly until: Timestamp }
   | { readonly kind: 'lock'; readonly resource: string };
 
+/**
+ * What a process can be blocked on — the *kind* of every {@link BlockedReason}.
+ *
+ * Exported as a list so that a view can name the thing in a column and size
+ * that column to the widest name the kernel can produce, rather than guess at
+ * one. The list is checked against the union above, so a new kind cannot be
+ * added to one and forgotten in the other.
+ */
+export const BLOCKED_KINDS = [
+  'recv',
+  'wait',
+  'tool',
+  'llm',
+  'sleep',
+  'budget',
+  'lock',
+] as const satisfies readonly BlockedReason['kind'][];
+
+/** The kind of thing a process is blocked on. */
+export type BlockedKind = BlockedReason['kind'];
+
+/**
+ * The budgets a process can run out of.
+ *
+ * When one of them runs out the kernel stops the process with SIGXCPU — and
+ * the frame that says so has to say *which* one, because "your agent was
+ * stopped" and "your agent ran out of tokens" are different facts and only
+ * one of them is actionable.
+ *
+ * Exported as a list for the same reason as {@link BLOCKED_KINDS}: a view
+ * sizes its column to the widest name the kernel can produce.
+ */
+export const BUDGET_KINDS = ['tokens', 'usd', 'wallTime'] as const;
+
+/** The budget that ran out. */
+export type BudgetKind = (typeof BUDGET_KINDS)[number];
+
 // =============================================================================
 // §7. Signals
 // =============================================================================

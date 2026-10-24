@@ -49,6 +49,7 @@ import {
   type AgentSpec,
   type BlockedReason,
   type BudgetCounters,
+  type BudgetKind,
   type BudgetLimits,
   type Capability,
   type ChainId,
@@ -1116,7 +1117,7 @@ export class ProcessTable {
    * exhausted kind. Used by the scheduler to decide whether to fire
    * SIGXCPU.
    */
-  checkBudget(pid: ProcessId): 'ok' | { readonly kind: 'tokens' | 'usd' | 'wallTime' } {
+  checkBudget(pid: ProcessId): 'ok' | { readonly kind: BudgetKind } {
     const entry = this.mustGet(pid, 'checkBudget');
     const r = entry.budgetsRemaining;
     if (r.tokens === 0) return { kind: 'tokens' };

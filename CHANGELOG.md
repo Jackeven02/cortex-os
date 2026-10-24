@@ -1546,6 +1546,51 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The scheduler's frames said what happened, and not why.** `cortex trace`
+  shows the kernel's own bookkeeping frames — `__state`, `__signal`, `__init`,
+  `__sched` — and each one is named after the thing that distinguishes it. The
+  `__state` frame was given its cause (`__state:running->blocked(recv)`) and
+  the `__signal` frame its outcome (`__signal:SIGTERM(delivered)`). The
+  `__sched` frame was left with the bare action:
+
+  ```
+  00:00:03.000  2       __sched:sigxcpu                       exit   -          idempotent
+  ```
+
+  So the log said the process was stopped — and not whether it had run out of
+  tokens, of money, or of wall time. The scheduler had recorded which one
+  (`budgetKind`), in the frame, the whole time; the view dropped it.
+
+  "Your agent was stopped" and "your agent ran out of tokens" are different
+  facts, and only one of them tells the operator what to change. The same was
+  true of the other scheduler frames: `blocked` and `parked` dropped what the
+  process was waiting on, and `exited` dropped why it was gone.
+
+  Now they say it, by the rule the other frames already follow:
+
+  ```
+  __sched:sigxcpu(tokens)
+  __sched:blocked(recv)
+  __sched:parked(sleep)
+  __sched:exited(reaped-during-quantum)
+  ```
+
+  **And the causes are words the kernel is held to.** `BUDGET_KINDS`
+  (`tokens`, `usd`, `wallTime`), `BLOCKED_KINDS` (what a process can be
+  blocked on) and `DISPATCH_EXITS` (why a dispatched process was gone) are
+  exported from the kernel, and the scheduler records a `BudgetKind`, a
+  `BlockedReason` and a `DispatchExit` — so a frame that says `sigxcpu` and
+  leaves out *which* budget is not something the code can write. The trace
+  table's syscall column is derived from those lists, as it always was.
+
+  **Two new smoke checks** (746 → 748), both reverse-verified: the cause
+  dropped from the view → "the frame lost the budget that ran out" (the output
+  says `__sched:sigxcpu`), and the blocked kind dropped → "the frame lost what
+  it was waiting on".
+
+  The `.crec` format is untouched — this is a view of the log, exactly as the
+  `__state` cause was.
+
 - **A run that spent $0.000027 was shown as having spent $0.0000.** The unit
   was fixed in the last release; the *precision* was not, and it cost the same
   thing.

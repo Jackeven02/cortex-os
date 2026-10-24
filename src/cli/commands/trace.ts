@@ -16,11 +16,11 @@ import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
 import { defaultKernelDir, existingCrecPath } from '../index.js';
 import { readRecords } from '../../kernel/recorder.js';
-import { unbrand, asProcessId, type SyscallRecord } from '../../kernel/types.js';
+import { unbrand, asProcessId, BUDGET_KINDS, BLOCKED_KINDS, type SyscallRecord } from '../../kernel/types.js';
 import { PROCESS_STATES, STATE_TRIGGERS } from '../../kernel/process_table.js';
 import { ALL_SIGNALS, DELIVERY_OUTCOMES } from '../../kernel/signals.js';
 import { INIT_ACTIONS } from '../../kernel/init.js';
-import { DISPATCH_ACTIONS } from '../../kernel/scheduler.js';
+import { DISPATCH_ACTIONS, DISPATCH_EXITS } from '../../kernel/scheduler.js';
 import { renderHeader, renderRow, ruleUnder, type Column } from '../table.js';
 
 /** The length of the longest string in a list. */
@@ -45,7 +45,8 @@ function longest(values: readonly string[]): number {
  *   `init-register-daemon` (20), so 58;
  * - `__signal:` + *signal* + `(` + *outcome* + `)` — 27;
  * - `__init:` + *action* — 23 (`restart-gave-up`);
- * - `__sched:` + *action* — 15.
+ * - `__sched:` + *action* + `(` + *cause* + `)` — the longest is
+ *   `__sched:exited(reaped-during-quantum)` (36).
  *
  * The lists come from the kernel modules themselves, so a new state, a new
  * signal, a new supervision action or a new transition cause widens the
@@ -61,7 +62,13 @@ export const TRACE_SYSCALL_WIDTH = Math.max(
     ')'.length,
   '__signal:'.length + longest(ALL_SIGNALS) + '('.length + longest(DELIVERY_OUTCOMES) + ')'.length,
   '__init:'.length + longest(INIT_ACTIONS),
+  // `__sched:` + *action* — and, when the frame recorded one, the cause it
+  // recorded: which budget ran out, what the process was waiting on, why it
+  // was gone. The widest is `__sched:exited(reaped-during-quantum)`.
   '__sched:'.length + longest(DISPATCH_ACTIONS),
+  '__sched:'.length + 'sigxcpu'.length + '('.length + longest(BUDGET_KINDS) + ')'.length,
+  '__sched:'.length + 'blocked'.length + '('.length + longest(BLOCKED_KINDS) + ')'.length,
+  '__sched:'.length + 'exited'.length + '('.length + longest(DISPATCH_EXITS) + ')'.length,
 );
 
 /**
@@ -111,10 +118,21 @@ export function frameName(rec: SyscallRecord): string {
       return typeof args?.['action'] === 'string'
         ? `__init:${args['action']}`
         : rec.syscall;
-    case '__sched':
-      return typeof args?.['action'] === 'string'
-        ? `__sched:${args['action']}`
-        : rec.syscall;
+    case '__sched': {
+      const action = typeof args?.['action'] === 'string' ? args['action'] : undefined;
+      if (action === undefined) return rec.syscall;
+      // The cause: **why** the scheduler decided what it decided. The frame
+      // recorded it — which budget ran out, what the process was waiting on,
+      // why it was gone — and the view dropped it, so the log said "sigxcpu"
+      // and not whether the agent had run out of tokens, of money, or of
+      // wall time. One of those is actionable and two are not, and the reader
+      // could not tell them apart.
+      //
+      // The shape is the same one the other frames use: `__state:<from>-><to>
+      // (<cause>)`, `__signal:<signal>(<outcome>)`.
+      const cause = schedCause(action, args);
+      return cause === '' ? `__sched:${action}` : `__sched:${action}(${cause})`;
+    }
     case '__state': {
       const from = typeof args?.['from'] === 'string' ? args['from'] : rec.stateBefore;
       const to = typeof args?.['to'] === 'string' ? args['to'] : rec.stateAfter;
@@ -158,6 +176,41 @@ function stateCause(args: Record<string, unknown> | undefined): string {
   if (typeof signal === 'string' && signal !== '') return signal;
   const trigger = args['trigger'];
   return typeof trigger === 'string' ? trigger : '';
+}
+
+/**
+ * What made the scheduler decide what it decided.
+ *
+ * Each action carries the one detail that explains it:
+ *
+ * - `sigxcpu` — **which budget ran out**. "Your agent was stopped" and "your
+ *   agent ran out of tokens" are different facts, and only one of them tells
+ *   the operator what to change.
+ * - `blocked` / `parked` — **what it is waiting on**, by kind. The channel id
+ *   and the call id stay in the frame; a column of ids would be a column of
+ *   noise.
+ * - `exited` — **why it was gone**.
+ *
+ * Empty when the frame carries no cause: an older kernel recorded the action
+ * without one, and a frame that says nothing is better than one that guesses.
+ */
+function schedCause(action: string, args: Record<string, unknown> | undefined): string {
+  if (args === undefined) return '';
+  if (action === 'sigxcpu') {
+    const kind = args['budgetKind'];
+    return typeof kind === 'string' ? kind : '';
+  }
+  if (action === 'blocked' || action === 'parked') {
+    const blockedOn = args['blockedOn'];
+    if (blockedOn === null || typeof blockedOn !== 'object') return '';
+    const kind = (blockedOn as { readonly kind?: unknown }).kind;
+    return typeof kind === 'string' ? kind : '';
+  }
+  if (action === 'exited') {
+    const reason = args['reason'];
+    return typeof reason === 'string' ? reason : '';
+  }
+  return '';
 }
 
 /**

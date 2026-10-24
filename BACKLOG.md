@@ -641,6 +641,48 @@ The user-facing surface. Should feel like a real OS shell.
   format; INTEGRATIONS — the tap's money is printed like every other money;
   both READMEs; CHANGELOG.
 
+- [x] **#086** The scheduler's frames say what happened, not why → **fixed.**
+  `cortex trace` names each kernel frame after the thing that distinguishes it,
+  and the `__state` frame was given its cause
+  (`__state:running->blocked(recv)`) — but `__sched` was left with the bare
+  action:
+
+  ```
+  __sched:sigxcpu
+  ```
+
+  So the log said the process was stopped, and not whether it had run out of
+  tokens, of money, or of wall time. The scheduler had recorded which
+  (`budgetKind`), in the frame, the whole time; the view dropped it. The same
+  for `blocked` / `parked` (dropped what the process was waiting on) and for
+  `exited` (dropped why it was gone).
+
+  Now they say it, by the rule the other frames already follow:
+
+  ```
+  __sched:sigxcpu(tokens)
+  __sched:blocked(recv)
+  __sched:parked(sleep)
+  __sched:exited(reaped-during-quantum)
+  ```
+
+  And the causes are **words the kernel is held to**: `BUDGET_KINDS`,
+  `BLOCKED_KINDS` and `DISPATCH_EXITS` are exported, and the scheduler records
+  a `BudgetKind`, a `BlockedReason` and a `DispatchExit` — so a frame that
+  leaves out *which* budget is not something the code can write. The trace
+  table's syscall column is derived from those lists, as it always was.
+
+  **Two new smoke checks** (746 → 748), both reverse-verified: the cause
+  dropped from the view → "the frame lost the budget that ran out"; the blocked
+  kind dropped → "the frame lost what it was waiting on".
+
+  The `.crec` format is untouched — this is a view of the log.
+
+  Docs: ABI.md §6.1 (the frame names, the vocabularies, and the enforcement);
+  ARCHITECTURE (the scheduler's frames gained a cause by the same rule);
+  PROCESS.md §8.3 (the log says which counter hit zero) and §7 (SIGXCPU is
+  about tokens, USD **or wall time**).
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

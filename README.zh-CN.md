@@ -118,7 +118,7 @@ time          pid     syscall                                                   
 # 3 record(s)
 # （内核自己的帧也有名字 —— 而且它们说清了**为什么**：
 #  __state:running->blocked(recv)、__state:new->ready(spawn)、
-#  __init:restart-gave-up、__sched:parked、__signal:SIGTERM(queued) —— 所以一份日志
+#  __init:restart-gave-up、__sched:parked(recv)、__signal:SIGTERM(queued) —— 所以一份日志
 #  读起来就是它本来该是的那个故事，而不是一排匿名占位符）
 
 # 读回一个进程**打印**过的东西
@@ -232,7 +232,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 746 项断言，0 失败
+npx tsx scripts/smoke.ts                # 748 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。

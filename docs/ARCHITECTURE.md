@@ -1176,13 +1176,13 @@ view of it.
 ```console
 $ cortex watch --pid 1234
 # watching the kernel event stream (Ctrl-C to stop)
-time          pid     syscall                              phase  duration   reversibility
-------------------------------------------------------------------------------------------
-19:50:09.072  1234    __sched:dispatch                     exit   -          idempotent
-19:50:09.072  1234    sleep                                exit   2523ms     idempotent
-19:50:09.073  1234    memory_write                         enter  -          reversible
-19:50:09.074  1234    memory_read                          exit   0ms        idempotent
-19:50:09.077  1234    exit                                 enter  -          irreversible
+time          pid     syscall                                                    phase  duration   reversibility
+----------------------------------------------------------------------------------------------------------------
+19:50:09.072  1234    __sched:blocked(recv)                                      exit   -          idempotent
+19:50:09.072  1234    sleep                                                      exit   2523ms     idempotent
+19:50:09.073  1234    memory_write                                               enter  -          reversible
+19:50:09.074  1234    memory_read                                                exit   0ms        idempotent
+19:50:09.077  1234    exit                                                       enter  -          irreversible
 # pid 1234 exited with code 3 (probe finished on purpose)
 ```
 
@@ -1208,7 +1208,7 @@ So the *view* now carries the distinguishing part:
 | frame | shown as | tells you |
 |---|---|---|
 | `__init` | `__init:restart-gave-up` | which supervision action was taken |
-| `__sched` | `__sched:dispatch` | which scheduling action was taken |
+| `__sched` | `__sched:sigxcpu(tokens)` | which scheduling action was taken, **and what caused it** |
 | `__state` | `__state:running->blocked(recv)` | the transition, **and what caused it** |
 | `__signal` | `__signal:SIGTERM(delivered)` | which signal, and what became of it |
 
@@ -1224,6 +1224,20 @@ more than `signal`. Every other cause is the trigger the kernel recorded —
 `recv`, `sleep`, `wait`, `scheduler-dispatch`, `init-register-daemon`, and so
 on.
 
+**And the scheduler's frames gained one too, by the same rule.** `sigxcpu`
+says the process was stopped — and not whether it ran out of tokens, of
+money, or of wall time. "Your agent was stopped" and "your agent ran out of
+tokens" are different facts, and only one of them tells the operator what to
+change. So the frame now says which budget fired, what the process was
+waiting on, and why it was gone:
+
+```
+__sched:sigxcpu(tokens)
+__sched:blocked(recv)
+__sched:parked(sleep)
+__sched:exited(reaped-during-quantum)
+```
+
 **And the causes are a vocabulary, not free text.** `STATE_TRIGGERS` is
 exported from the process table, `setState` takes a `StateTrigger`, and so a
 cause that is not on the list **cannot be recorded** — a typo is a compile
@@ -1231,6 +1245,13 @@ error (`Type '"revc"' is not assignable to type '"recv" | …'`) and not a frame
 nobody can explain. The list also widens the trace table's syscall column by
 itself: the widest frame name the kernel can produce is
 `__state:checkpointing->checkpointing(init-register-daemon)`, 58 characters.
+
+The scheduler's causes are words the same way: `BUDGET_KINDS` (what a
+process can run out of), `BLOCKED_KINDS` (what it can be blocked on) and
+`DISPATCH_EXITS` (why a dispatched process was gone) are exported, and the
+kernel records a `BudgetKind`, a `BlockedReason` and a `DispatchExit` — so a
+frame that says `sigxcpu` and leaves out *which* budget is not something the
+code can even write.
 
 The **recorded** syscall name is untouched — the `.crec` format is frozen
 (ABI.md §6), and this is a view of a log, not a change to the log. A

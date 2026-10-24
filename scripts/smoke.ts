@@ -11810,6 +11810,135 @@ async function runDiffChecks(): Promise<void> {
     }
   });
 
+  await checkAsync('the trace says which budget ran out', async () => {
+    // "Your agent was stopped" and "your agent ran out of tokens" are
+    // different facts, and only one of them tells the operator what to
+    // change. The scheduler recorded which budget fired — the frame said
+    // `sigxcpu` and the view dropped the rest, so the log said "sigxcpu" and
+    // the reader had to guess between tokens, money and wall time.
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-trace-budget-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(2), syscall: '__sched',
+        callId: 'sched-2-sigxcpu-1', phase: 'exit',
+        args: { action: 'sigxcpu', budgetKind: 'tokens', phase: 'post-quantum' },
+        stateBefore: 'running', stateAfter: 'stopped', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      // A frame with no cause at all — what an older kernel wrote, and what
+      // the scheduler writes for an action that has no explanation.
+      await rec.append({
+        timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(2), syscall: '__sched',
+        callId: 'sched-2-yielded-1', phase: 'exit',
+        args: { action: 'yielded', nice: 0 },
+        stateBefore: 'running', stateAfter: 'ready', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      console.error = (): void => {};
+      try {
+        const code = await cmdTrace(['2']);
+        assert(code === 0, `trace exit 0, got ${code}`);
+      } finally {
+        console.log = prevLog;
+        console.error = prevErr;
+      }
+
+      assert(
+        out.includes('__sched:sigxcpu(tokens)'),
+        `the frame lost the budget that ran out: ${out}`,
+      );
+      // A frame with no cause says no cause — it does not grow one.
+      assert(out.includes('__sched:yielded'), `the plain frame is still there: ${out}`);
+      assert(
+        !out.includes('__sched:yielded('),
+        `a frame without a cause does not grow one: ${out}`,
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  await checkAsync('the trace says what the process was waiting on', async () => {
+    // The same rule for the other scheduler frames: the frame recorded what
+    // the process was waiting on, and the view dropped it. The channel id and
+    // the call id stay in the frame — a column of ids is a column of noise —
+    // but the *kind* is the fact an operator reads.
+    const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const { tmpdir } = await import('node:os');
+    const tmp = mkdtempSync(join(tmpdir(), 'cortex-trace-blocked-'));
+    mkdirSync(join(tmp, 'processes'), { recursive: true });
+
+    const prevHome = process.env['CORTEX_HOME'];
+    const prevLog = console.log;
+    const prevErr = console.error;
+    try {
+      const rec = await Recorder.open({ pid: asProcessId(2), dir: join(tmp, 'processes', '2') });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:00.000Z', pid: asProcessId(2), syscall: '__sched',
+        callId: 'sched-2-blocked-1', phase: 'exit',
+        args: { action: 'blocked', blockedOn: { kind: 'recv', channel: 3 } },
+        stateBefore: 'running', stateAfter: 'blocked', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.append({
+        timestamp: '2026-01-01T00:00:01.000Z', pid: asProcessId(2), syscall: '__sched',
+        callId: 'sched-2-parked-1', phase: 'exit',
+        args: { action: 'parked', nice: 0, blockedOn: { kind: 'sleep', until: '2026-01-01T00:00:05.000Z' } },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
+      await rec.flush();
+      await rec.close();
+
+      process.env['CORTEX_HOME'] = tmp;
+      let out = '';
+      console.log = (...parts: unknown[]): void => {
+        out += parts.map((p) => String(p)).join(' ') + '\n';
+      };
+      console.error = (): void => {};
+      try {
+        const code = await cmdTrace(['2']);
+        assert(code === 0, `trace exit 0, got ${code}`);
+      } finally {
+        console.log = prevLog;
+        console.error = prevErr;
+      }
+
+      assert(
+        out.includes('__sched:blocked(recv)'),
+        `the frame lost what it was waiting on: ${out}`,
+      );
+      assert(
+        out.includes('__sched:parked(sleep)'),
+        `the frame lost what it was waiting on: ${out}`,
+      );
+    } finally {
+      if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+      else process.env['CORTEX_HOME'] = prevHome;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await checkAsync('the trace table lines up', async () => {
     // The header used to be a hand-typed string, and it had drifted: its
     // "phase" sat five columns to the right of where the rows printed theirs,
@@ -11919,6 +12048,15 @@ async function runDiffChecks(): Promise<void> {
         stateBefore: 'running', stateAfter: 'running', reversibility: 'idempotent',
         kernelAbiVersion: KERNEL_ABI_VERSION,
       });
+      // The widest name a scheduler frame can produce: the longest action and
+      // the longest reason.
+      await rec.append({
+        timestamp: '2026-01-01T00:00:03.000Z', pid: asProcessId(2), syscall: '__sched',
+        callId: 'w4', phase: 'exit',
+        args: { action: 'exited', reason: 'reaped-during-quantum' },
+        stateBefore: 'running', stateAfter: 'running', reversibility: 'idempotent',
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+      });
       await rec.flush();
       await rec.close();
 
@@ -11940,7 +12078,7 @@ async function runDiffChecks(): Promise<void> {
       const header = lines.find((l) => l.startsWith('time'));
       const rows = recordLines(out);
       assert(header !== undefined, `no header row: ${out}`);
-      assert(rows.length === 3, `expected 3 record rows, got ${rows.length}: ${out}`);
+      assert(rows.length === 4, `expected 4 record rows, got ${rows.length}: ${out}`);
 
       // The widest name the kernel can produce still fits.
       const widestFrame = '__state:checkpointing->checkpointing(init-register-daemon)';
@@ -11949,16 +12087,30 @@ async function runDiffChecks(): Promise<void> {
         `the syscall column is ${TRACE_SYSCALL_WIDTH} wide and the widest frame name is ` +
           `${widestFrame.length}`,
       );
+      // ...and so does the widest scheduler frame.
+      const widestSchedFrame = '__sched:exited(reaped-during-quantum)';
+      assert(
+        TRACE_SYSCALL_WIDTH >= widestSchedFrame.length,
+        `the syscall column is ${TRACE_SYSCALL_WIDTH} wide and the widest scheduler frame is ` +
+          `${widestSchedFrame.length}`,
+      );
 
       // Every row lines up with the header — including the widest frame, and
       // including the name that had to be cut.
+      //
+      // The column is found by **position**, not by looking for the word: a
+      // frame's own name can contain the phase's name (`__sched:exited(…)`
+      // contains "exit"), and a row that says "exit" in its syscall column
+      // was never misaligned — it just made the check look in the wrong place.
+      const phaseAt = header!.indexOf('phase');
+      const reversibilityAt = header!.indexOf('reversibility');
       for (const row of rows) {
         assert(
-          header!.indexOf('phase') === row.indexOf('exit'),
-          `the phase column is off: header ${header!.indexOf('phase')}, row ${row.indexOf('exit')} — ${row}`,
+          row.slice(phaseAt).trimStart().startsWith('exit'),
+          `the phase column is off: header ${phaseAt}, row ${row} — ${row}`,
         );
         assert(
-          header!.indexOf('reversibility') === row.indexOf('idempotent'),
+          row.slice(reversibilityAt).trimStart().startsWith('idempotent'),
           `the reversibility column is off in: ${row}`,
         );
       }
@@ -11967,6 +12119,10 @@ async function runDiffChecks(): Promise<void> {
       assert(
         out.includes('__state:checkpointing->checkpointing(checkpoint)'),
         `the widest frame was cut: ${out}`,
+      );
+      assert(
+        out.includes('__sched:exited(reaped-during-quantum)'),
+        `the widest scheduler frame was cut: ${out}`,
       );
 
       // A name that cannot fit is cut *and marked* — a fact that does not fit

@@ -756,7 +756,7 @@ signal events rather than user syscalls.
 |---|---|---|
 | `__state` | the process table | `from`, `to`, and the trigger that caused the transition |
 | `__init` | init | `action` — `boot`, `register-daemon`, `reap`, `restart`, `restart-gave-up`, `shutdown` — plus the action's details |
-| `__sched` | the scheduler | `action`, plus `nice` / `blockedOn` where they apply |
+| `__sched` | the scheduler | `action`, plus `nice` / `blockedOn` / `budgetKind` / `reason` where they apply |
 | `__signal` | the signal manager | `signal`, `signalNumber`, `outcome` (`delivered` / `queued` / `dropped` / `failed`), `from` |
 
 The **recorded** names are part of the frozen format: the name on disk is
@@ -770,7 +770,7 @@ opening the file:
 ```
 __init:restart-gave-up
 __state:new->ready(spawn)
-__sched:dispatch
+__sched:sigxcpu(tokens)
 __signal:SIGTERM(delivered)
 ```
 
@@ -780,6 +780,19 @@ process blocked, and not whether it was waiting on a channel, on a timer, on a
 child, or on a signal. A signal is named by the signal itself — "SIGTERM" says
 more than "signal" — and every other cause is the trigger the kernel recorded.
 
+A `__sched` frame names **why the scheduler decided what it decided**, by the
+same rule. `sigxcpu` says the process was stopped, and not whether it ran out
+of tokens, of money, or of wall time — and only one of those tells the
+operator what to change. `blocked` and `parked` say what the process was
+waiting on, by kind; `exited` says why the process was gone:
+
+```
+__sched:sigxcpu(tokens)
+__sched:blocked(recv)
+__sched:parked(sleep)
+__sched:exited(reaped-during-quantum)
+```
+
 Rendering a record under a longer name is not a change to the record
 (§11) — the same `.crec` file is byte-for-byte identical either way.
 
@@ -787,10 +800,13 @@ The **vocabularies** those names are built from are exported at runtime, so
 there is exactly one home for each of them and a view can size itself against
 them rather than guess: `PROCESS_STATES` and `STATE_TRIGGERS` (the process
 table), `ALL_SIGNALS` and `DELIVERY_OUTCOMES` (the signal manager),
-`INIT_ACTIONS` (init) and `DISPATCH_ACTIONS` (the scheduler). A new state,
-signal, delivery outcome, transition cause or supervision action widens
-whatever depends on it by itself — including the syscall column of the trace
-table, whose width is computed from these lists rather than typed by hand.
+`INIT_ACTIONS` (init), `DISPATCH_ACTIONS` and `DISPATCH_EXITS` (the
+scheduler), and `BUDGET_KINDS` and `BLOCKED_KINDS` (the budgets a process can
+run out of, and the things it can be blocked on). A new state, signal,
+delivery outcome, transition cause, supervision action, budget kind or
+blocked-on kind widens whatever depends on it by itself — including the
+syscall column of the trace table, whose width is computed from these lists
+rather than typed by hand.
 
 The trigger vocabulary is also **enforced**: `setState` takes a
 `StateTrigger`, so a cause that is not on the list cannot be recorded — a
@@ -799,6 +815,12 @@ typo is a compile error rather than a frame nobody can explain. (The recorded
 transition's own values always win: a caller cannot shadow them. The signal
 path records the pid that sent the signal under `sender`, for the same
 reason.)
+
+The scheduler's causes are enforced the same way: the budget that ran out is
+a `BudgetKind`, the thing a process is blocked on is a `BlockedReason` (and
+so its kind is one of `BLOCKED_KINDS`), and the reason a dispatched process
+was gone is a `DispatchExit`. A frame that says `sigxcpu` and leaves out
+*which* budget is a frame nobody can act on.
 
 ---
 
