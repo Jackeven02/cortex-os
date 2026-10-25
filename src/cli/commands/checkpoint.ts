@@ -27,6 +27,7 @@
  *
  * Usage:
  *   cortex checkpoint <pid> [--tag <tag>] [--detach]
+ *   cortex checkpoint --inspect <chainId>
  *
  * @module cli/commands/checkpoint
  */
@@ -34,6 +35,64 @@
 import { parseArgs } from 'node:util';
 import { defaultKernelDir, parsePid } from '../index.js';
 import { KernelCommandError, probeKernel } from '../kernel_client.js';
+import { findCheckpointFile, listCheckpoints } from '../process_store.js';
+import { readCheckpointFile } from '../../kernel/checkpoint.js';
+import {
+  describeCheckpoint,
+  formatCheckpointTokenBudget,
+  formatCheckpointUsdBudget,
+  type CheckpointFacts,
+} from '../checkpoint_view.js';
+
+/**
+ * How many memory entries `cortex checkpoint --inspect` prints.
+ *
+ * A snapshot's memory is a **full** dump in v0, so it can hold thousands of
+ * entries. The report prints the last N of them and says how many there were
+ * in all — a list showing 20 entries must not look like a snapshot that held
+ * 20.
+ */
+const INSPECT_MEMORY_LIMIT = 20;
+
+/**
+ * Say what a snapshot holds.
+ *
+ * The facts come from one module (`src/cli/checkpoint_view.ts`), so the
+ * terminal and the dashboard's checkpoint panel cannot disagree about what a
+ * snapshot carried.
+ */
+function printCheckpoint(facts: CheckpointFacts): void {
+  console.log(`checkpoint ${facts.chainId}`);
+  console.log(`  process:    pid ${facts.pid}${facts.parentPid === null ? '' : ` (child of ${facts.parentPid})`}`);
+  console.log(`  taken:      ${facts.createdAt}`);
+  console.log(`  chain:      ${facts.prevInChain === null ? 'first in its chain' : `follows ${facts.prevInChain}`}`);
+  // The conversation is counted, not quoted: the prompts and the model
+  // answers are the snapshot's most private part, and no view in this project
+  // returns them.
+  console.log(`  messages:   ${facts.messageCount}`);
+  if (facts.intent !== null) console.log(`  intent:     ${facts.intent}`);
+  if (facts.pendingCalls.length > 0) {
+    console.log(`  waiting on: ${facts.pendingCalls.map((call) => call.tool).join(', ')}`);
+  }
+  const shown = facts.memoryEntries.slice(
+    Math.max(0, facts.memoryEntries.length - INSPECT_MEMORY_LIMIT),
+  );
+  const memoryLine = facts.memoryWriteCount === 1 ? '1 entry' : `${facts.memoryWriteCount} entries`;
+  console.log(
+    `  memory:     ${memoryLine}${facts.memoryWriteCount > shown.length ? ` (showing the last ${shown.length})` : ''}`,
+  );
+  for (const entry of shown) {
+    const value = typeof entry.value === 'string' ? entry.value : JSON.stringify(entry.value);
+    console.log(`    ${entry.region}/${entry.key} = ${value}`);
+  }
+  console.log(`  tokens:     ${formatCheckpointTokenBudget(facts)}`);
+  console.log(`  usd:        ${formatCheckpointUsdBudget(facts)}`);
+  console.log(`  wall time:  ${facts.budgets.wallTimeMs}ms`);
+  console.log(`  log:        byte ${facts.logOffset.byteOffset}`);
+  console.log(
+    `  drivers:    ${facts.driverStates.length === 0 ? '(no driver state)' : facts.driverStates.join(', ')}`,
+  );
+}
 
 export async function cmdCheckpoint(args: string[]): Promise<number> {
   const { positionals, values } = parseArgs({
@@ -41,26 +100,70 @@ export async function cmdCheckpoint(args: string[]): Promise<number> {
     options: {
       tag: { type: 'string' },
       detach: { type: 'boolean', default: false },
+      inspect: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: true,
   });
 
+  // ---- inspect: what does a snapshot hold? ---------------------------------
+  //
+  // A checkpoint is the one thing in this system you can **restore** but never
+  // **look at**. This is the way to look: it reads the file, checks it the
+  // way the kernel checks it, and says what is inside — before anybody
+  // restores it.
+  //
+  // It needs no kernel: the snapshot is a file on disk, and the file is the
+  // truth.
+  if (values.inspect !== undefined) {
+    const dir = defaultKernelDir();
+    const chainId = values.inspect.trim();
+    const path = findCheckpointFile(dir, chainId);
+    if (path === undefined) {
+      console.error(`cortex checkpoint: no checkpoint with chain ${chainId}`);
+      const known = listCheckpoints(dir);
+      if (known.length > 0) {
+        console.error('  the checkpoints in this directory:');
+        for (const cp of known) console.error(`    ${cp.chainId}`);
+      } else {
+        console.error('  (there are none in this directory)');
+      }
+      return 1;
+    }
+    try {
+      printCheckpoint(describeCheckpoint(await readCheckpointFile(path)));
+      return 0;
+    } catch (err) {
+      console.error(
+        `cortex checkpoint: cannot read checkpoint ${chainId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return 1;
+    }
+  }
+
   if (values.help || positionals.length === 0) {
-    console.log(`cortex checkpoint — snapshot a running process to disk
+    console.log(`cortex checkpoint — snapshot a running process to disk, or look inside one
 
 USAGE
   cortex checkpoint <pid> [options]
+  cortex checkpoint --inspect <chainId>
 
 OPTIONS
   --tag <string>     Human-readable tag for the checkpoint
   --detach            Transition the process to SUSPENDED after checkpointing
+  --inspect <chain>   Say what a checkpoint holds (no kernel needed)
   -h, --help          Show this help
 
 NOTES
-  A checkpoint captures a live process, so this command needs a kernel that
+  A checkpoint captures a live process, so taking one needs a kernel that
   still has it: start one with 'cortex daemon run'. Without a live kernel
   the process is not in memory any more and there is nothing to snapshot.
+
+  Looking inside one does not: the snapshot is a file, and --inspect reads it
+  with the same checks the kernel uses. It says who the snapshot was of, how
+  long its conversation had been, what it was waiting on, the memory it
+  carried, what it had spent (next to the ceiling that spend was measured
+  against), and where in the syscall log it was cut.
 
   The agent can also be asked to snapshot itself: 'cortex kill <pid>
   --signal SIGUSR2' means "checkpoint now" (docs/PROCESS.md §7).
@@ -68,6 +171,7 @@ NOTES
 EXAMPLES
   cortex checkpoint 2 --tag "before risky edit"
   cortex checkpoint 2 --detach
+  cortex checkpoint --inspect 550e8400-e29b-41d4-a716-446655440000
 `);
     return values.help ? 0 : 1;
   }

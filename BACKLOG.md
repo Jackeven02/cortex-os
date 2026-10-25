@@ -1452,6 +1452,65 @@ The user-facing surface. Should feel like a real OS shell.
   a process said is kept, and the operator can read it); INTEGRATIONS
   (`/api/output/:pid` and the `output` frame); CHANGELOG.
 
+- [x] **#106** A checkpoint could be restored but never looked at → **fixed.**
+  A `.csnap` was the one thing in this system you could **restore** but never
+  **look at**. The dashboard's checkpoint panel listed them by pid, time and
+  size and offered a **恢复** button — so you could press it, but not see what
+  you were about to restore — and `cortex restore` re-materialised a process
+  without ever naming what it had brought back.
+
+  The snapshot describes itself now. The panel's chain cell is a door: click
+  it and the window says who the snapshot was of, when it was taken, which
+  chain it belongs to and which one came before it, how long the agent's
+  conversation had been, which tool call it was still waiting on, the memory
+  it carried entry by entry, what it had spent **next to the ceiling that
+  spend was measured against**, and the byte in the syscall log it was cut
+  at. The terminal asks the same question — `cortex checkpoint --inspect
+  <chainId>` — and the two answer it from one module
+  (`src/cli/checkpoint_view.ts`), so a snapshot cannot look like two different
+  things in two places.
+
+  **The reader is one, and it is the kernel's.** The kernel's `load()`
+  resolves a chain id to a path and reads it; the window already knows a
+  path. Both must apply the **same** checks — the file magic, the body
+  version and the SHA-256 signature — or the window could describe a body
+  the kernel would refuse to restore, which would be showing the operator
+  something untrue. So the reading lives in one place
+  (`readCheckpointFile`, in `src/kernel/checkpoint.ts`) and both callers use
+  it. A file that is not a checkpoint is not described as one: it is refused,
+  with the same `EINVAL` the kernel would have given.
+
+  **The conversation is counted, not quoted.** A snapshot carries the agent's
+  messages — the prompts and the model answers — and the dashboard does not
+  return those; the same rule that keeps them out of the event table keeps
+  them out of here. What the view says is how *long* the conversation was.
+  And a snapshot that does not say what was left of the budget does not say
+  "unlimited": `—` (not reported) and `∞` (unlimited) are different facts.
+
+  **And the reader was throwing away half of every budget.** Found while
+  building the reader: the snapshot records **both** the spend and what was
+  left of the ceiling, and the reader dropped the second one on the way in —
+  so every restored process woke up with the *default* envelope. An agent
+  capped at 1,000 tokens came back **unlimited**, silently, and nothing said
+  so. The code said it meant to keep it ("set spent + remaining directly … a
+  `tokens: 1000` agent would wake up unlimited"), and the reader took the
+  branch that comment was about away from it. The envelope is read back now,
+  and a snapshot that does not carry it behaves exactly as it did before.
+
+  **8 new smoke checks** (816 → 824), reverse-verified: with the reader
+  dropping the envelope again, the snapshot check and the restore check fail
+  independently — the second one prints `got -1`, which is the bug in one
+  number; with the server not sending the budget labels, the endpoint check
+  fails; with the page not rendering a label, or with the checkpoint row not
+  being a door, the page check fails; with the reader no longer checking the
+  signature, the corrupt-file check fails (`expected 502, got 200`); and with
+  the CLI not printing the memory, the CLI check fails.
+
+  Docs: ARCHITECTURE (the window says what a checkpoint holds); STATE §4 and
+  §7 (the envelope is part of the format, and optional); PROCESS §8.3 (a
+  restored process keeps its ceiling); INTEGRATIONS (`/api/checkpoints/:chain`);
+  CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

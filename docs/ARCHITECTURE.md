@@ -1996,6 +1996,57 @@ separators: the text may hold the separator itself, and everything after them
 is the line. A line that is not in the format is not a captured line, and
 says so by being absent — a reader must not invent a timestamp for it.
 
+**And the window says what a checkpoint holds.** A `.csnap` was the one thing
+in this system you could **restore** but never **look at**. The dashboard's
+checkpoint panel listed them by pid, time and size and offered a **恢复**
+button — you could press it, but not see what you were about to restore. And
+`cortex restore` re-materialised a process without ever naming what it had
+brought back.
+
+So the snapshot describes itself. The panel's chain cell is a door: click it
+and the window says who the snapshot was of, when it was taken, which chain it
+belongs to and which one came before it, how long the agent's conversation had
+been, which tool call it was still waiting on, the memory it carried entry by
+entry, what it had spent **next to the ceiling that spend was measured
+against**, and the byte in the syscall log it was cut at. The terminal asks
+the same question — `cortex checkpoint --inspect <chainId>` — and the two
+answer it from one module (`src/cli/checkpoint_view.ts`), so a snapshot
+cannot look like two different things in two places.
+
+**The reader is one, and it is the kernel's.** The kernel's `load()` resolves
+a chain id to a path and reads it; the window already knows a path. Both must
+apply the **same** checks — the file magic, the body version and the SHA-256
+signature — or the window could describe a body the kernel would refuse to
+restore, which would be showing the operator something untrue. So the reading
+lives in one place (`readCheckpointFile`, in `src/kernel/checkpoint.ts`) and
+both callers use it. A file that is not a checkpoint is not described as one:
+it is refused, with the same `EINVAL` the kernel would have given.
+
+**The conversation is counted, not quoted.** A snapshot carries the agent's
+messages — the prompts and the model answers — and the dashboard does not
+return those; the same rule that keeps them out of the event table keeps them
+out of here. What the view says is how *long* the conversation was. The
+agent's own **intent** is state rather than conversation (STATE.md §2.2), and
+the memory panel already shows agent-authored text, so the intent is said.
+
+**And a snapshot that does not say what was left does not say "unlimited".**
+The two are different facts, so the ceiling is `—` when the envelope was not
+recorded and `∞` when the budget really had no ceiling. The same rule the
+budget views follow, for the same reason: *not reported* is not the same
+answer as *no limit*.
+
+**And the reader was throwing away half of every budget.** The snapshot
+records **both** the spend and what was left of the ceiling — and the reader
+dropped the second one on the way in. So every restored process woke up with
+the *default* envelope: an agent capped at 1,000 tokens came back
+**unlimited**, silently, and nothing said so. The code said it meant to keep
+it ("set spent + remaining directly … a `tokens: 1000` agent would wake up
+unlimited"), and the reader took the branch that comment was about away from
+it. The envelope is now read back, and a restored process keeps the ceiling
+it was given. A snapshot written before the field existed carries no envelope
+and behaves exactly as it did before — the fallback is the old one, not a new
+silence.
+
 **And a unit has exactly one conversion point.** `budgetsSpent.usdSpent` is in
 **microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4). Three
 places disagreed about that, and two of them were wrong by a factor of a

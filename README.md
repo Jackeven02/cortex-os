@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 816 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 824 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -402,6 +402,10 @@ It says the same words `cortex memory` says (`read-write`, `read-only`, `∞`, `
 The lines were already kept — one stamped line per printed line in `processes/<pid>/output.log`, relayed by the kernel the moment it is printed, and read back by `cortex logs`. What was missing was a way to *ask* for them from the window. There is a third view now: click a process, switch to **输出**, and the window shows what it said, line by line, with the error stream marked.
 
 The panel re-reads the file rather than trusting a pushed copy of the line, so the window and the log cannot end up saying different things about the same line. When the history is longer than the panel shows, it says so (`12,000 lines in all — showing the last 500`) instead of looking like a process that printed 500 lines — and a process that printed nothing says so too.
+
+**And the window says what a checkpoint holds.** A `.csnap` was the one thing you could **restore** but never **look at**: the panel listed your snapshots and gave you a **恢复** button, with no way to see what you were about to restore. Click the chain id now and the window says who the snapshot was of, when it was taken, how long the agent's conversation had been, what it was still waiting on, the memory it carried, what it had spent **next to the ceiling that spend was measured against**, and the byte in the syscall log it was cut at. The conversation itself is counted, not quoted — the prompts and the model answers stay out of the window, as they do out of the event table. `cortex checkpoint --inspect <chainId>` asks the same question in the terminal.
+
+**And a restored process keeps the ceiling it was given.** A snapshot records both halves of a budget — what the process spent and what was left of the ceiling — and the reader was dropping the second one, so every restored process woke up with the *default* envelope. An agent capped at 1,000 tokens came back **unlimited**, silently. It does not any more.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

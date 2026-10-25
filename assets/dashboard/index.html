@@ -186,6 +186,11 @@
     .output-text { color: #344052; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
     .output-item.err .output-text { color: var(--red); }
     .output-note { margin-bottom: 9px; color: #8a93a1; font-size: 10px; }
+    /* What a checkpoint holds: a label column and a value column, so the
+       facts read as a list rather than as a table of peers. */
+    .ck-facts td { height: 30px; border-top: 1px solid #f4f5f7; }
+    .ck-facts td:first-child { border-top: 1px solid #f4f5f7; }
+    .ck-label { width: 92px; color: #929aa7; font-size: 10px; }
     @media (max-width: 1080px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .columns { grid-template-columns: minmax(0, 1.5fr) minmax(235px, .8fr); } .content { padding-right: 22px; padding-left: 22px; } .topbar { padding: 0 22px; } }
     @media (max-width: 760px) { .sidebar { width: 58px; padding: 16px 8px; } .brand { justify-content: center; padding: 0 0 23px; } .brand-copy, .nav-label, .nav-text, .nav-count, .workspace, .side-footer .version { display: none; } .nav-item { justify-content: center; padding: 11px 0; } .nav-icon { font-size: 17px; } .side-footer { justify-content: center; padding: 12px 0; } .main { margin-left: 58px; } .topbar { height: 52px; padding: 0 15px; } .content { padding: 23px 14px 34px; } .page-heading { align-items: flex-start; } h1 { font-size: 21px; } .columns { grid-template-columns: 1fr; } .heading-actions .button span:not(.button-icon) { display: none; } .heading-actions .button { width: 34px; padding: 0; } .search { width: 115px; } .metrics { gap: 9px; } .metric { min-height: 101px; padding: 13px; } .metric-value { font-size: 22px; } .panel-head { padding: 0 12px; } .table-wrap { max-width: calc(100vw - 84px); } }
     @media (max-width: 420px) { .connection { font-size: 0; } .connection .live-dot { width: 8px; height: 8px; } .crumb { font-size: 10px; } .content { padding-right: 10px; padding-left: 10px; } .metric-top { font-size: 10px; } .metric-icon { width: 23px; height: 23px; } .metric-foot { font-size: 9px; } }
@@ -602,9 +607,78 @@
         const created = fmtLocal(cp.createdAt ?? cp.modifiedAt);
         const chain = String(cp.chainId ?? '');
         const opsCell = opsEnabled && chain ? `<button class="text-button" data-chain="${esc(chain)}">恢复</button>` : '';
-        return `<tr><td class="pid-cell">${esc(cp.pid)}</td><td class="mono">${esc(created)}</td><td class="pid-cell">${esc(chain ? chain.slice(0, 13) : '—')}</td><td>${(Number(cp.sizeBytes ?? 0) / 1024).toFixed(1)} KB</td><td>${opsCell}</td></tr>`;
+        // The chain cell is a **door**: a snapshot is the one thing you can
+        // restore but could not look at, so clicking it says what it holds.
+        const chainCell = chain
+          ? `<button class="text-button" data-ck="${esc(chain)}" title="${esc(chain)}">${esc(chain.slice(0, 13))}…</button>`
+          : '—';
+        return `<tr><td class="pid-cell">${esc(cp.pid)}</td><td class="mono">${esc(created)}</td><td class="pid-cell">${chainCell}</td><td>${(Number(cp.sizeBytes ?? 0) / 1024).toFixed(1)} KB</td><td>${opsCell}</td></tr>`;
       }).join('') : '<tr><td colspan="5" class="empty">暂无检查点。对进程执行 cortex checkpoint &lt;pid&gt; 后会显示在这里。</td></tr>';
       $('checkpointRows').querySelectorAll('button[data-chain]').forEach((button) => button.addEventListener('click', () => restoreOps(button.dataset.chain)));
+      $('checkpointRows').querySelectorAll('button[data-ck]').forEach((button) => button.addEventListener('click', () => showCheckpoint(button.dataset.ck)));
+    }
+
+    // What a snapshot holds.
+    //
+    // The file is the truth and the kernel reads it with the same checks —
+    // the magic, the version and the signature — so the panel can only
+    // describe a body the kernel would actually restore.
+    //
+    // The budget labels come from the server, because the page is a static
+    // file and cannot compute them; and they are the same words every other
+    // view uses for a budget: the spend next to the ceiling it was measured
+    // against.
+    function checkpointBody(cp) {
+      const fact = (label, value) => `<tr><td class="ck-label">${esc(label)}</td><td>${value}</td></tr>`;
+      const pending = Array.isArray(cp.pendingCalls) && cp.pendingCalls.length > 0
+        ? esc(cp.pendingCalls.map((call) => call.tool).join(', '))
+        : '—';
+      const intent = cp.intent ? esc(cp.intent) : '—';
+      const drivers = Array.isArray(cp.driverStates) && cp.driverStates.length > 0
+        ? esc(cp.driverStates.join(', '))
+        : '无驱动状态';
+      const entries = Array.isArray(cp.memoryEntries) ? cp.memoryEntries : [];
+      const total = Number(cp.memoryEntryCount ?? entries.length);
+      const memoryRows = entries.map((entry) => {
+        const value = typeof entry.value === 'string' ? entry.value : JSON.stringify(entry.value);
+        return `<tr><td>${esc(entry.region)}</td><td class="mono">${esc(entry.key)}</td><td class="mono">${esc(value)}</td><td>${esc(fmtLocal(entry.at))}</td></tr>`;
+      }).join('');
+      const memory = entries.length
+        ? `<table><thead><tr><th>区域</th><th>键</th><th>值</th><th>时间</th></tr></thead><tbody>${memoryRows}</tbody></table>`
+        : '<div class="empty">这个检查点没有携带记忆。</div>';
+      // A snapshot's memory is a **full** dump in v0, so it can hold
+      // thousands of entries. Showing the last N of them must say how many
+      // there were in all — otherwise a table of 20 entries looks like a
+      // snapshot that held 20.
+      const memoryNote = total > entries.length
+        ? `<div class="output-note">共 ${total.toLocaleString()} 条，这里显示最后 ${entries.length.toLocaleString()} 条。</div>`
+        : '';
+      return `<table class="ck-facts"><tbody>${[
+        fact('进程', `pid ${esc(String(cp.pid))}${cp.parentPid === null || cp.parentPid === undefined ? '' : `（父进程 ${esc(String(cp.parentPid))}）`}`),
+        fact('时间', esc(fmtLocal(cp.createdAt))),
+        fact('链', cp.prevInChain ? `承接 ${esc(String(cp.prevInChain).slice(0, 13))}…` : '链上的第一个'),
+        fact('对话', `${esc(String(cp.messageCount))} 条消息`),
+        fact('意图', intent),
+        fact('等待中', pending),
+        fact('Token', esc(cp.tokenLabel ?? '—')),
+        fact('USD', esc(cp.usdLabel ?? '—')),
+        fact('存活', `${esc(String(cp.budgets?.wallTimeMs ?? 0))} ms`),
+        fact('日志位置', `第 ${esc(String(cp.logOffset?.byteOffset ?? 0))} 字节`),
+        fact('驱动状态', drivers),
+      ].join('')}</tbody></table><div class="panel-note" style="margin:14px 0 8px">记忆</div>${memoryNote}${memory}`;
+    }
+
+    async function showCheckpoint(chain) {
+      const title = `检查点 ${String(chain).slice(0, 13)}…`;
+      openDialog(title, '<div class="empty">正在读取检查点…</div>');
+      try {
+        const response = await fetch(`/api/checkpoints/${encodeURIComponent(chain)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? '读取失败');
+        openDialog(title, checkpointBody(data));
+      } catch (error) {
+        openDialog(title, `<div class="empty">${esc(error.message)}</div>`);
+      }
     }
 
     async function restoreOps(chain) {

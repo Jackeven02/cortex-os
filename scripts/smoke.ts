@@ -8,7 +8,9 @@
  * tests/ and deleted.
  */
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { encode as cborEncode } from 'cborg';
 import {
   CortexError,
   isCortexError,
@@ -72,6 +74,7 @@ import {
   type MemoryQuery,
   type MemoryEntry,
   CheckpointManager,
+  readCheckpointFile,
   CSNAP_MAGIC,
   CSNAP_MAGIC_STR,
   CSNAP_HEADER_SIZE,
@@ -269,6 +272,7 @@ import {
   enableCommand,
   unitPathFor,
 } from '../src/cli/commands/daemon.js';
+import { cmdCheckpoint } from '../src/cli/commands/checkpoint.js';
 
 import {
   InMemMemoryDriver,
@@ -3517,6 +3521,61 @@ async function runCheckpointChecks(): Promise<void> {
       restored.messages.length === 1 && restored.intent === 'resume',
       'cognitiveSink received the snapshot',
     );
+  });
+
+  await checkAsync('a checkpoint says what was left of the budget', async () => {
+    // The snapshot records **both** the spend and what was left of the
+    // budget. The reader used to drop the second one — so the fact was on
+    // disk and nobody could read it back.
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    table.setBudgets(pid, { remaining: { tokens: 1000, usd: 500_000, wallTimeMs: 60_000 } });
+    table.spend(pid, { tokensIn: 100, tokensOut: 50 });
+    const { ckpt } = makeCkpt(table);
+    const { chainId } = await ckpt.take(pid);
+
+    const cp = await ckpt.load(chainId);
+    assert(cp.budgetsRemaining !== undefined, 'the snapshot says what was left');
+    assert(
+      cp.budgetsRemaining!.tokens === 850,
+      `850 tokens were left, got ${String(cp.budgetsRemaining!.tokens)}`,
+    );
+    assert(
+      cp.budgetsRemaining!.usd === 500_000,
+      `the money envelope came back, got ${String(cp.budgetsRemaining!.usd)}`,
+    );
+  });
+
+  await checkAsync('a restored process keeps the budget ceiling it was given', async () => {
+    // The reader dropped the envelope, so every restored process woke up
+    // with the *default* one: an agent that was capped at 1,000 tokens came
+    // back **unlimited**, silently, and nothing said so.
+    //
+    // The code said it meant to keep it ("set spent + remaining directly …
+    // a `tokens: 1000` agent would wake up unlimited"), and the reader took
+    // the branch that comment was about away from it.
+    const table = await makeTable();
+    const pid = await spawnRunning(table);
+    table.setBudgets(pid, { remaining: { tokens: 1000, usd: 500_000, wallTimeMs: 60_000 } });
+    table.spend(pid, { tokensIn: 100, tokensOut: 50 });
+    const { ckpt } = makeCkpt(table);
+    const { chainId } = await ckpt.take(pid);
+
+    const newPid = await ckpt.restoreAs(chainId);
+    const restored = table.get(newPid)!;
+    assert(
+      restored.budgetsRemaining.tokens === 850,
+      `the token ceiling came back, got ${restored.budgetsRemaining.tokens}`,
+    );
+    assert(
+      restored.budgetsRemaining.usd === 500_000,
+      `the money ceiling came back, got ${restored.budgetsRemaining.usd}`,
+    );
+    assert(
+      restored.budgetsRemaining.wallTimeMs === 60_000,
+      `the wall-clock ceiling came back, got ${restored.budgetsRemaining.wallTimeMs}`,
+    );
+    assert(restored.budgetsSpent.tokensIn === 100, 'and the spend is still there');
   });
 
   await checkAsync('restoreAs without a restoreContext provider traps EINVAL', async () => {
@@ -10218,7 +10277,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -10252,6 +10311,30 @@ function pageFunction(
   const names = Object.keys(deps ?? {});
   const values = names.map((key) => (deps as Record<string, PageFn>)[key]!);
   return new Function(...names, src + '\nreturn ' + name + ';')(...values) as PageFn;
+}
+
+/**
+ * Write a real `.csnap` file: the CBOR body, then its SHA-256 signature.
+ *
+ * The reader checks the magic, the version and the signature — so a fixture
+ * has to be a **real** checkpoint. A file with the right name and the wrong
+ * bytes is exactly what the reader is supposed to refuse.
+ *
+ * `badSignature` writes a body that is perfectly decodable under a signature
+ * that does not belong to it — so the **signature** is the only check that
+ * can refuse it.
+ */
+function writeCsnap(
+  path: string,
+  body: Record<string, unknown>,
+  options: { badSignature?: boolean } = {},
+): void {
+  const encoded = cborEncode(body);
+  const signature =
+    options.badSignature === true
+      ? Buffer.alloc(32)
+      : createHash('sha256').update(encoded).digest();
+  writeFileSync(path, Buffer.concat([Buffer.from(CSNAP_MAGIC), encoded, signature]));
 }
 
 /** Render one event row the way the dashboard page renders it. */
@@ -10315,6 +10398,25 @@ function renderDashboardOutputRow(html: string, line: Record<string, unknown>): 
   const outputItem = pageFunction(html, 'outputItem', { esc });
   return String(outputItem(line));
 }
+
+/**
+ * Render the checkpoint panel's body, the way the page does.
+ *
+ * The body is built by the page's own `checkpointBody`, so the check cannot
+ * drift from what ships.
+ */
+function renderDashboardCheckpoint(html: string, cp: Record<string, unknown>): string {
+  const esc = pageFunction(html, 'esc');
+  const fmtLocal = pageFunction(html, 'fmtLocal');
+  const checkpointBody = pageFunction(html, 'checkpointBody', { esc, fmtLocal });
+  return String(checkpointBody(cp));
+}
+
+/** The chain id of the seeded snapshot in the dashboard fixture. */
+const CSNAP_CHAIN = '550e8400-e29b-41d4-a716-446655440000';
+
+/** The chain id of a file that is named like a snapshot but is not one. */
+const CSNAP_CORRUPT_CHAIN = '660e8400-e29b-41d4-a716-446655440001';
 
 async function runDashboardChecks(): Promise<void> {
   const { mkdtemp, mkdir, writeFile, appendFile, rm } = await import('node:fs/promises');
@@ -10392,8 +10494,69 @@ async function runDashboardChecks(): Promise<void> {
     );
     // Seed one checkpoint file named like the kernel writes them:
     // `<safeTimestamp>_<chainId>.csnap` under processes/<pid>/checkpoints/.
+    //
+    // It is a **real** one — the body is CBOR and carries its signature —
+    // because the reader checks both, and a file with the right name and the
+    // wrong bytes is exactly what it is supposed to refuse.
     await mkdir(join(tmp, 'processes', '2', 'checkpoints'), { recursive: true });
-    await writeFile(join(tmp, 'processes', '2', 'checkpoints', '2026-09-28T00-00-05-000Z_550e8400-e29b-41d4-a716-446655440000.csnap'), 'CRTX-fake-snapshot-bytes');
+    writeCsnap(
+      join(tmp, 'processes', '2', 'checkpoints', `2026-09-28T00-00-05-000Z_${CSNAP_CHAIN}.csnap`),
+      {
+        magic: CSNAP_MAGIC_STR,
+        version: CHECKPOINT_VERSION,
+        pid: 2,
+        parentPid: 1,
+        createdAt: '2026-09-28T00:00:05.000Z',
+        chainId: CSNAP_CHAIN,
+        prevInChain: null,
+        cognitive: {
+          messages: [
+            { role: 'user', content: 'refactor the parser' },
+            { role: 'assistant', content: 'on it' },
+            { role: 'user', content: 'make it faster' },
+          ],
+          intent: 'refactor the parser',
+          pendingCalls: [
+            { id: 'call-1', tool: 'fs_write', args: { path: 'a.txt' }, startedAt: '2026-09-28T00:00:04.500Z' },
+          ],
+        },
+        memoryDelta: {
+          baseChainId: null,
+          writes: [
+            { region: 'episodic', key: 'done', value: true, at: '2026-09-28T00:00:03.000Z' },
+            { region: 'semantic', key: 'plan', value: { steps: 3 }, at: '2026-09-28T00:00:04.000Z' },
+          ],
+        },
+        budgets: { tokensIn: 1200, tokensOut: 80, tokensCached: 900, usdSpent: 250, wallTimeMs: 95_000, syscallCount: 41 },
+        budgetsRemaining: { tokens: 8800, usd: 999_750, wallTimeMs: -1 },
+        syscallLogOffset: 4096,
+        driverStates: {},
+      },
+    );
+    // And one that is **not** a checkpoint, in the legacy flat layout — so the
+    // dashboard's list (which reads the per-process directories) does not show
+    // it, while the reader still has to refuse it. Its body is perfectly
+    // decodable and only its signature is wrong, so the **signature** is the
+    // only check that can catch it.
+    await mkdir(join(tmp, 'checkpoints'), { recursive: true });
+    writeCsnap(
+      join(tmp, 'checkpoints', `2026-09-28T00-00-06-000Z_${CSNAP_CORRUPT_CHAIN}.csnap`),
+      {
+        magic: CSNAP_MAGIC_STR,
+        version: CHECKPOINT_VERSION,
+        pid: 3,
+        parentPid: 1,
+        createdAt: '2026-09-28T00:00:06.000Z',
+        chainId: CSNAP_CORRUPT_CHAIN,
+        prevInChain: null,
+        cognitive: { messages: [], intent: null, pendingCalls: [] },
+        memoryDelta: { baseChainId: null, writes: [] },
+        budgets: { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 0, syscallCount: 0 },
+        syscallLogOffset: 0,
+        driverStates: {},
+      },
+      { badSignature: true },
+    );
     // Seed what the process **said**: two captured lines, written in the
     // format the capture writes. The second line's text holds the separator
     // itself — a parser that splits on every separator would cut it in the
@@ -11214,6 +11377,160 @@ async function runDashboardChecks(): Promise<void> {
         assert(list[0]!['chainId'] === '550e8400-e29b-41d4-a716-446655440000', 'chainId parsed from filename');
         assert(String(list[0]!['createdAt']) === '2026-09-28T00-00-05-000Z', 'createdAt parsed from filename');
         assert((list[0]!['sizeBytes'] as number) > 0, 'size from stat');
+      });
+
+      await checkAsync('the dashboard says what a checkpoint holds', async () => {
+        // A snapshot is the one thing in this system you could **restore** but
+        // never **look at**: the panel listed them by pid, time and size and
+        // offered a 恢复 button, with no way to see what you were about to
+        // restore. Now it says.
+        const res = await fetch(`${dash.url}/api/checkpoints/${CSNAP_CHAIN}`);
+        assert(res.status === 200, `status ${res.status}`);
+        const cp = (await res.json()) as Record<string, unknown>;
+        // Who it was.
+        assert(cp['pid'] === 2, `the pid is the one that was snapshotted, got ${String(cp['pid'])}`);
+        assert(cp['parentPid'] === 1, `and its parent, got ${String(cp['parentPid'])}`);
+        assert(cp['createdAt'] === '2026-09-28T00:00:05.000Z', 'and when it was taken');
+        assert(cp['prevInChain'] === null, 'and that it was the first in its chain');
+        // What the agent was doing — the conversation is **counted**, not
+        // quoted: the prompts and the model answers are the snapshot's most
+        // private part, and no view in this project returns them.
+        assert(cp['messageCount'] === 3, `the conversation is counted, got ${String(cp['messageCount'])}`);
+        assert(cp['intent'] === 'refactor the parser', `the intent is said, got ${String(cp['intent'])}`);
+        const pending = cp['pendingCalls'] as Array<{ tool?: string }>;
+        assert(pending.length === 1 && pending[0]!['tool'] === 'fs_write', 'the call it was waiting on is named');
+        // What it knew.
+        const entries = cp['memoryEntries'] as Array<{ region?: string; key?: string }>;
+        assert(entries.length === 2, `the memory it carried is there, got ${entries.length}`);
+        assert(entries[0]!['key'] === 'done' && entries[0]!['region'] === 'episodic', 'entry by entry');
+        assert(cp['memoryEntryCount'] === 2, 'and counted');
+        // What it had spent — next to the ceiling it was measured against,
+        // in the words every other view uses for a budget.
+        assert(
+          cp['tokenLabel'] === '1,280 (900 cached) of 10,080',
+          `the token spend carries its ceiling, got ${String(cp['tokenLabel'])}`,
+        );
+        assert(
+          cp['usdLabel'] === '$0.000250 of $1.000000',
+          `and so does the money, got ${String(cp['usdLabel'])}`,
+        );
+        // Where it was cut.
+        const offset = cp['logOffset'] as { byteOffset?: number };
+        assert(offset.byteOffset === 4096, `the log offset is said, got ${String(offset.byteOffset)}`);
+        // And the conversation itself is **not** there.
+        assert(!JSON.stringify(cp).includes('make it faster'), 'the conversation is not returned');
+      });
+
+      await checkAsync('the dashboard refuses a file that is not a checkpoint', async () => {
+        // The reader checks the magic, the version and the signature — the
+        // same checks the kernel makes. A file that is not a checkpoint is
+        // not described as one, and the window says so rather than showing an
+        // empty snapshot.
+        const res = await fetch(`${dash.url}/api/checkpoints/${CSNAP_CORRUPT_CHAIN}`);
+        assert(res.status === 502, `expected 502, got ${res.status}`);
+        const body = (await res.json()) as { error?: string };
+        assert(typeof body.error === 'string' && body.error.length > 0, 'and says why');
+      });
+
+      await checkAsync('the dashboard says so when a checkpoint is not there', async () => {
+        const res = await fetch(`${dash.url}/api/checkpoints/00000000-0000-0000-0000-000000000000`);
+        assert(res.status === 404, `expected 404, got ${res.status}`);
+      });
+
+      await checkAsync('the window shows what a checkpoint holds', async () => {
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        // The chain cell is a **door**: a snapshot you can restore but could
+        // not look at is a snapshot you restore blind.
+        assert(html.includes('data-ck='), 'the checkpoint row is a door');
+        const body = renderDashboardCheckpoint(html, {
+          pid: 2,
+          parentPid: 1,
+          createdAt: '2026-09-28T00:00:05.000Z',
+          prevInChain: null,
+          messageCount: 3,
+          intent: 'refactor the parser',
+          pendingCalls: [{ tool: 'fs_write', startedAt: '2026-09-28T00:00:04.500Z' }],
+          memoryEntries: [
+            { region: 'episodic', key: 'done', value: true, at: '2026-09-28T00:00:03.000Z' },
+          ],
+          memoryEntryCount: 2,
+          tokenLabel: '1,280 (900 cached) of 10,080',
+          usdLabel: '$0.000250 of $1.000000',
+          budgets: { wallTimeMs: 95_000 },
+          logOffset: { byteOffset: 4096 },
+          driverStates: [],
+        });
+        assert(body.includes('pid 2'), `the panel says which process, got: ${body}`);
+        assert(body.includes('3 条消息'), `and how long the conversation was, got: ${body}`);
+        assert(body.includes('refactor the parser'), 'and what the agent was doing');
+        assert(body.includes('fs_write'), 'and what it was waiting on');
+        assert(body.includes('1,280 (900 cached) of 10,080'), 'and what it had spent, next to its ceiling');
+        assert(body.includes('$0.000250 of $1.000000'), 'and the money too');
+        assert(body.includes('第 4096 字节'), 'and where it was cut');
+        assert(body.includes('done'), 'and the memory it carried');
+        // And it says when the memory it shows is only the tail of it.
+        assert(body.includes('共 2 条'), 'the panel says how many entries there were in all');
+      });
+
+      await checkAsync('cortex checkpoint --inspect says what a snapshot holds', async () => {
+        // The terminal and the window answer the same question about the same
+        // file, from the same module — so they cannot disagree about what a
+        // snapshot carried.
+        const prevHome = process.env['CORTEX_HOME'];
+        const prevLog = console.log;
+        process.env['CORTEX_HOME'] = tmp;
+        let out = '';
+        console.log = (...parts: unknown[]): void => {
+          out += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        try {
+          const code = await cmdCheckpoint(['--inspect', CSNAP_CHAIN]);
+          assert(code === 0, `the inspect ended cleanly, got ${code}`);
+        } finally {
+          console.log = prevLog;
+          if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+          else process.env['CORTEX_HOME'] = prevHome;
+        }
+        assert(out.includes(`checkpoint ${CSNAP_CHAIN}`), `the report names the snapshot, got: ${out}`);
+        assert(out.includes('pid 2'), 'and the process it was of');
+        assert(/messages:\s+3/.test(out), 'and how long the conversation was');
+        assert(out.includes('refactor the parser'), 'and what the agent was doing');
+        assert(out.includes('fs_write'), 'and what it was waiting on');
+        assert(out.includes('episodic/done = true'), 'and the memory it carried');
+        assert(out.includes('1.3k (900 cached) of 10.1k'), 'and what it had spent, next to its ceiling');
+        assert(out.includes('$0.000250 of $1.000000'), 'and the money too');
+        assert(out.includes('byte 4096'), 'and where it was cut');
+        // The conversation itself is not quoted — in either view.
+        assert(!out.includes('make it faster'), 'the conversation is not printed');
+      });
+
+      await checkAsync('cortex checkpoint --inspect says so when the snapshot is not there', async () => {
+        const prevHome = process.env['CORTEX_HOME'];
+        const prevLog = console.log;
+        const prevErr = console.error;
+        process.env['CORTEX_HOME'] = tmp;
+        let out = '';
+        let err = '';
+        console.log = (...parts: unknown[]): void => {
+          out += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        console.error = (...parts: unknown[]): void => {
+          err += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        try {
+          const code = await cmdCheckpoint(['--inspect', '00000000-0000-0000-0000-000000000000']);
+          assert(code === 1, `expected exit 1, got ${code}`);
+        } finally {
+          console.log = prevLog;
+          console.error = prevErr;
+          if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+          else process.env['CORTEX_HOME'] = prevHome;
+        }
+        assert(err.includes('no checkpoint with chain'), `the report says so, got: ${err}`);
+        // And it says what *is* there, so the operator can copy one.
+        assert(err.includes(CSNAP_CHAIN), 'and lists the ones that are');
+        assert(out === '', 'and prints nothing that looks like a snapshot');
       });
 
       await checkAsync('dashboard ops are disabled by default', async () => {

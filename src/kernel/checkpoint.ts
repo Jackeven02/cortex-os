@@ -217,6 +217,108 @@ function constantTimeEquals(a: Uint8Array, b: Uint8Array): boolean {
 /** The CBOR-encodable body: a `Checkpoint` without its `signature`. */
 type CheckpointBody = Omit<Checkpoint, 'signature'>;
 
+/**
+ * Read and verify one `.csnap` file.
+ *
+ * The kernel's `load()` resolves a chain id to a path and then reads it; the
+ * operator's window already knows a path — the file is sitting in
+ * `processes/<pid>/checkpoints/` — and wants to see what is inside it. Both
+ * must apply the **same** checks: the file magic, the body version and the
+ * SHA-256 signature. A window that described a body the kernel would refuse
+ * to restore would be showing the operator something untrue, and a body whose
+ * signature does not match is not a checkpoint at all.
+ *
+ * So the reading lives here, once, and both callers use it. A file that is
+ * not there traps `ENOENT`; a file that is not a valid checkpoint traps
+ * `EINVAL` — bad magic, truncated, the wrong version, or a signature that
+ * does not match the body.
+ */
+export async function readCheckpointFile(path: string): Promise<Checkpoint> {
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(path);
+  } catch (err) {
+    throw new CortexError('ENOENT', 'load', {
+      message: `cannot read checkpoint at ${path}`,
+      details: { path },
+      cause: err,
+    });
+  }
+
+  if (
+    bytes.byteLength < CSNAP_HEADER_SIZE + SIGNATURE_SIZE ||
+    !Buffer.from(CSNAP_MAGIC).equals(bytes.subarray(0, CSNAP_HEADER_SIZE))
+  ) {
+    trap('EINVAL', 'load', { reason: 'bad magic or truncated file', path });
+  }
+
+  const bodyBytes = bytes.subarray(CSNAP_HEADER_SIZE, bytes.byteLength - SIGNATURE_SIZE);
+  const signature = bytes.subarray(bytes.byteLength - SIGNATURE_SIZE);
+  if (!constantTimeEquals(sha256(new Uint8Array(bodyBytes)), new Uint8Array(signature))) {
+    trap('EINVAL', 'load', { reason: 'signature mismatch (corrupt or tampered)', path });
+  }
+
+  let raw: unknown;
+  try {
+    raw = decode(new Uint8Array(bodyBytes));
+  } catch (err) {
+    throw new CortexError('EINVAL', 'load', {
+      message: 'checkpoint body is not valid CBOR',
+      details: { path },
+      cause: err,
+    });
+  }
+
+  return rebrandCheckpoint(raw, path, new Uint8Array(signature));
+}
+
+/**
+ * Validate a decoded body and re-brand its primitives back into the typed
+ * `Checkpoint` shape.
+ */
+function rebrandCheckpoint(raw: unknown, path: string, signature: Uint8Array): Checkpoint {
+  if (typeof raw !== 'object' || raw === null) {
+    trap('EINVAL', 'load', { reason: 'body is not an object', path });
+  }
+  const b = raw as Record<string, unknown>;
+  if (b.magic !== CSNAP_MAGIC_STR) {
+    trap('EINVAL', 'load', { reason: `bad magic '${String(b.magic)}'`, path });
+  }
+  if (b.version !== CHECKPOINT_VERSION) {
+    trap('EINVAL', 'load', {
+      reason: `snapshot version ${String(b.version)} != kernel ${CHECKPOINT_VERSION}`,
+      path,
+    });
+  }
+
+  const parentPid = b.parentPid;
+  const prevInChain = b.prevInChain;
+
+  return {
+    magic: 'CRTX',
+    version: CHECKPOINT_VERSION,
+    pid: asProcessId(Number(b.pid)),
+    parentPid: parentPid === null || parentPid === undefined ? null : asProcessId(Number(parentPid)),
+    createdAt: String(b.createdAt),
+    chainId: asChainId(String(b.chainId)),
+    prevInChain:
+      prevInChain === null || prevInChain === undefined ? null : asChainId(String(prevInChain)),
+    cognitive: (b.cognitive as CognitiveSnapshot) ?? EMPTY_COGNITIVE,
+    memoryDelta: (b.memoryDelta as MemoryDelta) ?? { baseChainId: null, writes: [] },
+    budgets: b.budgets as Checkpoint['budgets'],
+    // The remaining envelope is kept **only if the body carried it**: a
+    // checkpoint written before this build has no such field, and "absent"
+    // there means "this snapshot did not say what was left" — not "the
+    // budget was unlimited".
+    ...(b.budgetsRemaining !== undefined
+      ? { budgetsRemaining: b.budgetsRemaining as NonNullable<Checkpoint['budgetsRemaining']> }
+      : {}),
+    syscallLogOffset: asSyscallOffset(Number(b.syscallLogOffset)),
+    driverStates: (b.driverStates as Record<string, Uint8Array | null>) ?? {},
+    signature,
+  };
+}
+
 // =============================================================================
 // §4. CheckpointManager
 // =============================================================================
@@ -504,82 +606,20 @@ export class CheckpointManager {
    */
   async load(chainId: ChainId): Promise<Checkpoint> {
     const path = await this.#resolvePath(chainId);
-    let bytes: Buffer;
     try {
-      bytes = await readFile(path);
+      return await readCheckpointFile(path);
     } catch (err) {
-      throw new CortexError('ENOENT', 'load', {
-        message: `cannot read checkpoint at ${path}`,
-        details: { path, chainId: unbrand(chainId) },
-        cause: err,
-      });
+      // The chain id is part of the error's story, and only the caller knows
+      // it — the file reader does not.
+      if (isCortexError(err) && err.errno === 'ENOENT') {
+        throw new CortexError('ENOENT', 'load', {
+          message: `cannot read checkpoint at ${path}`,
+          details: { path, chainId: unbrand(chainId) },
+          cause: err,
+        });
+      }
+      throw err;
     }
-
-    if (
-      bytes.byteLength < CSNAP_HEADER_SIZE + SIGNATURE_SIZE ||
-      !Buffer.from(CSNAP_MAGIC).equals(bytes.subarray(0, CSNAP_HEADER_SIZE))
-    ) {
-      trap('EINVAL', 'load', { reason: 'bad magic or truncated file', path });
-    }
-
-    const bodyBytes = bytes.subarray(CSNAP_HEADER_SIZE, bytes.byteLength - SIGNATURE_SIZE);
-    const signature = bytes.subarray(bytes.byteLength - SIGNATURE_SIZE);
-    if (!constantTimeEquals(sha256(new Uint8Array(bodyBytes)), new Uint8Array(signature))) {
-      trap('EINVAL', 'load', { reason: 'signature mismatch (corrupt or tampered)', path });
-    }
-
-    let raw: unknown;
-    try {
-      raw = decode(new Uint8Array(bodyBytes));
-    } catch (err) {
-      throw new CortexError('EINVAL', 'load', {
-        message: 'checkpoint body is not valid CBOR',
-        details: { path },
-        cause: err,
-      });
-    }
-
-    return this.#rebrand(raw, path, new Uint8Array(signature));
-  }
-
-  /**
-   * Validate a decoded body and re-brand its primitives back into the typed
-   * `Checkpoint` shape.
-   */
-  #rebrand(raw: unknown, path: string, signature: Uint8Array): Checkpoint {
-    if (typeof raw !== 'object' || raw === null) {
-      trap('EINVAL', 'load', { reason: 'body is not an object', path });
-    }
-    const b = raw as Record<string, unknown>;
-    if (b.magic !== CSNAP_MAGIC_STR) {
-      trap('EINVAL', 'load', { reason: `bad magic '${String(b.magic)}'`, path });
-    }
-    if (b.version !== CHECKPOINT_VERSION) {
-      trap('EINVAL', 'load', {
-        reason: `snapshot version ${String(b.version)} != kernel ${CHECKPOINT_VERSION}`,
-        path,
-      });
-    }
-
-    const parentPid = b.parentPid;
-    const prevInChain = b.prevInChain;
-
-    return {
-      magic: 'CRTX',
-      version: CHECKPOINT_VERSION,
-      pid: asProcessId(Number(b.pid)),
-      parentPid: parentPid === null || parentPid === undefined ? null : asProcessId(Number(parentPid)),
-      createdAt: String(b.createdAt),
-      chainId: asChainId(String(b.chainId)),
-      prevInChain:
-        prevInChain === null || prevInChain === undefined ? null : asChainId(String(prevInChain)),
-      cognitive: (b.cognitive as CognitiveSnapshot) ?? EMPTY_COGNITIVE,
-      memoryDelta: (b.memoryDelta as MemoryDelta) ?? { baseChainId: null, writes: [] },
-      budgets: b.budgets as Checkpoint['budgets'],
-      syscallLogOffset: asSyscallOffset(Number(b.syscallLogOffset)),
-      driverStates: (b.driverStates as Record<string, Uint8Array | null>) ?? {},
-      signature,
-    };
   }
 
   /**

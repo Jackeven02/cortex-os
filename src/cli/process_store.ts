@@ -819,15 +819,23 @@ export async function findCheckpointByTag(dir: string, tag: string): Promise<str
 }
 
 /**
+ * Every directory that may hold a checkpoint: the shared `<dir>/checkpoints/`
+ * (pre-0.2.1) and each `processes/<pid>/checkpoints/`.
+ */
+function checkpointDirs(dir: string): string[] {
+  const dirs = [join(dir, 'checkpoints')];
+  for (const p of listProcDirs(dir)) dirs.push(procCheckpointsDir(dir, asProcessId(p.pid)));
+  return dirs;
+}
+
+/**
  * List every checkpoint on disk. Scans both layouts: the shared
  * `<dir>/checkpoints/` (pre-0.2.1) and each `processes/<pid>/checkpoints/`.
  */
 export function listCheckpoints(dir: string): readonly { chainId: string; filename: string; createdAt: string }[] {
   const results = new Map<string, { chainId: string; filename: string; createdAt: string }>();
-  const dirs = [join(dir, 'checkpoints')];
-  for (const p of listProcDirs(dir)) dirs.push(procCheckpointsDir(dir, asProcessId(p.pid)));
 
-  for (const cpDir of dirs) {
+  for (const cpDir of checkpointDirs(dir)) {
     if (!existsSync(cpDir)) continue;
     for (const file of readdirSync(cpDir)) {
       if (!file.endsWith('.csnap')) continue;
@@ -841,4 +849,24 @@ export function listCheckpoints(dir: string): readonly { chainId: string; filena
     }
   }
   return [...results.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+/**
+ * Find the file of one checkpoint, by its chain id.
+ *
+ * The chain id is the file name's suffix (`<createdAt>_<chainId>.csnap`), so
+ * the file is found by scanning — the same scan the kernel does after a
+ * restart, and the same one the dashboard's checkpoint list uses. A chain id
+ * that is not on disk has no file, and says so by being absent.
+ */
+export function findCheckpointFile(dir: string, chainId: string): string | undefined {
+  for (const cpDir of checkpointDirs(dir)) {
+    if (!existsSync(cpDir)) continue;
+    for (const file of readdirSync(cpDir)) {
+      if (!file.endsWith('.csnap')) continue;
+      if (!file.endsWith(`_${chainId}.csnap`)) continue;
+      return join(cpDir, file);
+    }
+  }
+  return undefined;
 }

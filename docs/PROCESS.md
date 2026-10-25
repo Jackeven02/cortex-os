@@ -569,6 +569,18 @@ Budgets decrement on every relevant syscall. When exhausted:
 - Default disposition: STOPPED
 - Supervisor may: increase budget, terminate, fork a fresh attempt
 
+**And a restored process keeps the ceiling it was given.** A checkpoint carries
+**both** halves of a budget: what the process had spent, and what was left of
+the ceiling. Restoring re-materialises the process with the same envelope, so
+an agent capped at 1,000 tokens comes back capped at 1,000 — not with the
+default ceiling, and not unlimited. The reader used to drop the second half on
+the way in, so every restored process woke up with the *default* envelope: the
+ceiling was silently gone, and nothing said so. A snapshot that does not carry
+the envelope at all (one written before the field existed) is a different
+case: it says nothing about what was left, so the ceiling is **not reported**
+rather than unlimited — and the restore falls back to re-applying the spend
+onto the default limits, exactly as before.
+
 **And a token count has three parts.** The kernel records the input, the
 output, and the part of the input the provider served out of its cache
 (STATE.md §2.4). The cached part is **inside** the input — the provider

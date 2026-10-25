@@ -27,7 +27,7 @@ COMMANDS
   watch        Watch the kernel's event stream, live
   supervise    Keep a process honest: kill it if it stalls, restart it (as the
              same agent) if it ends
-  checkpoint   Snapshot a process to disk
+  checkpoint   Snapshot a process to disk, or say what a snapshot holds
   restore      Restore a process from a checkpoint
   fork         Clone a running process at its current state
   diff         Compare two forked branches' syscall logs

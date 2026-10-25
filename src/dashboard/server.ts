@@ -8,10 +8,12 @@ import { format } from 'node:util';
 import { asProcessId } from '../kernel/types.js';
 import type { BlockedReason, BudgetLimits, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
-import { readAllMetas, listProcDirs, readOutputEntries } from '../cli/process_store.js';
+import { readCheckpointFile } from '../kernel/checkpoint.js';
+import { readAllMetas, listProcDirs, readOutputEntries, findCheckpointFile } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView, formatAge, processAge, type AgeFacts } from '../cli/process_view.js';
 import { describeOutcome } from '../cli/process_outcome.js';
 import { describeBudget, formatTokenBudget, formatUsdBudget, type BudgetFacts } from '../cli/process_budget.js';
+import { describeCheckpoint, formatCheckpointTokenBudget, formatCheckpointUsdBudget } from '../cli/checkpoint_view.js';
 import { usdToDollars } from '../money.js';
 import { formatTokenUsage, callUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
@@ -104,6 +106,16 @@ const MAX_SCAN = 5000;
  * of a longer history instead of pretending the history is that short.
  */
 const DEFAULT_OUTPUT_TAIL = 500;
+
+/**
+ * How many memory entries of a checkpoint the window shows.
+ *
+ * A snapshot's memory is a **full** dump in v0, so it can hold thousands of
+ * entries. The window shows the last N of them and says how many there were
+ * in all — a panel showing 20 entries must not look like a snapshot that held
+ * 20.
+ */
+const DEFAULT_CHECKPOINT_MEMORY = 200;
 
 /**
  * How long the live path waits before it re-reads the process table.
@@ -758,6 +770,51 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         }
         response.setHeader('x-total-count', String(merged.length));
         json(response, 200, merged.slice(offset, offset + limit));
+        return;
+      }
+      // What one checkpoint holds.
+      //
+      // A `.csnap` is the one thing in this system you can **restore** but
+      // never **look at**: the panel listed them by pid, time and size and
+      // offered a 恢复 button, with no way to see what you were about to
+      // restore. `cortex restore` re-materialised a process without ever
+      // naming what it brought back.
+      //
+      // It is a **disk read**, and it is read with the *same reader the
+      // kernel uses* — the magic, the version and the signature are checked
+      // the same way — so the window can only describe a body the kernel
+      // would actually restore.
+      const checkpointMatch = /^\/api\/checkpoints\/([^/]+)$/.exec(url.pathname);
+      if (checkpointMatch !== null) {
+        const chainId = decodeURIComponent(checkpointMatch[1]!);
+        const path = findCheckpointFile(dir, chainId);
+        if (path === undefined) {
+          json(response, 404, { error: `no checkpoint with chain ${chainId}` });
+          return;
+        }
+        try {
+          const facts = describeCheckpoint(await readCheckpointFile(path));
+          // A snapshot's memory is a **full** dump in v0, so it can hold
+          // thousands of entries. The view shows the last N of them and says
+          // how many there were in all.
+          const limitRaw = url.searchParams.get('limit');
+          const requested = limitRaw === null ? DEFAULT_CHECKPOINT_MEMORY : Number(limitRaw);
+          const limit = Number.isFinite(requested) && requested >= 0 ? requested : DEFAULT_CHECKPOINT_MEMORY;
+          const shown = facts.memoryEntries.slice(Math.max(0, facts.memoryEntries.length - limit));
+          json(response, 200, {
+            ...facts,
+            memoryEntries: shown,
+            memoryEntryCount: facts.memoryWriteCount,
+            // The labels are computed here because the page is a static file
+            // and cannot compute them — and they are the same words every
+            // other view uses for a budget: the spend next to the ceiling it
+            // was measured against.
+            tokenLabel: formatCheckpointTokenBudget(facts, (n) => n.toLocaleString()),
+            usdLabel: formatCheckpointUsdBudget(facts),
+          });
+        } catch (err) {
+          json(response, 502, { error: err instanceof Error ? err.message : String(err) });
+        }
         return;
       }
       if (url.pathname === '/api/checkpoints') {

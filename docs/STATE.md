@@ -181,6 +181,14 @@ A checkpoint is a single file. Binary, CBOR-encoded, content-addressed by SHA-25
     wall_time_ms:   u64
     syscall_count:  u64
 
+  BudgetLimits                     # what was LEFT, not what was spent
+    tokens:         u64            # -1 = unlimited
+    usd:            u64
+    wall_time_ms:   u64
+    # Optional. A snapshot that does not carry it says nothing about what was
+    # left — and "nothing" is not "unlimited": the ceiling of such a snapshot
+    # is simply not reported.
+
   SyscallLogOffset
     file:         path               # usually .crec next to .csnap
     byte_offset:  u64
@@ -402,6 +410,7 @@ export interface Checkpoint {
   readonly cognitive: CognitiveSnapshot;
   readonly memoryDelta: MemoryDelta;
   readonly budgets: BudgetCounters;
+  readonly budgetsRemaining?: BudgetLimits;   // what was LEFT; absent = not reported
   readonly syscallLogOffset: SyscallOffset;
   readonly driverStates: Readonly<Record<string, Uint8Array | null>>;
   readonly signature: Uint8Array;   // sha256

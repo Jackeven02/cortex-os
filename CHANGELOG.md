@@ -1546,6 +1546,70 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **Every restored process woke up with no budget ceiling.** A checkpoint
+  records **both** halves of a budget — what the process had spent and what
+  was left of the ceiling — and the reader dropped the second one on the way
+  in. So every restored process got the *default* envelope: an agent capped
+  at 1,000 tokens came back **unlimited**, silently, and nothing said so.
+  The code said it meant to keep it ("set spent + remaining directly … a
+  `tokens: 1000` agent would wake up unlimited"), and the reader took the
+  branch that comment was about away from it.
+
+  The envelope is now read back, and a restored process keeps the ceiling it
+  was given. A snapshot that does not carry the envelope at all (one written
+  before the field existed) behaves exactly as it did before — the fallback
+  is the old one, not a new silence.
+
+- **The window could not say what a checkpoint held.** A `.csnap` was the one
+  thing in this system you could **restore** but never **look at**: the
+  dashboard's checkpoint panel listed them by pid, time and size and offered a
+  **恢复** button, so you could press it but not see what you were about to
+  restore. And `cortex restore` re-materialised a process without ever naming
+  what it had brought back.
+
+  The snapshot describes itself now. The panel's chain cell is a door: click
+  it and the window says who the snapshot was of, when it was taken, which
+  chain it belongs to and which one came before it, how long the agent's
+  conversation had been, which tool call it was still waiting on, the memory
+  it carried entry by entry, what it had spent **next to the ceiling that
+  spend was measured against**, and the byte in the syscall log it was cut at.
+  The terminal asks the same question — `cortex checkpoint --inspect
+  <chainId>` — and the two answer it from one module
+  (`src/cli/checkpoint_view.ts`), so a snapshot cannot look like two different
+  things in two places.
+
+  **The reader is one, and it is the kernel's.** The kernel's `load()`
+  resolves a chain id to a path and reads it; the window already knows a path.
+  Both must apply the **same** checks — the file magic, the body version and
+  the SHA-256 signature — or the window could describe a body the kernel
+  would refuse to restore, which would be showing the operator something
+  untrue. So the reading lives in one place (`readCheckpointFile`, in
+  `src/kernel/checkpoint.ts`) and both callers use it. A file that is not a
+  checkpoint is not described as one: it is refused, with the same `EINVAL`
+  the kernel would have given.
+
+  **The conversation is counted, not quoted.** A snapshot carries the agent's
+  messages — the prompts and the model answers — and the dashboard does not
+  return those; the same rule that keeps them out of the event table keeps
+  them out of here. What the view says is how *long* the conversation was.
+  And a snapshot that does not say what was left of the budget does not say
+  "unlimited": the ceiling is `—` (not reported) and `∞` (unlimited) are
+  different facts.
+
+  8 new smoke checks (816 → 824), reverse-verified: with the reader dropping
+  the envelope again, the snapshot check and the restore check fail
+  independently — the second one prints `got -1`, which is the bug in one
+  number; with the server not sending the budget labels, the endpoint check
+  fails; with the page not rendering a label, or with the checkpoint row not
+  being a door, the page check fails; with the reader no longer checking the
+  signature, the corrupt-file check fails (`expected 502, got 200`); and with
+  the CLI not printing the memory, the CLI check fails.
+
+  No ABI change: the `.csnap` format and the `Checkpoint` type are untouched
+  — `budgetsRemaining` was already an optional field of the type, and the
+  reader now honours it. A snapshot that does not carry it behaves exactly as
+  before.
+
 - **The window could not say what an agent said.** The process dialog had two
   views of one process — the syscall timeline (what it **did**) and the memory
   panel (what it **knows**) — and neither could show the lines the agent
