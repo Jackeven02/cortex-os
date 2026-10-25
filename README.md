@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 893 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 895 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -440,6 +440,10 @@ The journal had a hole in it, too. It named two of the three ways a supervisor g
 **And the window's state breakdown accounts for every process.** The **运行状态** panel says 「按进程状态分类」 — a classification — and it named five states. The kernel has nine, so a process in any of the other four — one parked at a checkpoint, one that had not run yet, one on its way out — was in the panel's total and in **no row**. Four processes on the panel's own total, and rows that added up to three: the numbers did not add up, while `cortex top`, counting the states it finds, said something different about the very same processes.
 
 Now the rule is one rule: the five states an operator watches always have a row, and every other state that is present gets one too — so the rows add up to the number of processes, *by construction*. The panel says so as well (「各行之和即总数」). And a state the window has no word for is printed as the **kernel words it** — never a name the page made up, and never a row it dropped.
+
+**And the number next to the table describes the table.** The process panel's title read 「Agent 进程 (4)」 — the workspace's process count — while the rows under it were the **filtered** ones. One panel, two numbers for one thing, disagreeing: an operator who typed into 「筛选进程…」 and was left with one row could not tell whether the other three were filtered out or the count was simply wrong. So the number is the table's now: **(1 / 4)** while a filter is narrowing the list, **(4)** when it is not — the first number is what the table shows, the second is what the workspace holds, so the workspace's size never leaves the screen.
+
+**And the two views filter by the same rule.** The panel has two views — 表格 and 监督树 — and each had **its own copy** of "does this process match what the operator typed". The tree's copy was missing two of the columns: a process holding one capability, and one parked at a checkpoint. So the same filter box, in the same panel, found a process in the table and said **没有匹配的进程** in the tree. One rule now, and the tree is built from it. The tree also says what it shows: the processes that match **and the path they hang under**, with the node that matched marked — because a tree that drops the parent is not a tree, and a tree that renders the whole subtree of anything that matched is not a filter.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

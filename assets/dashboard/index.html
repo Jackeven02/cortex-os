@@ -159,6 +159,11 @@
     .tree-wrap { padding: 10px 16px 14px; }
     .tree-node { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 0 8px; border-radius: 6px; cursor: pointer; }
     .tree-node:hover { background: #f8f9fc; }
+    /* **The node the filter found.** The tree also shows the parents a match
+       hangs under, so the match is marked — otherwise the operator cannot
+       tell which of the nodes the filter meant. */
+    .tree-node.match { background: var(--blue-soft); }
+    .tree-node.match .tree-role { color: var(--blue); }
     .tree-role { color: #273244; font-size: 11px; font-weight: 570; }
     .tree-pid { color: #53627a; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
     .tree-meta { margin-left: auto; display: flex; align-items: center; gap: 10px; color: #77808e; font-size: 9px; }
@@ -395,7 +400,7 @@
     }
     // What this agent was allowed to do. The label comes from the server,
     // which uses the same rule `cortex ps` prints — one rule, two views.
-    const processCaps = (process) => String(process.capsLabel ?? '—');
+    function processCaps(process) { return String(process.capsLabel ?? '—'); }
     // **What this agent is inside, and for how long.** The label comes from
     // the server, which asks the kernel — the kernel knows, and the log
     // would have to be read to find out. The wording is the same wording
@@ -459,6 +464,43 @@
         processPending(process),
       ].filter(Boolean).join(' — ');
     }
+
+    // **The one rule for "does this process match what the operator typed".**
+    //
+    // The table and the supervision tree each had **their own copy** of this
+    // rule, and the tree's copy was missing two of the columns: a process
+    // that holds one capability, and one parked at a checkpoint, were found
+    // by the filter box in the table and **not** in the tree — so the same
+    // box, in the same panel, found a process in one view and said there was
+    // none in the other.
+    //
+    // One rule, one function, both views. The columns are the ones the table
+    // shows: the identity, the state, and every note the server put on the
+    // row — what it is inside, what is queued for it, how it ended, what it
+    // has left, and where it was parked.
+    function processMatches(process, query) {
+      const q = String(query ?? '').trim().toLowerCase();
+      if (q === '') return true;
+      return `${process.pid} ${process.role} ${process.state} ${processCaps(process)} ${processInside(process)} ${processPending(process)} ${processOutcome(process)} ${processBudget(process)} ${processCheckpoint(process)}`.toLowerCase().includes(q);
+    }
+
+    // **The number next to the table, in the words the operator needs.**
+    //
+    // The panel's title used to say how many processes the **workspace**
+    // has — (4) — while the rows under it were the **filtered** ones. A
+    // window with one row on screen and a title saying four was two numbers
+    // for one thing, disagreeing.
+    //
+    // So the number describes what is on screen, and the workspace's size
+    // stays on screen too: **(1 / 4)** while a filter is narrowing the list,
+    // **(4)** when it is not. One rule either way — the first number is what
+    // the table shows, the second is what the workspace holds.
+    function processCountText(matched, total, query) {
+      if (total === 0) return '';
+      const filtering = String(query ?? '').trim() !== '';
+      return filtering ? `(${matched} / ${total})` : `(${total})`;
+    }
+
     let insideKnown = false;
     let pendingKnown = false;
     let outcomeKnown = false;
@@ -472,7 +514,7 @@
     let eventData = [];
 
     function renderProcesses() {
-      const query = $('processSearch').value.trim().toLowerCase();
+      const query = $('processSearch').value;
       insideKnown = processData.some((process) => typeof process.insideLabel === 'string');
       pendingKnown = processData.some((process) => processPending(process) !== '');
       outcomeKnown = processData.some((process) => processOutcome(process) !== '');
@@ -482,7 +524,11 @@
       // column of blanks would claim that nothing is inside a call and that
       // no signal is waiting.
       $('insideHead').hidden = !(insideKnown || pendingKnown || outcomeKnown || budgetKnown || checkpointKnown);
-      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)} ${processInside(process)} ${processPending(process)} ${processOutcome(process)} ${processBudget(process)} ${processCheckpoint(process)}`.toLowerCase().includes(query));
+      const visible = processData.filter((process) => processMatches(process, query));
+      // **The number next to the table describes the table.** It used to say
+      // how many processes the workspace has while the rows under it were the
+      // filtered ones — one panel, two numbers for one thing, disagreeing.
+      $('processCountLabel').textContent = processCountText(visible.length, processData.length, query);
       $('processRows').innerHTML = visible.length ? visible.map((process) => {
         const initial = String(process.role ?? '?').slice(0, 1).toUpperCase();
         const time = fmtLocal(process.startedAt);
@@ -667,12 +713,23 @@
     let activeProcessTab = 'trace';
     let outputPid = null;
 
-    function renderTree() {
-      const query = $('processSearch').value.trim().toLowerCase();
-      const byId = new Map(processData.map((process) => [process.pid, process]));
+    // **The supervision tree's shape, for a query.**
+    //
+    // The tree shows the processes that match the filter **and the path they
+    // hang under** — a child that matches is shown with its parents, because
+    // a tree that drops the parent is not a tree. The parents that are there
+    // only as a path are marked as *not* the match, so the operator can see
+    // which node the filter found.
+    //
+    // It used to render the **whole subtree** of anything that matched, so a
+    // filter that found one process showed the operator the unfiltered
+    // workspace — and, because the tree had its own copy of the matching
+    // rule, a filter on a capability or a park found nothing at all.
+    function processTree(processes, query) {
+      const byId = new Map(processes.map((process) => [process.pid, process]));
       const kids = new Map();
       const roots = [];
-      for (const process of processData) {
+      for (const process of processes) {
         const parent = process.ppid === null || process.ppid === undefined ? undefined : byId.get(process.ppid);
         if (parent && parent !== process) {
           if (!kids.has(parent.pid)) kids.set(parent.pid, []);
@@ -681,13 +738,34 @@
           roots.push(process);
         }
       }
-      const matches = (process) => `${process.pid} ${process.role} ${process.state} ${processInside(process)} ${processPending(process)} ${processOutcome(process)} ${processBudget(process)}`.toLowerCase().includes(query);
-      const keep = (process) => !query || matches(process) || (kids.get(process.pid) ?? []).some(keep);
       const byPid = (a, b) => a.pid - b.pid;
       roots.sort(byPid);
       kids.forEach((list) => list.sort(byPid));
-      const renderNode = (process, depth) => {
-        const children = (kids.get(process.pid) ?? []).map((child) => renderNode(child, depth + 1)).join('');
+      const q = String(query ?? '').trim().toLowerCase();
+      // **One rule**, the same one the table filters with.
+      const keeps = new Map();
+      const keep = (process) => {
+        if (keeps.has(process.pid)) return keeps.get(process.pid);
+        const value = q === '' || processMatches(process, q) || (kids.get(process.pid) ?? []).some(keep);
+        keeps.set(process.pid, value);
+        return value;
+      };
+      const nodes = [];
+      const walk = (process, depth) => {
+        if (!keep(process)) return;
+        nodes.push({ process, depth, matched: q !== '' && processMatches(process, q) });
+        for (const child of kids.get(process.pid) ?? []) walk(child, depth + 1);
+      };
+      for (const root of roots) walk(root, 0);
+      return nodes;
+    }
+
+    function renderTree() {
+      const query = $('processSearch').value;
+      const nodes = processTree(processData, query);
+      $('processTree').innerHTML = nodes.length ? nodes.map((node) => {
+        const process = node.process;
+        const depth = node.depth;
         const inside = processInside(process);
         const pending = processPending(process);
         const outcome = processOutcome(process);
@@ -697,10 +775,11 @@
         // stopped at a checkpoint read the same in both views.
         const detail = processDetail(process);
         const insideSpan = detail ? `<span class="tree-inside">${esc(detail)}</span>` : '';
-        return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${esc(processTokenLabel(process))} tok</span><span>${esc(processUsdLabel(process))}</span><span>${esc(processAgeLabel(process))}</span>${insideSpan}</span></div>${children}`;
-      };
-      const visible = roots.filter(keep);
-      $('processTree').innerHTML = visible.length ? visible.map((process) => renderNode(process, 0)).join('') : `<div class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，监督树会显示在这里。'}</div>`;
+        // The node the filter found is marked, so the operator can tell it
+        // from the parents that are only there as its path.
+        const mark = node.matched ? ' match' : '';
+        return `<div class="tree-node${mark}" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${esc(processTokenLabel(process))} tok</span><span>${esc(processUsdLabel(process))}</span><span>${esc(processAgeLabel(process))}</span>${insideSpan}</span></div>`;
+      }).join('') : `<div class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，监督树会显示在这里。'}</div>`;
       $('processTree').querySelectorAll('.tree-node').forEach((node) => node.addEventListener('click', () => showTrace(node.dataset.pid)));
     }
 
@@ -1272,7 +1351,9 @@
       $('eventCount').textContent = eventTotal.toLocaleString();
       $('navProcessCount').textContent = processData.length;
       $('navEventCount').textContent = eventTotal;
-      $('processCountLabel').textContent = processData.length ? `(${processData.length})` : '';
+      // The panel's own count is set by `renderProcesses()`, which knows what
+      // the filter left on screen — it is the table's count, not the
+      // workspace's.
       $('runtimeTotal').textContent = processData.length.toLocaleString();
       lastUpdated = new Date().toLocaleTimeString();
       renderFooter();

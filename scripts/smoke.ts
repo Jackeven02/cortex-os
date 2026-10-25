@@ -10304,7 +10304,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel' | 'processOutcome' | 'processBudget' | 'processCheckpoint' | 'processInside' | 'processPending' | 'processDetail',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel' | 'processOutcome' | 'processBudget' | 'processCheckpoint' | 'processInside' | 'processPending' | 'processDetail' | 'processCaps' | 'processMatches' | 'processCountText' | 'processTree',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -20256,6 +20256,123 @@ async function runDashboardLiveChecks(): Promise<void> {
         assert(
           !html.includes('cortex restore --chain'),
           'the page does not write the restore command itself',
+        );
+      });
+
+      await checkAsync('the filter finds the same processes in both views', async () => {
+        // The table and the supervision tree each had **their own copy** of
+        // the rule for "does this process match what the operator typed", and
+        // the tree's copy was missing two of the columns: a process holding
+        // one capability, and one parked at a checkpoint, were found by the
+        // filter box in the table and **not** in the tree — the same box, in
+        // the same panel, finding a process in one view and saying there was
+        // none in the other.
+        //
+        // The rule is one function now, and the tree is built from it.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        const processMatches = pageFunction(html, 'processMatches', {
+          processCaps: pageFunction(html, 'processCaps'),
+          processInside: pageFunction(html, 'processInside'),
+          processPending: pageFunction(html, 'processPending'),
+          processOutcome: pageFunction(html, 'processOutcome'),
+          processBudget: pageFunction(html, 'processBudget'),
+          processCheckpoint: pageFunction(html, 'processCheckpoint'),
+        });
+        const processTree = pageFunction(html, 'processTree', { processMatches });
+        const res = await fetch(`${dash.url}/api/processes`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const byPid = new Map(rows.map((row) => [Number(row['pid']), row]));
+
+        // The two processes the tree's old rule could not see: one holding a
+        // single capability, one parked at a checkpoint.
+        for (const [role, query] of [['capped', 'spawn'], ['parked', 'checkpointed']] as const) {
+          const row = rows.find((r) => r['role'] === role);
+          assert(row !== undefined, `the ${role} agent is in the window`);
+          assert(
+            processMatches(row, query) === true,
+            `the filter finds the ${role} by "${query}", got ${String(processMatches(row, query))}`,
+          );
+
+          const nodes = processTree(rows, query) as Array<{
+            process: Record<string, unknown>;
+            depth: number;
+            matched: boolean;
+          }>;
+          // **The two views find the same processes.** If the tree kept its
+          // own copy of the rule, this is where the two answers part.
+          const tableFinds = rows
+            .filter((r) => processMatches(r, query) === true)
+            .map((r) => Number(r['pid']))
+            .sort();
+          const treeFinds = nodes
+            .filter((n) => n.matched)
+            .map((n) => Number(n.process['pid']))
+            .sort();
+          assert(
+            JSON.stringify(tableFinds) === JSON.stringify(treeFinds),
+            `the table and the tree find the same processes by "${query}", got ${JSON.stringify(treeFinds)} vs ${JSON.stringify(tableFinds)}`,
+          );
+          assert(
+            treeFinds.includes(Number(row!['pid'])),
+            `the tree finds the ${role} the table found, got ${JSON.stringify(treeFinds)}`,
+          );
+
+          // And the tree shows the match **and the path it hangs under** —
+          // nothing else. A tree that drops the parent is not a tree, but a
+          // tree that shows the whole subtree is not a filter.
+          const path = new Set<number>();
+          let parent = row!['ppid'];
+          while (parent !== null && parent !== undefined) {
+            path.add(Number(parent));
+            parent = byPid.get(Number(parent))?.['ppid'];
+          }
+          for (const node of nodes) {
+            const nodePid = Number(node.process['pid']);
+            assert(
+              nodePid === Number(row!['pid']) || path.has(nodePid),
+              `the tree shows only the match and its path, got ${String(node.process['role'])}`,
+            );
+          }
+        }
+
+        // With no filter the tree is the whole workspace, and nothing in it
+        // is marked: there is no match to point at.
+        const all = processTree(rows, '') as Array<{
+          process: Record<string, unknown>;
+          depth: number;
+          matched: boolean;
+        }>;
+        assert(all.length === rows.length, `an unfiltered tree shows every process, got ${all.length} of ${rows.length}`);
+        assert(
+          all.every((node) => !node.matched),
+          'an unfiltered tree marks nothing, because nothing matched',
+        );
+      });
+
+      await checkAsync('the number next to the table describes the table', async () => {
+        // The panel's title said how many processes the **workspace** has —
+        // (4) — while the rows under it were the **filtered** ones: one
+        // panel, two numbers for one thing, disagreeing. The operator could
+        // not tell whether the rows were missing or the count was wrong.
+        //
+        // So the number describes the table, and the workspace's size stays
+        // on screen next to it.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        const processCountText = pageFunction(html, 'processCountText');
+        assert(processCountText(4, 4, '') === '(4)', `no filter: the number is the workspace's, got ${String(processCountText(4, 4, ''))}`);
+        assert(processCountText(1, 4, 'spawn') === '(1 / 4)', `a filter: the number is the rows on screen out of the workspace's, got ${String(processCountText(1, 4, 'spawn'))}`);
+        assert(processCountText(0, 4, 'zzz') === '(0 / 4)', `a filter that found nothing is still a true number, got ${String(processCountText(0, 4, 'zzz'))}`);
+        assert(processCountText(4, 4, ' ') === '(4)', `a blank filter is no filter, got ${String(processCountText(4, 4, ' '))}`);
+        assert(processCountText(0, 0, '') === '', 'an empty panel says nothing');
+
+        // And the panel sets that number **from the rows on screen** — in one
+        // place. A second copy of the count is a second rule, and the second
+        // rule is the one that goes missing.
+        const assignments = html.match(/processCountLabel'\)\.textContent\s*=\s*([^;]+);/g) ?? [];
+        assert(assignments.length === 1, `the panel sets its count in one place, got ${assignments.length}`);
+        assert(
+          assignments[0]!.includes('visible'),
+          `the count is built from the rows on screen, got ${assignments[0]}`,
         );
       });
 

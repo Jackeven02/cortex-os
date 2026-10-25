@@ -2125,30 +2125,72 @@ The user-facing surface. Should feel like a real OS shell.
   up to the three processes beside them — the console is clean, and `cortex top`
   on the same workspace says `3 processes · 1 running · 1 blocked · 1 suspended`.
 
-- [ ] **#121** The process table's title count does not describe the table →
-  **open.**
-  Found while verifying #120, on the same window. The table's title reads
-  「Agent 进程 (4)」 — and when the operator types into 「筛选进程…」 and one row
-  is left on screen, the title still says (4). The number is the workspace's
+- [x] **#121** The process table's title count does not describe the table →
+  **fixed.**
+  Found while verifying #120, on the same window. The table's title read
+  「Agent 进程 (4)」 — and when the operator typed into 「筛选进程…」 and one row
+  was left on screen, the title still said (4). The number was the workspace's
   process count (the one the sidebar and the 运行状态 panel use), while the rows
-  below it are the **filtered** ones: two numbers for one thing, in one panel,
-  disagreeing — the same shape as #110 and #115.
+  below it were the **filtered** ones: two numbers for one thing, in one panel,
+  disagreeing.
 
-  Which of the two should win is not the question it was for the events table,
-  because the other numbers in the window quote the *workspace* count too (the
-  sidebar, the 「Agent 进程」 card, the panel's total). So the options are:
+  The **second option** was the one that kept both facts on screen: the count
+  **shows both** — 「(1 / 4)」 while a filter is on, 「(4)」 when it is not. The
+  first number is what the table shows, the second is what the workspace holds,
+  so the operator loses neither, and the rule is one rule either way. The
+  numbers that are about the *workspace* say so: the metric card's foot reads
+  「当前工作区记录」, and the 运行状态 panel's total is the workspace's
+  processes.
 
-  - the count **follows the filter** — the title says how many rows are on
-    screen. Then the sidebar, the card and the panel all disagree with it, and
-    the operator loses the size of the workspace.
-  - the count **shows both** — 「(1 / 4)」 while a filter is on. Then every
-    number in the window has to be read as "matched of total", and the ones
-    that quote only the total have to say so.
-  - the count **stays the total** and the table says what it is showing — e.g.
-    「显示 1 / 4」 on the table's own line, or on the empty-state row.
+  **And the same filter box turned out to be two filters.** The panel has two
+  views — 表格 and 监督树 — and each had **its own copy** of "does this process
+  match what the operator typed". The tree's copy was missing two of the
+  columns: a process holding one capability, and one parked at a checkpoint. So
+  the same box, in the same panel, found a process in the table and said
+  **没有匹配的进程** in the tree — measured on a real window over a real kernel,
+  with a filter of `spawn` and a filter of `checkpointed`. The rule is one
+  function now (`processMatches`, on the page), and the tree is built from it.
+
+  The tree also says what it shows: the processes that match **and the path they
+  hang under** (a tree that drops the parent is not a tree), with the node that
+  matched **marked** so the operator can tell it from the parents that are only
+  there as its path. It used to render the **whole subtree** of anything that
+  matched, so a filter that found one process showed the operator the
+  unfiltered workspace.
+
+  2 new smoke checks (893 → 895), all reverse-verified: with the tree keeping
+  its own narrower rule, the check fails and reports the two views' answers
+  (`[] vs [8]` — the tree found nothing, the table found one); with the tree
+  rendering whole subtrees again, the check fails and names the process that
+  does not belong; with the count built from the workspace's total again, the
+  check fails and shows the assignment; and with the count's wording losing the
+  fraction, the check fails and reports `(4)`.
+
+  Browser-verified on a real window over a real kernel: the title reads
+  「Agent 进程 (1 / 6)」 with one row on screen, the tree shows `init #1` and
+  the matching `narrow-one #3` with the match marked, a filter of
+  `checkpointed` finds the parked process in the tree (it used to find
+  nothing), and the console is clean.
 
   **Exit criteria:** the number next to the table says one thing, and that thing
-  is true of the table it sits on.
+  is true of the table it sits on. — met.
+
+- [ ] **#123** The supervision tree's role name wraps when the note is long →
+  **open.**
+  Found while verifying #121, on the same window. A tree node is one flex row:
+  the role, the PID, the state, and the note the server put on the row. The
+  note is the long one — `checkpointed — 'cortex restore --chain …' brings it
+  back` — and the flex row gives the space to it, so the **role name** is what
+  wraps: `parked-` on one line, `one` on the next.
+
+  It is not new — the tree has always laid out this way, and the note has
+  always been long — but it became visible once the tree showed a filtered
+  list, because now one node sits in a row of its own with the whole width to
+  itself. The fix is a layout decision rather than a fact: the role name should
+  not wrap (`white-space: nowrap`), and the note should give way instead
+  (truncate with a title, or wrap onto a second line under the row). Whichever
+  way it goes, the note must not push the role out of shape — a name split
+  across two lines is a name the operator has to read twice.
 
 - [ ] **#122** A spawned agent cannot be given a wall-clock ceiling →
   **open.**

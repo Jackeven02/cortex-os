@@ -2441,6 +2441,36 @@ brings it back. The two views now build the note with **one function**
 (`processDetail`, on the page), in the order `cortex ps` prints: how it
 ended, then the budget, then the park, then what it is waiting on.
 
+**The number next to the table describes the table.** The process panel's title
+reads 「Agent 进程 (4)」 — the workspace's process count — while the rows under
+it were the **filtered** ones. One panel, two numbers for one thing,
+disagreeing: an operator who typed into 「筛选进程…」 and was left with one row
+could not tell whether the other three were filtered out or the count was
+simply wrong.
+
+So the number is the table's: **(1 / 4)** while a filter is narrowing the list,
+**(4)** when it is not. One rule either way — the first number is what the table
+shows, the second is what the workspace holds, so the workspace's size never
+leaves the screen. The numbers that are about the *workspace* say so: the
+metric card's foot reads 「当前工作区记录」, and the 运行状态 panel's total is the
+workspace's processes, with its rows adding up to that total (above).
+
+**And the two views filter by the same rule.** The panel has two views — 表格
+and 监督树 — and each had **its own copy** of "does this process match what the
+operator typed". The tree's copy was missing two of the columns: a process
+holding one capability, and one parked at a checkpoint. The same filter box, in
+the same panel, found a process in the table and said **没有匹配的进程** in the
+tree. The rule is one function now (`processMatches`, on the page), and the tree
+is built from it.
+
+The tree says what it shows, because of that rule: the processes that match
+**and the path they hang under** — a child that matches is shown with its
+parents, because a tree that drops the parent is not a tree — and the node that
+matched is marked, so the operator can tell it from the parents that are only
+there as its path. It used to render the **whole subtree** of anything that
+matched, so a filter that found one process showed the operator the unfiltered
+workspace.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up
