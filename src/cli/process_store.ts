@@ -35,6 +35,7 @@
  */
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, unlinkSync, mkdirSync, statSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 
 import { unbrand, asProcessId, type ProcessId, type BudgetCounters, type BudgetLimits, type AgentSpec, type SyscallRecord, type ProcessState, type MemoryRegionPolicy, type BlockedReason, type Capability, type PersistedProcessMeta, CAPABILITIES, DEFAULT_CAPABILITIES } from '../kernel/types.js';
@@ -174,8 +175,14 @@ export function outputPath(dir: string, pid: ProcessId): string {
 export interface OutputEntry {
   /** ISO-8601 timestamp of the moment the line was completed. */
   readonly at: string;
-  /** Which standard stream the line came from. */
-  readonly stream: 'out' | 'err';
+  /**
+   * Which standard stream the line came from.
+   *
+   * The capture writes `'out'` or `'err'`. The type is wider than that
+   * because a line may also arrive over the wire from a host that captured
+   * it, and a reader keeps what it read rather than inventing a tag.
+   */
+  readonly stream: string;
   /** The line itself, without its trailing newline. */
   readonly text: string;
 }
@@ -493,6 +500,71 @@ export function formatOutputEntry(entry: {
   readonly text: string;
 }): string {
   return `${entry.at} | ${entry.stream} | ${entry.text}\n`;
+}
+
+/**
+ * Take one captured line apart again.
+ *
+ * The format and its inverse live together, so a line the writer wrote is a
+ * line a reader can take apart — and every reader takes it apart the same
+ * way.
+ *
+ * Only the **first** two separators are separators: the text may hold the
+ * separator itself, and everything after them is the line. A line that is
+ * not in the format is not a captured line, and says so by being absent — a
+ * reader must not invent a timestamp for it.
+ */
+export function parseOutputEntry(line: string): OutputEntry | undefined {
+  const first = line.indexOf(' | ');
+  if (first <= 0) return undefined;
+  const second = line.indexOf(' | ', first + 3);
+  if (second < 0) return undefined;
+  const stream = line.slice(first + 3, second);
+  if (stream.length === 0) return undefined;
+  return {
+    at: line.slice(0, first),
+    stream,
+    text: line.slice(second + 3),
+  };
+}
+
+/**
+ * Read a process's captured output.
+ *
+ * The lines come back in the order they were printed, and `tail` keeps only
+ * the last N of them: an agent that has printed a hundred thousand lines
+ * should not cost the operator's window a hundred thousand lines of JSON.
+ * `total` says how many there were, so a view can say that it is showing the
+ * end of a longer history instead of pretending the history is that short.
+ *
+ * A process that has printed nothing has no output log. That is not an
+ * error — it is a process that printed nothing — so the answer is an empty
+ * list, and the caller says so in its own words.
+ */
+export async function readOutputEntries(
+  dir: string,
+  pid: ProcessId,
+  options: { readonly tail?: number } = {},
+): Promise<{ readonly entries: OutputEntry[]; readonly total: number }> {
+  let text: string;
+  try {
+    text = await readFile(outputPath(dir, pid), 'utf8');
+  } catch {
+    return { entries: [], total: 0 };
+  }
+  const lines = text.split('\n');
+  // A trailing newline yields an empty last element; drop it.
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  const entries: OutputEntry[] = [];
+  for (const line of lines) {
+    const entry = parseOutputEntry(line);
+    if (entry !== undefined) entries.push(entry);
+  }
+  const tail = options.tail;
+  if (tail !== undefined && tail >= 0 && entries.length > tail) {
+    return { entries: entries.slice(entries.length - tail), total: entries.length };
+  }
+  return { entries, total: entries.length };
 }
 
 /**

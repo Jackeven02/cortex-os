@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 809 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 816 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -396,6 +396,12 @@ It says the same words `cortex memory` says (`read-write`, `read-only`, `∞`, `
 **And the window says which calls can be undone.** The kernel tags every frame with what it would take to undo it — `reversible`, `idempotent`, `irreversible` — and the tag is not decoration: it is what traps an irreversible call inside a `forkable` region, and what `cortex audit` reads to surface the tools that never declared one. The event table dropped it, so a tool call that charged a credit card read exactly like a read. There is a **可逆性** column now, between the duration and the cost, in the same words `cortex trace` prints — and the syscall timeline says it too.
 
 **And the window says what a LangChain call spent.** The event table merges two sources — the kernel's syscall frames and the LangChain callback log — and the two used to name a call's tokens differently (`tokensIn`/`tokensOut` against `inputTokens`/`outputTokens`). The window read one set, so half its rows said `—` about calls that had spent tokens: the numbers were on disk, under the other name. Both sources now come out in one shape, so the tokens show up whichever log the event came from.
+
+**And the window says what the agent said.** The process dialog had two views of one process — the syscall timeline (what it *did*) and the memory panel (what it *knows*) — and neither could show the lines the agent printed. That is the first thing you reach for when an agent is behaving strangely: the printed line is the evidence, and everything else is the story around it.
+
+The lines were already kept — one stamped line per printed line in `processes/<pid>/output.log`, relayed by the kernel the moment it is printed, and read back by `cortex logs`. What was missing was a way to *ask* for them from the window. There is a third view now: click a process, switch to **输出**, and the window shows what it said, line by line, with the error stream marked.
+
+The panel re-reads the file rather than trusting a pushed copy of the line, so the window and the log cannot end up saying different things about the same line. When the history is longer than the panel shows, it says so (`12,000 lines in all — showing the last 500`) instead of looking like a process that printed 500 lines — and a process that printed nothing says so too.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

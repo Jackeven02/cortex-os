@@ -1398,6 +1398,60 @@ The user-facing surface. Should feel like a real OS shell.
   call's counters have one name in every view); INTEGRATIONS (`/api/events`
   hands out one shape); CHANGELOG.
 
+- [x] **#105** The window cannot say what an agent said → **fixed.** The
+  process dialog had two views of one process — the syscall timeline (what it
+  **did**) and the memory panel (what it **knows**) — and neither could show
+  the lines the agent printed. That is the first thing an operator reaches for
+  when an agent is behaving strangely: the printed line is the evidence, and
+  everything else is the story around it.
+
+  **The lines were not missing — they were kept.** The capture writes one
+  stamped line per printed line into `processes/<pid>/output.log`, the kernel
+  relays every one of them the moment it is printed, and `cortex logs` reads
+  them back (by push when a live kernel holds the process, from the file when
+  it does not). What was missing was a way to *ask* for them from the window.
+
+  So the dialog has a third view now — **输出** — fed by a new endpoint,
+  `GET /api/output/:pid?tail=N`, answering `{ pid, total, lines }` with each
+  line's `{ at, stream, text }`. It is a **disk read**, so it answers for a
+  process that has already exited and for one whose kernel is gone: the same
+  limit `cortex logs` has, and the same freedom. A process that printed
+  nothing says so, rather than looking like a process whose history is empty.
+
+  **The file is the truth, so the panel reads it.** The live path tells the
+  page *that* something was printed and *which* process printed it — not the
+  line — and the page re-reads the file, so the window and the log cannot end
+  up saying different things about the same line, and a line still being
+  written cannot reach the screen as half a line. The kernel relays every
+  printed line, and the window used to drop those events on the floor; now
+  `/api/stream` carries an `output` frame naming the pids that printed, and
+  without a live kernel the window watches the file instead.
+
+  **A panel that shows the end of a longer history says so.** The endpoint
+  answers with the lines *and* with how many there were, so a panel showing
+  the last 500 of 12,000 says `共 12,000 行，这里显示最后 500 行` instead of
+  looking like a process that printed 500 lines.
+
+  **The separator belongs to the format, not to the text.** A captured line is
+  `<at> | <stream> | <text>`, and the format and its inverse live together
+  (`formatOutputEntry` / `parseOutputEntry`, in `src/cli/process_store.ts`).
+  Only the **first two** separators are separators — the text may hold the
+  separator itself — and a line that is not in the format is not a captured
+  line, and says so by being absent rather than by inventing a timestamp.
+
+  **7 new smoke checks** (809 → 816), reverse-verified: with the parser
+  splitting on every separator, three checks fail ("got boom and then some");
+  with the endpoint handing over the raw file lines, two fail; with the tail
+  ignored, only the tail check fails; with the page's output tab removed, only
+  the page check fails; with the page not rendering the line, and with the
+  error stream not marked, only those checks fail; and with the kernel's
+  `output` event dropped — on the live path and on the watched-file path — the
+  two push checks fail.
+
+  Docs: ARCHITECTURE (the window says what the agent said); STATE §2.6 (what
+  a process said is kept, and the operator can read it); INTEGRATIONS
+  (`/api/output/:pid` and the `output` frame); CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

@@ -179,6 +179,13 @@
     .trace-time { color: #929aa7; }
     .trace-syscall { color: #344052; font-weight: 570; }
     .trace-phase { color: #858e9b; }
+    /* What a process said: the time, and the line itself. Two columns — the
+       line is the point, so it gets the space the trace's third column
+       takes. */
+    .output-item { grid-template-columns: 82px 1fr; }
+    .output-text { color: #344052; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+    .output-item.err .output-text { color: var(--red); }
+    .output-note { margin-bottom: 9px; color: #8a93a1; font-size: 10px; }
     @media (max-width: 1080px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .columns { grid-template-columns: minmax(0, 1.5fr) minmax(235px, .8fr); } .content { padding-right: 22px; padding-left: 22px; } .topbar { padding: 0 22px; } }
     @media (max-width: 760px) { .sidebar { width: 58px; padding: 16px 8px; } .brand { justify-content: center; padding: 0 0 23px; } .brand-copy, .nav-label, .nav-text, .nav-count, .workspace, .side-footer .version { display: none; } .nav-item { justify-content: center; padding: 11px 0; } .nav-icon { font-size: 17px; } .side-footer { justify-content: center; padding: 12px 0; } .main { margin-left: 58px; } .topbar { height: 52px; padding: 0 15px; } .content { padding: 23px 14px 34px; } .page-heading { align-items: flex-start; } h1 { font-size: 21px; } .columns { grid-template-columns: 1fr; } .heading-actions .button span:not(.button-icon) { display: none; } .heading-actions .button { width: 34px; padding: 0; } .search { width: 115px; } .metrics { gap: 9px; } .metric { min-height: 101px; padding: 13px; } .metric-value { font-size: 22px; } .panel-head { padding: 0 12px; } .table-wrap { max-width: calc(100vw - 84px); } }
     @media (max-width: 420px) { .connection { font-size: 0; } .connection .live-dot { width: 8px; height: 8px; } .crumb { font-size: 10px; } .content { padding-right: 10px; padding-left: 10px; } .metric-top { font-size: 10px; } .metric-icon { width: 23px; height: 23px; } .metric-foot { font-size: 9px; } }
@@ -482,6 +489,12 @@
     }
 
     let processView = 'table';
+    // Which of the three views of one process the window is showing, and
+    // which process it is about. The live path uses both: when the kernel
+    // says "something was printed", the window only bothers to re-read if
+    // the operator is looking at that process's output.
+    let activeProcessTab = 'trace';
+    let outputPid = null;
 
     function renderTree() {
       const query = $('processSearch').value.trim().toLowerCase();
@@ -721,6 +734,9 @@
         eventsOffset = 0;
         await loadEvents(false);
         applyData();
+        // The polling fallback has no push to tell it that a line was
+        // printed, so it re-reads the output panel while it is on screen.
+        if (activeProcessTab === 'output' && outputPid !== null) await refreshOutput(outputPid);
       } catch (error) {
         $('updated').textContent = `连接失败：${error.message}`;
         document.querySelector('.connection .live-dot').style.background = '#d65b62';
@@ -738,6 +754,16 @@
       const source = new EventSource('/api/stream?limit=100');
       source.addEventListener('processes', (event) => { processData = JSON.parse(event.data); applyData(); });
       source.addEventListener('events', (event) => { eventData = JSON.parse(event.data); eventsTotal = Math.max(eventsTotal, eventData.length); applyData(); });
+      // Something was printed. The message says *that* it changed, not *what*
+      // was printed — the page re-reads the file, so the window and the log
+      // cannot say different things about the same line.
+      source.addEventListener('output', (event) => {
+        if (activeProcessTab !== 'output' || outputPid === null) return;
+        const payload = JSON.parse(event.data);
+        const pids = Array.isArray(payload.pids) ? payload.pids : [];
+        if (!pids.some((pid) => String(pid) === String(outputPid))) return;
+        refreshOutput(outputPid);
+      });
       source.onopen = () => {
         $('updated').textContent = '实时连接（SSE）';
         document.querySelector('.connection .live-dot').style.background = '#25a879';
@@ -777,18 +803,20 @@
       return `<div class="trace-item"><span class="trace-time">${esc(new Date(record.timestamp).toLocaleTimeString())}</span><span class="trace-syscall">${esc(parts.join(' · '))}</span><span class="trace-phase">${esc(record.phase)}${record.durationMs === undefined ? '' : ` · ${esc(record.durationMs)} ms`}</span></div>`;
     }
 
-    // **The process dialog has two views of one process.**
+    // **The process dialog has three views of one process.**
     //
-    // What it **did** — the syscall timeline — and what it **knows** — its
-    // memory regions. The window had only the first, and for an agent the
-    // knowledge is the point: the event table says what it called, and
-    // nothing said what it wrote down. Both answers come from the kernel:
-    // the frames from the log, the regions from the memory engine.
-    const processTabs = (active) => `<div class="view-toggle" style="margin-bottom:12px"><button type="button" class="${active === 'trace' ? 'active' : ''}" data-tab="trace">Syscall 时间线</button><button type="button" class="${active === 'memory' ? 'active' : ''}" data-tab="memory">记忆</button></div>`;
+    // What it **did** — the syscall timeline — what it **knows** — its
+    // memory regions — and what it **said** — the lines it printed. The
+    // window had the first two, and the third is the one an operator reaches
+    // for first when an agent is behaving strangely: the project keeps every
+    // printed line (`processes/<pid>/output.log`) and `cortex logs` reads
+    // them back, but the window had no way to ask.
+    const processTabs = (active) => `<div class="view-toggle" style="margin-bottom:12px"><button type="button" class="${active === 'trace' ? 'active' : ''}" data-tab="trace">Syscall 时间线</button><button type="button" class="${active === 'memory' ? 'active' : ''}" data-tab="memory">记忆</button><button type="button" class="${active === 'output' ? 'active' : ''}" data-tab="output">输出</button></div>`;
 
     const wireProcessTabs = (pid) => {
       $('traceBody').querySelectorAll('button[data-tab]').forEach((button) => button.addEventListener('click', () => {
         if (button.dataset.tab === 'memory') showMemory(pid);
+        else if (button.dataset.tab === 'output') showOutput(pid);
         else showTrace(pid);
       }));
     };
@@ -802,6 +830,8 @@
     };
 
     async function showTrace(pid) {
+      activeProcessTab = 'trace';
+      outputPid = null;
       openDialog(`进程 ${pid} · Syscall 时间线`, processTabs('trace') + '<div class="empty">正在读取记录…</div>');
       wireProcessTabs(pid);
       try {
@@ -818,6 +848,8 @@
     }
 
     async function showMemory(pid) {
+      activeProcessTab = 'memory';
+      outputPid = null;
       openDialog(`进程 ${pid} · 记忆`, processTabs('memory') + '<div class="empty">正在读取记忆…</div>');
       wireProcessTabs(pid);
       try {
@@ -839,6 +871,8 @@
     }
 
     async function showRegion(pid, region) {
+      activeProcessTab = 'memory';
+      outputPid = null;
       openDialog(`进程 ${pid} · 记忆 · ${region}`, processTabs('memory') + '<div class="empty">正在读取…</div>');
       wireProcessTabs(pid);
       try {
@@ -854,6 +888,58 @@
         wireProcessTabs(pid);
       } catch (error) {
         openDialog(`进程 ${pid} · 记忆 · ${region}`, processTabs('memory') + `<div class="empty">${esc(error.message)}</div>`);
+        wireProcessTabs(pid);
+      }
+    }
+
+    // What a process **said** — the lines the capture kept, in the order they
+    // were printed.
+    //
+    // The file is the truth: the endpoint reads it and the page renders what
+    // it says. The live path tells the page *that* something was printed and
+    // the page re-reads — so the window and the log cannot end up saying
+    // different things, and a line that was still being written cannot reach
+    // the screen as half a line.
+    function outputItem(line) {
+      const at = line && line.at ? new Date(line.at).toLocaleTimeString() : '—';
+      const stream = line && line.stream === 'err' ? 'err' : 'out';
+      const text = line && line.text !== undefined ? String(line.text) : '';
+      return `<div class="trace-item output-item ${stream}"><span class="trace-time">${esc(at)}</span><span class="output-text">${esc(text)}</span></div>`;
+    }
+
+    async function showOutput(pid) {
+      activeProcessTab = 'output';
+      outputPid = pid;
+      openDialog(`进程 ${pid} · 输出`, processTabs('output') + '<div class="empty">正在读取输出…</div>');
+      wireProcessTabs(pid);
+      await refreshOutput(pid);
+    }
+
+    async function refreshOutput(pid) {
+      try {
+        const response = await fetch(`/api/output/${encodeURIComponent(pid)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? '读取失败');
+        // The operator may have moved to another tab while this was in
+        // flight. Landing the output on top of the memory view would show
+        // the wrong thing — so a late answer is dropped, not painted.
+        if (activeProcessTab !== 'output' || outputPid !== pid) return;
+        const lines = Array.isArray(data.lines) ? data.lines : [];
+        const total = Number(data.total ?? lines.length);
+        const body = lines.length
+          ? `<div class="trace-list">${lines.map((line) => outputItem(line)).join('')}</div>`
+          : '<div class="empty">这个进程没有留下输出。</div>';
+        // A longer history than the window shows is said out loud: a panel
+        // that shows the last 500 lines of 12,000 must not look like a
+        // process that printed 500 lines.
+        const note = total > lines.length
+          ? `<div class="output-note">共 ${total.toLocaleString()} 行，这里显示最后 ${lines.length.toLocaleString()} 行。</div>`
+          : '';
+        openDialog(`进程 ${pid} · 输出`, processTabs('output') + note + body);
+        wireProcessTabs(pid);
+      } catch (error) {
+        if (activeProcessTab !== 'output' || outputPid !== pid) return;
+        openDialog(`进程 ${pid} · 输出`, processTabs('output') + `<div class="empty">${esc(error.message)}</div>`);
         wireProcessTabs(pid);
       }
     }

@@ -1946,6 +1946,56 @@ contents live in the kernel that owns it, and there is no on-disk copy to read
 instead. The same limit `cortex memory` has — and the same rule: a view that
 has no answer must not look like a view whose answer is "nothing".
 
+**And the window says what the agent said.** The window could show what an
+agent **did** — the event table, the syscall timeline — and what it **knows** —
+the memory panel. It could not show what it **said**, and that is the first
+thing an operator reaches for when an agent is behaving strangely: the line
+the agent printed is the evidence, and everything else is the story around it.
+
+The lines were not missing — they were **kept**. The capture writes one
+stamped line per printed line into `processes/<pid>/output.log`, and
+`cortex logs` reads them back, prints them live by push, and joins them to the
+file with the byte offset. What was missing was a way to *ask* for them from
+the window.
+
+So the process dialog has **three views of one process** now: what it **did**
+(the syscall timeline), what it **knows** (the memory panel), and what it
+**said** (the output panel) — one click apart, and the same three facts
+`cortex trace`, `cortex memory` and `cortex logs` answer in the terminal.
+
+The panel is fed by a **disk read** (`GET /api/output/:pid?tail=N`), so it
+answers for a process that has already exited and for one whose kernel is
+gone — the same limit `cortex logs` has, and the same freedom. It needs no
+live kernel, and it never pretends that a missing kernel means an empty
+history: a process that printed nothing has no output log, and the panel says
+that it printed nothing.
+
+**The file is the truth, so the panel reads it.** The live path tells the page
+*that* something was printed and *which* process printed it — not the line
+itself — and the page re-reads the file. So the window and the log cannot end
+up saying different things about the same line, and a line that was still
+being written cannot reach the screen as half a line. The kernel relays every
+printed line the moment it is printed, and the window used to drop those
+events on the floor; now `/api/stream` carries an `output` frame naming the
+pids that printed, and without a live kernel the window watches the file
+instead.
+
+**A panel that shows the end of a longer history says so.** The endpoint
+answers with the lines *and* with how many there were, and the panel says
+`共 12,000 行,这里显示最后 500 行`. A panel showing the last 500 lines of 12,000
+must not look like a process that printed 500 lines — the same rule as
+everywhere else here: a view that is showing part of the truth must say that
+it is.
+
+**The separator belongs to the format, not to the text.** A captured line is
+`<at> | <stream> | <text>`, and the format and its inverse live together
+(`formatOutputEntry` and `parseOutputEntry`, in `src/cli/process_store.ts`),
+so a line the writer wrote is a line a reader can take apart — and every
+reader takes it apart the same way. Only the **first two** separators are
+separators: the text may hold the separator itself, and everything after them
+is the line. A line that is not in the format is not a captured line, and
+says so by being absent — a reader must not invent a timestamp for it.
+
 **And a unit has exactly one conversion point.** `budgetsSpent.usdSpent` is in
 **microdollars** — an integer count, 1 USD = 1_000_000 (STATE.md §2.4). Three
 places disagreed about that, and two of them were wrong by a factor of a

@@ -8,7 +8,7 @@ import { format } from 'node:util';
 import { asProcessId } from '../kernel/types.js';
 import type { BlockedReason, BudgetLimits, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
-import { readAllMetas, listProcDirs } from '../cli/process_store.js';
+import { readAllMetas, listProcDirs, readOutputEntries } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView, formatAge, processAge, type AgeFacts } from '../cli/process_view.js';
 import { describeOutcome } from '../cli/process_outcome.js';
 import { describeBudget, formatTokenBudget, formatUsdBudget, type BudgetFacts } from '../cli/process_budget.js';
@@ -94,6 +94,16 @@ const inRange = (atMs: number, range: TimeRange): boolean =>
   (range.from === undefined || atMs >= range.from) && (range.to === undefined || atMs <= range.to);
 
 const MAX_SCAN = 5000;
+
+/**
+ * How many lines of a process's captured output the window asks for.
+ *
+ * An agent that has printed a hundred thousand lines should not cost the
+ * operator's window a hundred thousand lines of JSON. The endpoint says how
+ * many there were in total, so the view can say that it is showing the end
+ * of a longer history instead of pretending the history is that short.
+ */
+const DEFAULT_OUTPUT_TAIL = 500;
 
 /**
  * How long the live path waits before it re-reads the process table.
@@ -770,6 +780,35 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           if (!closed) response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
         };
 
+        // --- something was printed -------------------------------------------
+        //
+        // The kernel relays every line an agent prints, the moment it is
+        // printed — and the window used to drop those events on the floor.
+        // So the window could not show what an agent **said**, which is the
+        // first thing an operator reaches for when an agent is behaving
+        // strangely.
+        //
+        // The line itself is **not** forwarded: the file is the truth, and
+        // the page re-reads it. So the window and the file cannot disagree
+        // about what was said, and a line that was written half-way cannot
+        // reach the screen as half a line.
+        //
+        // It is **throttled**, not debounced, for the same reason the process
+        // table is: a chatty agent prints a line at a time, and a debounce
+        // that waited for the silence would never see the busy period at all.
+        const outputPids = new Set<number>();
+        let outputTimer: ReturnType<typeof setTimeout> | undefined;
+        const outputChanged = (pid: number): void => {
+          outputPids.add(pid);
+          if (outputTimer !== undefined) return;
+          outputTimer = setTimeout(() => {
+            outputTimer = undefined;
+            const pids = [...outputPids];
+            outputPids.clear();
+            send('output', { pids });
+          }, PROCESS_REFRESH_DEBOUNCE_MS);
+        };
+
         // --- the live path: the kernel pushes ------------------------------
         // Nothing is re-read. The frames arrive as the kernel writes them,
         // and the process list comes from the kernel's own table. This is
@@ -851,6 +890,12 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             if (event.kind === 'process-start' || event.kind === 'process-exit') {
               refreshProcesses(true);
             }
+            if (event.kind === 'output') {
+              // A line was printed. The window is told *that* it changed and
+              // re-reads the file — the file is the truth, so the page and
+              // the log cannot end up saying different things.
+              outputChanged(event.pid ?? 0);
+            }
           };
 
           try {
@@ -889,6 +934,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
               closed = true;
               if (heartbeat !== undefined) clearInterval(heartbeat);
               if (processRefresh !== undefined) clearTimeout(processRefresh);
+              if (outputTimer !== undefined) clearTimeout(outputTimer);
               unsubscribe?.();
             });
             return;
@@ -911,7 +957,13 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         };
         void push();
         try {
-          watcher = watch(dir, { recursive: true }, () => {
+          watcher = watch(dir, { recursive: true }, (_eventType, filename) => {
+            // A line was printed: the output panel has to hear it, even
+            // though no kernel is pushing anything here.
+            const printed = filename === null || filename === undefined
+              ? null
+              : /processes[/\\](\d+)[/\\]output\.log$/.exec(String(filename));
+            if (printed !== null) outputChanged(Number(printed[1]));
             if (debounce !== undefined) clearTimeout(debounce);
             debounce = setTimeout(() => { void push(); }, 250);
           });
@@ -927,6 +979,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           closed = true;
           if (heartbeat !== undefined) clearInterval(heartbeat);
           if (debounce !== undefined) clearTimeout(debounce);
+          if (outputTimer !== undefined) clearTimeout(outputTimer);
           watcher?.close();
         });
         return;
@@ -1014,6 +1067,31 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           });
           return;
         }
+      }
+      // What the process **said**.
+      //
+      // The `.crec` log answers "what did it do", and it says nothing about
+      // what it said: an agent's `console.log` used to go to the daemon's
+      // stdout and nowhere else. It is kept now — one stamped line per
+      // printed line, in `processes/<pid>/output.log` — and `cortex logs`
+      // reads it back. The operator's window had no way to ask, so the one
+      // thing an operator reaches for first was the one thing the window
+      // could not show.
+      //
+      // It is a **disk read**: the lines are on disk, so this answers for a
+      // process that has already exited and for one whose kernel is gone —
+      // the same limit `cortex logs` has, and the same freedom.
+      const outputMatch = /^\/api\/output\/(\d+)$/.exec(url.pathname);
+      if (outputMatch !== null) {
+        const pid = Number(outputMatch[1]);
+        const tailRaw = url.searchParams.get('tail');
+        // A tail that is not a number is not a tail. Falling back to the
+        // default keeps a typo from asking for the whole history.
+        const requested = tailRaw === null ? DEFAULT_OUTPUT_TAIL : Number(tailRaw);
+        const tail = Number.isFinite(requested) && requested >= 0 ? requested : DEFAULT_OUTPUT_TAIL;
+        const { entries, total } = await readOutputEntries(dir, asProcessId(pid), { tail });
+        json(response, 200, { pid, total, lines: entries });
+        return;
       }
       if (url.pathname === '/' || url.pathname === '/index.html') {
         response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });

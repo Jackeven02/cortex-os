@@ -297,6 +297,9 @@ import {
   specPath,
   outputPath,
   readOutput,
+  formatOutputEntry,
+  parseOutputEntry,
+  readOutputEntries,
   writeMeta,
   type ProcessMeta,
   type ProcessSpec,
@@ -10215,7 +10218,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -10301,8 +10304,20 @@ function renderDashboardTraceRow(html: string, record: Record<string, unknown>):
   return String(traceItem(record));
 }
 
+/**
+ * Render one line of a process's captured output, the way the page does.
+ *
+ * The line is rendered by the page's own `outputItem`, so the check cannot
+ * drift from what ships.
+ */
+function renderDashboardOutputRow(html: string, line: Record<string, unknown>): string {
+  const esc = pageFunction(html, 'esc');
+  const outputItem = pageFunction(html, 'outputItem', { esc });
+  return String(outputItem(line));
+}
+
 async function runDashboardChecks(): Promise<void> {
-  const { mkdtemp, mkdir, writeFile, rm } = await import('node:fs/promises');
+  const { mkdtemp, mkdir, writeFile, appendFile, rm } = await import('node:fs/promises');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
 
@@ -10379,6 +10394,16 @@ async function runDashboardChecks(): Promise<void> {
     // `<safeTimestamp>_<chainId>.csnap` under processes/<pid>/checkpoints/.
     await mkdir(join(tmp, 'processes', '2', 'checkpoints'), { recursive: true });
     await writeFile(join(tmp, 'processes', '2', 'checkpoints', '2026-09-28T00-00-05-000Z_550e8400-e29b-41d4-a716-446655440000.csnap'), 'CRTX-fake-snapshot-bytes');
+    // Seed what the process **said**: two captured lines, written in the
+    // format the capture writes. The second line's text holds the separator
+    // itself — a parser that splits on every separator would cut it in the
+    // wrong place, and the operator would read a line that was never said.
+    await writeFile(
+      outputPath(tmp, asProcessId(2)),
+      formatOutputEntry({ at: '2026-09-28T00:00:02.100Z', stream: 'out', text: 'hello from the agent' })
+      + formatOutputEntry({ at: '2026-09-28T00:00:03.200Z', stream: 'err', text: 'boom | and then some' }),
+      'utf8',
+    );
 
     const dash = await startDashboard({ dir: tmp, port: 0 });
     try {
@@ -10619,6 +10644,160 @@ async function runDashboardChecks(): Promise<void> {
         assert(trap['errorMessage'] === 'auth failed for key [REDACTED]', `trace sanitizes secrets, got ${String(trap['errorMessage'])}`);
         const exit = rows.find((r) => r['phase'] === 'exit' && r['syscall'] === 'llm_call')!;
         assert(exit['model'] === 'gpt-test' && exit['tokensIn'] === 7, 'trace surfaces model and usage');
+      });
+
+      await checkAsync('the dashboard says what a process said', async () => {
+        // An agent's `console.log` used to go to the daemon's stdout and
+        // nowhere else — it was never recorded, so the operator's window
+        // could not show it, and the first thing an operator reaches for
+        // when an agent is behaving strangely was the one thing the window
+        // could not say.
+        //
+        // The lines are kept (one stamped line per printed line, in
+        // `processes/<pid>/output.log`) and `cortex logs` reads them back.
+        // Now the window can ask too.
+        const res = await fetch(`${dash.url}/api/output/2`);
+        assert(res.status === 200, `status ${res.status}`);
+        const data = (await res.json()) as {
+          pid?: number;
+          total?: number;
+          lines?: Array<Record<string, unknown>>;
+        };
+        assert(data.pid === 2, `the pid is the one that was asked for, got ${String(data.pid)}`);
+        assert(data.total === 2, `two lines were said, got ${String(data.total)}`);
+        const lines = data.lines ?? [];
+        assert(lines.length === 2, `both lines come back, got ${lines.length}`);
+        assert(lines[0]!['at'] === '2026-09-28T00:00:02.100Z', `the moment is kept, got ${String(lines[0]!['at'])}`);
+        assert(lines[0]!['stream'] === 'out', `the stream is kept, got ${String(lines[0]!['stream'])}`);
+        assert(lines[0]!['text'] === 'hello from the agent', `the line is kept, got ${String(lines[0]!['text'])}`);
+        // The separator belongs to the **format**, not to the text: a line
+        // that says "boom | and then some" was said whole, and a reader
+        // that cut it at the third separator would invent a line that was
+        // never said.
+        assert(lines[1]!['text'] === 'boom | and then some', `the separator stays inside the text, got ${String(lines[1]!['text'])}`);
+        assert(lines[1]!['stream'] === 'err', 'and the stream is the one it went to');
+      });
+
+      await checkAsync('a process that printed nothing says so', async () => {
+        // A process that printed nothing has no output log. That is not an
+        // error — it is a process that printed nothing — so the answer is
+        // an empty list, not a 404.
+        const res = await fetch(`${dash.url}/api/output/7`);
+        assert(res.status === 200, `status ${res.status}`);
+        const data = (await res.json()) as {
+          total?: number;
+          lines?: Array<Record<string, unknown>>;
+        };
+        assert(data.total === 0, `nothing was said, got ${String(data.total)}`);
+        assert((data.lines ?? []).length === 0, 'and there are no lines');
+      });
+
+      await checkAsync('the output panel says when there is more history than it shows', async () => {
+        // A panel that shows the last line of two must not look like a
+        // process that printed one line. The endpoint says how many there
+        // were, and the view says so out loud.
+        const res = await fetch(`${dash.url}/api/output/2?tail=1`);
+        assert(res.status === 200, `status ${res.status}`);
+        const data = (await res.json()) as {
+          total?: number;
+          lines?: Array<Record<string, unknown>>;
+        };
+        assert(data.lines?.length === 1, `only the last line is sent, got ${String(data.lines?.length)}`);
+        assert(data.total === 2, `but the total is the truth, got ${String(data.total)}`);
+        assert(data.lines![0]!['text'] === 'boom | and then some', 'and it is the last line');
+      });
+
+      await checkAsync('the window shows what a process said', async () => {
+        const res = await fetch(`${dash.url}/`);
+        const html = await res.text();
+        // The process dialog has three views of one process: what it **did**,
+        // what it **knows**, and what it **said**. The third one was missing.
+        assert(html.includes('data-tab="output"'), 'the process dialog has an output tab');
+        assert(html.includes('>输出<'), 'and it is named for what it shows');
+        const row = renderDashboardOutputRow(html, {
+          at: '2026-09-28T00:00:02.100Z',
+          stream: 'out',
+          text: 'hello from the agent',
+        });
+        assert(row.includes('hello from the agent'), `the row says the line, got: ${row}`);
+        // The error stream is not the same colour as the rest: an operator
+        // reading the panel has to see at a glance which lines went to
+        // stderr.
+        const errRow = renderDashboardOutputRow(html, {
+          at: '2026-09-28T00:00:03.200Z',
+          stream: 'err',
+          text: 'boom',
+        });
+        assert(/class="[^"]*\berr\b[^"]*"/.test(errRow), `the error stream is marked, got: ${errRow}`);
+        assert(!/class="[^"]*\berr\b[^"]*"/.test(row), `and the ordinary stream is not, got: ${row}`);
+        // A process that printed nothing says so, in the window's own words.
+        assert(html.includes('这个进程没有留下输出'), 'the panel says when nothing was said');
+      });
+
+      await checkAsync('a line that was not captured is not read as one', async () => {        // The format and its inverse live together, so a line the writer
+        // wrote is a line a reader can take apart. A line that is not in
+        // the format is not a captured line, and says so by being absent —
+        // a reader must not invent a timestamp for it.
+        const parsed = parseOutputEntry('2026-09-28T00:00:02.100Z | out | hello');
+        assert(parsed !== undefined, 'a captured line comes apart');
+        assert(parsed!.text === 'hello', `and the text is the text, got ${parsed!.text}`);
+        assert(parsed!.stream === 'out', 'and the stream is the stream');
+        assert(parseOutputEntry('just some text') === undefined, 'a bare line is not a captured line');
+        assert(parseOutputEntry('2026-09-28T00:00:02.100Z | out') === undefined, 'a half-written line is not one either');
+        assert(parseOutputEntry('') === undefined, 'nor is an empty line');
+        // And the reader on disk agrees with the format.
+        const read = await readOutputEntries(tmp, asProcessId(2));
+        assert(read.total === 2, `the file holds two lines, got ${read.total}`);
+        assert(read.entries[1]!.text === 'boom | and then some', 'and the last one is whole');
+      });
+
+      await checkAsync('the window is told when a line is printed, even without a kernel', async () => {
+        // With no live kernel there is nothing to push, so the window
+        // watches the file instead. A line printed while the window is open
+        // must still reach it — otherwise the panel would sit there showing
+        // the history and never the present.
+        const res = await fetch(`${dash.url}/api/stream?limit=10`);
+        assert(res.status === 200, `status ${res.status}`);
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let text = '';
+        const readUntil = async (needle: string, ms: number): Promise<boolean> => {
+          const deadline = Date.now() + ms;
+          for (;;) {
+            const left = deadline - Date.now();
+            if (left <= 0) return false;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const expiry = new Promise<null>((resolve) => {
+              timer = setTimeout(() => resolve(null), left);
+            });
+            const chunk = await Promise.race([reader.read(), expiry]);
+            if (timer !== undefined) clearTimeout(timer);
+            if (chunk === null) return false;
+            const { value, done } = chunk;
+            if (done) return false;
+            text += decoder.decode(value, { stream: true });
+            if (text.includes(needle)) return true;
+          }
+        };
+
+        // Open the stream **first**, so the line is printed while the
+        // window is watching.
+        await readUntil('event: processes', 3000);
+        await appendFile(
+          outputPath(tmp, asProcessId(2)),
+          formatOutputEntry({ at: '2026-09-28T00:00:09.900Z', stream: 'out', text: 'printed while watching' }),
+          'utf8',
+        );
+        const told = await readUntil('event: output', 6000);
+        assert(told, `the window was told, got: ${text.slice(0, 400)}`);
+        const frame = /event: output\ndata: (.*)/.exec(text);
+        assert(frame !== null, 'the frame carries a payload');
+        const payload = JSON.parse(frame![1]!) as { pids?: number[] };
+        assert(
+          Array.isArray(payload.pids) && payload.pids.includes(2),
+          `the pid is named in the payload, got ${JSON.stringify(payload)}`,
+        );
+        await reader.cancel().catch(() => undefined);
       });
 
       await checkAsync('the dashboard and cortex trace name a frame the same way', async () => {
@@ -14313,6 +14492,81 @@ async function runOutputPushChecks(): Promise<void> {
         `the second entry starts where the first one ends, got ${pushed[1]!.offset}`,
       );
       await kernel.shutdown();
+    });
+
+    await checkAsync('the operator\'s window is told when a process printed', async () => {
+      // The kernel relays every line an agent prints, the moment it is
+      // printed — and the window used to drop those events on the floor. So
+      // the window could not show what an agent **said**, which is the
+      // first thing an operator reaches for when an agent is behaving
+      // strangely.
+      //
+      // The message says *that* it changed and *which* process — not the
+      // line itself, because the file is the truth and the page re-reads
+      // it. So the window and the log cannot end up saying different
+      // things about the same line.
+      const kernel = await bootCliKernel(tmp);
+      const server = await startKernelServer(kernel, { log: () => {} });
+      servers.push(server);
+      writeEndpoint(tmp, server.endpoint);
+      process.env['CORTEX_HOME'] = tmp;
+
+      const probe = await probeKernel(tmp);
+      assert(probe.kind === 'live', `the kernel is reachable, got ${probe.kind}`);
+      const client = probe.kind === 'live' ? probe.client : undefined;
+
+      const dash = await startDashboard({ dir: tmp, port: 0, kernel: client! });
+      try {
+        const res = await fetch(`${dash.url}/api/stream?limit=10`);
+        assert(res.status === 200, `status ${res.status}`);
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let text = '';
+        const readUntil = async (needle: string, ms: number): Promise<boolean> => {
+          const deadline = Date.now() + ms;
+          for (;;) {
+            const left = deadline - Date.now();
+            if (left <= 0) return false;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const expiry = new Promise<null>((resolve) => {
+              timer = setTimeout(() => resolve(null), left);
+            });
+            const chunk = await Promise.race([reader.read(), expiry]);
+            if (timer !== undefined) clearTimeout(timer);
+            if (chunk === null) return false;
+            const { value, done } = chunk;
+            if (done) return false;
+            text += decoder.decode(value, { stream: true });
+            if (text.includes(needle)) return true;
+          }
+        };
+
+        // The agent waits half a second before its first line, so the
+        // window is already watching when the first line lands.
+        const pid = unbrand(
+          await kernel.spawn({
+            role: 'chatty-dash',
+            agent: { module: pathToFileURL(modulePath).href },
+          }),
+        );
+
+        const pushed = await readUntil('event: output', 5000);
+        assert(pushed, `the window was told, got: ${text.slice(0, 400)}`);
+        const frame = /event: output\ndata: (.*)/.exec(text);
+        assert(frame !== null, 'the frame carries a payload');
+        const payload = JSON.parse(frame![1]!) as { pids?: number[] };
+        assert(
+          Array.isArray(payload.pids) && payload.pids.includes(pid),
+          `the pid is named in the payload, got ${JSON.stringify(payload)}`,
+        );
+        // The line itself is **not** forwarded: the file is the truth, and
+        // the page re-reads it.
+        assert(!text.includes('chat 0'), 'the line itself is not forwarded');
+        await reader.cancel().catch(() => undefined);
+      } finally {
+        await dash.close();
+        await kernel.shutdown();
+      }
     });
 
     await checkAsync('cortex logs --follow streams the lines and ends when the process ends', async () => {
