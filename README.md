@@ -23,42 +23,49 @@ Read the **[Manifesto](./MANIFESTO.md)** first. It is short, opinionated, and ex
 $ cortex spawn --role coder --task "fix issue #42"
 [pid 1234]
 
+# ...and give it a rank. LOWER runs first: among the processes that are
+# ready, the scheduler dispatches the lowest NICE first.
+$ cortex spawn --role urgent --task "page the on-call" --nice -10
+[pid 1235]
+  nice: -10 (lower runs first)
+
 # Inspect the process tree
 $ cortex ps
-PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE
----------------------------------------------------------------
-1    -     init            running  0 of ∞      all   19s
-2    1     holder          blocked  0 of 20.0k  all   19s  a channel — SIGTERM queued
-3    1     planner         blocked  0 of ∞      all   19s  child 6 — SIGCHLD queued
-4    3     coder:overview  zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)
-5    3     coder:install   zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)
-6    3     coder:api       blocked  0 of ∞      all   19s  a timer
+PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE                        NICE
+-------------------------------------------------------------------------------------------
+1    -     init            running  0 of ∞      all   4s                               0
+2    1     holder          blocked  0 of 20.0k  all   4s   a channel — SIGTERM queued  0
+3    1     planner         blocked  0 of ∞      all   4s   child 6 — SIGCHLD queued    0
+4    3     coder:overview  zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)   0
+5    3     coder:install   zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)   0
+6    3     coder:api       blocked  0 of ∞      all   4s   a timer                     0
 
 # Same processes, as the tree they actually are — and what each is waiting
 # on, and for how long. AGE is how long each one has lived: the two that
 # finished show the lifetime the kernel recorded for them (2s), and it stops
-# growing there — the running ones are still aging (19s).
+# growing there — the running ones are still aging (4s). NICE is the rank
+# each one runs at; the two that finished keep it in their record.
 $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
 0 tokens · $0.000000 spent · home .cortex
 
-      PID  ROLE            STATE    TOKENS      USD                     AGE  NOTE
----------------------------------------------------------------------------------
-      1    init            running  0 of ∞      $0.000000 of ∞          19s  3 syscalls
-├─    2    holder          blocked  0 of 20.0k  $0.000000 of $1.000000  19s  waiting on a channel for 18.8s — SIGTERM queued
-└─    3    planner         blocked  0 of ∞      $0.000000 of ∞          19s  waiting on child 6 for 18.8s — SIGCHLD queued
-   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞          2s   exit 137 (signal:SIGKILL)
-   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞          2s   exit 137 (signal:SIGKILL)
-   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞          19s  waiting on a timer for 18.8s
+      PID  ROLE            STATE    TOKENS      USD             AGE  NOTE                                            NICE
+-------------------------------------------------------------------------------------------------------------------------
+      1    init            running  0 of ∞      $0.000000 of ∞  4s   2 syscalls                                      0
+├─    2    holder          blocked  0 of 20.0k  $0.000000 of ∞  4s   waiting on a channel for 4.2s — SIGTERM queued  0
+└─    3    planner         blocked  0 of ∞      $0.000000 of ∞  4s   waiting on child 6 for 4.2s — SIGCHLD queued    0
+   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞  2s   exit 137 (signal:SIGKILL)                       0
+   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞  2s   exit 137 (signal:SIGKILL)                       0
+   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞  4s   waiting on a timer for 4.2s                     0
 
 trace one:   cortex trace <pid>      follow one:  cortex attach <pid>
 
 # ...and the ones that are stuck, with the command to act on them
-$ cortex top --stall-after 5000
-# pid 2 has been inside recv for 18830ms — over your 5000ms threshold.
-#   cortex supervise 2 --kill-after 5000
-# pid 3 has been inside wait for 18821ms — over your 5000ms threshold.
-#   cortex supervise 3 --kill-after 5000
+$ cortex top --stall-after 2000
+# pid 2 has been inside recv for 4219ms — over your 2000ms threshold.
+#   cortex supervise 2 --kill-after 2000
+# pid 3 has been inside wait for 4208ms — over your 2000ms threshold.
+#   cortex supervise 3 --kill-after 2000
 
 # What may this agent spend, in total — and how much of that is left
 # (a running agent's budget lives in the kernel, so this needs a live kernel:
@@ -258,7 +265,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 897 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 902 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -434,6 +441,12 @@ And when there is **no kernel to ask**, the panel says *unknown*, and says why. 
 The journal had a hole in it, too. It named two of the three ways a supervisor gives up (*max restarts reached*, *restart storm*) and not the third — the one the **policy** decides. So a daemon whose policy said `never` left the log saying only "not restarted", while the live state said "gave up: the restart policy says no": the kernel knew a decision it could not read back. All three give-ups are recorded the same way now, the journal names the daemon it is about, and when the two answers do not match, the row says so in words.
 
 **And the window says how much wall clock is left.** The token and money ceilings stand beside their spend in every table. The wall clock's did not: it was in `cortex limit` and nowhere else, so an agent with ten minutes of wall clock looked exactly like an agent with all of it — and an operator watching a row had no way to know that the agent they were watching was about to be stopped. It cannot be printed the way the other two are (its spend is the age, and the age is a *different* number — the clock pauses while a process is stopped or parked), so it says the two things it can say **exactly**: how much is **left** of it, and how much there was — `wall time 9m58s left of 10m`. The remainder is printed to the second and never rounded up: a remainder that rounds up to its ceiling reads as a budget that is still full when it is nearly empty.
+
+**And the rank a process runs at.** The kernel's `ProcessInfo` has carried a process's **`nice`** since the beginning — -20..19, and **lower runs first** — and the scheduler honours it: among the processes that are ready, it dispatches the lowest `nice` first. So `nice` decides *which of your agents runs*, and when two of them compete the other can be starved. **No view said so**: two agents at `-7` and `5` produced two rows of `cortex ps` that differed in nothing but their names, and the dashboard's process list had no `nice` in it at all.
+
+There is a **NICE** column now — in `cortex ps`, in `cortex top`, and in the window (优先级) — and the number is the same in all of them, because they read it through one function. A rank that was **not recorded** says so (`-`) instead of showing the default: `0` is the one number that hides the problem. The rank is kept in the process's record when it ends, so a finished agent's row says it too.
+
+And there is a knob: `cortex spawn --nice <n>` and `cortex daemon install --nice <n>`. The number the command prints is read back from the process table, so it reports what the kernel did — not what it was asked to do.
 
 **And the tree says the same note the table says.** The window has two views of the process table — 表格 and 监督树 — and the tree used to build its note from its own list of facts, which was missing one: the park. A process stopped at a checkpoint read `suspended` in the table and `suspended` in the tree, and only the table said it was parked and handed over the command that brings it back. One function builds the note now, in the order `cortex ps` prints.
 

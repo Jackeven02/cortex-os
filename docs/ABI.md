@@ -201,6 +201,12 @@ const child = await ctx.spawn({
 });
 ```
 
+**What `nice` means.** The child's **scheduling priority**: -20..19, and
+**lower runs first** (PROCESS.md §8.1). Among the READY processes the
+scheduler dispatches the lowest `nice` first, so it decides which of two
+competing agents runs — and it is kept in the child's record when the child
+ends, so the views can say what rank a process ran at.
+
 **What `module` names.** `agent.module` is a **path or an import specifier**, and
 one rule resolves it (`src/module_spec.ts`):
 
@@ -653,6 +659,15 @@ the model above, not a change to it. What it buys is that a process which is
 process rather than as a stronger one: the replacement replays the spec, and
 falls back to the kernel's exit record when the spec is too old to say. See
 docs/ARCHITECTURE.md §12.1.
+
+The exit record keeps **two kinds of fact about the process that ended**: what
+it was *allowed* to do (`capabilities`), and what *rank* it ran at (`nice`).
+The second is there for the same reason as the first: an agent that never got
+a turn and one that ran first leave the same syscall log, and only the record
+says which one the scheduler would have picked. It is an **optional** field —
+a record written by a build that did not keep it says nothing rather than
+guessing — so it is an additive change, and the ABI did not move: no syscall,
+no argument, no errno, no `ProcessInfo` field, no `.crec` / `.csnap` format.
 
 **The exit record has one author per fact, and the CLI does not get to
 overwrite the kernel.** `meta.json` is written twice in a normal run — by the

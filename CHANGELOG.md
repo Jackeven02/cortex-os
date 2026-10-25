@@ -42,6 +42,37 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The priority a process runs at is a column, and there is a knob for it.**
+  The kernel's `ProcessInfo` has carried a process's **`nice`** (-20..19, lower
+  = higher priority) since the beginning, and the scheduler honours it —
+  among the READY processes it dispatches the lowest `nice` first. It decided
+  which of the operator's agents ran first, and it reached **no view at all**:
+  measured on a live kernel, two agents at `-7` and `5` produced two rows of
+  `cortex ps` that differed in nothing but their names. The transport sent the
+  number in every process record; the table dropped it.
+
+  `cortex ps` and `cortex top` now print a **`NICE`** column (at the end of
+  the table — the columns keep the positions they have had since #070), the
+  window prints **优先级**, and the supervision tree shows it on the node. All
+  of them read the number through one function, and the window's label is
+  computed by the server, so the three views cannot say different things about
+  how a process is ranked. A priority that was **not recorded** says so (`-`,
+  `—`) and is never shown as `0` — the default is the one number that hides
+  the problem.
+
+  The kernel's **exit record** keeps the rank the process ran at, so a
+  finished agent's row says it too. The field is optional and additive, so
+  the ABI did not move: no syscall, no argument, no errno, no `ProcessInfo`
+  field, no `.crec` / `.csnap` format.
+
+  And there is a knob: **`cortex spawn --nice <n>`** and **`cortex daemon
+  install --nice <n>`**, both refused outside the kernel's own range
+  (-20..19). `--nice -7` works in the spaced spelling too — Node's argument
+  parser reads a value that starts with a dash as another option, and the
+  priority is negative more often than not. The number the command prints is
+  read back from the process table: it reports what the kernel did, not what
+  it was asked to do.
+
 - **The number under the events table says whether it is the whole history.**
   The count under the table read 「共 N 条」 — *N records in total* — and it was
   a number nobody had counted. The activity store keeps the newest events of

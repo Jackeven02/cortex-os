@@ -283,7 +283,7 @@ import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import { cmdPs } from '../src/cli/commands/ps.js';
 import { cmdLimit } from '../src/cli/commands/limit.js';
-import { formatCaps, formatAge } from '../src/cli/process_view.js';
+import { formatCaps, formatAge, formatNice } from '../src/cli/process_view.js';
 import { readOpenCall, readOpenCallsFromKernel, isDeclaredWait } from '../src/cli/open_call.js';
 import { cmdTop } from '../src/cli/commands/top.js';
 import {
@@ -10304,7 +10304,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel' | 'processOutcome' | 'processBudget' | 'processCheckpoint' | 'processInside' | 'processPending' | 'processDetail' | 'processCaps' | 'processMatches' | 'processCountText' | 'processTree' | 'eventCountText',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel' | 'processOutcome' | 'processBudget' | 'processCheckpoint' | 'processInside' | 'processPending' | 'processDetail' | 'processCaps' | 'processNice' | 'processMatches' | 'processCountText' | 'processTree' | 'eventCountText',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -15744,6 +15744,56 @@ async function runCliChecks(): Promise<void> {
         ]);
         assert(typeof code === 'number', 'spawn returns a numeric exit code when --memory validates');
       });
+
+      await checkAsync('cortex spawn --nice gives the process that priority', async () => {
+        // The knob. `nice` decides which of two ready agents runs, and the
+        // operator had no way to set it: the flag did not exist, so a
+        // priority was something only an agent could ask for.
+        const module = join(tmp, 'nice-agent.ts');
+        writeFileSync(
+          module,
+          `export default async function agent(ctx: any): Promise<void> { ctx.now(); ctx.exit(0, 'done'); }\n`,
+          'utf8',
+        );
+        let out = '';
+        const savedLog = console.log;
+        console.log = (...parts: unknown[]): void => {
+          out += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        // The checks above this one leave `console.error` a no-op, so a
+        // failure here would be swallowed instead of reported.
+        console.error = prevErr;
+        try {
+          const code = await cmdSpawn(['--role', 'nice-one', '--module', module, '--nice', '-7']);
+          console.log = savedLog;
+          assert(code === 0, `spawn failed: ${out}`);
+          assert(out.includes('nice: -7'), `the command says the priority it set, got: ${out}`);
+          const pid = Number(/\[pid (\d+)\]/.exec(out)?.[1] ?? '0');
+          assert(pid > 0, `the spawn printed no pid, got: ${out}`);
+          // And the record keeps it, so the table can say it after the run.
+          const meta = readMeta(tmp, asProcessId(pid));
+          assert(meta !== undefined, 'the run left a record');
+          assert(meta!.nice === -7, `the record keeps the priority, got ${String(meta!.nice)}`);
+        } finally {
+          console.log = savedLog;
+        }
+      });
+
+      await checkAsync('cortex spawn --nice refuses a priority outside the range', async () => {
+        // The kernel's range is -20..19. A number outside it is not a
+        // priority the kernel promised to honour, and a flag that quietly
+        // accepted one would be a flag that quietly did something else.
+        let err = '';
+        console.log = () => {};
+        console.error = (...parts: unknown[]): void => {
+          err += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        const code = await cmdSpawn(['--role', 'x', '--nice', '99']);
+        console.log = prevLog;
+        console.error = prevErr;
+        assert(code === 1, `exit 1 for an out-of-range priority, got ${code}`);
+        assert(err.includes('--nice'), `the message names the flag, got: ${err.trim()}`);
+      });
     } finally {
       console.log = prevLog;
       console.error = prevErr;
@@ -18332,6 +18382,25 @@ function psRow(out: string, pid: number): string {
 }
 
 /**
+ * The cell in one column of one row of `cortex ps`'s table.
+ *
+ * The same rule the tree's `topCell` follows: the column is found by its
+ * **position** in the header — the header and the rows are rendered from one
+ * column list, so their offsets line up — and the cell is the text at that
+ * offset. Looking a column up by name in the row would find a *value* that
+ * happens to be spelled like the header.
+ */
+function psCell(out: string, pid: number, column: string): string {
+  const header = out.split('\n').find((l) => l.includes('PID') && l.includes('PPID'));
+  if (header === undefined) return '';
+  const at = header.indexOf(column);
+  if (at < 0) return '';
+  const row = psRow(out, pid);
+  if (row === '') return '';
+  return row.slice(at).trim().split(/\s{2,}/)[0] ?? '';
+}
+
+/**
  * Empty a process's log for the duration of one call, and put it back after.
  *
  * The point is to ask the kernel a question the log used to answer. With the
@@ -19223,6 +19292,80 @@ async function runTopChecks(): Promise<void> {
     });
 
     // -----------------------------------------------------------------------
+    // The priority a process runs at
+    // -----------------------------------------------------------------------
+
+    await checkAsync('the process table says what priority a process runs at', async () => {
+      // The kernel's `nice` decides which of two ready processes runs, and it
+      // reached **no** view at all: the transport sent it in every process
+      // record, and the table dropped it on the floor. Measured on a live
+      // kernel: two agents at -7 and 5, and their rows differed in nothing
+      // but their names — so an operator watching one of them starve had
+      // nothing to read about why.
+      const greedy = await kernel.spawn({
+        role: 'greedy',
+        agent: { module: 'test:wedged', args: { mode: 'wedged' } },
+        nice: -7,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const ps = await capture(() => cmdPs([]));
+      assert(ps.code === 0, `exit 0, got ${ps.code}`);
+      const cell = psCell(ps.out, unbrand(greedy), 'NICE');
+      assert(cell === '-7', `the row says the priority, got: ${ps.out}`);
+
+      // And the tree says the same number — one rule, two views. A table and
+      // a tree that ranked the same process differently would be worse than
+      // saying nothing at all.
+      const top = await capture(() => cmdTop([]));
+      assert(top.code === 0, `exit 0, got ${top.code}`);
+      const inTree = topCell(top.out, unbrand(greedy), 'NICE');
+      assert(inTree === '-7', `the tree says the same number, got: ${top.out}`);
+    });
+
+    await checkAsync('a priority that was not recorded says so', async () => {
+      // `-` is the absence of an answer, never a default. A row that said
+      // `0` for a process whose priority nobody recorded would claim the
+      // one number that hides the problem: the default is exactly what a
+      // starved process looks like.
+      assert(formatNice(undefined) === '-', 'an unreported priority prints as a dash');
+      assert(formatNice(0) === '0', 'the default prints as itself');
+      assert(formatNice(-7) === '-7', 'a negative priority prints as itself');
+      assert(formatNice(19) === '19', 'the top of the range prints as itself');
+    });
+
+    await checkAsync('the window says the same priority the table says', async () => {
+      // The window is the operator's other table, and it had no priority at
+      // all: the server sent the process row and the row carried none. The
+      // label is computed by the **server** — the page never invents a second
+      // vocabulary for a number the kernel owns.
+      const dash = await startDashboard({ dir: tmp, port: 0 });
+      try {
+        const res = await fetch(`${dash.url}/api/processes`);
+        const rows = (await res.json()) as { pid: number; role: string; niceLabel?: string }[];
+        const row = rows.find((r) => r.role === 'greedy');
+        assert(row !== undefined, `the window lists the process, got: ${JSON.stringify(rows)}`);
+        assert(
+          row!.niceLabel === '-7',
+          `the window says the priority, got ${String(row!.niceLabel)}`,
+        );
+
+        // And the page prints the label the server gave it, rather than
+        // writing its own version of it.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        const nice = pageFunction(html, 'processNice');
+        assert(nice({ niceLabel: '-7' }) === '-7', 'the page prints the label it was given');
+        assert(nice({}) === '—', 'a priority that was not reported says so');
+        assert(
+          html.includes('<td class="mono">${esc(processNice(process))}</td>'),
+          'the panel prints the priority through the rule',
+        );
+      } finally {
+        await dash.close();
+      }
+    });
+
+    // -----------------------------------------------------------------------
     // The shape of the table — the same fact in three commands
     // -----------------------------------------------------------------------
 
@@ -19458,14 +19601,14 @@ async function runTopChecks(): Promise<void> {
       assert(result.code === 0, `exit 0, got ${result.code}`);
       // The labels the help describes, taken from the text itself.
       const named = [...result.out.matchAll(/^ {2}([A-Z][A-Z]+)\s{2,}/gm)].map((m) => m[1]!);
-      const real = ['PID', 'ROLE', 'STATE', 'TOKENS', 'USD', 'AGE', 'NOTE'];
+      const real = ['PID', 'ROLE', 'STATE', 'TOKENS', 'USD', 'AGE', 'NOTE', 'NICE'];
       for (const name of named) {
         assert(
           real.includes(name),
           `the help describes a column the table does not have: ${name}`,
         );
       }
-      for (const name of ['STATE', 'TOKENS', 'USD', 'AGE', 'NOTE']) {
+      for (const name of ['STATE', 'TOKENS', 'USD', 'AGE', 'NOTE', 'NICE']) {
         assert(
           named.includes(name),
           `the help does not describe the ${name} column, got: ${result.out}`,
@@ -20395,6 +20538,7 @@ async function runDashboardLiveChecks(): Promise<void> {
           processOutcome: pageFunction(html, 'processOutcome'),
           processBudget: pageFunction(html, 'processBudget'),
           processCheckpoint: pageFunction(html, 'processCheckpoint'),
+          processNice: pageFunction(html, 'processNice'),
         });
         const processTree = pageFunction(html, 'processTree', { processMatches });
         const res = await fetch(`${dash.url}/api/processes`);
@@ -22528,7 +22672,7 @@ async function runKernelHardeningChecks(): Promise<void> {
       // The `exit` syscall persisted the meta; a signal death used to skip
       // that path entirely, so a killed agent vanished from `ps` instead of
       // showing up as a zombie with its exit code.
-      const exits: { pid: number; exitCode: number | null; exitReason: string | null }[] = [];
+      const exits: { pid: number; exitCode: number | null; exitReason: string | null; nice?: number }[] = [];
       const k = await bootKernel({
         kernelAbiVersion: KERNEL_ABI_VERSION,
         dir: tmp,
@@ -22543,12 +22687,12 @@ async function runKernelHardeningChecks(): Promise<void> {
           }
         },
         onProcessExit: (meta) => {
-          exits.push({ pid: meta.pid, exitCode: meta.exitCode, exitReason: meta.exitReason });
+          exits.push({ pid: meta.pid, exitCode: meta.exitCode, exitReason: meta.exitReason, nice: meta.nice });
         },
       });
       kernels.push(k);
 
-      const pid = await k.spawn({ role: 'victim', agent: { module: 'test:victim' } });
+      const pid = await k.spawn({ role: 'victim', agent: { module: 'test:victim' }, nice: -3 });
       assert(await waitFor(() => k.table.get(pid)?.state === 'blocked'), 'the victim parked');
 
       await k.signals.send(pid, 'SIGKILL');
@@ -22558,6 +22702,11 @@ async function runKernelHardeningChecks(): Promise<void> {
       assert(meta.pid === unbrand(pid), `the meta names the right pid, got ${meta.pid}`);
       assert(meta.exitReason === 'signal:SIGKILL', `exit reason, got ${meta.exitReason}`);
       assert(meta.exitCode === 137, `exit code, got ${meta.exitCode}`);
+      // The rank it ran at. The exit record is the kernel's own account of
+      // the process, and the priority is part of that account: an agent that
+      // never got a turn and one that ran first leave the same syscall log,
+      // so only the record says which one the scheduler would have picked.
+      assert(meta.nice === -3, `the priority it ran at, got ${String(meta.nice)}`);
     });
 
     await checkAsync('a state frame records the state it came from, not the sender', async () => {

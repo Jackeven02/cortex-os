@@ -947,6 +947,11 @@ async function dispatch(
         ...(args['budgets'] !== undefined
           ? { budgets: args['budgets'] as Partial<BudgetLimits> }
           : {}),
+        // The priority the child runs at (docs/PROCESS.md section 8.1). The
+        // kernel's `nice`, -20..19, lower runs first. Only a number is
+        // carried: a host that sends anything else is not setting a priority,
+        // and the process is born at the default.
+        ...(typeof args['nice'] === 'number' ? { nice: args['nice'] } : {}),
         ...(args['memory'] !== undefined
           ? { memory: args['memory'] as Record<string, MemoryRegionPolicy> }
           : {}),
@@ -963,7 +968,10 @@ async function dispatch(
       // `ctx.spawn` would be. The agent keeps running after this request
       // answers — that is the whole point of asking a live kernel.
       const pid = await kernel.spawn(opts);
-      return { pid: unbrand(pid), role };
+      // The priority the child was actually born at, so the command that
+      // asked for it can report what the kernel did rather than what it
+      // requested.
+      return { pid: unbrand(pid), role, nice: kernel.table.get(pid)?.nice ?? 0 };
     }
 
     case 'fork': {

@@ -525,6 +525,22 @@ loop:
   dispatch to RUNNING
 ```
 
+**The rank is visible, and it can be set.** `nice` decides which of two
+ready processes runs, so an operator who cannot see it is watching the
+scheduler's decisions without being able to explain them: two agents, one
+of them starved, and no way to tell which one the kernel would have picked.
+The number is on the row — the `NICE` column of `cortex ps` and `cortex
+top`, the 优先级 column of the window — and it is kept in the process's
+record when the process ends, so a finished agent's row says it too. A
+priority that was not recorded says so, and is never shown as `0`: the
+default is the one number that hides the problem.
+
+An operator sets it when they start the process (`cortex spawn --nice <n>`,
+`cortex daemon install --nice <n>`); the range is the one above, and the
+CLI refuses anything outside it rather than handing it to a kernel that
+would have accepted it. **Changing the rank of a process that is already
+running is not possible**: there is no syscall for it (BACKLOG #125).
+
 ### 8.2 Cooperative, not preemptive
 
 Cortex does **not** preempt a running syscall. If an LLM call is in flight, it completes. If a tool call hangs, it hangs until its own timeout.

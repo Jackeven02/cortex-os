@@ -26,6 +26,7 @@ import {
 } from '../index.js';
 import type { ProcessMeta } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
+import { rewriteNegativeValues } from '../negative_args.js';
 import { processOutcome, formatOutcomeCode } from '../process_outcome.js';
 import { KernelCommandError, probeKernel } from '../kernel_client.js';
 import type { AgentSpec, Capability, ProcessState, MemoryRegionPolicy } from '../../kernel/types.js';
@@ -38,7 +39,10 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 
 export async function cmdSpawn(args: string[]): Promise<number> {
   const { values } = parseArgs({
-    args,
+    // `--nice -7` is a negative number, and Node's parser reads a value that
+    // starts with a dash as another option. The priority is negative more
+    // often than not, so the spelling has to work.
+    args: rewriteNegativeValues(args, ['--nice']),
     options: {
       role: { type: 'string' },
       task: { type: 'string' },
@@ -48,6 +52,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       model: { type: 'string' },
       'max-tokens': { type: 'string' },
       'token-budget': { type: 'string' },
+      nice: { type: 'string' },
       'max-region-entries': { type: 'string' },
       memory: { type: 'string' },
       cap: { type: 'string' },
@@ -156,6 +161,25 @@ export async function cmdSpawn(args: string[]): Promise<number> {
     }
   }
 
+  // The priority the process runs at: the kernel's `nice`, -20..19, and
+  // **lower runs first** (docs/PROCESS.md section 8.1). The range is the
+  // kernel's own, and it is checked here rather than left to the kernel --
+  // which would accept a number outside it and rank the process against
+  // values it never promised. A flag that quietly did something else is
+  // worse than a flag that refuses.
+  let nice: number | undefined;
+  if (values.nice !== undefined) {
+    const raw = values.nice.trim();
+    const parsed = /^[+-]?\d+$/.test(raw) ? Number(raw) : Number.NaN;
+    if (!Number.isInteger(parsed) || parsed < -20 || parsed > 19) {
+      console.error(
+        `cortex spawn: invalid --nice: '${values.nice}' (expected an integer from -20 to 19)`,
+      );
+      return 1;
+    }
+    nice = parsed;
+  }
+
   // --args hands a JSON object to the agent as `AgentSpec.args`, so one agent
   // module can be reused for different work without editing it. It is the only
   // channel: `parseArgs` runs with `allowPositionals: false`, so an ad-hoc
@@ -205,6 +229,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       agent: agentSpec,
       memory: regionPolicies,
       ...(tokenBudget !== undefined ? { tokenBudget } : {}),
+      ...(nice !== undefined ? { nice } : {}),
       ...(capabilities !== undefined ? { capabilities } : {}),
       ...(grantable !== undefined ? { grantable } : {}),
     });
@@ -221,10 +246,23 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       agent: agentSpec,
       memory: regionPolicies,
       ...(tokenBudget !== undefined ? { budgets: { tokens: tokenBudget } } : {}),
+      ...(nice !== undefined ? { nice } : {}),
       ...(capabilities !== undefined ? { capabilities } : {}),
       ...(grantable !== undefined ? { grantable } : {}),
     });
     console.log(`[pid ${unbrand(pid)}]`);
+    // The priority, when the operator asked for one: the knob has to say
+    // that it did what it was told, and "lower runs first" is the half of
+    // it that is not obvious.
+    //
+    // **Read back from the kernel**, not from the flag: the number printed
+    // is the number the process is actually running at. A command that
+    // reports what it *intended* is a command that can report a thing that
+    // did not happen.
+    if (nice !== undefined) {
+      const running = kernel.table.get(pid)?.nice;
+      console.log(`  nice: ${String(running)} (lower runs first)`);
+    }
 
     // Let the agent run. v0: wait for completion or timeout.
     const startTime = Date.now();
@@ -344,6 +382,9 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       // afterwards. This view does not copy it back out of the record: the
       // CLI does not get to answer for a process it can no longer see.
       ...(entry !== undefined ? { capabilities: heldCapabilities(entry.capabilities) } : {}),
+      // The rank it ran at. The kernel's exit record has it too; this fills
+      // in a record written by a build that did not keep it.
+      ...(entry?.nice !== undefined ? { nice: entry.nice } : {}),
       kernelAbiVersion: KERNEL_ABI_VERSION,
     };
     writeProcessView(dir, meta);
@@ -380,6 +421,7 @@ async function spawnLive(opts: {
   readonly agent: AgentSpec;
   readonly memory: Record<string, MemoryRegionPolicy>;
   readonly tokenBudget?: number;
+  readonly nice?: number;
   readonly capabilities?: readonly Capability[];
   readonly grantable?: readonly Capability[];
 }): Promise<number> {
@@ -399,15 +441,21 @@ async function spawnLive(opts: {
 
   const client = probe.client;
   try {
-    const result = await client.request<{ pid: number; role: string }>('spawn', {
+    const result = await client.request<{ pid: number; role: string; nice?: number }>('spawn', {
       role: opts.role,
       agent: opts.agent,
       memory: opts.memory,
       ...(opts.tokenBudget !== undefined ? { budgets: { tokens: opts.tokenBudget } } : {}),
+      ...(opts.nice !== undefined ? { nice: opts.nice } : {}),
       ...(opts.capabilities !== undefined ? { capabilities: opts.capabilities } : {}),
       ...(opts.grantable !== undefined ? { grantable: opts.grantable } : {}),
     });
     console.log(`[pid ${result.pid}]`);
+    if (opts.nice !== undefined) {
+      // The kernel's own answer, not the flag: the number printed is the
+      // number the process is actually running at.
+      console.log(`  nice: ${String(result.nice ?? opts.nice)} (lower runs first)`);
+    }
     console.log('  spawned into the live kernel — it keeps running after this command');
     console.log(`  (its output goes to the daemon's stdout; 'cortex trace ${result.pid}' follows its syscalls)`);
     return 0;
@@ -444,6 +492,11 @@ OPTIONS
   --model <string>      Model name to pass to the driver (prompt agent only)
   --max-tokens <n>      Max output tokens per LLM call (prompt agent only)
   --token-budget <n>    Total token budget for the process
+  --nice <n>            Scheduling priority: -20..19, and LOWER RUNS FIRST.
+                        The kernel's own number -- the same one the NICE
+                        column of 'cortex ps' prints. Two ready processes
+                        are dispatched by it, lowest first, so a lower
+                        number means the process runs sooner.
   --max-region-entries <n>  Cap writes per memory region; a region that would
                         exceed n writes traps ENOMEM. Omit for unlimited.
   --memory <json>       Per-region memory policy overrides, a JSON object

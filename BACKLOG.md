@@ -2092,8 +2092,8 @@ The user-facing surface. Should feel like a real OS shell.
   reads `checkpointed — 'cortex restore --chain eeac2f96-…' brings it back`,
   the console is clean, and the 检查点 panel beside it offers the same chain.
 
-- [ ] **#119** The scheduler's priority reaches no view, and has no knob →
-  **open.**
+- [x] **#119** The scheduler's priority reaches no view, and has no knob →
+  **fixed.**
   The other half of the audit (#118): the kernel's `ProcessInfo` carries a
   process's **`nice`** (-20..19, lower = higher priority), and the scheduler
   honours it — among the READY processes it dispatches the lowest `nice`
@@ -2101,23 +2101,91 @@ The user-facing surface. Should feel like a real OS shell.
   runs first**, and when two of them compete, the one with the lower `nice`
   wins every time and the other can be starved.
 
-  Nothing shows it. Nothing sets it either: `cortex spawn` has no `--nice`,
-  `cortex daemon install` has no `--nice`, and only an agent can ask for one
-  (`ctx.spawn({ nice })` — the daemon spec carries it, so the supervisor's
-  replacement inherits it). So the operator has a fact that changes the
+  Nothing showed it. Nothing set it either: `cortex spawn` had no `--nice`,
+  `cortex daemon install` had no `--nice`, and only an agent could ask for
+  one (`ctx.spawn({ nice })` — the daemon spec carried it, so the supervisor's
+  replacement inherited it). So the operator had a fact that changes the
   behaviour they observe, with no way to see it and no way to move it.
 
-  The options are a **shape** question, so they need a decision before code:
-  (a) a PRIO column in the tables — which breaks the "the columns keep their
-  positions" rule the flat table has kept since #070; (b) the priority in the
-  NOTE cell, which is a cell about *what the process is doing* and not about
-  how it is ranked; (c) the knob only — `cortex spawn --nice N` and
-  `cortex daemon install --nice N`, so the operator can set a priority
-  without being able to see the one they inherited; (d) both, in a column
-  whose position is chosen deliberately.
+  **Measured on a live kernel**: two agents at `nice -7` and `nice 5`, and
+  the two rows of `cortex ps` differed in **nothing but their names**. The
+  transport's `ps` answer carried the number — `nice=-7` was in the JSON the
+  client received — and the table dropped it on the floor. `cortex top` said
+  nothing either, and the dashboard's process list had no `nice` key at all.
+
+  **Now the priority is a column, and it is the same column in every view.**
+  `cortex ps` and `cortex top` print a `NICE` column at the **end** of the
+  table (the columns keep the positions they have had since #070: a new
+  fact goes at the end, never in the middle), and the window prints 优先级 —
+  the same number, computed by the server, from the same function
+  (`formatNice`), so the three views cannot say different things about how a
+  process is ranked. The supervision tree shows it on the node too.
+
+  **A priority that was not recorded says so**: `-` in the table, `—` in the
+  window. It is never `0` — the default is the one number that hides the
+  problem, and a view that turns an absence into a number claims a ranking
+  it never read.
+
+  **And the record keeps it.** The kernel's exit record
+  (`PersistedProcessMeta`) carries the rank the process ran at, so a
+  finished agent's row says it too: an agent that never got a turn and one
+  that ran first leave the same syscall log, and only the record says which
+  one the scheduler would have picked. The field is **optional** and
+  additive, which is why the ABI did not move: no syscall, no argument, no
+  errno, no `ProcessInfo` field, no `.crec`/`.csnap` format — the same
+  treatment `capabilities` got when it was added to that record.
+
+  **And the knob**: `cortex spawn --nice <n>` and `cortex daemon install
+  --nice <n>`, both refused outside the kernel's own range (-20..19) rather
+  than handed to a kernel that would have accepted them. `--nice -7` works
+  in the spaced spelling too: Node's argument parser reads a value that
+  starts with a dash as another option, and the priority is negative more
+  often than not.
+
+  **The command reports what the kernel did, not what it intended**: the
+  number it prints is read back from the process table, so a spawn that
+  asked for -7 and got 0 says `nice: 0`.
+
+  5 new smoke checks (897 → 902) and one extended, all reverse-verified:
+  with the table dropping the priority the check fails and prints the table;
+  with the tree printing a different number the check fails; with the exit
+  record dropping it the check fails with `the priority it ran at, got
+  undefined`; with the window's label off by one the check fails with `the
+  window says the priority, got -6`; and with the knob silently dropping
+  the flag the check fails with `nice: 0`. The **page** check needed a
+  second attempt: its first version asserted only that the page mentioned
+  the rule, and the filter box mentioned it too — so the panel could have
+  written its own version and the check would have passed.
 
   **Exit criteria:** the priority a process runs at is visible, and an
-  operator can change it.
+  operator can change it. — met.
+
+- [ ] **#125** A running process cannot be moved up or down the queue →
+  **open.**
+  Found while fixing #119. The operator can give a process a priority when
+  they start it (`cortex spawn --nice`, `cortex daemon install --nice`), and
+  they can see the rank every process runs at — but they cannot move one
+  afterwards. An agent that has been running for an hour at the default
+  cannot be promoted, and one that is hogging the queue cannot be pushed
+  back; the only way to change a running process's rank is to kill it and
+  start it again.
+
+  **The kernel is already ready for it.** The scheduler reads `nice` live
+  from the process table at selection time — its own comment says "so a
+  future `renice` is honoured without re-queueing" — so the run queue does
+  not have to be rebuilt; changing the number is enough.
+
+  What is missing is a **verb**, and a verb is an ABI decision. A new
+  syscall (`renice`) would be an *additive* change and so a `1.1.0`
+  conversation (ABI §status), and it would have to answer the capability
+  gate too: is changing another process's rank something a process may do
+  to a stranger? The options are (a) a host-only transport command — the
+  operator may move a process, an agent may not; (b) a syscall, subject to
+  the capability gate; (c) neither — the priority is fixed at birth and the
+  operator restarts the process instead.
+
+  **Exit criteria:** an operator can move a running process up or down the
+  queue, and the change shows in the same column that shows the rank.
 
 - [x] **#120** The window's state breakdown dropped the states it did not name →
   **fixed.**

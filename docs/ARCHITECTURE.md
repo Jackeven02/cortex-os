@@ -2513,6 +2513,62 @@ comes from one function (`describePendingSignals`, in
 `src/cli/process_view.ts`), because a table, a tree and a page that each
 phrased it for themselves would be three rules — and three rules drift.
 
+**And the rank a process runs at is on the row.** The kernel's `ProcessInfo`
+carries a process's **`nice`** — -20..19, lower runs first — and the
+scheduler honours it: among the READY processes it dispatches the lowest
+`nice` first (PROCESS.md §8.1). So `nice` decides **which of the operator's
+agents runs first**, and when two of them compete, the one with the lower
+`nice` wins every time and the other can be starved.
+
+**No view said so.** Measured on a live kernel: two agents at `-7` and `5`,
+and their rows in `cortex ps` differed in **nothing but their names**. The
+transport sent the number in every process record — `nice=-7` was in the
+JSON the client received — and the table dropped it. The tree said nothing
+either, and the dashboard's process list had no `nice` key at all.
+
+So the priority is a **column**, and it is the same column everywhere:
+
+```console
+$ cortex ps
+PID  PPID  ROLE      STATE    TOKENS  CAPS  AGE    NOTE       NICE
+-------------------------------------------------------------------
+2    1     greedy    blocked  0 of ∞  all   425ms  a channel  -7
+3    1     polite    blocked  0 of ∞  all   423ms  a channel  5
+```
+
+`cortex ps` and `cortex top` print it at the **end** of the table — the
+columns keep the positions they have had since #070, and a new fact goes
+at the end, never in the middle of them — and the window prints 优先级 on
+the row and on the tree node. All of them read the number through **one
+function** (`formatNice`, in `src/cli/process_view.ts`), and the window's
+label is computed by the **server**, so a table, a tree and a page cannot
+say different things about how a process is ranked.
+
+A priority that was **not recorded** says so — `-` in the table, `—` in the
+window — and is never shown as `0`: the default is the one number that
+hides the problem, and a view that turns an absence into a number claims a
+ranking it never read.
+
+**The record keeps it.** The kernel's exit record (`PersistedProcessMeta`)
+carries the rank the process ran at, so a finished agent's row says it too:
+an agent that never got a turn and one that ran first leave the same
+syscall log, and only the record says which one the scheduler would have
+picked. The field is optional and additive — the same treatment
+`capabilities` got when it was added to that record — so the **ABI did not
+move**: no syscall, no argument, no errno, no `ProcessInfo` field, no
+`.crec`/`.csnap` format.
+
+**And there is a knob.** `cortex spawn --nice <n>` and `cortex daemon
+install --nice <n>`, both refused outside the kernel's own range (-20..19)
+rather than handed to a kernel that would have accepted them and ranked the
+process against numbers it never promised. `--nice -7` works in the spaced
+spelling too: Node's argument parser reads a value that starts with a dash
+as another option, and the priority is negative more often than not.
+
+The number the command prints is **read back from the process table**: it
+reports what the kernel did, not what it intended. A spawn that asked for
+`-7` and got `0` says `nice: 0`.
+
 **A stream needs an ending.** A subscriber is watching something that can
 leave. The kernel can be stopped, and it can crash — and when it does, the
 socket closes and the stream stops without saying a word. That silence is

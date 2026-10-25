@@ -51,6 +51,7 @@ import {
   readProcessView,
   describePendingSignals,
   formatAge,
+  formatNice,
   processAge,
   type ProcessRow,
   type ProcessView,
@@ -125,6 +126,8 @@ const USD_MAX = formatUsdBudget({
   remaining: { tokens: -1, usd: 1_234_567_890, wallTimeMs: -1 },
 }).length;
 
+const NICE_MAX = Math.max('-20'.length, 'NICE'.length);
+
 /**
  * The columns of the tree, and the widest each one may be.
  *
@@ -133,6 +136,9 @@ const USD_MAX = formatUsdBudget({
  * and it gets a stated maximum. A value longer than its column is cut and
  * marked (`…`), never allowed to run on into the next one: a role that ran
  * into the state column made the two read as one word.
+ *
+ * The columns keep the positions they have had: a new fact goes at the END,
+ * never in the middle. The priority is the last column.
  */
 const TOP_COLUMNS: readonly ColumnSpec[] = [
   { header: 'PID', max: 8, gap: 2 },
@@ -141,7 +147,8 @@ const TOP_COLUMNS: readonly ColumnSpec[] = [
   { header: 'TOKENS', max: TOKENS_MAX, gap: 2 },
   { header: 'USD', max: USD_MAX, gap: 2 },
   { header: 'AGE', max: 10, gap: 2 },
-  { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 0 },
+  { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 2 },
+  { header: 'NICE', max: NICE_MAX, gap: 0 },
 ];
 
 
@@ -427,6 +434,7 @@ function cellsFor(
     // keeps growing for as long as the record is on disk.
     formatAge(processAge(m, now)),
     note,
+    formatNice(m.nice),
   ];
 }
 
@@ -466,6 +474,10 @@ its own process table is merged in, so running agents appear in the tree too.
             parked: a process that was checkpointed with '--detach' is
             SUSPENDED, and the row says it is checkpointed and hands over
             the command that brings it back ('cortex restore --chain <id>')
+  NICE      the priority the process runs at: the kernel's 'nice', from -20
+            to 19, and LOWER RUNS FIRST. It is the one fact that decides
+            which of two ready processes runs, so a tree where one agent is
+            starved says why. A '-' means the priority was not recorded.
 
 NOTES
   "Waiting" and "stuck" are different, and only one of them is in the process

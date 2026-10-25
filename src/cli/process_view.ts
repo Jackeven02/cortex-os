@@ -99,6 +99,25 @@ export function describePendingSignals(
 }
 
 /**
+ * The priority a process runs at (docs/PROCESS.md §8.1).
+ *
+ * The kernel's word for it is `nice`: -20..19, and **lower runs first**. It
+ * is the one fact about a process that decides which of the operator's agents
+ * gets the CPU when two of them are ready at the same time — and it used to
+ * reach no view at all, so an operator could watch one agent starve and had
+ * nothing to read about why.
+ *
+ * `-` means **not recorded**: a record written before the kernel kept the
+ * priority, or a kernel too old to carry it. It does **not** mean "the
+ * default" — a view that turns an absence into a number claims a ranking it
+ * never read, and the default is the one number that hides the problem.
+ */
+export function formatNice(nice: number | undefined): string {
+  if (nice === undefined) return '-';
+  return String(nice);
+}
+
+/**
  * The facts a duration needs.
  *
  * How long a process lived is three facts: when it started, whether it is
@@ -222,6 +241,16 @@ export interface ProcessRow {
    */
   readonly checkpointChain?: readonly string[];
   /**
+   * The priority this process runs at (docs/PROCESS.md §8.1) — the kernel's
+   * `nice`, -20..19, lower runs first.
+   *
+   * Absent means *not reported*: the record was written by a build that did
+   * not keep it, or there is no kernel to ask. It does **not** mean "the
+   * default" — a row that shows `0` for a process it never checked is
+   * claiming a ranking it did not read.
+   */
+  readonly nice?: number;
+  /**
    * Whether the kernel still has this process.
    *
    * A process that is *running* has no `meta.json` yet (the kernel writes it
@@ -300,6 +329,14 @@ interface LiveProcessInfo {
    * means "this process was never checkpointed".
    */
   readonly checkpointChain?: readonly string[];
+  /**
+   * The priority it runs at.
+   *
+   * Optional, for the same reason `pendingSignals` is: a kernel too old to
+   * carry the field does not have it. Absent is *not reported* — it never
+   * means "the default".
+   */
+  readonly nice?: number;
 }
 
 function rowFromMeta(meta: ProcessMeta): ProcessRow {
@@ -317,6 +354,7 @@ function rowFromMeta(meta: ProcessMeta): ProcessRow {
     budgetsRemaining: meta.budgetsRemaining,
     ...(meta.blockedOn !== undefined ? { blockedOn: meta.blockedOn } : {}),
     ...(meta.capabilities !== undefined ? { capabilities: meta.capabilities } : {}),
+    ...(meta.nice !== undefined ? { nice: meta.nice } : {}),
     live: false,
   };
 }
@@ -338,6 +376,7 @@ function rowFromLive(info: LiveProcessInfo): ProcessRow {
     capabilities: info.capabilities,
     ...(info.pendingSignals !== undefined ? { pendingSignals: info.pendingSignals } : {}),
     ...(info.checkpointChain !== undefined ? { checkpointChain: info.checkpointChain } : {}),
+    ...(info.nice !== undefined ? { nice: info.nice } : {}),
     live: true,
   };
 }

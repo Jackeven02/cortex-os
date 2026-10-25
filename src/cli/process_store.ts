@@ -119,6 +119,16 @@ export interface ProcessMeta {
    * absent means "written by a build that did not record it".
    */
   readonly capabilities?: readonly Capability[];
+  /**
+   * The priority this process ran at (docs/PROCESS.md §8.1) — the kernel's
+   * `nice`, -20..19, lower runs first.
+   *
+   * Persisted so the read-only views can say **what rank the process ran at**,
+   * not only what it did: an agent that never got a turn and one that ran
+   * first leave the same syscall log. Optional: absent means "written by a
+   * build that did not record it".
+   */
+  readonly nice?: number;
   readonly kernelAbiVersion: string;
 }
 
@@ -328,6 +338,10 @@ export function writeProcessView(
     ...(recorded.capabilities === undefined && meta.capabilities !== undefined
       ? { capabilities: meta.capabilities }
       : {}),
+    // The same for the priority it ran at: the kernel's record is the one
+    // that has it, and a record written before the kernel kept it gets it
+    // from the view.
+    ...(recorded.nice === undefined && meta.nice !== undefined ? { nice: meta.nice } : {}),
     // The ending belongs to whoever decided it: the process, in which case
     // the record already has it, or the CLI — which only happens when the
     // CLI stopped the run itself.

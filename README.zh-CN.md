@@ -23,42 +23,49 @@ PID。Fork。Exec。Signals。IPC。Checkpoint。Restore。监督树。Syscall �
 $ cortex spawn --role coder --task "fix issue #42"
 [pid 1234]
 
+# ...也可以给它一个优先级。数字越小越先跑：多个进程同时就绪时，
+# 调度器先派发 NICE 最小的那个。
+$ cortex spawn --role urgent --task "page the on-call" --nice -10
+[pid 1235]
+  nice: -10 (lower runs first)
+
 # 看进程树
 $ cortex ps
-PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE
----------------------------------------------------------------
-1    -     init            running  0 of ∞      all   19s
-2    1     holder          blocked  0 of 20.0k  all   19s  a channel — SIGTERM queued
-3    1     planner         blocked  0 of ∞      all   19s  child 6 — SIGCHLD queued
-4    3     coder:overview  zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)
-5    3     coder:install   zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)
-6    3     coder:api       blocked  0 of ∞      all   19s  a timer
+PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE                        NICE
+-------------------------------------------------------------------------------------------
+1    -     init            running  0 of ∞      all   4s                               0
+2    1     holder          blocked  0 of 20.0k  all   4s   a channel — SIGTERM queued  0
+3    1     planner         blocked  0 of ∞      all   4s   child 6 — SIGCHLD queued    0
+4    3     coder:overview  zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)   0
+5    3     coder:install   zombie   0 of ∞      all   2s   exit 137 (signal:SIGKILL)   0
+6    3     coder:api       blocked  0 of ∞      all   4s   a timer                     0
 
 # 同样这些进程，但按它们真实的父子关系画成树，
 # 并标出各自在等什么、已经等了多久。
 # AGE 是每个进程活了多久：已经结束的两个显示内核记下的
-# 存活时长（2s），而且到那里就不再增长；还在跑的两个仍在变老（19s）。
+# 存活时长（2s），而且到那里就不再增长；还在跑的两个仍在变老（4s）。
+# NICE 是每个进程跑在第几档；已经结束的两个也把它留在了记录里。
 $ cortex top
 cortex top — 6 processes · 3 blocked · 2 zombie · 1 running · live kernel
 0 tokens · $0.000000 spent · home .cortex
 
-      PID  ROLE            STATE    TOKENS      USD                     AGE  NOTE
----------------------------------------------------------------------------------
-      1    init            running  0 of ∞      $0.000000 of ∞          19s  3 syscalls
-├─    2    holder          blocked  0 of 20.0k  $0.000000 of $1.000000  19s  waiting on a channel for 18.8s — SIGTERM queued
-└─    3    planner         blocked  0 of ∞      $0.000000 of ∞          19s  waiting on child 6 for 18.8s — SIGCHLD queued
-   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞          2s   exit 137 (signal:SIGKILL)
-   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞          2s   exit 137 (signal:SIGKILL)
-   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞          19s  waiting on a timer for 18.8s
+      PID  ROLE            STATE    TOKENS      USD             AGE  NOTE                                            NICE
+-------------------------------------------------------------------------------------------------------------------------
+      1    init            running  0 of ∞      $0.000000 of ∞  4s   2 syscalls                                      0
+├─    2    holder          blocked  0 of 20.0k  $0.000000 of ∞  4s   waiting on a channel for 4.2s — SIGTERM queued  0
+└─    3    planner         blocked  0 of ∞      $0.000000 of ∞  4s   waiting on child 6 for 4.2s — SIGCHLD queued    0
+   ├─ 4    coder:overview  zombie   0 of ∞      $0.000000 of ∞  2s   exit 137 (signal:SIGKILL)                       0
+   ├─ 5    coder:install   zombie   0 of ∞      $0.000000 of ∞  2s   exit 137 (signal:SIGKILL)                       0
+   └─ 6    coder:api       blocked  0 of ∞      $0.000000 of ∞  4s   waiting on a timer for 4.2s                     0
 
 trace one:   cortex trace <pid>      follow one:  cortex attach <pid>
 
 # ...以及卡住的那几个，顺带把该跑的命令给你
-$ cortex top --stall-after 5000
-# pid 2 has been inside recv for 18830ms — over your 5000ms threshold.
-#   cortex supervise 2 --kill-after 5000
-# pid 3 has been inside wait for 18821ms — over your 5000ms threshold.
-#   cortex supervise 3 --kill-after 5000
+$ cortex top --stall-after 2000
+# pid 2 has been inside recv for 4219ms — over your 2000ms threshold.
+#   cortex supervise 2 --kill-after 2000
+# pid 3 has been inside wait for 4208ms — over your 2000ms threshold.
+#   cortex supervise 3 --kill-after 2000
 
 # 这个 agent 一共可以花多少，以及还剩多少
 # （运行中 agent 的预算在内核里，所以这需要活内核：`cortex daemon run`；
@@ -249,7 +256,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 897 项断言，0 失败
+npx tsx scripts/smoke.ts                # 902 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -422,6 +429,12 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 日志以前也有个洞：它叫得出监管放弃的三种方式里的两种（*max restarts reached*、*restart storm*），却叫不出第三种——由**策略**决定的那一种。于是策略是 `never` 的守护进程在日志里只留下「not restarted」，而活状态说的是「gave up: the restart policy says no」：内核知道一个自己读不回来的决定。现在三种放弃都用同一种方式记录，日志也点出它说的是哪个守护进程；两个答案对不上时，那一行会明说。
 
 **而且大屏说得出还剩多少墙钟。** token 和钱的**上限**都摆在各自的花费旁边，墙钟的上限却只在 `cortex limit` 里：于是「十分钟墙钟」的 agent 和「无限墙钟」的 agent 长得一模一样——盯着那一行的运维根本看不出来，**他盯着的那个 agent 马上要被掐掉**。它没法像另外两个那样印（墙钟的「花费」是进程的年龄，而年龄是**另一个数**——进程停住或被挂起时，时钟是暂停的），所以它只说两件能说准的事：还**剩**多少、上限**是多少**——`wall time 9m58s left of 10m`。余量按秒精确打印、绝不向上取整：一个向上取整到上限的余量，读起来就是「预算还是满的」，而它其实快空了。
+
+**而且大屏说得出进程跑在第几档。** 内核的 `ProcessInfo` 从一开始就带着进程的 **`nice`**——-20 到 19，**数字越小越先跑**——而调度器认它：就绪的进程里，它先派发 `nice` 最小的那个。于是 `nice` 决定**你的哪几个 agent 先跑**，两个抢起来时，另一个会被饿死。**曾经没有任何视图说这件事**：两个分别是 `-7` 和 `5` 的 agent，在 `cortex ps` 里那两行除了名字**什么都不差**；大屏的进程列表里干脆连 `nice` 这个键都没有。
+
+现在多了一列 **NICE**——`cortex ps`、`cortex top`、大屏（优先级）都有——而且三处是同一个数字，因为它们问的是同一个函数。**没有记录**的档位就说「没有记录」（`-`），而不是显示默认值：`0` 恰恰是最会藏事的那一个数字。进程结束时，这一档也会留在它的记录里，所以已经结束的那个 agent 的那一行也说得出来。
+
+也有旋钮：`cortex spawn --nice <n>`、`cortex daemon install --nice <n>`。命令打印的数字是从进程表**读回来**的——它报的是内核做了什么，不是别人让它做什么。
 
 **而且监督树和表格说的是同一句备注。** 大屏里进程表有两个视图——表格和监督树——而监督树以前**自己**列事实，漏掉了一条：停靠。于是停在检查点上的进程，在表格里是 `suspended`，在树里也是 `suspended`，只有表格说出它是停着的、还把带它回来的命令交出来。现在备注由**一个函数**拼成，顺序就是 `cortex ps` 的顺序。
 

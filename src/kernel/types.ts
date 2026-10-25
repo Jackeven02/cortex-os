@@ -505,6 +505,20 @@ export interface PersistedProcessMeta {
    * which one it was.
    */
   readonly capabilities: readonly Capability[];
+  /**
+   * The priority this process ran at (docs/PROCESS.md §8.1) — the kernel's
+   * `nice`, -20..19, and **lower runs first**.
+   *
+   * Recorded so the read-only views can say **what rank the process ran at**,
+   * not only what it did: two agents that made the same calls and one that
+   * never got a turn leave the same syscall log, and only this says which one
+   * the scheduler would have picked first.
+   *
+   * Optional and additive: a record written by a build that did not keep the
+   * priority has none, and the view says "not recorded" rather than guessing
+   * the default.
+   */
+  readonly nice?: number;
   readonly kernelAbiVersion: string;
 }
 

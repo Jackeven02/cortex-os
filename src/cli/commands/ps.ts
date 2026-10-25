@@ -17,6 +17,7 @@ import {
   formatCaps,
   describePendingSignals,
   formatAge,
+  formatNice,
   processAge,
   readProcessView,
   type ProcessRow,
@@ -83,7 +84,24 @@ const TOKENS_MAX = formatTokenBudget({
  * value longer than it is cut and marked (`…`) rather than running on into the
  * next column — which is what used to happen, and which glued a role name to
  * a state and a capability list to an age.
+ *
+ * The columns keep the positions they have had since #070: a new fact goes
+ * at the END of the table, never in the middle of it. The priority is the
+ * newest fact, so it is the last column.
  */
+/**
+ * The widest a priority cell may be.
+ *
+ * The kernel's priority is `nice`, and its documented range is -20..19
+ * (docs/PROCESS.md section 8.1), so the widest cell is "-20": three
+ * characters. A value outside that range is a value the kernel was never
+ * asked to hold, and it is cut and marked rather than allowed to run on.
+ *
+ * The heading is wider than any of them -- "NICE" is four characters -- and
+ * a column is never narrower than its own heading, so the heading decides.
+ */
+const NICE_MAX = Math.max('-20'.length, 'NICE'.length);
+
 const PS_COLUMNS: readonly ColumnSpec[] = [
   { header: 'PID', max: 8, gap: 2 },
   { header: 'PPID', max: 8, gap: 2 },
@@ -92,7 +110,8 @@ const PS_COLUMNS: readonly ColumnSpec[] = [
   { header: 'TOKENS', max: TOKENS_MAX, gap: 2 },
   { header: 'CAPS', max: CAPS_MAX, gap: 2 },
   { header: 'AGE', max: 10, gap: 2 },
-  { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 0 },
+  { header: 'NOTE', max: Number.POSITIVE_INFINITY, gap: 2 },
+  { header: 'NICE', max: NICE_MAX, gap: 0 },
 ];
 
 export async function cmdPs(args: string[]): Promise<number> {
@@ -118,7 +137,7 @@ OPTIONS
   -h, --help         Show this help
 
 COLUMNS
-  PID PPID ROLE STATE TOKENS CAPS AGE NOTE
+  PID PPID ROLE STATE TOKENS CAPS AGE NOTE NICE
 
   TOKENS is what the process spent and what it is measured against:
   '1.2k (300 cached) of 10k'. The ceiling is the total the process may ever
@@ -162,6 +181,15 @@ COLUMNS
 
   Where the answer comes from: with a live kernel, from the kernel; without
   one, from the process's log. The two give the same words.
+
+  NICE is the priority the process runs at: the kernel's 'nice', from -20 to
+  19, and LOWER RUNS FIRST. It is the one fact that decides which of two
+  ready agents runs, so an operator watching one of them starve has
+  something to read about why. A '-' means the priority was not recorded --
+  the record was written by a build that did not keep it -- and never that
+  the process ran at the default.
+
+  Give one with 'cortex spawn --nice <n>'.
 `);
     return 0;
   }
@@ -259,6 +287,7 @@ COLUMNS
       formatCaps(p.capabilities),
       formatAge(ageMs),
       note(p),
+      formatNice(p.nice),
     ];
   });
   const columns = sizeColumns(PS_COLUMNS, cells);

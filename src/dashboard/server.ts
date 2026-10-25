@@ -10,7 +10,7 @@ import type { BlockedReason, BudgetCounters, BudgetLimits, ProcessInfo, ProcessS
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readCheckpointFile } from '../kernel/checkpoint.js';
 import { readAllMetas, listProcDirs, readOutputEntries, findCheckpointFile } from '../cli/process_store.js';
-import { formatCaps, describePendingSignals, readProcessView, formatAge, processAge, type AgeFacts } from '../cli/process_view.js';
+import { formatCaps, describePendingSignals, readProcessView, formatAge, formatNice, processAge, type AgeFacts } from '../cli/process_view.js';
 import { describeOutcome } from '../cli/process_outcome.js';
 import { describeBudget, formatTokenBudget, formatUsdBudget, type BudgetFacts } from '../cli/process_budget.js';
 import { describeCheckpoint, describeCheckpointPark, formatCheckpointTokenBudget, formatCheckpointUsdBudget } from '../cli/checkpoint_view.js';
@@ -375,9 +375,10 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
     pendingSignals?: readonly Signal[];
     blockedOn?: BlockedReason | null;
     checkpointChain?: readonly string[];
+    nice?: number;
   }>(
     row: T,
-  ): T & { pendingLabel: string; insideLabel?: string; tokenLabel: string; usdLabel: string; usdSpentDollars: number; capsLabel: string; outcomeLabel: string; budgetLabel: string; checkpointLabel: string; ageLabel: string } => {
+  ): T & { pendingLabel: string; insideLabel?: string; tokenLabel: string; usdLabel: string; usdSpentDollars: number; capsLabel: string; outcomeLabel: string; budgetLabel: string; checkpointLabel: string; ageLabel: string; niceLabel?: string } => {
     const pending = withPendingLabel(row);
     const inside = withInside(pending);
     const tokens = withTokenLabel(inside);
@@ -387,7 +388,8 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
     const outcome = withOutcomeLabel(caps);
     const budget = withBudgetLabel(outcome);
     const checkpoint = withCheckpointLabel(budget);
-    return withAgeLabel(checkpoint, now);
+    const nice = withNiceLabel(checkpoint);
+    return withAgeLabel(nice, now);
   };
 
   if (options.processes !== undefined) {
@@ -655,6 +657,27 @@ function withCapsLabel<T extends { capabilities?: readonly Capability[] }>(
   row: T,
 ): T & { capsLabel: string } {
   return { ...row, capsLabel: formatCaps(row.capabilities) };
+}
+
+/**
+ * Put the priority on the row, in the same words `cortex ps` uses.
+ *
+ * The kernel's `nice`: -20..19, and **lower runs first** (docs/PROCESS.md
+ * §8.1). It is the one fact that decides which of two ready agents runs, and
+ * it used to reach no view at all — so an operator watching one agent starve
+ * had nothing to read about why. The number is the label: the page does not
+ * invent a second vocabulary for it, and both views print it from the same
+ * function, so the window and the table cannot say different things about
+ * how a process is ranked.
+ *
+ * The label's **presence** is the signal. A row without one is a row whose
+ * priority was not reported — the record was written by a build that did not
+ * keep it, or there is no kernel to ask — and the page says nothing about it
+ * rather than printing a default the kernel never said.
+ */
+function withNiceLabel<T extends { nice?: number }>(row: T): T & { niceLabel?: string } {
+  if (row.nice === undefined) return row;
+  return { ...row, niceLabel: formatNice(row.nice) };
 }
 
 /**

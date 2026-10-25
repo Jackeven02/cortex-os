@@ -1525,6 +1525,11 @@ export class SyscallDispatcher {
       agent: entry.agent,
       // What it was allowed to do, so the view can say so (docs/ABI.md §4.9).
       capabilities: entry.capabilities === null ? DEFAULT_CAPABILITIES : [...entry.capabilities],
+      // The rank it ran at, so the view can say so (docs/PROCESS.md §8.1).
+      // Two agents that made the same calls and one that never got a turn
+      // leave the same log — only the record says which one the scheduler
+      // would have picked first.
+      nice: entry.nice,
       kernelAbiVersion: this.kernelAbiVersion,
     };
     try {

@@ -80,6 +80,7 @@ import { startKernelServer } from '../kernel_server.js';
 import { KernelCommandError, probeKernel } from '../kernel_client.js';
 import { clearEndpoint, endpointPath, writeEndpoint } from '../kernel_endpoint.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns } from '../table.js';
+import { rewriteNegativeValues } from '../negative_args.js';
 
 // =============================================================================
 // Subcommand dispatch
@@ -119,7 +120,9 @@ export async function cmdDaemon(args: string[]): Promise<number> {
 
 export async function cmdDaemonInstall(args: string[]): Promise<number> {
   const { positionals, values } = parseArgs({
-    args,
+    // `--nice -7` is a negative number, and Node's parser reads a value that
+    // starts with a dash as another option.
+    args: rewriteNegativeValues(args, ['--nice']),
     options: {
       role: { type: 'string' },
       task: { type: 'string' },
@@ -129,6 +132,7 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
       model: { type: 'string' },
       'max-tokens': { type: 'string' },
       'token-budget': { type: 'string' },
+      nice: { type: 'string' },
       restart: { type: 'string', default: 'never' },
       'max-restarts': { type: 'string' },
       'backoff-ms': { type: 'string' },
@@ -176,6 +180,23 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
       console.error(`cortex daemon install: invalid --backoff-ms: '${values['backoff-ms']}'`);
       return 1;
     }
+  }
+
+  // The priority the daemon runs at: the kernel's `nice`, -20..19, and
+  // **lower runs first** (docs/PROCESS.md section 8.1). It rides along with
+  // the restart policy, so the supervisor's replacement comes back at the
+  // same rank and not at the default.
+  let nice: number | undefined;
+  if (values.nice !== undefined) {
+    const raw = values.nice.trim();
+    const parsed = /^[+-]?\d+$/.test(raw) ? Number(raw) : Number.NaN;
+    if (!Number.isInteger(parsed) || parsed < -20 || parsed > 19) {
+      console.error(
+        `cortex daemon install: invalid --nice: '${values.nice}' (expected an integer from -20 to 19)`,
+      );
+      return 1;
+    }
+    nice = parsed;
   }
 
   const system = values.system ?? `You are a ${values.role}. Your task: ${values.task ?? '(no task specified)'}`;
@@ -239,6 +260,7 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
     ...(values['token-budget'] !== undefined
       ? { budgets: { tokens: parseInt(values['token-budget'], 10) } }
       : {}),
+    ...(nice !== undefined ? { nice } : {}),
   };
 
   const dir = defaultKernelDir();
@@ -250,7 +272,7 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
     unitPlatform: osPlatform(),
   });
 
-  console.log(`[daemon ${name}] installed (role=${values.role}, restart=${restartKind}${maxRestarts !== undefined ? `, max-restarts=${maxRestarts}` : ''})`);
+  console.log(`[daemon ${name}] installed (role=${values.role}, restart=${restartKind}${maxRestarts !== undefined ? `, max-restarts=${maxRestarts}` : ''}${nice !== undefined ? `, nice=${nice}` : ''})`);
   console.log(`  spec persisted at ${join(dir, 'daemons.json')}`);
 
   // Generate + (best-effort) install the OS service unit.
@@ -820,6 +842,9 @@ OPTIONS
                         name.
   --driver/--model/--max-tokens   Prompt-agent LLM options
   --token-budget <n>    Total token budget
+  --nice <n>            Scheduling priority: -20..19, and LOWER RUNS FIRST.
+                        Persisted into the daemon spec, so the supervisor's
+                        replacement comes back at the same rank.
   --restart <kind>      always | on-failure | never (default: never)
   --max-restarts <n>    Cap restarts for always/on-failure
   --backoff-ms <n>      Base restart backoff in ms (default: 1000, exponential)
