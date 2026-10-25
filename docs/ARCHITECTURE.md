@@ -377,6 +377,40 @@ table's number and writes a `__sched` frame with the action `renice`, because
 the rank already has a history in that log and a change to it belongs beside
 that history (PROCESS.md §8.1).
 
+**And the operator's window can reach it.** The verb existed, and the window
+showed every process's rank in a column, and the operator still had to leave
+the window and open a shell to use it — the window could say "this agent is at
+`-7` and that one is at `5`" and do nothing about the difference. The
+dashboard's write ops are the operator's buttons (`spawn`, `kill`, `restore`,
+and now `renice`), and they are carried out by the same `cortex renice`
+command the shell would run, so there is one path to a rank and not two.
+
+The **control** is a button in the ops cell, on the row of the process it
+moves: a rank belongs to a process, so the control belongs to that process's
+row. It opens the window's existing dialog with a number field — the same
+dialog that carries the syscall timeline — because a native `prompt()` cannot
+be driven by a test, and a control that cannot be tested is a control whose
+behaviour nobody knows.
+
+**The range is the kernel's and the server reports it.** The page does not own
+the kernel's value domains and does not get to state them, so the dashboard
+answers `/api/ops` with `niceMin` and `niceMax` taken from the kernel's own
+constants, and the page renders **no control at all** until the server has
+answered. A page that hardcoded the range would be stating a domain it does
+not own, and it would be right only until the kernel moved. A rank that was
+never reported starts **empty** rather than at `0` — `Number('')` is `0`, so a
+pre-filled default would turn a click into "set this process to the default
+rank", a number the operator never saw. The **endpoint** applies that rule
+too: it reads the body's `nice` as the digits it is and refuses it when it is
+not digits, rather than coercing the body first — a careful page behind a
+careless door is still a careless door.
+
+A rank change asks **no confirmation**: it is reversible and loses no work, so
+a second "are you sure?" would be the window distrusting an operator who has
+just said what they want. A kill asks, because a kill ends something. And the
+op is behind the same gate as the other writes — `--ops kill` does not quietly
+grant renice, and `--ops renice` grants renice and nothing else.
+
 **The "resume the async function" part** is the trickiest. Each agent process is implemented as a Promise that the kernel can suspend and resume. v0 uses a simple continuation-passing approach: every syscall returns a Promise that the kernel controls. When the scheduler decides to resume, it resolves the Promise.
 
 Two consequences of that design are worth stating explicitly, because the first

@@ -1167,6 +1167,20 @@ daemons may share one. The `.crec` format did not change either: the name
 travels in the `args` of the `__init` records that were already there, and a
 record that carries no name simply does not have one.
 
+**The window is host-side too, so the window's renice control is not an ABI
+change.** The dashboard's write ops (`spawn`, `kill`, `restore`, `renice`) are
+the operator's buttons, reached over the dashboard's own HTTP API and carried
+out by the same `cortex renice` command — an agent cannot press them and
+cannot observe that they were pressed. The dashboard's `/api/ops` answer grew
+`niceMin` and `niceMax`, and that is the **kernel's** range being *reported*,
+not a new domain being defined: the numbers come from the same constants the
+kernel refuses a value outside of, and the window renders no control at all
+until the server has sent them. A window that hardcoded the range would be
+stating a domain it does not own, and it would be right only until the kernel
+moved. `KERNEL_PROTOCOL_VERSION` did not move either — the transport's
+`renice` command was already there, and the dashboard's HTTP API has no
+protocol version to move.
+
 **And a declared tag is not a declared *driver*.** A tool's reversibility tag
 says whether *that call* can be undone. Whether a **driver** can cross a
 cognitive fork is a separate fact, and the kernel does not take the driver's

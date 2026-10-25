@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { join, basename } from 'node:path';
 import { format } from 'node:util';
-import { asProcessId } from '../kernel/types.js';
+import { asProcessId, NICE_MAX, NICE_MIN } from '../kernel/types.js';
 import type { BlockedReason, BudgetCounters, BudgetLimits, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readCheckpointFile } from '../kernel/checkpoint.js';
@@ -742,7 +742,7 @@ function withCheckpointLabel<T extends { state: ProcessState; checkpointChain?: 
 }
 
 /** Every write operation the dashboard knows how to perform. */
-const DASHBOARD_OPS = ['spawn', 'kill', 'restore'] as const;
+const DASHBOARD_OPS = ['spawn', 'kill', 'restore', 'renice'] as const;
 
 const allowedOps = (option: DashboardOptions['allowOps']): readonly string[] =>
   option === true ? DASHBOARD_OPS : Array.isArray(option) ? DASHBOARD_OPS.filter((op) => option.includes(op)) : [];
@@ -824,6 +824,46 @@ async function handleKill(request: IncomingMessage, response: ServerResponse, di
   const signal = body.signal === undefined ? undefined : String(body.signal);
   const { cmdKill } = await import('../cli/commands/kill.js');
   json(response, 200, await runCliCommand(dir, () => cmdKill(signal === undefined ? [String(pid)] : [String(pid), '--signal', signal])));
+}
+
+/**
+ * Run `cortex renice <pid> --nice <n>` in-process, so the window moves a
+ * running process up or down the queue with the same verb the shell uses.
+ *
+ * The window showed the rank in its 优先级 column and could not act on it —
+ * an operator had to leave the window and open a shell. The plumbing was
+ * already there (`cortex renice`, BACKLOG #125); this is the door.
+ *
+ * The CLI's own rules still apply to every attempt: a rank outside the
+ * kernel's range is refused, and a process that is not running cannot be
+ * moved (a rank is a thing a running process has). The window adds no
+ * permission model of its own beyond the ops gate at the route.
+ */
+async function handleRenice(request: IncomingMessage, response: ServerResponse, dir: string): Promise<void> {
+  let body: { pid?: unknown; nice?: unknown } = {};
+  try {
+    body = JSON.parse(await readBody(request) || '{}') as { pid?: unknown; nice?: unknown };
+  } catch {
+    body = {};
+  }
+  const pid = Number(body.pid);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    json(response, 400, { error: 'missing or invalid "pid" in request body' });
+    return;
+  }
+  const nice = body.nice;
+  // **An absent value is not a rank.** `Number('')` is `0`, and `0` is a rank
+  // the kernel holds — so coercing the body first would turn "nobody said" into
+  // "the default", silently demoting the process. The value is read as the
+  // digits it is, and refused when it is not digits at all; the CLI's own rule
+  // (an integer inside the kernel's range) still applies to whatever survives.
+  const rawNice = typeof nice === 'number' ? String(nice) : typeof nice === 'string' ? nice.trim() : '';
+  if (!/^[+-]?\d+$/.test(rawNice)) {
+    json(response, 400, { error: 'missing or invalid "nice" in request body' });
+    return;
+  }
+  const { cmdRenice } = await import('../cli/commands/renice.js');
+  json(response, 200, await runCliCommand(dir, () => cmdRenice([String(pid), '--nice', rawNice])));
 }
 
 /**
@@ -910,11 +950,12 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
       if (request.method === 'POST' && url.pathname.startsWith('/api/ops/')) {
         const op = url.pathname.slice('/api/ops/'.length);
         if (!allowedOps(options.allowOps).includes(op)) {
-          json(response, 403, { error: 'ops disabled: start the dashboard with --allow-ops (or --ops spawn,kill,restore)' });
+          json(response, 403, { error: 'ops disabled: start the dashboard with --allow-ops (or --ops spawn,kill,restore,renice)' });
           return;
         }
         if (op === 'restore') await handleRestore(request, response, dir);
         else if (op === 'kill') await handleKill(request, response, dir);
+        else if (op === 'renice') await handleRenice(request, response, dir);
         else if (op === 'spawn') await handleSpawn(request, response, dir);
         else json(response, 404, { error: `unknown op: ${op}` });
         return;
@@ -925,7 +966,15 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
       }
       if (url.pathname === '/api/ops') {
         const ops = allowedOps(options.allowOps);
-        json(response, 200, { allowOps: ops.length > 0, ops: [...ops] });
+        // The rank range the kernel holds, so the window's control can ask
+        // for a number inside it instead of the page stating the kernel's
+        // value domain itself. The page prints what it is given.
+        json(response, 200, {
+          allowOps: ops.length > 0,
+          ops: [...ops],
+          niceMin: NICE_MIN,
+          niceMax: NICE_MAX,
+        });
         return;
       }
       if (url.pathname === '/api/processes') {

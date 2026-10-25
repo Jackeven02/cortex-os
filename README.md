@@ -270,7 +270,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 911 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 916 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -380,7 +380,7 @@ $ cortex diff 2 3
 
 ```bash
 $ cortex dashboard                  # read-only: watch only
-$ cortex dashboard --ops spawn,kill,restore   # allow those three from the UI
+$ cortex dashboard --ops spawn,kill,restore,renice   # allow those four from the UI
 ```
 
 Read-only by default. With a live kernel in the directory (`cortex daemon run`), the dashboard **watches that kernel**: the processes that are *running* appear in the list — a running process has no `meta.json` yet, so a disk-only view would show a directory of corpses — and the event stream arrives by push, as the kernel writes it. Without one it does what any viewer of a filesystem can do: it reads `.cortex/processes/<pid>/meta.json`, decodes the `.crec` syscall logs (including the logs of processes that are still running), lists checkpoints, and renders the tree. `restore` is a pure disk write, which is why it works even in v0's no-daemon model.
@@ -471,11 +471,12 @@ Now the rule is one rule: the five states an operator watches always have a row,
 
 **And the count under the event table says what it is.** The number read 「共 N 条」 — *N records in total* — and it was a number nobody had counted. The window keeps the newest events of each kind, so a history longer than that is counted in part: on a real workspace with 6,000 events the table said 「共 5,000 条」, and the operator could not tell 5,000 from 6,000. The server knows the difference — it remembers what it dropped — so it says it together with the number, and the window words it accordingly: 「共 N 条」 when the count is the whole of the history, 「至少 N 条」 when it is only a lower bound on it.
 
-The three mutating operations are gated because they *do* boot a real kernel to do the work:
+The mutating operations are gated because they *do* real work on the kernel's behalf:
 
 - `spawn` — runs a new agent to completion (or until it self-suspends, or `--timeout`). Default cap: 30s, so the HTTP request never hangs.
 - `kill` — sends the signal to the process. With no live kernel in the state directory it marks the entry a zombie on disk; with one, the signal is delivered for real through the kernel's signal engine.
 - `restore` — writes the snapshot back and re-materialises the process as a new PID.
+- `renice` — moves a running process up or down the scheduler's queue (`-20`..`19`, lower runs first). It needs a live kernel, because a rank is a thing a *running* process has, and it is carried out by the same `cortex renice` the shell would run — so the window and the shell cannot disagree about a rank. The window asks the server for the range the kernel holds and renders no control at all until the server has answered: the page does not own the kernel's value domains.
 
 Ops are fine-grained: `--ops spawn` gives you a spawn button and nothing else. `GET /api/ops` reports what the current server was granted, and each `POST /api/ops/<op>` returns `403` for anything not granted. The server binds to `127.0.0.1` unless `--host` says otherwise, and serves a static, CSP-locked HTML file — no CDN, no build step, zero dependencies. You can also embed it in your own Node app via `cortex-agent-os/dashboard`. Full endpoint reference: [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md#embedded-dashboard).
 

@@ -42,6 +42,52 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The window can move a running process up or down the queue.** The dashboard
+  could **kill** a process and **restore** one, and it showed every process's
+  **优先级** in a column — but it could not act on a rank. An operator who
+  wanted to promote the agent that was about to miss its deadline had to leave
+  the window and type `cortex renice` in a shell, so the window could say
+  "this agent is at `-7` and that one is at `5`" and do nothing about the
+  difference.
+
+  The **优先级** button now sits in the ops cell beside **停止**, on the row of
+  the process it moves — a rank belongs to a process, so the control belongs
+  there too. It opens the window's existing dialog with a number field bounded
+  by the range the **kernel** holds, prefilled with the rank that row is
+  actually running at, and applies it. A process that has exited has no button:
+  it has no rank left to move, exactly like it has nothing left to stop.
+
+  **The range is the kernel's and the server says what it is.** `/api/ops` now
+  carries `niceMin` and `niceMax`, taken from the kernel's own constants, and
+  the page renders **no control at all** until the server has answered. The
+  page does not own the kernel's value domains and does not get to state them:
+  a page that guessed the range would be a page stating a domain it does not
+  own — and the guess would be right until the kernel changed.
+
+  **A rank that was never reported starts empty**, not at `0` — `Number('')`
+  is `0`, so a control that pre-filled the default would turn a click on 应用
+  into "set this process to the default rank", a number the operator never
+  saw. An unreported rank is `null`, it is printed as `—`, and the window
+  refuses a number outside the range it was given rather than sending it to
+  the kernel. The **endpoint** applies the same rule: it reads the body's
+  `nice` as the digits it is and refuses it when it is not digits, rather than
+  coercing the body first, so a request that says nothing cannot demote a
+  process to the default rank.
+
+  **No second confirmation.** A kill asks "are you sure?" because it ends
+  something. A rank change is reversible and loses no work, so asking again
+  would be the window distrusting an operator who has just said what they
+  want.
+
+  The op is behind the **same gate as the other writes**: `--ops kill` does
+  not quietly grant renice, and `--ops renice` grants renice and nothing else.
+
+  Measured on a real kernel in a real browser: clicked 优先级 on 进程 2, typed
+  `-7`, applied — the dialog said `pid 2 (alpha): nice 0 -> -7`, the 优先级
+  column went `0` → `-7`, the kernel's table held `-7`, the process's `.crec`
+  carried `__sched:renice(0->-7)`, and the window's own syscall timeline
+  showed that same frame. The other three rows stayed at `0`.
+
 - **A running process can be moved up or down the queue.** The kernel ranks
   the processes it dispatches by the kernel's `nice` (-20..19, **lower runs
   first**) and reads that number **live** — the scheduler compares it at the

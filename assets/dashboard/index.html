@@ -181,6 +181,11 @@
     .spawn-bar input { flex: 1; min-width: 0; height: 30px; padding: 0 8px; border: 1px solid #e7e9ed; border-radius: 6px; background: #fff; color: var(--ink); font-size: 11px; }
     .event-filters input[type="datetime-local"] { height: 27px; padding: 0 6px; border: 1px solid #e7e9ed; border-radius: 6px; background: #fff; color: var(--ink); font-size: 10px; }
     .ops-output { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; font-size: 10px; color: #4b5665; }
+    .ops-form { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 12px 0 6px; }
+    .ops-form label { color: #5b6472; font-size: 10px; }
+    .ops-form input { width: 92px; height: 28px; padding: 0 8px; border: 1px solid #e7e9ed; border-radius: 6px; background: #fff; color: var(--ink); font-size: 11px; }
+    .ops-form input:focus { border-color: #9aabf6; box-shadow: 0 0 0 2px #4263eb18; outline: 0; }
+    .ops-note { margin: 10px 0 0; color: #6d7684; font-size: 10px; line-height: 1.6; }
     .events-panel { margin-bottom: 14px; }
     .event-table td { height: 42px; }
     .event-name { color: #344052; font-weight: 550; }
@@ -414,6 +419,13 @@
     // reported (an old record, or no kernel to ask) — the page says nothing
     // about it rather than printing a default the kernel never said.
     function processNice(process) { return String(process.niceLabel ?? '—'); }
+    // The rank as a **number**, for the control that changes it. The page
+    // does not decide what the number is — the server read it off the kernel
+    // and sent it — and a row whose rank was never reported has **no** number:
+    // the control starts empty rather than at `0`, because an operator who
+    // clicks 应用 without typing anything should not have moved the process
+    // to the default by accident.
+    function processNiceValue(process) { return typeof process.nice === 'number' ? process.nice : null; }
     // **What this agent is inside, and for how long.** The label comes from
     // the server, which asks the kernel — the kernel knows, and the log
     // would have to be read to find out. The wording is the same wording
@@ -575,8 +587,20 @@
       $('processRows').innerHTML = visible.length ? visible.map((process) => {
         const initial = String(process.role ?? '?').slice(0, 1).toUpperCase();
         const time = fmtLocal(process.startedAt);
-        const canKill = opsList.includes('kill') && process.state !== 'zombie' && process.state !== 'exiting';
-        const opsCell = canKill ? `<td><button class="text-button" data-kill="${esc(process.pid)}">停止</button></td>` : '<td></td>';
+        // A process that has exited has nothing left to stop and nothing left
+        // to move — a rank on a process that is gone is a rank nobody runs at.
+        const alive = process.state !== 'zombie' && process.state !== 'exiting';
+        const canKill = opsList.includes('kill') && alive;
+        // **Moving a process up or down the queue.** The window showed the rank
+        // in its 优先级 column and could not act on it, so an operator had to
+        // leave the window and open a shell. The button sits next to 停止
+        // because it is the same kind of thing: an action on *this* row.
+        const canRenice = opsList.includes('renice') && alive && niceMin !== null && niceMax !== null;
+        const opsButtons = [
+          canKill ? `<button class="text-button" data-kill="${esc(process.pid)}">停止</button>` : '',
+          canRenice ? `<button class="text-button" data-nice="${esc(process.pid)}" data-nice-value="${esc(processNiceValue(process) ?? '')}" title="调整调度优先级：数字越小越先跑">优先级</button>` : '',
+        ].filter((button) => button !== '').join(' ');
+        const opsCell = `<td>${opsButtons}</td>`;
         const inside = processInside(process);
         const pending = processPending(process);
         const outcome = processOutcome(process);
@@ -595,6 +619,7 @@
       }).join('') : `<tr><td colspan="${10 + (insideKnown || pendingKnown || outcomeKnown || budgetKnown || checkpointKnown ? 1 : 0) + (niceKnown ? 1 : 0)}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
       $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
       $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
+      $('processRows').querySelectorAll('button[data-nice]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); reniceOps(Number(button.dataset.nice), button.dataset.niceValue === '' ? null : Number(button.dataset.niceValue)); }));
     }
 
     // **The breakdown classifies every process the window lists.**
@@ -911,6 +936,16 @@
     let calibrationTimer = null;
     let opsEnabled = false;
     let opsList = [];
+    // **The range of ranks the kernel holds.** It comes from the server,
+    // because the range is the kernel's own and the page does not get to
+    // state it: a control that asked for a number outside the kernel's range
+    // would be a control asking for something the kernel cannot hold.
+    //
+    // `null` until the server has answered, and the control does not appear
+    // before then — a page that guessed the range would be a page stating a
+    // domain it does not own.
+    let niceMin = null;
+    let niceMax = null;
     // How many rows of the history this window covers, and how many there
     // are.
     //
@@ -1171,6 +1206,67 @@
       } catch (error) {
         $('traceBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
       }
+    }
+
+    /**
+     * Move a process up or down the queue.
+     *
+     * **The number you want to change is the number in the table**, so the
+     * control asks for it where the table shows it: the 优先级 column says
+     * where the process runs now, and this asks where it should run instead.
+     *
+     * **No confirmation.** A kill asks "are you sure?" because it ends
+     * something — a rank change is reversible and loses no work, so asking
+     * again would be the window distrusting an operator who has just said
+     * what they want.
+     *
+     * The range is the kernel's, and the server sends it: the page does not
+     * own the kernel's value domains and does not get to state them.
+     */
+    function reniceOps(pid, current) {
+      const min = niceMin;
+      const max = niceMax;
+      // The rank the process runs at now, when the server reported one. A row
+      // whose rank was never reported starts **empty**: the operator types the
+      // rank they want rather than confirming one they never saw.
+      const from = typeof current === 'number' ? current : null;
+      openDialog('调整优先级', `
+        <p class="ops-note">优先级决定它在就绪队列里的位置：<strong>数字越小越先跑</strong>（${esc(min)} 最急，${esc(max)} 最不急）。<br>进程 #${esc(pid)} 现在是 ${from === null ? '未记录' : esc(from)}。</p>
+        <div class="ops-form">
+          <label for="niceInput">新的优先级</label>
+          <input type="number" id="niceInput" min="${esc(min)}" max="${esc(max)}" step="1" value="${esc(from === null ? '' : from)}">
+          <button class="button" id="niceApply" type="button">应用</button>
+          <button class="icon-button" id="niceCancel" type="button" aria-label="取消">×</button>
+        </div>
+        <div id="niceResult"></div>
+      `);
+      const input = $('niceInput');
+      const apply = async () => {
+        const raw = input.value.trim();
+        const nice = Number(raw);
+        // An empty box is not a zero. `Number('')` is 0, and 0 is a rank the
+        // kernel holds — so the empty case has to be refused before the number
+        // is read.
+        if (raw === '' || !Number.isInteger(nice) || nice < min || nice > max) {
+          $('niceResult').innerHTML = `<div class="empty">优先级必须是 ${esc(min)} 到 ${esc(max)} 之间的整数。</div>`;
+          return;
+        }
+        $('niceResult').innerHTML = '<div class="empty">正在调整…</div>';
+        try {
+          const res = await fetch('/api/ops/renice', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pid, nice }) });
+          const data = await res.json();
+          if (!res.ok && data.error) throw new Error(data.error);
+          $('niceResult').innerHTML = `<div class="ops-output">${esc(data.output ?? JSON.stringify(data))}</div>`;
+          pollOnce();
+        } catch (error) {
+          $('niceResult').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+        }
+      };
+      $('niceApply').addEventListener('click', () => { void apply(); });
+      $('niceCancel').addEventListener('click', () => $('traceDialog').close());
+      input.addEventListener('keydown', (event) => { if (event.key === 'Enter') { event.preventDefault(); void apply(); } });
+      input.focus();
+      input.select();
     }
 
     async function spawnOps() {
@@ -1462,6 +1558,9 @@
         daemonKernelLive = daemonPayload.kernelLive === true;
         opsList = Array.isArray(opsData.ops) ? opsData.ops : (opsData.allowOps === true ? ['restore'] : []);
         opsEnabled = opsList.length > 0;
+        // The kernel's range, told rather than assumed.
+        if (Number.isInteger(opsData.niceMin)) niceMin = opsData.niceMin;
+        if (Number.isInteger(opsData.niceMax)) niceMax = opsData.niceMax;
         $('spawnBar').hidden = !opsList.includes('spawn');
         // A read is a merge, not a replacement. The poll used to reset the
         // table to the newest page every time — so the rows the operator had

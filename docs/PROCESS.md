@@ -563,6 +563,24 @@ nothing in between to say which changed first. A move that changes nothing
 records nothing: a frame that says "the rank moved" when it did not is a
 frame nobody can act on.
 
+**And the window can move it too.** The verb existed, and the window showed
+every process's 优先级, and an operator still had to leave the window and
+open a shell to use it. The **优先级** button is now in the window's ops
+cell, on the row of the process it moves — a rank belongs to a process, so
+the control belongs to that row — and it is carried out by the same
+`cortex renice` command, so there is one path to a rank and not two.
+
+The range is the kernel's, and the **server** says what it is: the window
+asks for it and renders no control at all until the answer arrives, because
+a window that hardcoded the range would be stating a domain it does not own.
+A rank that was never recorded starts **empty** in that control, not at `0` —
+`Number('')` is `0`, so a pre-filled default would turn a click into "set
+this process to the default rank", a number the operator never saw. The
+endpoint behind that control says the same thing: a `nice` that is absent or
+is not an integer is refused, not read as a number. The change asks no
+confirmation: it is reversible and loses no work, where a kill asks because a
+kill ends something.
+
 ### 8.2 Cooperative, not preemptive
 
 Cortex does **not** preempt a running syscall. If an LLM call is in flight, it completes. If a tool call hangs, it hangs until its own timeout.

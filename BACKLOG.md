@@ -2245,31 +2245,88 @@ The user-facing surface. Should feel like a real OS shell.
   **Exit criteria:** an operator can move a running process up or down the
   queue, and the change shows in the same column that shows the rank. — met.
 
-- [ ] **#127** The window can kill a process, but it cannot move one →
-  **open.**
-  Found while fixing #125. The dashboard's write ops are `spawn`, `kill` and
+- [x] **#127** The window can kill a process, but it cannot move one →
+  **fixed.**
+  Found while fixing #125. The dashboard's write ops were `spawn`, `kill` and
   `restore`, and they are all there because an operator watching a window
   needs them: spawn a replacement, stop the one that is misbehaving, put a
   snapshot back. A **rank** is on the same list — it is the fact that decides
   which of two agents runs — and the window shows it in its 优先级 column,
-  but there is no way to move a process from the window. The operator has to
+  but there was no way to move a process from the window. The operator had to
   leave the window and type `cortex renice` in a shell.
 
-  So the window can say "this agent is at `-7` and that one is at `5`" and
-  cannot act on the difference. The verb exists (`Kernel.setNice()`, the
-  transport's `renice`) and the column updates live when it is used — so this
-  is the *control* that is missing, not the plumbing.
+  So the window could say "this agent is at `-7` and that one is at `5`" and
+  could not act on the difference. The verb existed (`Kernel.setNice()`, the
+  transport's `renice`) and the column updated live when it was used — so this
+  was the *control* that was missing, not the plumbing.
 
-  **It is a shape question, because a rank is a number and the other ops are
-  not.** A kill is a button: one action, no argument. A renice needs a
-  number, and a row-level control for it has to answer questions the table
-  does not: is the number typed or picked from a list (-20..19 is forty
+  **The shape.** It is a shape question, because a rank is a number and the
+  other ops are not. A kill is a button: one action, no argument. A renice
+  needs a number, and a row-level control for it has to answer questions the
+  table does not: is the number typed or picked from a list (-20..19 is forty
   values), does the button live on every row or in a panel, what does it say
   when the process is not running, and does a rank change need a confirmation
   the way a kill does not (it is reversible, and it does not lose work).
 
+  **The answers.** The number is **typed**, into a number input bounded by
+  the range — a list of forty values is a worse control than a box that says
+  what the range is. The button lives **on the row**, beside 停止, because a
+  rank belongs to a process and a panel would need a second "which process?"
+  step; the same dialog the window already uses for a trace carries the form,
+  because a native `prompt()` cannot be driven by a test and this control
+  has to be. A process that has exited **has no button**: it has no rank left
+  to move, exactly like it has nothing left to stop. And a rank change asks
+  **no confirmation** — it is reversible and loses no work, so a second "are
+  you sure?" would be the window distrusting an operator who has just said
+  what they want. A kill asks, because a kill ends something.
+
+  **The range is the kernel's, and the server says what it is.** The page
+  does not own the kernel's value domains and does not get to state them:
+  `/api/ops` now carries `niceMin` and `niceMax`, taken from the kernel's own
+  constants, and the page starts with `null` and renders no control at all
+  until the server has answered. A page that guessed the range would be a
+  page stating a domain it does not own — and the guess would be right until
+  the kernel changed.
+
+  **A row whose rank was never reported starts empty**, not at `0`. `Number('')`
+  is `0`, so a control that pre-filled the default would turn an operator's
+  click on 应用 into "set this process to the default rank" — and the
+  operator would never have seen that number before. An unreported rank is
+  `null`, and it is printed as `—`.
+
+  **The op is behind the same gate as the other writes.** `--ops kill` does
+  not quietly grant renice: the window asks the server for `/api/ops`, and the
+  server answers with the ops it was actually given. `--ops renice` gives the
+  window the renice verb and nothing else.
+
+  **And an absent value is not a rank.** The page refuses an empty box
+  before it reads a number out of it — `Number('')` is `0`, and `0` is a rank
+  the kernel holds — and so does the **endpoint** behind it. The server reads
+  the body's `nice` as the digits it is and refuses it when it is not digits
+  at all, rather than coercing the body first: a request that says nothing
+  must not be able to demote a process to the default rank. The rule is the
+  same one the CLI applies, and it now holds on both sides of the door.
+
+  **Measured, not assumed.** In a real browser against a real kernel: clicked
+  优先级 on 进程 2, typed `-7`, clicked 应用. The dialog said
+  `pid 2 (alpha): nice 0 -> -7`; the 优先级 column went from `0` to `-7`;
+  the kernel's own table held `-7`; the process's `.crec` carried
+  `__sched:renice(0->-7)`; and the window's own syscall timeline showed that
+  same frame. The other three rows stayed at `0`. Typing `99` — outside the
+  range the server sent — was refused by the page
+  (`优先级必须是 -20 到 19 之间的整数。`) and never reached the kernel.
+
+  5 new smoke checks (911 → 916), all reverse-verified: with the server not
+  telling the range, the check fails with `the range comes from the kernel,
+  got 0`; with the page treating an unreported rank as `0`, it fails with
+  `an unreported rank is not a number, got 0`; with the gate open to an op
+  that was not opted into, it fails with `a write that was not opted into must
+  403, got 200`; with an empty rank read as a number, it fails with `a rank
+  nobody stated must 400, got 200`; and with the op reporting success without
+  moving the kernel, it fails with `the kernel's table holds it, got 0`.
+
   **Exit criteria:** an operator can move a running process up or down the
-  queue from the window, and the 优先级 column shows the new rank.
+  queue from the window, and the 优先级 column shows the new rank. — met.
 
 - [ ] **#126** An agent cannot change a process's rank — not even its own →
   **open.**

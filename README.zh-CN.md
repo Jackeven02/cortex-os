@@ -261,7 +261,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 911 项断言，0 失败
+npx tsx scripts/smoke.ts                # 916 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -368,7 +368,7 @@ $ cortex diff 2 3
 
 ```bash
 $ cortex dashboard                  # 只读：仅观察
-$ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
+$ cortex dashboard --ops spawn,kill,restore,renice   # 允许这四个操作
 ```
 
 **默认只读。** 状态目录里有活内核时（`cortex daemon run`），大屏**盯着那个内核**：**正在运行**的进程会出现在列表里——活进程还没有 `meta.json`，只看磁盘的话看到的是一堆尸体——事件流也由内核推送，边写边到。没有活内核时，大屏能做的就是任何"看文件系统的人"能做的事：读 `.cortex/processes/<pid>/meta.json`、解码 `.crec` syscall 日志（**包括还在跑的进程的日志**）、列出检查点、渲染进程树。`restore` 是纯写盘操作，所以它在 v0 的无守护进程模型下也能工作。
@@ -459,11 +459,12 @@ __sched:renice(0->-7)
 
 **而且事件表下面那个数，会说清它是什么。** 那个数以前写「共 N 条」——「一共 N 条」——而它是**没人核对过**的数。窗口每类只留最新的事件，所以比那更长的历史只能数出一部分：真跑一个 6,000 条事件的工作区，表格写的是「共 5,000 条」，运维分不清 5,000 和 6,000。服务端知道这个差别——它记得自己丢过什么——所以连着数字一起说；窗口据此措辞：数就是全部时写「共 N 条」，只是下界时写「至少 N 条」。
 
-三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
+会改状态的操作都要显式授权，因为它们确实替你在内核身上干实事：
 
 - `spawn` —— 把新 agent 跑到终态（或自行挂起，或 `--timeout` 兜底）。默认上限 30 秒，避免 HTTP 请求长挂。
 - `kill` —— 把信号发给该进程。状态目录里没有活内核时，它把进程在磁盘上标记为 zombie；有活内核时，信号会通过内核的信号引擎真的投递出去。
 - `restore` —— 把快照写回，把进程以新 PID 重新实体化。
+- `renice` —— 把一个**正在跑**的进程在调度队列里挪前挪后（`-20`..`19`，数字越小越先跑）。它需要活内核，因为优先级是「正在跑的进程」才有的东西；而且它走的就是命令行那条 `cortex renice`，所以大屏和终端不可能对同一个优先级给出两种说法。大屏不自己硬写内核的值域：它向服务端要范围，服务端没回答之前就**根本不渲染这个控件**。
 
 授权是细粒度的：`--ops spawn` 只给你一个 spawn 按钮。`GET /api/ops` 回报当前服务器被授了哪些操作，未授权的 `POST /api/ops/<op>` 直接 `403`。服务器默认绑 `127.0.0.1`（除非 `--host` 指定），页面是静态 HTML + 严格 CSP，不挂 CDN、不需要构建、零依赖。也可以在自己的 Node 应用里通过 `cortex-agent-os/dashboard` 嵌入。完整接口见 [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md#embedded-dashboard)。
 

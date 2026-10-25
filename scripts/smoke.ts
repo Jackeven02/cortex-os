@@ -229,7 +229,7 @@ import {
   type JsonRpcResponse,
 } from '../src/drivers/tool/mcp.js';
 
-import { CAPABILITIES, type ToolInvokeContext, type Capability } from '../src/kernel/types.js';
+import { CAPABILITIES, NICE_MAX, NICE_MIN, type ToolInvokeContext, type Capability } from '../src/kernel/types.js';
 
 import {
   diffRecords,
@@ -10421,7 +10421,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel' | 'processOutcome' | 'processBudget' | 'processCheckpoint' | 'processInside' | 'processPending' | 'processDetail' | 'processCaps' | 'processNice' | 'processMatches' | 'processCountText' | 'processTree' | 'eventCountText',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel' | 'processOutcome' | 'processBudget' | 'processCheckpoint' | 'processInside' | 'processPending' | 'processDetail' | 'processCaps' | 'processNice' | 'processNiceValue' | 'processMatches' | 'processCountText' | 'processTree' | 'eventCountText',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -20071,6 +20071,120 @@ async function runDashboardLiveChecks(): Promise<void> {
           label.includes('SIGTERM queued'),
           `the queued signal is said out loud, got ${JSON.stringify(row)}`,
         );
+      });
+
+      await checkAsync('the window can move a running process up or down the queue', async () => {
+        // The window showed the rank in its 优先级 column and could not act on
+        // it: an operator had to leave the window and open a shell to change
+        // it. The verb was already there (`cortex renice`); this is the door.
+        const pid = await kernel.spawn({
+          role: 'movable',
+          agent: { module: 'test:live', args: { mode: 'push' } },
+        });
+        const reniceDash = await startDashboard({ dir: tmp, port: 0, allowOps: ['renice'] });
+        try {
+          const res = await fetch(`${reniceDash.url}/api/ops/renice`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ pid: unbrand(pid), nice: -7 }),
+          });
+          assert(res.status === 200, `status ${res.status}`);
+          const data = (await res.json()) as { ok?: boolean; output?: string };
+          assert(data.ok === true, `the move must succeed, got ${JSON.stringify(data)}`);
+          assert(
+            (data.output ?? '').includes('nice 0 -> -7'),
+            `the window says the rank it applied, got: ${data.output ?? ''}`,
+          );
+          // The kernel's own table is the truth the window was talking about.
+          assert(
+            kernel.table.get(pid)?.nice === -7,
+            `the kernel's table holds it, got ${String(kernel.table.get(pid)?.nice)}`,
+          );
+        } finally {
+          await reniceDash.close();
+        }
+      });
+
+      await checkAsync('the window\'s renice is behind the same gate as the other writes', async () => {
+        // Writing is off unless the operator asked for it, and the ask is per
+        // op: `--ops kill` does not quietly grant renice.
+        const gated = await startDashboard({ dir: tmp, port: 0, allowOps: ['kill'] });
+        try {
+          const res = await fetch(`${gated.url}/api/ops/renice`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ pid: 1, nice: -7 }),
+          });
+          assert(res.status === 403, `a write that was not opted into must 403, got ${res.status}`);
+        } finally {
+          await gated.close();
+        }
+      });
+
+      await checkAsync('the window\'s renice refuses a rank nobody stated', async () => {
+        // `Number('')` is 0, and 0 is a rank the kernel holds — so an absent
+        // value must never be read as a number. A client that says nothing is
+        // told so, and the process keeps the rank it had.
+        const pid = await kernel.spawn({
+          role: 'unranked',
+          agent: { module: 'test:live', args: { mode: 'push' } },
+        });
+        const emptyDash = await startDashboard({ dir: tmp, port: 0, allowOps: ['renice'] });
+        try {
+          const res = await fetch(`${emptyDash.url}/api/ops/renice`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ pid: unbrand(pid), nice: '' }),
+          });
+          assert(res.status === 400, `a rank nobody stated must 400, got ${res.status}`);
+          assert(
+            kernel.table.get(pid)?.nice === 0,
+            `the kernel's table is untouched, got ${String(kernel.table.get(pid)?.nice)}`,
+          );
+        } finally {
+          await emptyDash.close();
+        }
+      });
+
+      await checkAsync('the window is told the range of ranks the kernel holds', async () => {
+        // The page does not own the kernel's value domains: it asks for a
+        // number inside the range the kernel holds, and the kernel is the one
+        // that says what that range is.
+        const opsDash = await startDashboard({ dir: tmp, port: 0, allowOps: ['renice'] });
+        try {
+          const res = await fetch(`${opsDash.url}/api/ops`);
+          const data = (await res.json()) as { ops?: string[]; niceMin?: number; niceMax?: number };
+          assert(
+            (data.ops ?? []).includes('renice'),
+            `renice is an op the window knows, got ${JSON.stringify(data.ops)}`,
+          );
+          assert(data.niceMin === NICE_MIN, `the range comes from the kernel, got ${String(data.niceMin)}`);
+          assert(data.niceMax === NICE_MAX, `the range comes from the kernel, got ${String(data.niceMax)}`);
+        } finally {
+          await opsDash.close();
+        }
+      });
+
+      await checkAsync('the page asks for a number inside the range the server sent', async () => {
+        // The page must not state the kernel's range itself — it asks the
+        // server, and the control does not appear until the server has
+        // answered. A page that guessed the range would be a page stating a
+        // domain it does not own.
+        const dash = await startDashboard({ dir: tmp, port: 0, allowOps: ['renice'] });
+        try {
+          const html = await (await fetch(`${dash.url}/`)).text();
+          assert(html.includes('let niceMin = null;'), 'the page waits for the server before it has a range');
+          assert(!html.includes('niceMin = -20'), 'the page does not state the range itself');
+          assert(html.includes('min="${esc(min)}"'), 'the control bounds itself by the range it was given');
+          // And the number the control starts at is the one the server sent —
+          // or **none at all**, because an operator who applies an empty box
+          // should not have moved the process to the default by accident.
+          const niceValue = pageFunction(html, 'processNiceValue') as (p: unknown) => unknown;
+          assert(niceValue({ nice: -7 }) === -7, `the rank comes through, got ${String(niceValue({ nice: -7 }))}`);
+          assert(niceValue({}) === null, `an unreported rank is not a number, got ${String(niceValue({}))}`);
+        } finally {
+          await dash.close();
+        }
       });
 
       await checkAsync('the dashboard pushes live events instead of re-reading', async () => {

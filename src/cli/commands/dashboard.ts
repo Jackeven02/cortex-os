@@ -39,9 +39,12 @@ export async function cmdDashboard(args: string[]): Promise<number> {
 
 OPS
   Write operations are disabled unless opted in:
-    --allow-ops               enable every op (spawn, kill, restore)
+    --allow-ops               enable every op (spawn, kill, restore, renice)
     --ops spawn,kill          enable exactly the listed ops
   Ops are served as POST /api/ops/<op> from the same origin.
+
+  'renice' moves a running process up or down the queue (the rank in the
+  优先级 column). It is the same verb as 'cortex renice <pid> --nice <n>'.
 
 NOTES
   With a live kernel in this directory ('cortex daemon run'), the dashboard
