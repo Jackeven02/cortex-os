@@ -10304,7 +10304,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel' | 'processOutcome' | 'processBudget' | 'processCheckpoint' | 'processInside' | 'processPending' | 'processDetail' | 'processCaps' | 'processMatches' | 'processCountText' | 'processTree',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel' | 'processOutcome' | 'processBudget' | 'processCheckpoint' | 'processInside' | 'processPending' | 'processDetail' | 'processCaps' | 'processMatches' | 'processCountText' | 'processTree' | 'eventCountText',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -12706,6 +12706,117 @@ async function runDashboardStoreChecks(): Promise<void> {
         assert(
           dash.activity.bytesRead === afterFirst,
           `the second request re-read the log: ${dash.activity.bytesRead - afterFirst} bytes`,
+        );
+      } finally {
+        await dash.close();
+      }
+    });
+
+    await checkAsync('the count under the table says whether it is the whole history', async () => {
+      // The store keeps the newest events of each kind, so the count it
+      // reports can be a **lower bound** on the history rather than its size.
+      // The count under the table said 「共 N 条」 either way — a claim about a
+      // history nobody counted. Measured on a real window over a real
+      // workspace: 6,000 events on the disk, 「共 5,000 条」 under the table.
+      //
+      // The server knows which it has: the store remembers the oldest event
+      // it dropped. So the answer carries that, and a view can say 「至少
+      // N 条」 instead of claiming a total.
+      const root = join(tmp, 'overflow');
+      const dir = join(root, 'processes', '2');
+      mkdirSync(dir, { recursive: true });
+      const rec = await Recorder.open({ pid: asProcessId(2), dir });
+      // One more than the store keeps, so it has to drop one.
+      for (let i = 0; i < MAX_EVENTS + 1; i += 1) {
+        await rec.append({
+          ...base,
+          timestamp: new Date(Date.UTC(2026, 0, 1) + i).toISOString(),
+          syscall: 'memory_read',
+          callId: `o${i}`,
+          phase: 'exit',
+          durationMs: 1,
+        } as never);
+      }
+      await rec.close();
+
+      const dash = await startDashboard({ dir: root, port: 0 });
+      try {
+        const res = await fetch(`${dash.url}/api/events?limit=1`);
+        const total = Number(res.headers.get('x-total-count') ?? 0);
+        const exact = res.headers.get('x-total-exact');
+        assert(total === MAX_EVENTS, `the count is what the window holds, got ${total}`);
+        assert(exact === '0', `the count says it is only a lower bound, got ${String(exact)}`);
+
+        // **And the disk holds more than the count** — which is the whole
+        // point: the number is a lower bound because the history is longer.
+        let frames = 0;
+        for await (const _frame of readRecords(join(root, 'processes', '2', 'log.crec'))) {
+          frames += 1;
+        }
+        assert(frames === MAX_EVENTS + 1, `the disk holds more than the count, got ${frames}`);
+
+        // **And the other reader says the same thing.** The window that
+        // reaches back past the oldest event the store kept is answered from
+        // the disk — and the disk keeps the newest of each kind too, so its
+        // count is a lower bound in exactly the same way.
+        const old = await fetch(`${dash.url}/api/events?limit=1&from=1970-01-01T00:00:00.000Z`);
+        const oldTotal = Number(old.headers.get('x-total-count') ?? 0);
+        assert(oldTotal === MAX_EVENTS, `the disk path counts the window it keeps, got ${oldTotal}`);
+        assert(
+          old.headers.get('x-total-exact') === '0',
+          `the disk path says the count is only a lower bound too, got ${String(old.headers.get('x-total-exact'))}`,
+        );
+
+        // A short history is counted whole, and says so: the flag is not
+        // "always a lower bound", it is the truth about this window.
+        const small = join(tmp, 'small');
+        const smallRec = await writeFrame(small, 'memory_read', 's1', 'exit', '2026-09-28T00:00:02.000Z', {
+          durationMs: 1,
+        });
+        await smallRec.close();
+        const smallDash = await startDashboard({ dir: small, port: 0 });
+        try {
+          const smallRes = await fetch(`${smallDash.url}/api/events?limit=1`);
+          assert(
+            smallRes.headers.get('x-total-exact') === '1',
+            `a history that fits is counted whole, got ${String(smallRes.headers.get('x-total-exact'))}`,
+          );
+        } finally {
+          await smallDash.close();
+        }
+      } finally {
+        await dash.close();
+      }
+    });
+
+    await checkAsync('the page says a lower bound as a lower bound', async () => {
+      // The number under the table says one thing, and that thing is true:
+      // 「共 N 条」 when the count is the whole of the history, 「至少 N 条」
+      // when it is only a lower bound on it.
+      const root = join(tmp, 'wording');
+      const rec = await writeFrame(root, 'memory_read', 'w1', 'exit', '2026-09-28T00:00:02.000Z', {
+        durationMs: 1,
+      });
+      await rec.close();
+      const dash = await startDashboard({ dir: root, port: 0 });
+      try {
+        const html = await (await fetch(`${dash.url}/`)).text();
+        const eventCountText = pageFunction(html, 'eventCountText');
+        assert(
+          eventCountText(5000, true) === '共 5,000 条',
+          `a count that is the whole of it says 共, got ${String(eventCountText(5000, true))}`,
+        );
+        assert(
+          eventCountText(5000, false) === '至少 5,000 条',
+          `a count that is only a lower bound says 至少, got ${String(eventCountText(5000, false))}`,
+        );
+        assert(eventCountText(0, true) === '', 'an empty feed says nothing');
+        // **And the panel prints it through that rule** — one wording, one
+        // place. A second phrasing under the table would be a second rule, and
+        // the second rule is the one that goes missing.
+        assert(
+          html.includes('eventCountText(eventsTotal, eventsExact)'),
+          'the panel prints the count through the rule',
         );
       } finally {
         await dash.close();
@@ -19767,7 +19878,7 @@ async function runDashboardLiveChecks(): Promise<void> {
         let text = '';
         try {
           const deadline = Date.now() + 5000;
-          let payload: { events?: unknown[]; total?: number | null } | undefined;
+          let payload: { events?: unknown[]; total?: number | null; totalExact?: boolean } | undefined;
           while (payload === undefined && Date.now() < deadline) {
             const timer = new Promise<null>((resolve) => setTimeout(() => resolve(null), 200));
             const chunk = await Promise.race([reader.read(), timer]);
@@ -19781,7 +19892,7 @@ async function runDashboardLiveChecks(): Promise<void> {
               .filter((line) => line.startsWith('data: '))
               .map((line) => line.slice(6))
               .join('');
-            payload = JSON.parse(data) as { events?: unknown[]; total?: number | null };
+            payload = JSON.parse(data) as { events?: unknown[]; total?: number | null; totalExact?: boolean };
           }
           assert(payload !== undefined, `the stream pushed a frame, got: ${text.slice(0, 300)}`);
           assert(Array.isArray(payload!.events), `the push carries the rows, got ${JSON.stringify(payload)}`);
@@ -19799,6 +19910,13 @@ async function runDashboardLiveChecks(): Promise<void> {
           assert(
             readTotal >= payload!.total!,
             `the count does not go backwards: push=${payload!.total} read=${readTotal}`,
+          );
+          // **And the two paths say the same thing about the count** — not
+          // only how many, but whether that many is the whole of the history
+          // or only a lower bound on it.
+          assert(
+            (read.headers.get('x-total-exact') === '1') === payload!.totalExact,
+            `the push and the read agree about the count: push=${String(payload!.totalExact)} read=${String(read.headers.get('x-total-exact'))}`,
           );
         } finally {
           await reader.cancel().catch(() => undefined);

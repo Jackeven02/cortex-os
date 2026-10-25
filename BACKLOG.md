@@ -1925,42 +1925,73 @@ The user-facing surface. Should feel like a real OS shell.
   should pretend otherwise: nothing today says "seen", and nothing should
   start saying it without saying what a look is.
 
-- [ ] **#115** The count under the table says how many events there are, but it
-  counts what the window can still reach → **open.**
-  The count the window shows — and now the count the push carries with the
-  rows (#110) — is the number of events the activity store holds for the
-  window. The store keeps the newest **5,000** of each kind (`MAX_EVENTS`), so
-  past that the number stops growing: a workspace with 50,000 events says
-  「共 10,000 条」, and the operator cannot tell 10,000 from 50,000. The
-  number is used for two things at once — it is the *size of the history* in
-  the header, and it is the *yardstick* the 「加载更多」 button is compared
-  against — and only the first of those is a lie.
+- [x] **#115** The count under the table says how many events there are, but it
+  counts what the window can still reach → **fixed.**
+  The count the window shows — and the count the push carries with the rows
+  (#110) — was the number of events the activity store holds for the window.
+  The store keeps the newest **5,000** of each kind (`MAX_EVENTS`), so past
+  that the number stops growing, and the header said 「共 N 条」 — *N records in
+  total*. Measured on a real window over a real workspace: **6,000 events on
+  the disk, 「共 5,000 条」 under the table**. The operator could not tell 5,000
+  from 6,000, because the number claimed a history the server had only part
+  of.
 
-  The server **knows** the difference: the store remembers the oldest event it
-  dropped (`ActivityStore.covers()` is false once it has), so it could say
-  *at least* N. What it should say is a wording question with a measurement
-  behind it:
+  **The server knows the difference, and now it says it.** The store remembers
+  the oldest event it dropped, and the disk reader knows it truncated — so the
+  answer carries the number *and what it is*: `totalExact` in the push's
+  `events` frame, `x-total-exact` in the read endpoint's headers, and the two
+  paths always agree (the count and what it is travel together, the way the
+  rows and the count already did).
 
-  - **「共 10,000 条」** — the count of what the window can serve. Simple, and
-    it reads as the size of the history, which it is not.
-  - **「至少 10,000 条」** — honest about the ceiling, for one extra word. But
-    then the number is no longer a count, and the 「加载更多」 button — which
-    compares it against the rows loaded — has to be reasoned about separately:
-    a window that has loaded 10,000 rows out of *at least* 10,000 has not
-    reached the end, and the button must not go dark.
-  - **the size of the history** — read from the disk. The disk knows the size
-    of a file, but the size of an *event count* means reading every frame,
-    which is the O(history) cost the store was built to remove.
+  **And the page words it accordingly**: 「共 N 条」 when the count is the whole
+  of the window's history, 「至少 N 条」 when it is only a lower bound on it.
+  One number, one meaning, never more than it is.
 
-  There is a fourth question underneath the wording one, and it is the real
-  one: should the number be the count of **the history** (so it is the truth
-  about everything that happened) or the count of **the window on screen** (so
-  it is the truth about what the operator is looking at)? Today it is the
-  first, capped by the store, and it is used for the second as well — which is
-  where the ambiguity lives.
+  The **third option** — the size of the history, read off the disk — turns
+  out not to need a disk scan at all: the store reads every frame anyway, it
+  just does not keep them, so counting them is free. That is the next step
+  (#124), and it is a bigger product decision than a wording.
+
+  2 new smoke checks (895 → 897) and one extended, all reverse-verified: with
+  the store forgetting that it had dropped events, the check fails and reports
+  `got 1`; with the page's wording losing the qualifier, the check fails and
+  reports `共 5,000 条`; with the panel printing the count without going
+  through the rule, the check fails; and with the **disk** path claiming the
+  count is the whole of the history, the check fails and reports `got 1` —
+  that last one needed a second attempt, because the first break was in a
+  branch no check reached.
+
+  Browser-verified on a real window over a real kernel: the header reads 「至少
+  5,000 条」 where it used to read 「共 5,000 条」, the endpoint reports
+  `x-total-exact: 0`, and the console is clean.
 
   **Exit criteria:** the number under the table says one thing, and that thing
-  is true.
+  is true. — met.
+
+- [ ] **#124** The events window cannot reach past the newest 10,000 → **open.**
+  Found while fixing #115. The count under the table now says 「至少 N 条」 when
+  the window holds only part of the history — which is true, and it is also a
+  promise the window cannot keep: the store keeps the newest 5,000 of each
+  kind, and so do the disk readers, so the rows older than that are **not
+  reachable at all**. An operator who pages to the end finds the 「加载更多」
+  button greyed out under a number that says there is more than they can see.
+
+  Two ways out, and they are different products:
+
+  - **count the whole history.** The store reads every frame anyway — it just
+    does not keep them — so a counter is free, and the number under the table
+    becomes the true size of the history. But then the 「加载更多」 button's
+    yardstick is the history's size, so the window has to *serve* the whole
+    history too: the deep pages come off the disk (O(history) per page) rather
+    than off the store, which is the cost the store exists to avoid.
+  - **say what the window is.** The panel says 「窗口内 N 条」, the history's
+    size is not claimed at all, and the unreachable older rows are a stated
+    limit rather than a silent one.
+
+  The first is the better product and the more expensive one; the second is
+  honest and cheap. **Exit criteria:** the number under the table and the rows
+  the 「加载更多」 button can reach are the same thing — or the panel says
+  plainly that they are not.
 
 - [x] **#116** The dashboard's heartbeat outlived the window it was keeping
   warm → **fixed.**

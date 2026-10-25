@@ -42,6 +42,25 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The number under the events table says whether it is the whole history.**
+  The count under the table read 「共 N 条」 — *N records in total* — and it was
+  a number nobody had counted. The activity store keeps the newest events of
+  each kind (5,000 a kind), so past that the count stops growing: measured on a
+  real window over a real workspace, **6,000 events on the disk and 「共 5,000
+  条」 under the table**. The operator could not tell 5,000 from 6,000, because
+  the number claimed a history the server had only part of.
+
+  Both readers know when they dropped something — the store remembers the
+  oldest event it dropped, and the disk reader knows it truncated — so the
+  answer now carries that fact with the number: `totalExact` in the push's
+  `events` frame, `x-total-exact` in the read endpoint's headers, and the two
+  paths always agree. The page words it accordingly: **「共 N 条」** when the
+  count is the whole of the window's history, **「至少 N 条」** when it is only a
+  lower bound on it.
+
+  The number under the table is now one number with one meaning, and it is
+  never more than it is.
+
 - **The number next to the table describes the table.** The process panel's
   title read 「Agent 进程 (4)」 — the workspace's process count — while the rows
   under it were the **filtered** ones. One panel, two numbers for one thing,

@@ -163,10 +163,22 @@ const DEFAULT_CHECKPOINT_MEMORY = 200;
  */
 const PROCESS_REFRESH_DEBOUNCE_MS = 250;
 
-async function readEvents(dir: string, range: TimeRange): Promise<unknown[]> {
+/**
+ * The LangChain callback events on disk, and whether any were dropped.
+ *
+ * The reader keeps the newest {@link MAX_SCAN} of them, so a log with more
+ * than that is read in part. The flag says so: a count of what is left is a
+ * **lower bound** on the history, and a view that prints it as the size of
+ * the history is claiming something nobody counted.
+ */
+async function readEvents(
+  dir: string,
+  range: TimeRange,
+): Promise<{ rows: unknown[]; truncated: boolean }> {
   const path = join(dir, 'integrations', 'langchain', 'events.jsonl');
-  if (!existsSync(path)) return [];
+  if (!existsSync(path)) return { rows: [], truncated: false };
   const rows: unknown[] = [];
+  let truncated = false;
   const input = createInterface({ input: createReadStream(path, { encoding: 'utf8' }), crlfDelay: Infinity });
   const filtering = range.from !== undefined || range.to !== undefined;
   for await (const line of input) {
@@ -178,12 +190,15 @@ async function readEvents(dir: string, range: TimeRange): Promise<unknown[]> {
       if (event === undefined) continue;
       if (filtering && !inRange(Date.parse(event.at), range)) continue;
       rows.push(event);
-      if (rows.length > MAX_SCAN) rows.shift();
+      if (rows.length > MAX_SCAN) {
+        rows.shift();
+        truncated = true;
+      }
     } catch {
       continue;
     }
   }
-  return rows.reverse();
+  return { rows: rows.reverse(), truncated };
 }
 
 /**
@@ -203,7 +218,17 @@ type DashboardEvent = ActivityEvent;
  */
 const toDashboardEvent = toActivityEvent;
 
-async function readSyscallEvents(dir: string, range: TimeRange): Promise<unknown[]> {
+/**
+ * The syscall events on disk, and whether any were dropped.
+ *
+ * The reader keeps the newest {@link MAX_SCAN} of them, so a workspace with
+ * more than that is read in part. The flag says so — a count of what is left
+ * is a **lower bound** on the history, not its size.
+ */
+async function readSyscallEvents(
+  dir: string,
+  range: TimeRange,
+): Promise<{ rows: DashboardEvent[]; truncated: boolean }> {
   const events: DashboardEvent[] = [];
   const filtering = range.from !== undefined || range.to !== undefined;
   // Every process that has a log — running or finished.
@@ -230,9 +255,10 @@ async function readSyscallEvents(dir: string, range: TimeRange): Promise<unknown
       continue;
     }
   }
-  return events
-    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
-    .slice(0, MAX_SCAN);
+  const sorted = events
+    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  const truncated = sorted.length > MAX_SCAN;
+  return { rows: sorted.slice(0, MAX_SCAN), truncated };
 }
 
 const byNewest = (a: unknown, b: unknown): number =>
@@ -249,23 +275,34 @@ const byNewest = (a: unknown, b: unknown): number =>
  * window reaches back past the oldest event it kept — the disk is asked,
  * because a shorter answer than the disk holds is a truncation nobody can
  * see.
+ *
+ * **And the number says what it is.** The store keeps the newest events of
+ * each kind, and so do the disk readers, so a count of either can be a
+ * **lower bound** on the history rather than its size. Both readers know when
+ * they dropped something, so the answer carries that: `exact` is false when
+ * the number is only a lower bound. A view that prints "N events in total"
+ * for a lower bound is claiming a history nobody counted.
  */
 async function eventsForRange(
   dir: string,
   store: ActivityStore,
   range: TimeRange,
-): Promise<{ events: readonly unknown[]; total: number }> {
+): Promise<{ events: readonly unknown[]; total: number; exact: boolean }> {
   await store.refresh(dir);
   if (store.covers(range)) {
     const events = store.read(range).events;
-    return { events, total: events.length };
+    return { events, total: events.length, exact: store.countsAll(range) };
   }
   const [callbacks, syscalls] = await Promise.all([
     readEvents(dir, range),
     readSyscallEvents(dir, range),
   ]);
-  const merged = [...callbacks, ...syscalls].sort(byNewest);
-  return { events: merged, total: merged.length };
+  const merged = [...callbacks.rows, ...syscalls.rows].sort(byNewest);
+  return {
+    events: merged,
+    total: merged.length,
+    exact: !callbacks.truncated && !syscalls.truncated,
+  };
 }
 
 /**
@@ -281,10 +318,10 @@ async function eventsForRange(
 function storeWindow(
   store: ActivityStore,
   range: TimeRange,
-): { events: readonly unknown[]; total: number } | undefined {
+): { events: readonly unknown[]; total: number; exact: boolean } | undefined {
   if (!store.covers(range)) return undefined;
   const events = store.read(range).events;
-  return { events, total: events.length };
+  return { events, total: events.length, exact: store.countsAll(range) };
 }
 
 /**
@@ -888,8 +925,14 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         // answers with the same helper — so the number this endpoint
         // reports and the number the window is told are the same number,
         // measured the same way.
-        const { events: merged, total } = await eventsForRange(dir, store, range);
+        const { events: merged, total, exact } = await eventsForRange(dir, store, range);
         response.setHeader('x-total-count', String(total));
+        // **Whether the number is the whole of it.** The count is the size of
+        // the window the server holds, and a window that keeps only the
+        // newest events can be a lower bound on the history. The header says
+        // which, so the view can say 「共 N 条」 or 「至少 N 条」 — and never
+        // claim a history nobody counted.
+        response.setHeader('x-total-exact', exact ? '1' : '0');
         json(response, 200, merged.slice(offset, offset + limit));
         return;
       }
@@ -1287,6 +1330,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
               send('events', {
                 events: [...window.events].slice(0, limit),
                 total: window.total,
+                totalExact: window.exact,
               });
             } catch {
               // Transient read failure: keep the stream alive.
@@ -1473,6 +1517,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             send('events', {
               events: [...window.events].slice(0, limit),
               total: window.total,
+              totalExact: window.exact,
             });
           } catch {
             // Transient read failure: keep the stream alive.

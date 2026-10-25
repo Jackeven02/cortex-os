@@ -501,6 +501,31 @@
       return filtering ? `(${matched} / ${total})` : `(${total})`;
     }
 
+    // **The number under the table says one thing, and that thing is true.**
+    //
+    // The server keeps the newest events of each kind, so the count it
+    // reports can be a **lower bound** on the history rather than its size: a
+    // workspace with 6,000 events said 「共 5,000 条」, and the operator could
+    // not tell 5,000 from 6,000 — the number claimed a history nobody had
+    // counted.
+    //
+    // The server now says whether its number is the whole of it, and the page
+    // words it: 「共 N 条」 when it is, 「至少 N 条」 when it is only a lower
+    // bound. One rule, and the number is never more than it is.
+    function eventCountText(total, exact) {
+      if (typeof total !== 'number' || !Number.isFinite(total) || total === 0) return '';
+      return exact === true ? `共 ${total.toLocaleString()} 条` : `至少 ${total.toLocaleString()} 条`;
+    }
+
+    // **The count and what it is, read together.** The server sends the
+    // number and whether it is the whole of the history or only a lower bound
+    // on it; a header that is missing is not a claim of completeness, so the
+    // default is the honest one.
+    function readEventTotal(res) {
+      eventsTotal = Number(res.headers.get('x-total-count') ?? 0);
+      eventsExact = res.headers.get('x-total-exact') === '1';
+    }
+
     let insideKnown = false;
     let pendingKnown = false;
     let outcomeKnown = false;
@@ -669,7 +694,7 @@
 
     function renderEvents() {
       const rows = eventData;
-      $('eventTotal').textContent = eventsTotal ? `共 ${eventsTotal.toLocaleString()} 条` : '';
+      $('eventTotal').textContent = eventCountText(eventsTotal, eventsExact);
       $('eventMore').disabled = eventData.length >= eventsTotal;
       $('eventRows').innerHTML = rows.length ? rows.map((event) => {
         const label = eventLabel(event);
@@ -872,6 +897,11 @@
     // poll 30 seconds later, so the number under the table was half a
     // minute stale while the rows above it were live.
     let eventsTotal = 0;
+    // **Whether that count is the whole history or only a lower bound.** The
+    // server keeps the newest events of each kind, so a count of what it
+    // holds can be smaller than the history — and the number under the table
+    // must say so rather than claim a history nobody counted.
+    let eventsExact = false;
     const EVENTS_PAGE = 100;
 
     function renderCheckpoints() {
@@ -1172,14 +1202,19 @@
     // did not, the rows in between were never seen — the server's page
     // reached past everything this window holds — and the window keeps what
     // it has and asks again, rather than showing a gap it cannot see.
-    function applyEvents(rows, total) {
+    function applyEvents(rows, total, exact) {
       const merged = mergeEvents(eventData, rows);
       const met = merged.overlap || eventData.length === 0;
       if (met) {
         eventData = merged.rows;
         eventsOffset = eventData.length;
       }
-      if (typeof total === 'number' && Number.isFinite(total)) eventsTotal = total;
+      if (typeof total === 'number' && Number.isFinite(total)) {
+        eventsTotal = total;
+        // The count and what it is travel together: a number that is only a
+        // lower bound must not keep the wording of an exact one.
+        eventsExact = exact === true;
+      }
       return met;
     }
 
@@ -1191,7 +1226,7 @@
         for (let offset = 0; offset < depth; offset += EVENTS_PAGE) {
           const res = await fetch(`/api/events?${eventQuery(offset)}`, { cache: 'no-store' });
           if (!res.ok) throw new Error('事件读取失败');
-          eventsTotal = Number(res.headers.get('x-total-count') ?? 0);
+          readEventTotal(res);
           const page = await res.json();
           rows.push(...page);
         }
@@ -1210,6 +1245,7 @@
       eventData = [];
       eventsOffset = 0;
       eventsTotal = 0;
+      eventsExact = false;
     }
 
     async function loadEvents(mode) {
@@ -1221,7 +1257,7 @@
       const offset = mode === 'more' ? eventsOffset : 0;
       const res = await fetch(`/api/events?${eventQuery(offset)}`, { cache: 'no-store' });
       if (!res.ok) throw new Error('事件读取失败');
-      eventsTotal = Number(res.headers.get('x-total-count') ?? 0);
+      readEventTotal(res);
       const page = await res.json();
       if (mode === 'more') {
         eventData = appendEvents(eventData, page);
@@ -1229,7 +1265,7 @@
         return;
       }
       const depth = eventsOffset;
-      if (!applyEvents(page, eventsTotal)) await refillWindow(depth);
+      if (!applyEvents(page, eventsTotal, eventsExact)) await refillWindow(depth);
     }
 
     // What the footer says about how fresh the page is.
@@ -1441,11 +1477,12 @@
         const payload = JSON.parse(event.data);
         const rows = payload && Array.isArray(payload.events) ? payload.events : [];
         const total = payload && typeof payload.total === 'number' ? payload.total : null;
+        const exact = payload && payload.totalExact === true;
         const depth = eventsOffset;
         // A push is a **merge**, not a replacement: the rows the operator
         // paged back to are still rows the operator asked for, and the
         // pushed page is the newest slice of the same history.
-        if (!applyEvents(rows, total)) void refillWindow(depth);
+        if (!applyEvents(rows, total, exact)) void refillWindow(depth);
         applyData();
       });
       // Something was printed. The message says *that* it changed, not *what*

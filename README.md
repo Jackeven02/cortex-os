@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 895 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 897 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -444,6 +444,8 @@ Now the rule is one rule: the five states an operator watches always have a row,
 **And the number next to the table describes the table.** The process panel's title read 「Agent 进程 (4)」 — the workspace's process count — while the rows under it were the **filtered** ones. One panel, two numbers for one thing, disagreeing: an operator who typed into 「筛选进程…」 and was left with one row could not tell whether the other three were filtered out or the count was simply wrong. So the number is the table's now: **(1 / 4)** while a filter is narrowing the list, **(4)** when it is not — the first number is what the table shows, the second is what the workspace holds, so the workspace's size never leaves the screen.
 
 **And the two views filter by the same rule.** The panel has two views — 表格 and 监督树 — and each had **its own copy** of "does this process match what the operator typed". The tree's copy was missing two of the columns: a process holding one capability, and one parked at a checkpoint. So the same filter box, in the same panel, found a process in the table and said **没有匹配的进程** in the tree. One rule now, and the tree is built from it. The tree also says what it shows: the processes that match **and the path they hang under**, with the node that matched marked — because a tree that drops the parent is not a tree, and a tree that renders the whole subtree of anything that matched is not a filter.
+
+**And the count under the event table says what it is.** The number read 「共 N 条」 — *N records in total* — and it was a number nobody had counted. The window keeps the newest events of each kind, so a history longer than that is counted in part: on a real workspace with 6,000 events the table said 「共 5,000 条」, and the operator could not tell 5,000 from 6,000. The server knows the difference — it remembers what it dropped — so it says it together with the number, and the window words it accordingly: 「共 N 条」 when the count is the whole of the history, 「至少 N 条」 when it is only a lower bound on it.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

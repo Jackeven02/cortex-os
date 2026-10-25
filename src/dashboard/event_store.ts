@@ -443,6 +443,33 @@ export class ActivityStore {
   }
 
   /**
+   * Whether the count of this range is the **whole** of it.
+   *
+   * `covers()` asks whether the store can answer a window at all. This asks
+   * something stricter: whether the number it answers with is the size of
+   * that window's history, or only a **lower bound** on it.
+   *
+   * The store keeps the newest {@link MAX_EVENTS} of each kind, and when it
+   * drops one it knows. So:
+   *
+   * - an unbounded window that dropped something is counted only in part —
+   *   the history holds more than the store does, and the number says so;
+   * - a window that starts **after** the oldest event the store kept is
+   *   complete, because what was dropped is older than the window.
+   *
+   * A view that prints this count as "N events in total" when it is a lower
+   * bound is claiming a history it did not count.
+   */
+  countsAll(range: TimeRange = {}): boolean {
+    if (range.from === undefined) {
+      return this.#oldestSyscall === undefined && this.#oldestCallback === undefined;
+    }
+    if (this.#oldestSyscall !== undefined && range.from <= this.#oldestSyscall) return false;
+    if (this.#oldestCallback !== undefined && range.from <= this.#oldestCallback) return false;
+    return true;
+  }
+
+  /**
    * Read whatever is new in every log, and remember it.
    *
    * Concurrent callers share one read: the second one waits for the first

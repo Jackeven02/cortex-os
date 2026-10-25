@@ -2324,11 +2324,21 @@ Three things hold it together now, and they are one thing: **the window's
 state belongs to the window.**
 
 - The push carries the **rows and the count together** (`{"events": [...],
-  "total": N}`), measured by the same reader the read endpoint uses — so
-  `total` is the same number `GET /api/events` reports in `x-total-count`, and
-  the number under the table is as fresh as the rows above it. When the server
-  cannot count the window it was asked about, it says so (`total: null`)
-  instead of sending a number it did not measure.
+  "total": N, "totalExact": true|false}`), measured by the same reader the read
+  endpoint uses — so `total` is the same number `GET /api/events` reports in
+  `x-total-count`, and the number under the table is as fresh as the rows above
+  it. When the server cannot count the window it was asked about, it says so
+  (`total: null`) instead of sending a number it did not measure.
+- **And the count says what it is.** The store keeps the newest events of each
+  kind, and so do the disk readers, so a count of either can be a **lower
+  bound** on the history rather than its size: measured on a real window over a
+  real workspace, 6,000 events on the disk and 「共 5,000 条」 under the table —
+  a claim about a history nobody had counted. Both readers know when they
+  dropped something, so the answer carries that: `totalExact` in the push, the
+  `x-total-exact` header in the read. The page words it accordingly — 「共 N 条」
+  when the count is the whole of it, 「至少 N 条」 when it is only a lower bound —
+  and the two paths always answer the same way, because the count and what it
+  is travel together.
 - The stream answers about the **window it was asked about**: it takes the
   same range the read takes. The read took a range and the push ignored it, so
   a window filtered to one hour was fed the whole history and the filter was a
