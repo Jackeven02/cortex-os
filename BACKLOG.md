@@ -2054,6 +2054,68 @@ The user-facing surface. Should feel like a real OS shell.
   **Exit criteria:** the priority a process runs at is visible, and an
   operator can change it.
 
+- [x] **#120** The window's state breakdown dropped the states it did not name →
+  **fixed.**
+  Found by looking at the window with a real kernel behind it. The 运行状态
+  panel on the right says 「按进程状态分类」 — a classification — and it listed
+  five states: running, ready, blocked, stopped, zombie. The kernel has
+  **nine** (PROCESS.md §10), so a process in any of the other four was in the
+  panel's total and in **no row**.
+
+  The arithmetic showed it: four processes on the panel's own total, and rows
+  that added up to **three**. The missing one was the process parked at a
+  checkpoint — SUSPENDED, the state #118 had just taught the table to say out
+  loud. And `cortex top`, counting the states it finds, said `4 processes · 1
+  running · 2 blocked · 1 suspended`: the same four processes, a different
+  account. Two views of one fact, disagreeing, in one window.
+
+  So the rule is one rule: the five states an operator watches always have a
+  row, and **every other state that is present gets one too** — which makes the
+  rows add up to the number of processes, *by construction*. The panel says so
+  as well (「各行之和即总数」), so the operator is not left to work out whether
+  the numbers are meant to add up.
+
+  A state the page has no Chinese word for is printed as the **kernel words it**
+  (`stateLabel`): the page names the states an operator reads often, and a state
+  it does not know gets the kernel's own name — not a made-up one, and not a
+  dropped row.
+
+  **2 new smoke checks** (887 → 889), reverse-verified: with the breakdown
+  keeping only the five watched states, the check fails and the message names
+  the gap (`the rows add up to the processes: 13 vs 14`); with the page
+  inventing a name for a state it does not know, the check fails; and with the
+  panel no longer saying that the rows add up, the check fails.
+
+  Browser-verified on a real window over a real kernel: the panel reads 运行中
+  1 / 就绪 0 / 等待中 1 / 已停止 0 / 已退出 0 / **已挂起 1** — six rows that add
+  up to the three processes beside them — the console is clean, and `cortex top`
+  on the same workspace says `3 processes · 1 running · 1 blocked · 1 suspended`.
+
+- [ ] **#121** The process table's title count does not describe the table →
+  **open.**
+  Found while verifying #120, on the same window. The table's title reads
+  「Agent 进程 (4)」 — and when the operator types into 「筛选进程…」 and one row
+  is left on screen, the title still says (4). The number is the workspace's
+  process count (the one the sidebar and the 运行状态 panel use), while the rows
+  below it are the **filtered** ones: two numbers for one thing, in one panel,
+  disagreeing — the same shape as #110 and #115.
+
+  Which of the two should win is not the question it was for the events table,
+  because the other numbers in the window quote the *workspace* count too (the
+  sidebar, the 「Agent 进程」 card, the panel's total). So the options are:
+
+  - the count **follows the filter** — the title says how many rows are on
+    screen. Then the sidebar, the card and the panel all disagree with it, and
+    the operator loses the size of the workspace.
+  - the count **shows both** — 「(1 / 4)」 while a filter is on. Then every
+    number in the window has to be read as "matched of total", and the ones
+    that quote only the total have to say so.
+  - the count **stays the total** and the table says what it is showing — e.g.
+    「显示 1 / 4」 on the table's own line, or on the empty-state row.
+
+  **Exit criteria:** the number next to the table says one thing, and that thing
+  is true of the table it sits on.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

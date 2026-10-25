@@ -143,8 +143,10 @@
     .state-track { height: 5px; overflow: hidden; border-radius: 9px; background: #eef0f4; }
     .state-fill { height: 100%; min-width: 0; border-radius: inherit; background: #9aa8c4; transition: width .25s ease; }
     .state-fill.running { background: #36a77d; }
+    .state-fill.ready { background: #7cc4a5; }
     .state-fill.blocked { background: #e7ad48; }
     .state-fill.stopped { background: #d4767b; }
+    .state-fill.suspended, .state-fill.exiting, .state-fill.zombie { background: #aeb6c2; }
     .state-number { color: #4c5665; text-align: right; font-variant-numeric: tabular-nums; }
     .runtime-foot { display: flex; align-items: center; justify-content: space-between; margin-top: auto; padding: 11px 16px; border-top: 1px solid #eff0f3; color: #8a93a1; font-size: 9px; }
     /* A second line in the same foot: one rule, two facts — so the border is
@@ -276,7 +278,7 @@
           </section>
 
           <section class="panel runtime">
-            <div class="panel-head"><div><div class="panel-title">运行状态</div><div class="panel-note">按进程状态分类</div></div><span class="state">只读监控</span></div>
+            <div class="panel-head"><div><div class="panel-title">运行状态</div><div class="panel-note">按进程状态分类 · 各行之和即总数</div></div><span class="state">只读监控</span></div>
             <div class="runtime-body"><div class="runtime-total"><strong id="runtimeTotal">—</strong><span>个进程</span></div><div class="state-list" id="stateList"></div></div>
             <div class="runtime-foot"><span>内核 ABI</span><span class="mono" id="kernelAbi">—</span></div>
             <div class="runtime-foot"><span>内核已运行</span><span class="mono" id="kernelAge">—</span></div>
@@ -475,12 +477,50 @@
       $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
     }
 
+    // **The breakdown classifies every process the window lists.**
+    //
+    // The panel said 「按进程状态分类」 and named five states, so any process
+    // in another state — one parked at a checkpoint, one that had not run
+    // yet, one on its way out — was in the total and in **no row**: the
+    // numbers did not add up, and the panel claimed a classification it had
+    // not made. `cortex top` counts the states it finds, and the two views
+    // disagreed about the same processes.
+    //
+    // So the rule is one rule: the five states an operator watches always
+    // have a row, and **every other state that is present gets one too** —
+    // which makes the rows add up to the number of processes, by
+    // construction.
+    //
+    // A state this page has no Chinese word for is printed as the kernel
+    // words it. The page never invents a name for a state, and never drops
+    // one.
+    function stateBreakdown(processes) {
+      const watched = ['running', 'ready', 'blocked', 'stopped', 'zombie'];
+      const stateOf = (process) => String(process.state ?? '');
+      const present = [...new Set(processes.map(stateOf))].filter((state) => state !== '');
+      const states = [...watched, ...present.filter((state) => !watched.includes(state))];
+      return states.map((state) => ({
+        state,
+        count: processes.filter((process) => stateOf(process) === state).length,
+      }));
+    }
+
+    // The word for a state.
+    //
+    // The kernel has nine states (`ProcessState`, docs/PROCESS.md §10) and this
+    // page names the ones an operator reads often. A state this page has no
+    // word for is printed as the **kernel words it** — the page never invents
+    // a name for a state, and never drops one.
+    function stateLabel(state) {
+      const labels = { running: '运行中', ready: '就绪', new: '新建', blocked: '等待中', stopped: '已停止', checkpointing: '存档中', suspended: '已挂起', exiting: '退出中', zombie: '已退出' };
+      const word = labels[String(state)];
+      return word === undefined ? String(state) : word;
+    }
+
     function renderStates() {
-      const states = ['running', 'ready', 'blocked', 'stopped', 'zombie'];
-      const counts = Object.fromEntries(states.map((state) => [state, processData.filter((process) => process.state === state).length]));
-      const max = Math.max(1, ...Object.values(counts));
-      const labels = { running: '运行中', ready: '就绪', blocked: '等待中', stopped: '已停止', zombie: '已退出' };
-      $('stateList').innerHTML = states.map((state) => `<div class="state-row"><span>${labels[state]}</span><div class="state-track"><div class="state-fill ${state}" style="width:${counts[state] / max * 100}%"></div></div><span class="state-number">${counts[state]}</span></div>`).join('');
+      const rows = stateBreakdown(processData);
+      const max = Math.max(1, ...rows.map((row) => row.count));
+      $('stateList').innerHTML = rows.map((row) => `<div class="state-row"><span>${esc(stateLabel(row.state))}</span><div class="state-track"><div class="state-fill ${esc(row.state)}" style="width:${row.count / max * 100}%"></div></div><span class="state-number">${row.count}</span></div>`).join('');
     }
 
     function eventLabel(event) {

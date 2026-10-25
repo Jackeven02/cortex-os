@@ -2380,6 +2380,25 @@ A process whose chain the kernel did not report says only that it is
 checkpointed: the command needs a chain id, and one that was not reported is
 not invented.
 
+**The breakdown classifies every process.** The window's 运行状态 panel says
+「按进程状态分类」 — a classification — and named five states: running, ready,
+blocked, stopped, zombie. A process in any *other* state was in the panel's
+total and in **no row**: one parked at a checkpoint, one that had not run yet,
+one on its way out. The rows added up to less than the number of processes, so
+the panel claimed a classification it had not made — and `cortex top`, counting
+the states it finds, said something different about the very same processes.
+
+So the rule is one rule: the five states an operator watches always have a row,
+and **every other state that is present gets one too** — which makes the rows
+add up to the number of processes, *by construction*. The panel says so as
+well (「各行之和即总数」), so the operator is not left to work out whether the
+numbers are supposed to add up.
+
+A state the page has no Chinese word for is printed as the **kernel words it**.
+The kernel has nine states (`ProcessState`, PROCESS.md §10) and the page names
+the ones an operator reads often; a state it does not know gets the kernel's
+own name — not a made-up one, and not a dropped row.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up

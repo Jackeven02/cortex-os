@@ -10304,7 +10304,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -20119,6 +20119,64 @@ async function runDashboardLiveChecks(): Promise<void> {
         assert(
           !html.includes('cortex restore --chain'),
           'the page does not write the restore command itself',
+        );
+      });
+
+      await checkAsync('the breakdown accounts for every process the window lists', async () => {
+        // The panel says 「按进程状态分类」 — a classification. So every
+        // process the window lists has to be in one of its rows.
+        //
+        // It used to name five states and drop the rest: a process parked at
+        // a checkpoint was in the total and in **no row**. The rows added up
+        // to less than the number of processes, and the panel claimed a
+        // classification it had not made — while `cortex top`, counting the
+        // states it found, said something else about the same processes.
+        //
+        // The rule is one rule: the five states an operator watches always
+        // have a row, and **every other state that is present gets one too**
+        // — which makes the rows add up to the number of processes, by
+        // construction.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        const res = await fetch(`${dash.url}/api/processes`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const breakdown = pageFunction(html, 'stateBreakdown')(rows) as Array<{ state: string; count: number }>;
+        const total = breakdown.reduce((sum, row) => sum + row.count, 0);
+        assert(
+          total === rows.length,
+          `the rows add up to the processes: ${total} vs ${rows.length} — ${JSON.stringify(breakdown)}`,
+        );
+        // The parked process has a row of its own — it is not counted as
+        // running, and it is not counted as nothing.
+        const parked = breakdown.find((row) => row.state === 'suspended');
+        assert(
+          parked !== undefined && parked.count >= 1,
+          `the parked process has a row, got: ${JSON.stringify(breakdown)}`,
+        );
+        // And the states an operator watches are always there, so a run with
+        // nothing in them says so.
+        for (const watched of ['running', 'ready', 'blocked', 'stopped', 'zombie']) {
+          assert(
+            breakdown.some((row) => row.state === watched),
+            `the watched state ${watched} has a row, got: ${JSON.stringify(breakdown)}`,
+          );
+        }
+        // The panel tells the operator how to read it.
+        assert(html.includes('各行之和即总数'), 'the panel says that the rows add up');
+      });
+
+      await checkAsync('a state the page has no word for is printed as the kernel words it', async () => {
+        // The page names the states it knows. A state it does not know — one
+        // a newer kernel might add — is printed as the **kernel words it**.
+        // The page never invents a name for a state, and never drops one.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        const stateLabel = pageFunction(html, 'stateLabel') as (state: string) => string;
+        assert(
+          stateLabel('suspended') === '已挂起',
+          `the parked state has a word, got ${stateLabel('suspended')}`,
+        );
+        assert(
+          stateLabel('brand-new-state') === 'brand-new-state',
+          `an unknown state keeps the kernel's word, got ${stateLabel('brand-new-state')}`,
         );
       });
 

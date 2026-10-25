@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 887 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 889 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -432,6 +432,10 @@ And when there is **no kernel to ask**, the panel says *unknown*, and says why. 
 **And the window shows what the supervisor said about them.** The live state says *now*; the kernel's **journal** says *what was decided* — and the panel shows both, side by side.
 
 The journal had a hole in it, too. It named two of the three ways a supervisor gives up (*max restarts reached*, *restart storm*) and not the third — the one the **policy** decides. So a daemon whose policy said `never` left the log saying only "not restarted", while the live state said "gave up: the restart policy says no": the kernel knew a decision it could not read back. All three give-ups are recorded the same way now, the journal names the daemon it is about, and when the two answers do not match, the row says so in words.
+
+**And the window's state breakdown accounts for every process.** The **运行状态** panel says 「按进程状态分类」 — a classification — and it named five states. The kernel has nine, so a process in any of the other four — one parked at a checkpoint, one that had not run yet, one on its way out — was in the panel's total and in **no row**. Four processes on the panel's own total, and rows that added up to three: the numbers did not add up, while `cortex top`, counting the states it finds, said something different about the very same processes.
+
+Now the rule is one rule: the five states an operator watches always have a row, and every other state that is present gets one too — so the rows add up to the number of processes, *by construction*. The panel says so as well (「各行之和即总数」). And a state the window has no word for is printed as the **kernel words it** — never a name the page made up, and never a row it dropped.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

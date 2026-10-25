@@ -42,6 +42,25 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The window's state breakdown accounts for every process it lists.** The
+  dashboard's 运行状态 panel says 「按进程状态分类」 — a classification — and it
+  named five states: running, ready, blocked, stopped, zombie. A process in any
+  *other* state was in the panel's total and in **no row**: one parked at a
+  checkpoint, one that had not run yet, one on its way out. The rows added up to
+  less than the number of processes, so the panel claimed a classification it had
+  not made — and `cortex top`, counting the states it finds, said something
+  different about the very same processes.
+
+  Now the rule is one rule: the five states an operator watches always have a
+  row, and **every other state that is present gets one too** — which makes the
+  rows add up to the number of processes, *by construction*. The panel says so
+  as well (「各行之和即总数」).
+
+  A state the page has no Chinese word for is printed as the **kernel words it**
+  (`stateLabel`): the kernel has nine states (docs/PROCESS.md §10) and the page
+  names the ones an operator reads often; a state it does not know gets the
+  kernel's own name — not a made-up one, and not a dropped row.
+
 - **A parked process says it is parked, and hands over the command that brings
   it back.** A process that was checkpointed with `--detach` is SUSPENDED
   (docs/PROCESS.md §3.6): it is not running, not waiting, and not stuck — it
