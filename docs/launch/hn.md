@@ -34,12 +34,12 @@ against a deterministic mock driver, no API key):
 - **Cognition / memory / IPC:** `llm_call`, `tool_call`, `memory_read/write`,
   `send`, `recv`, `channel_open`, `channel_close`, `sleep`, `now`, `random`,
   `on_signal`, `budget`.
-- **Least privilege:** `acquire` / `release` / `caps` over six capabilities, so
+- **Least privilege:** `acquire` / `release` / `caps` over seven capabilities, so
   an agent can run with *less* authority than the kernel would give it. Killing
   your own children and calling reversible tools never need a capability —
   otherwise `kill` would be handed to every supervisor and mean nothing.
-- 13 kernel modules, 24 syscalls, 7 drivers (mock/deepseek/openai LLMs;
-  filesystem + MCP tools; inmem + sqlite memory), 750 assertions in the test
+- 13 kernel modules, 25 syscalls, 7 drivers (mock/deepseek/openai LLMs;
+  filesystem + MCP tools; inmem + sqlite memory), 923 assertions in the test
   suite.
 
 **1.0 means the syscall ABI is frozen.** This is the part I'd want a skeptic to
@@ -112,7 +112,7 @@ that collapses under real workloads.
   *"what's the actual kernel LOC?"*, *"can I run two agents on one box?"*
   (answer honestly: one kernel per state dir, no cross-kernel IPC yet).
 - **"Why should I trust a 1.0 from someone I've never heard of?"** — lead with
-  the freeze, not the feature list. The interesting claim is not "it has 24
+  the freeze, not the feature list. The interesting claim is not "it has 25
   syscalls" but "the syscall contract is frozen and here is the written rule for
   what is allowed to change". Anyone can publish a 1.0; the freeze is a
   commitment about the future, and it is the only part a potential user cannot

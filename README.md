@@ -288,10 +288,12 @@ Everything through `0.2.1` was building the thing and then closing the gaps the 
 
 `1.0.0` is a different kind of release — it settles the contract. Two things the ABI had explicitly deferred to "v1" are now in:
 
-- **Capabilities (§4.9)** — `acquire` / `release` / `caps` over a closed set of six (`spawn`, `kill`, `fork`, `tool:dangerous`, `ipc:any`, `admin`). A process can now run with *less* authority than the kernel would give it. The default is full privilege, not least privilege, because defaulting to least privilege would turn every pre-1.0 agent into an `EPERM` trap; you narrow a child explicitly at `spawn`. Two gates are conditional by design: killing your own children and calling reversible tools never need a capability — otherwise `kill` would be handed to every supervisor and mean nothing.
+- **Capabilities (§4.9)** — `acquire` / `release` / `caps` over a closed set of six (`spawn`, `kill`, `fork`, `tool:dangerous`, `ipc:any`, `admin`; `renice` joined them in `1.1.0`). A process can now run with *less* authority than the kernel would give it. The default is full privilege, not least privilege, because defaulting to least privilege would turn every pre-1.0 agent into an `EPERM` trap; you narrow a child explicitly at `spawn`. Two gates are conditional by design: killing your own children and calling reversible tools never need a capability — otherwise `kill` would be handed to every supervisor and mean nothing.
 - **Explicit channels (§4.5)** — `channel_open` / `channel_close`. Implicit creation on `send` is kept for compatibility, but it is no longer the only way to get a channel, and a typo'd channel name no longer silently mints one nobody reads.
 
 That is 24 syscalls, up from 19. **From here:** breaking changes need a major bump; additive changes land in a minor. See [ABI.md §"ABI status"](./docs/ABI.md).
+
+**`1.1.0` is the first additive bump, and it came from a gap the operator's own command kept proving.** An agent could not change a rank at all — not its own, not its child's, not a stranger's — while the operator had a command for exactly that. It can now, with the `renice` syscall (§4.10), under the same reach rule `kill` and `send` use: its own tree is its own, and a stranger's rank needs the new `renice` capability (§4.9). Nothing was removed, renamed or redefined, so an agent written against `1.0.0` still runs — it just did not know it could move a rank. That is 25 syscalls.
 
 **Phase 0 — Design (complete).** Four documents drafted v0: `STATE.md` (the hard part), `PROCESS.md` (lifecycle), `ABI.md` (syscall contract), `ARCHITECTURE.md` (kernel modules). Open questions in each doc are logged and resolve as implementation forces decisions.
 
@@ -493,7 +495,7 @@ See **[BACKLOG.md](./BACKLOG.md)** for the full list, prioritized.
 | [MANIFESTO.md](./MANIFESTO.md) | Why cortex exists. Start here. |
 | [docs/STATE.md](./docs/STATE.md) | **The hard part.** What agent state is, what gets copied on fork, what cannot be copied at all. |
 | [docs/PROCESS.md](./docs/PROCESS.md) | Agent lifecycle: 9 states, the legal-transition table, signals, scheduling |
-| [docs/ABI.md](./docs/ABI.md) | Syscall contract: 24 syscalls, 3 driver interfaces, error model, recording format |
+| [docs/ABI.md](./docs/ABI.md) | Syscall contract: 25 syscalls, 3 driver interfaces, error model, recording format |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow: 13 modules, syscall lifecycle, persistence layout, concurrency model |
 | [docs/HACKING.md](./docs/HACKING.md) | Contributor guide: dev setup, conventions, how to write a driver / agent / syscall, testing. |
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | Recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC (+ explicit channels), budgets, least privilege (capabilities), testing. |

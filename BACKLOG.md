@@ -2193,8 +2193,10 @@ The user-facing surface. Should feel like a real OS shell.
   and a host method and a transport command are not part of the frozen
   contract (ABI §11) — the same ground `Kernel.openCalls()`, the transport's
   `openCalls` and `daemons` commands, and `Kernel.daemons()` stand on. An
-  *agent* still cannot move a process's rank; that question is open and
-  written up as #126.
+  *agent* still could not move a process's rank here; that question was
+  written up as #126, and #126 gave the agent its own door — the `renice`
+  syscall (ABI §4.10) — which moved the ABI to `1.1.0` additively. The
+  operator's verb stayed where it was.
 
   **And the verb reports what the kernel did, not what it intended.** The
   number it prints is read back from the process table, so a move the kernel
@@ -2328,8 +2330,8 @@ The user-facing surface. Should feel like a real OS shell.
   **Exit criteria:** an operator can move a running process up or down the
   queue from the window, and the 优先级 column shows the new rank. — met.
 
-- [ ] **#126** An agent cannot change a process's rank — not even its own →
-  **open.**
+- [x] **#126** An agent cannot change a process's rank — not even its own →
+  **fixed.**
   Found while fixing #125. The operator can move any running process up or
   down the queue (`cortex renice <pid> --nice <n>`), but an **agent** has
   no verb at all: it cannot promote the child it is waiting for, cannot push
@@ -2357,7 +2359,59 @@ The user-facing surface. Should feel like a real OS shell.
   **Exit criteria:** an agent can change the rank of a process the
   capability system says it may, the change is recorded like every other
   change to a rank, and the ABI's version moves to `1.1.0` with the new
-  syscall and the capability that guards it.
+  syscall and the capability that guards it. — met.
+
+  **The shape.** A syscall `renice(pid, nice)` (ABI §4.10) and a capability
+  `renice` (ABI §4.9) — the same word for both, because it is the same
+  action, and the project already has one word per action (`kill`, `spawn`,
+  `fork`). The reach rule is the one `kill` and `send` already use, with no
+  new axis invented for it: **your own tree is yours** — yourself, your
+  descendants, your own process group — and reaching **across** the tree
+  needs the capability, or the call is `EPERM`.
+
+  That answers the three questions at once. (a) Yes: your own rank needs no
+  permission. (b) Yes: a child is yours, and a supervision tree has to be
+  able to promote a child it is starving. (c) Yes, but behind the capability
+  — and the DoS worry that opened this entry is already answered by the
+  existing rule: a process that can `kill` a group-mate can already starve
+  it, so a demote adds no power the same-tree rule does not hand out. The
+  Unix-style "you may only lower your own priority" was considered and
+  rejected: it would introduce a **second kind of gate** (direction, not
+  reach) to a system that has exactly one, and it would have been the first
+  place the project used it.
+
+  **Two doors, one log vocabulary.** The operator's door was already there
+  (`Kernel.setNice()`, the transport's `renice` command, the window's
+  优先级 button); the agent's door is the syscall. Both write the same
+  `__sched:renice` frame — and the frame now says **who** moved the rank:
+  `operator` or `agent:<pid>`. A frame that says "the rank moved" without
+  saying who moved it is a fact without an explanation, and now that two
+  actors can do it, the explanation is missing from the frame that used to
+  be complete. The request and the effect stay in two different logs, as
+  with `kill` and the `__signal` frame it causes: the caller's log carries
+  the `renice` syscall like any other, the target's log carries the effect.
+
+  **The version moved to `1.1.0`**, additively: a new syscall, a new
+  capability, and one additive field on an existing frame. Nothing was
+  removed, renamed or redefined, so an agent written against `1.0.0` still
+  runs — it just does not know it can move a rank. The drivers declare
+  `abiCompat: '^1.0.0'`, and `^1.0.0` still matches `1.1.0`, so no driver
+  had to change.
+
+  **Verified by running it, not by reading it.** Seven smoke assertions
+  (own rank / the log says who / a child's rank / a stranger is `EPERM`
+  without the capability / the capability lets it through / a rank outside
+  the kernel's range is `EINVAL` / the ABI's list and version), each
+  reverse-verified by breaking the code it claims to cover — eight
+  reversals, all of them caught by the assertion that was supposed to catch
+  them. The two reach assertions deliberately run with the capability
+  **narrowed away**, because a default process holds everything: without
+  that, "your own tree is yours" would have passed for the wrong reason.
+  And the real run: `cortex renice 2 --nice -7` against a live kernel
+  prints `pid 2 (listener): nice 0 -> -7` and leaves
+  `__sched:renice(0->-7 by operator)` in the trace; an agent that moves its
+  own rank leaves `__sched:renice(0->-7 by agent:3)` in its own log, and
+  `cortex ps` reads `-7` for it.
 
 - [x] **#120** The window's state breakdown dropped the states it did not name →
   **fixed.**

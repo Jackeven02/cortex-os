@@ -32,6 +32,16 @@ function longest(values: readonly string[]): number {
 }
 
 /**
+ * How wide the pid column is — seven characters, which is the widest pid the
+ * table accounts for.
+ *
+ * It is here because **two** things depend on it: the column itself, and the
+ * actor a `__sched:renice` frame names (`agent:<pid>`), which is a pid too.
+ * One number, so the two cannot drift apart.
+ */
+const TRACE_PID_WIDTH = 7;
+
+/**
  * How wide the syscall column has to be so that **no** frame name the naming
  * rule can produce is ever cut short.
  *
@@ -72,15 +82,18 @@ export const TRACE_SYSCALL_WIDTH = Math.max(
   '__sched:'.length + 'sigxcpu'.length + '('.length + longest(BUDGET_KINDS) + ')'.length,
   '__sched:'.length + 'blocked'.length + '('.length + longest(BLOCKED_KINDS) + ')'.length,
   '__sched:'.length + 'exited'.length + '('.length + longest(DISPATCH_EXITS) + ')'.length,
-  // `__sched:renice(<from>-><nice>)` — two ranks, both of which can be the
-  // widest the kernel holds, so the width is derived from the range rather
-  // than from the numbers that happened to be in a log.
+  // `__sched:renice(<from>-><nice> by <who>)` — two ranks, both of which can be
+  // the widest the kernel holds, so the width is derived from the range rather
+  // than from the numbers that happened to be in a log; and the actor, which
+  // is either the operator or an agent's pid — bounded by the pid column.
   '__sched:'.length +
     'renice'.length +
     '('.length +
     String(NICE_MIN).length +
     '->'.length +
     String(NICE_MAX).length +
+    ' by '.length +
+    Math.max('operator'.length, 'agent:'.length + TRACE_PID_WIDTH) +
     ')'.length,
 );
 
@@ -126,7 +139,7 @@ export const TRACE_SPEND_WIDTH =
  */
 const TRACE_COLUMNS: readonly Column[] = [
   { header: 'time', width: 12, gap: 2 },
-  { header: 'pid', width: 7, gap: 1 },
+  { header: 'pid', width: TRACE_PID_WIDTH, gap: 1 },
   { header: 'syscall', width: TRACE_SYSCALL_WIDTH, gap: 1 },
   { header: 'phase', width: 6, gap: 1 },
   { header: 'duration', width: 10, gap: 1 },

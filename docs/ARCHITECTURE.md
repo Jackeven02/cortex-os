@@ -371,11 +371,17 @@ has said so since the rank was introduced ("so a future `renice` is honoured
 without re-queueing"); the verb is what it was waiting for.
 
 `setNice` is the **operator's** verb and it lives on the host's side of the
-kernel — `Kernel.setNice()` and the transport's `renice` command — rather than
-as a syscall, so the frozen ABI did not move (ABI.md §11). It changes the
+kernel — `Kernel.setNice()` and the transport's `renice` command. It changes the
 table's number and writes a `__sched` frame with the action `renice`, because
 the rank already has a history in that log and a change to it belongs beside
 that history (PROCESS.md §8.1).
+
+**And since `1.1.0` the agent has a door to the same scheduler.** The
+`renice` syscall (ABI.md §4.10) is gated by the same reach rule `kill` and
+`send` use — your own tree is yours, a stranger needs the `renice` capability
+(ABI.md §4.9) — and it writes the same `__sched` frame, with the **actor**
+added: `operator` for the host's door, `agent:<pid>` for the agent's. That is
+what moved the ABI, additively, to `1.1.0` (ABI.md §11).
 
 **And the operator's window can reach it.** The verb existed, and the window
 showed every process's rank in a column, and the operator still had to leave
@@ -1077,14 +1083,17 @@ it and start it again.
 
 The kernel was already ready. The scheduler reads `nice` **live** at selection
 time, so a changed rank takes effect at the next dispatch and the run queue
-is never rebuilt; the verb was the missing piece. Like `limit`, it is the
-operator's own — a host-side command (`Kernel.setNice()` and the transport's
-`renice`), not a syscall, so the frozen ABI did not move (ABI.md §11).
+is never rebuilt; the verb was the missing piece. Like `limit`, the command
+itself is the operator's own — a host-side command (`Kernel.setNice()` and the
+transport's `renice`) — and it did not move the ABI when it landed. The *agent's*
+door to the same queue did, in `1.1.0`: the `renice` syscall (ABI.md §4.10),
+which is additive (ABI.md §11).
 
 It is recorded, and that is the difference from `limit`: the **rank** already
 has a history in the process's log (the scheduler writes it on every yield),
 so a change to it belongs beside that history — a `__sched` frame with the
-action `renice`, carrying the rank it came from and the rank it went to. A
+action `renice`, carrying the rank it came from and the rank it went to, and
+who asked for it. A
 **budget** is the opposite case: the ABI leaves budgets out of the log on
 purpose, so changing one starts no history and leaves none. A rank that did
 not move records nothing.

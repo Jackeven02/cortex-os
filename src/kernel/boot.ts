@@ -1152,14 +1152,18 @@ export class Kernel {
    * and one that was hogging the queue could not be pushed back — the only
    * way to change a running process's rank was to kill it and start it again.
    *
-   * ## Why it is the host's verb and not a syscall
+   * ## Why the host has its own door
    *
-   * The need is the **operator's**, and the host is where an operator acts.
-   * Whether an *agent* may move another process's rank is a different
-   * question — a capability question, and one that has an answer only if the
-   * capability system is asked (docs/ABI.md §4.9). This method is the host's
-   * side of the kernel, which is not part of the frozen contract (ABI.md
-   * §11), so adding it moves neither `KERNEL_ABI_VERSION` nor the transport's
+   * The need is the **operator's**, and the host is where an operator acts —
+   * at a shell, or in the operator's window. So the host gets a method that
+   * reaches the same scheduler the agent's syscall does, and the change is
+   * recorded the same way.
+   *
+   * An **agent** has its own door too — the `renice` syscall (docs/ABI.md
+   * §4.10) — gated by the same reach rule `kill` uses: your own tree is
+   * yours, and a stranger needs the `renice` capability. This method is the
+   * host's side of the kernel, so it is not part of the frozen contract
+   * (ABI.md §11) and it moves neither `KERNEL_ABI_VERSION` nor the transport's
    * protocol version.
    *
    * @param pid  The process to move.
@@ -1175,7 +1179,9 @@ export class Kernel {
     nice: number,
   ): Promise<{ readonly nice: number; readonly from: number }> {
     this.#assertBooted('kernel.setNice');
-    return await this.scheduler.setNice(pid, nice);
+    // The host is not a process: it has no PID to name. The frame says
+    // `operator`, so a reader can tell the operator's move from an agent's.
+    return await this.scheduler.setNice(pid, nice, { by: 'operator' });
   }
 
   // ---------------------------------------------------------------------------
@@ -1447,6 +1453,7 @@ export class Kernel {
         throw new ProcessExitSignal(code, reason ?? 'exit');
       },
       kill: (t: ProcessId, s: Signal) => d.invoke(pid, 'kill', t, s),
+      renice: (t: ProcessId, n: number) => d.invoke(pid, 'renice', t, n),
       ps: (f?: ProcessFilter) => d.invoke(pid, 'ps', f),
 
       // §4.2 State management

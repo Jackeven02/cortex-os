@@ -63,8 +63,13 @@ export const VERSION = readPackageVersion();
  * Bumped on every ABI change. Within a major version, recordings are
  * forward-compatible: a kernel of version `1.x.y` can replay any `.crec`
  * written by `1.0.0` or later.
+ *
+ * `1.1.0` added the `renice` syscall and the `renice` capability
+ * (docs/ABI.md §4.10, §4.9). Nothing was removed, renamed or redefined, so
+ * an agent written against `1.0.0` still runs — it just does not know it can
+ * move a rank.
  */
-export const KERNEL_ABI_VERSION = '1.0.0' as const;
+export const KERNEL_ABI_VERSION = '1.1.0' as const;
 
 // Re-export the kernel public surface (types + errors + boot).
 export * from './kernel/index.js';

@@ -276,10 +276,12 @@ npx tsx scripts/smoke.ts                # 916 项断言，0 失败
 
 `1.0.0` 是另一种发布 —— 它**把契约定下来**。ABI 里两条明写「留给 v1」的事，现在做完了：
 
-- **能力系统（§4.9）** —— `acquire` / `release` / `caps`，六个封闭的能力（`spawn`、`kill`、`fork`、`tool:dangerous`、`ipc:any`、`admin`）。一个进程现在可以带着**比内核想给的更少的权限**运行。默认是「全权限」而不是「最小权限」，因为默认最小权限会让所有 1.0 之前的 agent 一升级就撞 `EPERM`；要收窄就在 `spawn` 时显式指定。有两道门是刻意做成「按条件触发」的：杀**自己的**子进程、调用**可逆**工具，永远不需要能力 —— 否则 `kill` 会发给每一个监督者，那它就什么也不意味着了。
+- **能力系统（§4.9）** —— `acquire` / `release` / `caps`，六个封闭的能力（`spawn`、`kill`、`fork`、`tool:dangerous`、`ipc:any`、`admin`；`renice` 在 `1.1.0` 时加入）。一个进程现在可以带着**比内核想给的更少的权限**运行。默认是「全权限」而不是「最小权限」，因为默认最小权限会让所有 1.0 之前的 agent 一升级就撞 `EPERM`；要收窄就在 `spawn` 时显式指定。有两道门是刻意做成「按条件触发」的：杀**自己的**子进程、调用**可逆**工具，永远不需要能力 —— 否则 `kill` 会发给每一个监督者，那它就什么也不意味着了。
 - **显式 channel（§4.5）** —— `channel_open` / `channel_close`。`send` 时的隐式创建为兼容性保留，但它不再是拿到 channel 的唯一方式，channel 名打错也不再会悄悄造出一个没人读的 channel。
 
 syscall 从 19 个变成 24 个。**从此以后**：破坏性变更需要大版本；新增式变更进小版本。见 [ABI.md「ABI status」](./docs/ABI.md)。
+
+**`1.1.0` 是第一次「新增式」推进，而它是宿主自己的命令反复证明的那个缺口。** agent 以前**完全**改不了档位 —— 改不了自己的、改不了孩子的、改不了陌生人的 —— 而运维侧明明有一条干这件事的命令。现在 agent 有了自己的门（`renice` syscall，§4.10），用的是 `kill` 和 `send` 早就用的那套 reach 规则：自己人随便改，别人的档位要新的 `renice` 能力（§4.9）。没有删除、没有改名、没有重新定义，所以按 `1.0.0` 写的 agent 照样跑 —— 它只是以前不知道自己能改档位。现在是 25 个 syscall。
 
 **Phase 0 — 设计（完成）。** 四份文档 v0 落地：`STATE.md`（最难的那份）、`PROCESS.md`（生命周期）、`ABI.md`（syscall 契约）、`ARCHITECTURE.md`（内核模块）。每份文档末尾的 open questions 是有意滚动记录的，会随着实现逼出决定而解决。
 
@@ -481,7 +483,7 @@ __sched:renice(0->-7)
 | [MANIFESTO.md](./MANIFESTO.md) | cortex 为什么存在。先读这个。（[中文](./MANIFESTO.zh-CN.md)） |
 | [docs/STATE.md](./docs/STATE.md) | **最难的部分。** agent state 是什么，fork 时复制什么，什么根本不能复制。（[中文](./docs/STATE.zh-CN.md)） |
 | [docs/PROCESS.md](./docs/PROCESS.md) | agent 生命周期：9 个状态、合法转换表、signals、调度 |
-| [docs/ABI.md](./docs/ABI.md) | syscall 契约：24 个 syscall、3 个 driver 接口、错误模型、记录格式 |
+| [docs/ABI.md](./docs/ABI.md) | syscall 契约：25 个 syscall、3 个 driver 接口、错误模型、记录格式 |
 | [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md) | 将 LangChain 事件和只读 Dashboard 接入现有 Node.js 项目 |
 | [docs/DRIVERS.md](./docs/DRIVERS.md) | 内置 LLM 驱动（mock / deepseek / openai）：选择顺序、环境变量、端点覆盖 |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 内核模块和数据流：12 个模块、syscall 生命周期、持久化布局、并发模型 |

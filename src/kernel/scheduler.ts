@@ -61,6 +61,7 @@ import {
   type BudgetKind,
   type BudgetLimits,
   type ProcessId,
+  type NiceCause,
   type ProcessState,
   type Timestamp,
   unbrand,
@@ -509,7 +510,7 @@ export class Scheduler {
   /**
    * Move a process up or down the queue.
    *
-   * ## Why this is here, and not a syscall
+   * ## Why this is here
    *
    * The rank a process runs at is the scheduler's own fact, and the scheduler
    * reads it **live**: `#selectNext` compares `entry.nice` at the moment it
@@ -517,25 +518,29 @@ export class Scheduler {
    * queue does not have to be rebuilt. The kernel was already ready for this;
    * what was missing was a way to ask.
    *
-   * The way to ask is the **operator's**, not the agent's. An agent that has
-   * been running an hour at the default cannot be promoted by the operator, and
-   * one that is hogging the queue cannot be pushed back — so the verb belongs
-   * to the host (docs/ABI.md §11: the host's side of the kernel is not the
-   * frozen contract). Whether an *agent* may move another process's rank is a
-   * different question, and a capability question; it is not answered here.
+   * There are **two** doors now, and both end here. The **operator's** is the
+   * host method `Kernel.setNice()` and the transport's `renice` command; the
+   * **agent's** is the `renice` syscall (docs/ABI.md §4.10). The agent's door
+   * is gated by the same reach rule `kill` uses: your own tree is yours, and a
+   * stranger needs the `renice` capability.
    *
    * ## What is recorded
    *
    * A `__sched` frame with the action `renice`, carrying the rank it was at
-   * and the rank it now has. The rank is a fact the process's log otherwise
-   * only shows at the moments the scheduler happened to write one — and the
-   * exit record says the rank it *finished* at. Without this frame, a reader
-   * could hold a log that says `-7` and a record that says `5`, with nothing
-   * in between to say which changed first.
+   * and the rank it now has — and **who asked for it**. The rank is a fact the
+   * process's log otherwise only shows at the moments the scheduler happened
+   * to write one — and the exit record says the rank it *finished* at. Without
+   * this frame, a reader could hold a log that says `-7` and a record that
+   * says `5`, with nothing in between to say which changed first. And now that
+   * two different actors can move a rank, a frame that says "the rank moved"
+   * without saying who moved it is a fact without an explanation.
    *
    * @param pid  The process to move.
    * @param nice The rank to move it to: the kernel's `nice`, -20..19, and
    *              **lower runs first**.
+   * @param opts `by` names the actor: the operator, or the agent that asked.
+   *              It is **required** — a rank that moved without saying who
+   *              moved it is a fact without an explanation.
    *
    * @returns The rank the process now runs at, and the one it was at.
    *
@@ -546,6 +551,7 @@ export class Scheduler {
   async setNice(
     pid: ProcessId,
     nice: number,
+    opts: { readonly by: NiceCause },
   ): Promise<{ readonly nice: number; readonly from: number }> {
     if (!isValidNice(nice)) {
       trap('EINVAL', 'setNice', {
@@ -575,7 +581,7 @@ export class Scheduler {
     }
 
     this.#table.setNice(pid, nice);
-    await this.#recordSched(pid, 'renice', { nice, from });
+    await this.#recordSched(pid, 'renice', { nice, from, by: opts.by });
     return { nice, from };
   }
 

@@ -548,14 +548,18 @@ the next dispatch and the run queue is never rebuilt. `cortex renice <pid>
 *running* process has. A process that has finished keeps the rank it ran at
 (in its record), but there is nothing left to move.
 
-The verb is the **operator's**, not the agent's. It is a host-side command —
-`Kernel.setNice()` and the transport's `renice` — and not a syscall, so the
-frozen ABI did not move (docs/ABI.md §11). Whether an *agent* may move
-another process's rank is a different question and a capability question;
-that one is open (BACKLOG #126).
+The verb is the **operator's** — `Kernel.setNice()` and the transport's
+`renice` — and for a long time it was the *only* one there was: an agent could
+not move a rank at all, not its own and not its child's. Since `1.1.0` the agent
+has its own door, the `renice` syscall (docs/ABI.md §4.10), under the same reach
+rule `kill` and `send` use: its own tree is its own, and a stranger's rank
+needs the `renice` capability. That is why the ABI moved — additively, from
+`1.0.0` to `1.1.0` (docs/ABI.md §11).
 
 The change is recorded in the process's own log, as a `__sched` frame with
-the action `renice` and the rank it came from and the rank it went to. The
+the action `renice` and the rank it came from and the rank it went to — and,
+now that two actors can move a rank, **who** moved it: `operator` for the
+host's door, `agent:<pid>` for the agent's. The
 rank already has a history in that log — the scheduler writes it on every
 yield — so a change to it belongs beside that history. Without the frame, a
 reader could hold a log that says `-7` and an exit record that says `5`, with

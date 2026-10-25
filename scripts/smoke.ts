@@ -229,7 +229,7 @@ import {
   type JsonRpcResponse,
 } from '../src/drivers/tool/mcp.js';
 
-import { CAPABILITIES, NICE_MAX, NICE_MIN, type ToolInvokeContext, type Capability } from '../src/kernel/types.js';
+import { CAPABILITIES, NICE_MAX, NICE_MIN, type ToolInvokeContext, type Capability, type PersistedProcessMeta } from '../src/kernel/types.js';
 
 import {
   diffRecords,
@@ -4549,7 +4549,7 @@ async function runSchedulerChecks(): Promise<void> {
     );
 
     // The operator promotes the one that was going second.
-    const moved = await sched.setNice(b, -7);
+    const moved = await sched.setNice(b, -7, { by: 'operator' });
     assert(
       moved.nice === -7 && moved.from === 0,
       `the move is reported, got ${JSON.stringify(moved)}`,
@@ -4576,7 +4576,7 @@ async function runSchedulerChecks(): Promise<void> {
     const { sched } = makeSched(table);
     let errno = '';
     try {
-      await sched.setNice(pid, 99);
+      await sched.setNice(pid, 99, { by: 'operator' });
     } catch (err) {
       errno = isCortexError(err) ? err.errno : String(err);
     }
@@ -4596,7 +4596,7 @@ async function runSchedulerChecks(): Promise<void> {
     const { sched } = makeSched(table);
     let errno = '';
     try {
-      await sched.setNice(pid, -7);
+      await sched.setNice(pid, -7, { by: 'operator' });
     } catch (err) {
       errno = isCortexError(err) ? err.errno : String(err);
     }
@@ -4613,7 +4613,7 @@ async function runSchedulerChecks(): Promise<void> {
     const table = await makeTable({ record: true, dir: sub });
     const pid = await spawn(table, { role: 'moved' });
     const { sched } = makeSched(table);
-    await sched.setNice(pid, -7);
+    await sched.setNice(pid, -7, { by: 'operator' });
 
     const rec = table.recorderFor(pid)!;
     await rec.flush();
@@ -4621,17 +4621,18 @@ async function runSchedulerChecks(): Promise<void> {
     for await (const r of readRecords(rec.path)) records.push(r);
     const renice = records.find((r) => (r.args as { action?: string }).action === 'renice');
     assert(renice !== undefined, 'a __sched renice record exists');
-    const args = renice!.args as { nice?: number; from?: number };
+    const args = renice!.args as { nice?: number; from?: number; by?: string };
     assert(args.nice === -7, `the frame carries the new rank, got ${String(args.nice)}`);
     assert(args.from === 0, `the frame carries the old rank, got ${String(args.from)}`);
+    assert(args.by === 'operator', `the frame carries who moved it, got ${String(args.by)}`);
     assert(
-      frameName(renice!) === '__sched:renice(0->-7)',
+      frameName(renice!) === '__sched:renice(0->-7 by operator)',
       `the frame is named after what happened, got ${frameName(renice!)}`,
     );
 
     // And nothing is recorded when the rank did not move: a frame that says
     // "the rank moved" when it did not is a frame nobody can act on.
-    await sched.setNice(pid, -7);
+    await sched.setNice(pid, -7, { by: 'operator' });
     const rec2 = table.recorderFor(pid)!;
     await rec2.flush();
     const after: SyscallRecord[] = [];
@@ -4879,6 +4880,261 @@ async function runSchedulerChecks(): Promise<void> {
     }
   }
   await rm(tmp, { recursive: true, force: true });
+}
+
+/**
+ * The `renice` syscall — an agent moving a process up or down the queue
+ * (docs/ABI.md §4.10, BACKLOG #126).
+ *
+ * The verb existed for the **operator** (BACKLOG #125: `cortex renice`), and
+ * the operator's window could press it (BACKLOG #127) — but an **agent** had
+ * no way to move a rank at all: not its own, not its child's, not a
+ * stranger's.
+ *
+ * The reach rule is the one `kill` and `send` already use: your own tree is
+ * yours — yourself, your descendants, your own process group — and reaching
+ * *across* the tree needs the `renice` capability.
+ */
+async function runReniceSyscallChecks(): Promise<void> {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-renice-syscall-'));
+
+  /** The kernel's own exit records — the kernel's facts, not the agent's. */
+  const exits = new Map<number, PersistedProcessMeta>();
+
+  const kernel = await bootKernel({
+    kernelAbiVersion: KERNEL_ABI_VERSION,
+    dir: tmp,
+    autoStart: true,
+    loadDrivers: (reg) => {
+      reg.registerMemory(inmemMemory());
+    },
+    onProcessExit: (meta) => {
+      exits.set(meta.pid, meta);
+    },
+    // One loader serves every case: what the agent does is decided by the
+    // spec's args, so the test never has to write an agent module.
+    agentLoader: async () => async (ctx, args) => {
+      const mode = typeof args['mode'] === 'string' ? args['mode'] : 'alive';
+      if (mode === 'alive') {
+        await ctx.recv();
+        return;
+      }
+      if (mode === 'self') {
+        await ctx.renice(ctx.pid, -7);
+        return;
+      }
+      if (mode === 'child') {
+        const child = await ctx.spawn({
+          role: 'renice-child',
+          agent: { module: 'test:renice', args: { mode: 'alive' } },
+        });
+        await ctx.renice(child.pid, -7);
+        return;
+      }
+      if (mode === 'stranger') {
+        // The target is named by pid, not by role: two cases in this group each
+        // have a stranger, and a role lookup finds whichever came first — which
+        // is how a test ends up moving the wrong process and asserting on it.
+        const raw = typeof args['targetPid'] === 'number' ? args['targetPid'] : undefined;
+        if (raw === undefined) throw new Error('no target to move');
+        await ctx.renice(asProcessId(raw), -7);
+        return;
+      }
+      if (mode === 'range') {
+        await ctx.renice(ctx.pid, 99);
+        return;
+      }
+      await ctx.recv();
+    },
+  });
+
+  /** Read a process's log off disk. */
+  const readLog = async (pid: number): Promise<SyscallRecord[]> => {
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(existingCrecPath(tmp, asProcessId(pid)))) records.push(r);
+    return records;
+  };
+
+  /** The frame a `renice` call ended in — an answer, or a refusal. */
+  const reniceFrame = (
+    records: readonly SyscallRecord[],
+    phase: 'exit' | 'trap',
+  ): SyscallRecord | undefined =>
+    records.find((r) => r.syscall === 'renice' && r.phase === phase);
+
+  try {
+    await checkAsync('an agent can move its own rank', async () => {
+      // Its own rank is a fact about itself, and the kernel reads the rank
+      // live — so the move lands at the next dispatch.
+      //
+      // The process holds **no** capability at all. That is the point: your own
+      // rank is yours, and a permission that were needed here would be a
+      // permission handed to every leaf in the tree.
+      const pid = unbrand(
+        await kernel.spawn({
+          role: 'self-mover',
+          agent: { module: 'test:renice', args: { mode: 'self' } },
+          capabilities: [],
+        }),
+      );
+      await kernel.awaitExit(asProcessId(pid), { timeoutMs: 5000 });
+      const exit = exits.get(pid);
+      assert(exit !== undefined, 'the kernel recorded the exit');
+      assert(
+        exit!.nice === -7,
+        `the kernel's own record says the rank it ran at, got ${String(exit!.nice)}`,
+      );
+    });
+
+    await checkAsync('the log says who moved the rank', async () => {
+      // Two frames, in two logs, and they answer two questions. The caller's
+      // own log carries the **request** — the `renice` syscall, recorded like
+      // any other — and the `__sched:renice` frame carries the **effect**:
+      // the ranks it came from and went to, and who asked.
+      //
+      // The who matters now that two different actors can move a rank: the
+      // operator and an agent. A frame that says "the rank moved" without
+      // saying who moved it is a fact without an explanation.
+      const pid = unbrand(
+        await kernel.spawn({
+          role: 'logged-mover',
+          agent: { module: 'test:renice', args: { mode: 'self' } },
+        }),
+      );
+      await kernel.awaitExit(asProcessId(pid), { timeoutMs: 5000 });
+      await kernel.table.flushAll();
+      const records = await readLog(pid);
+      const request = reniceFrame(records, 'exit');
+      assert(request !== undefined, 'the renice call is recorded like any other syscall');
+      const effect = records.find((r) => (r.args as { action?: string }).action === 'renice');
+      assert(effect !== undefined, 'the change itself is recorded');
+      const args = effect!.args as { nice?: number; from?: number; by?: string };
+      assert(args.by === `agent:${pid}`, `the frame carries who moved it, got ${String(args.by)}`);
+      assert(
+        frameName(effect!) === `__sched:renice(0->-7 by agent:${pid})`,
+        `the frame is named after what happened, got ${frameName(effect!)}`,
+      );
+    });
+
+    await checkAsync("an agent can move its child's rank", async () => {
+      // A child is the caller's own: the parent chose the rank at spawn, so
+      // the parent may change it. No capability needed — the same reach `kill`
+      // has, and for the same reason.
+      //
+      // The parent holds `spawn` (it built the tree) and **not** `renice`: the
+      // move must be allowed because the child is its own, not because the
+      // parent happened to be privileged.
+      const pid = unbrand(
+        await kernel.spawn({
+          role: 'parent-mover',
+          agent: { module: 'test:renice', args: { mode: 'child' } },
+          capabilities: ['spawn'],
+        }),
+      );
+      await kernel.awaitExit(asProcessId(pid), { timeoutMs: 5000 });
+      const child = kernel.table.list().find((p) => p.role === 'renice-child');
+      assert(child !== undefined, 'the child is in the table');
+      assert(child!.nice === -7, `the kernel's table holds the new rank, got ${child!.nice}`);
+    });
+
+    await checkAsync("an agent cannot move a stranger's rank", async () => {
+      // The outsider is in its own process group and is nobody's descendant,
+      // so reaching it is reaching *across* the tree — which is what the
+      // capability governs. The mover holds no capability at all: an unnarrowed
+      // process holds everything, so "narrowed to nothing" is the only way to
+      // say "you may not reach across the tree".
+      const outsider = unbrand(
+        await kernel.spawn({
+          role: 'outsider-refused',
+          agent: { module: 'test:renice', args: { mode: 'alive' } },
+          group: asProcessId(4242),
+        }),
+      );
+      const pid = unbrand(
+        await kernel.spawn({
+          role: 'stranger-mover',
+          agent: { module: 'test:renice', args: { mode: 'stranger', targetPid: outsider } },
+          capabilities: [],
+        }),
+      );
+      await kernel.awaitExit(asProcessId(pid), { timeoutMs: 5000 });
+      await kernel.table.flushAll();
+      const records = await readLog(pid);
+      const trap = reniceFrame(records, 'trap');
+      assert(trap !== undefined, 'the refused call is recorded as a trap');
+      assert(
+        trap!.error?.errno === 'EPERM',
+        `the refusal says EPERM, got ${String(trap!.error?.errno)}`,
+      );
+      assert(
+        kernel.table.get(asProcessId(outsider))?.nice === 0,
+        `the stranger's rank is untouched, got ${String(kernel.table.get(asProcessId(outsider))?.nice)}`,
+      );
+    });
+
+    await checkAsync('the renice capability lets an agent move a stranger\'s rank', async () => {
+      // The same call, with the capability that says "you may reach across
+      // the tree". And only that capability — the process holds nothing else.
+      const outsider = unbrand(
+        await kernel.spawn({
+          role: 'outsider-capable',
+          agent: { module: 'test:renice', args: { mode: 'alive' } },
+          group: asProcessId(4343),
+        }),
+      );
+      const pid = unbrand(
+        await kernel.spawn({
+          role: 'capable-mover',
+          agent: { module: 'test:renice', args: { mode: 'stranger', targetPid: outsider } },
+          capabilities: ['renice'],
+        }),
+      );
+      await kernel.awaitExit(asProcessId(pid), { timeoutMs: 5000 });
+      assert(
+        kernel.table.get(asProcessId(outsider))?.nice === -7,
+        `the kernel's table holds the new rank, got ${String(kernel.table.get(asProcessId(outsider))?.nice)}`,
+      );
+    });
+
+    await checkAsync("a rank outside the kernel's range is refused", async () => {
+      // The range is the kernel's own (-20..19), and the kernel is the one
+      // that has to hold it — so the syscall refuses it, exactly as the
+      // operator's command does.
+      const pid = unbrand(
+        await kernel.spawn({
+          role: 'greedy-mover',
+          agent: { module: 'test:renice', args: { mode: 'range' } },
+        }),
+      );
+      await kernel.awaitExit(asProcessId(pid), { timeoutMs: 5000 });
+      await kernel.table.flushAll();
+      const records = await readLog(pid);
+      const trap = reniceFrame(records, 'trap');
+      assert(trap !== undefined, 'the refused call is recorded as a trap');
+      assert(
+        trap!.error?.errno === 'EINVAL',
+        `the refusal says EINVAL, got ${String(trap!.error?.errno)}`,
+      );
+      const exit = exits.get(pid);
+      assert(exit?.nice === 0, `the rank did not change, got ${String(exit?.nice)}`);
+    });
+
+    await checkAsync('the ABI carries the renice syscall and its capability', async () => {
+      // The syscall is in the ABI's list, the capability is in the ABI's list,
+      // and the version moved — because the agent surface moved. `1.1.0` is
+      // additive: nothing was removed, renamed or redefined, so an agent
+      // written against `1.0.0` still runs.
+      assert(SYSCALL_NAMES.includes('renice'), "the syscall is in the ABI's list");
+      assert(CAPABILITIES.includes('renice'), "the capability is in the ABI's list");
+      assert(KERNEL_ABI_VERSION === '1.1.0', `the ABI version moved, got ${KERNEL_ABI_VERSION}`);
+    });
+  } finally {
+    await kernel.shutdown();
+    rmSync(tmp, { recursive: true, force: true });
+  }
 }
 
 async function runInitChecks(): Promise<void> {
@@ -5777,18 +6033,20 @@ async function runDispatcherChecks(): Promise<void> {
 
   // --- constants / policy tables -------------------------------------------
 
-  check('dispatcher exports 24 syscall names, no duplicates', () => {
-    assert(SYSCALL_NAMES.length === 24, `expected 24 syscalls, got ${SYSCALL_NAMES.length}`);
+  check('dispatcher exports 25 syscall names, no duplicates', () => {
+    assert(SYSCALL_NAMES.length === 25, `expected 25 syscalls, got ${SYSCALL_NAMES.length}`);
     const uniq = new Set(SYSCALL_NAMES);
     assert(uniq.size === SYSCALL_NAMES.length, 'duplicate syscall names');
     // The v1 promises from docs/ABI.md §9: capabilities (§9.2) and the
-    // explicit channel lifecycle (§9.3).
+    // explicit channel lifecycle (§9.3). And the one `1.1.0` added: the
+    // agent's door to the scheduler (§4.10).
     for (const s of [
       'acquire',
       'release',
       'caps',
       'channel_open',
       'channel_close',
+      'renice',
     ] as const) {
       assert(SYSCALL_NAMES.includes(s), `missing syscall '${s}'`);
     }
@@ -25088,6 +25346,7 @@ await runMemoryChecks();
 await runCheckpointChecks();
 await runForkChecks();
 await runSchedulerChecks();
+await runReniceSyscallChecks();
 await runInitChecks();
 await runDispatcherChecks();
 await runDriverRegistryChecks();

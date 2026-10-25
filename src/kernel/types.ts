@@ -466,6 +466,42 @@ export function isValidNice(value: unknown): value is number {
 }
 
 /**
+ * What a rank change did.
+ *
+ * `from` is the rank the process was at and `nice` the one it runs at now —
+ * read back from the process table, so the answer is what the kernel did and
+ * not what was asked for. When the two are the same, the move changed
+ * nothing: the rank is still reported, because "it is already there" is an
+ * answer too.
+ *
+ * See: docs/ABI.md §4.10, docs/PROCESS.md §8.1
+ */
+export interface NiceChange {
+  /** The process that was moved. */
+  readonly pid: ProcessId;
+  /** The rank it runs at now. */
+  readonly nice: number;
+  /** The rank it ran at before. */
+  readonly from: number;
+}
+
+/**
+ * Who asked for a rank change.
+ *
+ * `operator` is the **host** — a person at a shell or in the operator's
+ * window, outside the process tree, so it has no PID to name. `agent:<pid>`
+ * names the process that called the `renice` syscall.
+ *
+ * The cause travels with the change because a rank that moved without saying
+ * who moved it is a fact without an explanation — and now that an *agent* can
+ * move a rank as well as the operator, there are two answers to "who did
+ * this" and the log has to carry one of them.
+ *
+ * See: docs/ABI.md §6.1
+ */
+export type NiceCause = 'operator' | `agent:${number}`;
+
+/**
  * Snapshot of a process's state, returned by `ps()`. Read-only.
  *
  * See: docs/PROCESS.md §10
@@ -711,6 +747,12 @@ export interface SpawnOptions {
  *                       your own group always works; this governs reaching
  *                       *across* the tree, which is what makes one agent able
  *                       to disrupt another's work.
+ * - `renice`          — change the rank of a process that is neither your
+ *                       descendant nor in your process group. Same reach as
+ *                       `kill`, and for the same reason: a tree may discipline
+ *                       itself without a permission, and the permission governs
+ *                       reaching *across* the tree. Moving your own process up
+ *                       or down the queue always works.
  * - `fork`            — cognitive fork (docs/STATE.md §3.1). Gated because a
  *                       fork duplicates the process's world and is the most
  *                       expensive thing an agent can ask for.
@@ -729,6 +771,7 @@ export interface SpawnOptions {
 export type Capability =
   | 'spawn'
   | 'kill'
+  | 'renice'
   | 'fork'
   | 'tool:dangerous'
   | 'ipc:any'
@@ -738,6 +781,7 @@ export type Capability =
 export const CAPABILITIES: readonly Capability[] = Object.freeze([
   'spawn',
   'kill',
+  'renice',
   'fork',
   'tool:dangerous',
   'ipc:any',
@@ -1211,7 +1255,7 @@ export interface SyscallRecord {
  * The entire kernel surface available to an agent function. There is no
  * other way to talk to the kernel.
  *
- * Twenty-two syscalls plus four identity properties plus `forkable()` as a
+ * Twenty-five syscalls plus four identity properties plus `forkable()` as a
  * structured wrapper around reversibility enforcement.
  *
  * See: docs/ABI.md §2.1, §8
@@ -1337,6 +1381,30 @@ export interface CortexContext {
    * (docs/ABI.md §4.8: readable introspection is derivable, like `budget`).
    */
   caps(): readonly Capability[];
+
+  // ---------------------------------------------------------------------------
+  // §4.10 Scheduling
+  // ---------------------------------------------------------------------------
+  /**
+   * Move a running process up or down the scheduler's queue.
+   *
+   * The rank is the kernel's `nice` (-20..19, **lower runs first**), and the
+   * scheduler reads it **live** — so a changed rank takes effect at the next
+   * dispatch and the run queue is never rebuilt.
+   *
+   * Moving **your own** process always works. Moving a descendant or a
+   * member of your own process group always works too — the same reach
+   * `kill` has, and for the same reason: a tree may discipline itself without
+   * a permission. Moving a **stranger's** process needs the `renice`
+   * capability; without it the call traps `EPERM`.
+   *
+   * A rank outside the kernel's range traps `EINVAL`, and a process that has
+   * already exited cannot be moved at all — a rank on a process that is gone
+   * is a rank nobody runs at.
+   *
+   * See: docs/ABI.md §4.10, docs/PROCESS.md §8.1
+   */
+  renice(pid: ProcessId, nice: number): Promise<NiceChange>;
 
   // ---------------------------------------------------------------------------
   // Forkable regions (docs/STATE.md §5.2)

@@ -90,6 +90,7 @@ import {
   type MemoryEntry,
   type MemoryQuery,
   type MemoryWriteOptions,
+  type NiceChange,
   type PersistedProcessMeta,
   type ProcessFilter,
   type ProcessId,
@@ -149,6 +150,7 @@ export type SyscallName =
   | 'wait'
   | 'exit'
   | 'kill'
+  | 'renice'
   | 'ps'
   | 'fork'
   | 'checkpoint'
@@ -176,6 +178,7 @@ export const SYSCALL_NAMES: readonly SyscallName[] = Object.freeze([
   'wait',
   'exit',
   'kill',
+  'renice',
   'ps',
   'fork',
   'checkpoint',
@@ -209,6 +212,7 @@ export interface SyscallArgs {
   wait: [pid?: ProcessId, opts?: WaitOptions];
   exit: [code: number, reason?: string];
   kill: [pid: ProcessId, signal: Signal];
+  renice: [pid: ProcessId, nice: number];
   ps: [filter?: ProcessFilter];
   fork: [opts?: ForkOptions];
   checkpoint: [opts?: CheckpointOptions];
@@ -237,6 +241,7 @@ export interface SyscallReturn {
   wait: WaitResult;
   exit: never;
   kill: void;
+  renice: NiceChange;
   ps: readonly ProcessInfo[];
   fork: ForkResult;
   checkpoint: { readonly chainId: ChainId };
@@ -286,6 +291,7 @@ export const SYSCALL_ALLOWED_STATES: Readonly<Record<SyscallName, readonly Proce
     wait: ['running'],
     exit: ANY_LIVE_STATE,
     kill: ['running'],
+    renice: ['running'],
     ps: ['running'],
     fork: ['running', 'blocked', 'stopped', 'suspended'],
     checkpoint: ['running', 'blocked', 'stopped'],
@@ -319,6 +325,7 @@ export const SYSCALL_REVERSIBILITY: Readonly<Record<SyscallName, Reversibility>>
   wait: 'idempotent',
   exit: 'irreversible',
   kill: 'reversible',
+  renice: 'reversible',
   ps: 'idempotent',
   fork: 'reversible',
   checkpoint: 'idempotent',
@@ -421,7 +428,7 @@ export const UNRECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName
  * Capability required for a syscall, when the requirement does not depend on
  * the arguments (docs/ABI.md §4.9).
  *
- * Only the unconditional gates live here. Three syscalls gate on *who or what*
+ * Only the unconditional gates live here. Four syscalls gate on *who or what*
  * you are touching rather than on the mere fact of the call, and are checked
  * inside their handlers where the argument is available:
  *
@@ -429,6 +436,11 @@ export const UNRECORDED_SYSCALLS: ReadonlySet<SyscallName> = new Set<SyscallName
  *             and not in your process group. Killing your own children and
  *             your own group is always allowed; that is what makes a
  *             supervision tree work without handing out a capability.
+ * - `renice` → `renice` capability only when the target is not your descendant
+ *             and not in your process group. Same reach, same reason: a tree
+ *             may move its own processes up and down the queue without a
+ *             permission, and the permission governs reaching *across* the
+ *             tree.
  * - `tool_call` → `tool:dangerous` only when the driver tagged the tool
  *             `irreversible` (docs/STATE.md §5.1). Reversible tools stay
  *             callable by an unprivileged leaf.
@@ -1137,6 +1149,8 @@ export class SyscallDispatcher {
         return await this.#exit(pid, args[0] as number, args[1] as string | undefined, callId);
       case 'kill':
         return await this.#kill(pid, args[0] as ProcessId, args[1] as Signal);
+      case 'renice':
+        return await this.#renice(pid, args[0] as ProcessId, args[1] as number);
       case 'ps':
         return this.#ps(pid, args[0] as ProcessFilter | undefined);
       case 'fork':
@@ -1662,6 +1676,40 @@ export class SyscallDispatcher {
       this.#requireCapability(pid, 'kill', 'kill');
     }
     await this.#signals.send(target, signal, pid);
+  }
+
+  /**
+   * Move a running process up or down the scheduler's queue.
+   *
+   * ## The reach rule
+   *
+   * The **same rule `kill` and `send` use**: your own tree is yours. Moving
+   * **your own** process always works, and so does moving a descendant or a
+   * member of your own process group — a supervision tree has to be able to
+   * discipline itself, or the permission would be handed out so widely that it
+   * stopped meaning anything. Moving a **stranger's** process needs the
+   * `renice` capability.
+   *
+   * The kernel refuses the rest of it: a rank outside the kernel's own range
+   * is `EINVAL`, and a process that has already exited cannot be moved at all
+   * — a rank on a process that is gone is a rank nobody runs at.
+   *
+   * The change is recorded in the **target's** own log as a `__sched:renice`
+   * frame carrying who asked for it, beside the ranks it came from and went
+   * to. The caller gets a `renice` frame in its own log, as for every
+   * syscall — the request in one log, the effect in the other, exactly like
+   * `kill` and the `__signal` frame it causes.
+   */
+  async #renice(caller: ProcessId, target: ProcessId, nice: number): Promise<NiceChange> {
+    if (!this.#isKin(caller, target)) {
+      this.#requireCapability(caller, 'renice', 'renice');
+    }
+    const scheduler = this.#scheduler;
+    if (scheduler === null) {
+      trap('EDRIVER', 'renice', { reason: 'scheduler not configured' });
+    }
+    const moved = await scheduler.setNice(target, nice, { by: `agent:${unbrand(caller)}` });
+    return { pid: target, nice: moved.nice, from: moved.from };
   }
 
   #ps(_pid: ProcessId, filter?: ProcessFilter): readonly ProcessInfo[] {

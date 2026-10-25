@@ -42,6 +42,51 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **An agent can move a process's rank — its own, its child's, or a stranger's.**
+  The operator had a verb for this (`cortex renice`, the window's 优先级 button)
+  and an **agent** had none at all: it could not promote the child it was waiting
+  for, could not push back a sibling hogging the queue, and could not even raise
+  or lower **its own** rank. A process's own rank is a fact about itself, the way
+  its budgets are — and the ABI has had a syscall for reading one's own budget
+  (`budget()`) since `1.0`.
+
+  **`ctx.renice(pid, nice)`** is the agent's door (docs/ABI.md §4.10). The
+  **reach rule is the one `kill` and `send` already use**, so no new axis of
+  authority was invented for it: your own tree is yours — yourself, your
+  descendants, your own process group — and reaching **across** the tree needs
+  the new **`renice` capability** (docs/ABI.md §4.9), or the call is `EPERM`. A
+  supervision tree has to be able to promote a child it is starving; if that
+  needed a permission, the permission would have to be handed to every
+  supervisor, and a permission handed to everyone means nothing.
+
+  The **range is the kernel's**: `-20..19`, lower runs first, and a rank outside
+  it is `EINVAL` — the same rule the operator's command follows.
+
+  **Two logs, two questions.** The request lives in the **caller's** log, like
+  any other syscall; the effect lives in the **target's** log, as a
+  `__sched:renice` frame. And the frame now says **who** moved the rank:
+  `operator` for the host's door, `agent:<pid>` for the agent's — because two
+  actors can now do it, and a frame that says "the rank moved" without saying
+  who moved it is a fact without an explanation.
+
+  **The ABI moved to `1.1.0`**, additively: a new syscall, a new capability,
+  one additive field on an existing frame. Nothing was removed, renamed or
+  redefined, so an agent written against `1.0.0` still runs — it just does not
+  know it can move a rank. The drivers declare `abiCompat: '^1.0.0'`, and
+  `^1.0.0` still matches `1.1.0`, so no driver had to change. The transport's
+  protocol version did not move either: the `renice` command was already there.
+
+  Verified by running it: seven smoke assertions, each reverse-verified by
+  breaking the code it covers (eight reversals, all caught by the assertion
+  meant to catch them), and a real run against a live kernel — `cortex renice 2
+  --nice -7` prints `pid 2 (listener): nice 0 -> -7` and leaves
+  `__sched:renice(0->-7 by operator)` in the trace; an agent that moves its own
+  rank leaves `__sched:renice(0->-7 by agent:3)` in its own log, and `cortex ps`
+  reads `-7` for it. And in the window, on the same live kernel: the 优先级
+  column read `-7` and the syscall timeline showed
+  `__sched:renice(0->-7 by operator)` — the same name the terminal prints, with
+  the actor in it and nothing cut off.
+
 - **The window can move a running process up or down the queue.** The dashboard
   could **kill** a process and **restore** one, and it showed every process's
   **优先级** in a column — but it could not act on a rank. An operator who
@@ -85,8 +130,8 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   Measured on a real kernel in a real browser: clicked 优先级 on 进程 2, typed
   `-7`, applied — the dialog said `pid 2 (alpha): nice 0 -> -7`, the 优先级
   column went `0` → `-7`, the kernel's table held `-7`, the process's `.crec`
-  carried `__sched:renice(0->-7)`, and the window's own syscall timeline
-  showed that same frame. The other three rows stayed at `0`.
+  carried `__sched:renice(0->-7 by operator)`, and the window's own syscall
+  timeline showed that same frame. The other three rows stayed at `0`.
 
 - **A running process can be moved up or down the queue.** The kernel ranks
   the processes it dispatches by the kernel's `nice` (-20..19, **lower runs
@@ -107,14 +152,16 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rewritten before the parser sees it.
 
   It is the **operator's** verb, and it is a host-side one — `Kernel.setNice()`
-  and the transport's `renice` command — so the frozen ABI did not move
-  (docs/ABI.md §11): no syscall, no argument, no errno, no `ProcessInfo`
+  and the transport's `renice` command — so by itself it did not move the frozen
+  ABI (docs/ABI.md §11): no syscall, no argument, no errno, no `ProcessInfo`
   field, no `.crec` / `.csnap` format, and no new transport protocol version.
-  An *agent* still cannot move a process's rank; that is an open question and
-  a `1.1.0` conversation (BACKLOG #126).
+  The **agent's** door is a separate question, and it was answered separately
+  (BACKLOG #126): the `renice` syscall, which moved the ABI to `1.1.0`
+  additively.
 
   The change is **recorded**: a `__sched` frame with the action `renice`,
-  carrying the rank it came from and the rank it went to (`__sched:renice(0->-7)`).
+  carrying the rank it came from and the rank it went to, and who asked for it
+  (`__sched:renice(0->-7 by operator)`).
   The rank already has a history in the process's log — the scheduler writes
   it on every yield — so a change to it belongs beside that history; without
   the frame a reader could hold a log that says `-7` and an exit record that

@@ -389,7 +389,7 @@ world; a sub-agent you did not write should not be able to kill your others.
 
 ```ts
 // What do I hold? (synchronous, like budget())
-console.log(ctx.caps());        // ['spawn', 'kill', 'fork', 'tool:dangerous', 'ipc:any', 'admin']
+console.log(ctx.caps());        // ['spawn', 'kill', 'renice', 'fork', 'tool:dangerous', 'ipc:any', 'admin']
 
 // Run unprivileged, escalate for the one operation that needs it.
 await ctx.acquire('kill');      // recorded in .crec, like any other syscall
@@ -403,7 +403,7 @@ cortex spawn --role classifier --task "..." --cap 'tool:dangerous'
 cortex spawn --role coder      --task "..." --cap spawn --grantable kill
 ```
 
-Six capabilities, a closed set: `spawn`, `kill`, `fork`, `tool:dangerous`,
+Seven capabilities, a closed set: `spawn`, `kill`, `renice`, `fork`, `tool:dangerous`,
 `ipc:any`, `admin`. Full list in `ABI.md` §4.9.
 
 Three things worth internalising, because they are where the design is
@@ -413,10 +413,12 @@ non-obvious:
    `--grantable` leaves the agent holding everything — so an agent written before
    1.0 does not start trapping `EPERM` merely because it upgraded. Least privilege
    is **opt-in**: pass `--cap` to narrow.
-2. **`kill`, `ipc:any` and `tool:dangerous` are conditional, not blanket.**
+2. **`kill`, `renice`, `ipc:any` and `tool:dangerous` are conditional, not blanket.**
    Killing your own descendants and your own process group always works — that is
    what makes a supervision tree (recipe 1) expressible without handing out
-   `kill`. The capability governs reaching *across* the tree. Likewise
+   `kill`. Moving your own processes always works too, for the same reason: a
+   supervisor that promotes a child it is starving is disciplining its own tree.
+   The capability governs reaching *across* the tree. Likewise
    `tool:dangerous` is only required for tools tagged `irreversible`; a narrowed
    leaf can still read, compute and call reversible tools.
 3. **`acquire` is recorded.** "When did this agent escalate, and what did it do

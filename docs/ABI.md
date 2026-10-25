@@ -4,7 +4,7 @@
 >
 > **If a behavior is not in this document, it does not exist.**
 
-> ## 🔒 ABI status: **FROZEN** since `1.0.0`
+> ## 🔒 ABI status: **FROZEN** since `1.0.0` — currently `1.1.0` (additive)
 >
 > Before `1.0.0` the ABI was deliberately unsettled: the version line said
 > `0.x`, and a minor bump was allowed to change a syscall, its arguments, or
@@ -25,6 +25,13 @@
 >   `kernel_abi_version`, so a replay engine can tell which contract a log was
 >   written under (§9.6).
 >
+> **Current version: `1.1.0`** — the first additive bump. It adds the
+> `renice` syscall (§4.10) and the `renice` capability (§4.9): an agent can
+> now move a rank in its own tree without a permission, and a rank across the
+> tree with one. Nothing was removed, renamed or redefined, so an agent
+> written against `1.0.0` still runs — it just does not know it can move a
+> rank.
+>
 > The freeze is why `1.0` also had to settle the questions §9 had deferred to
 > "v1" — capabilities (§9.2) and the channel lifecycle (§9.3). Both are in.
 
@@ -36,9 +43,9 @@ Read [`STATE.md`](./STATE.md) and [`PROCESS.md`](./PROCESS.md) first. This docum
 
 Every OS lives or dies by its syscall ABI. POSIX is ~300 syscalls and fifty years of compatibility. Plan 9 fit the whole world into ~30. seL4 fits a verifiable kernel into ~20.
 
-Cortex ships **twenty-four** in 1.0. Not because twenty-four is magic, but because every syscall we add is one more thing every driver, every test, every recording, every replay engine has to handle. Syscalls are forever. We pick carefully.
+Cortex ships **twenty-five** in 1.1. Not because twenty-five is magic, but because every syscall we add is one more thing every driver, every test, every recording, every replay engine has to handle. Syscalls are forever. We pick carefully.
 
-`0.x` shipped nineteen. `1.0` adds five: three for the capability system (§4.9, promised by §9.2) and two for the explicit channel lifecycle (§4.5, promised by §9.3). Nineteen was the number we could defend without having watched anyone use it; twenty-four is the number we can defend after having done so. The freeze means the next one has to be worth a major version.
+`0.x` shipped nineteen. `1.0` adds five: three for the capability system (§4.9, promised by §9.2) and two for the explicit channel lifecycle (§4.5, promised by §9.3). `1.1` adds one: `renice` (§4.10), the agent's door to the scheduler — with the `renice` capability (§4.9) that says who may reach across the tree to use it. Nineteen was the number we could defend without having watched anyone use it; twenty-four is the number we could defend after having done so; twenty-five is the number we could defend because an agent that could not even move its own rank was a gap the operator's own command kept proving. The freeze means the next one has to be worth a major version.
 
 This document is the contract. The kernel implements it. Agents depend on it. Drivers conform to it. The recording format encodes it. If we get it right, third parties can build cortex-compatible tooling without ever talking to us. If we get it wrong, we will spend years apologizing.
 
@@ -70,7 +77,7 @@ The reason: an agent process must be **interruptible**. While `await`-ing an LLM
 
 Multi-word syscalls use `snake_case`: `llm_call`, `tool_call`, `memory_read`, `memory_write`, `on_signal`.
 
-Single-word syscalls use the obvious form: `spawn`, `wait`, `exit`, `kill`, `ps`, `fork`, `checkpoint`, `restore`, `send`, `recv`, `sleep`, `now`, `random`, `budget`.
+Single-word syscalls use the obvious form: `spawn`, `wait`, `exit`, `kill`, `renice`, `ps`, `fork`, `checkpoint`, `restore`, `send`, `recv`, `sleep`, `now`, `random`, `budget`.
 
 This is deliberate. Snake case visually marks the kernel boundary. When you read agent code, you should be able to spot syscalls at a glance. Linters be damned; we will ship an eslint preset that allows it.
 
@@ -150,11 +157,11 @@ Modeled on POSIX where possible. New codes prefixed with `E` and documented here
 | Errno | Meaning | Typical syscalls |
 |---|---|---|
 | `EINVAL` | Invalid argument | all |
-| `ESRCH` | No such process | `kill`, `wait`, `send` |
+| `ESRCH` | No such process | `kill`, `renice`, `wait`, `send` |
 | `ENOENT` | No such entity (memory region, channel, snapshot) | `memory_read`, `recv`, `restore` |
 | `EAGAIN` | Resource temporarily unavailable; retry | `recv` (non-blocking), `spawn` (PID exhaustion — should never happen) |
 | `EINTR` | Syscall interrupted by signal | any blocking syscall |
-| `EPERM` | Permission denied | `kill` (cross-group), `memory_write` (read-only region), driver-internal |
+| `EPERM` | Permission denied | `kill` (cross-group), `renice` (cross-tree), `memory_write` (read-only region), driver-internal |
 | `ETIMEDOUT` | Driver or kernel timeout | `llm_call`, `tool_call`, `recv` |
 | `ENOMEM` | Memory region full or budget exhausted | `memory_write` |
 | `EBADF` | Bad channel/file descriptor | `send`, `recv` |
@@ -177,7 +184,7 @@ The distinction matters for replay. Traps are deterministic. Return-with-errors 
 
 ## 4. The syscalls
 
-Nineteen syscalls, grouped by purpose.
+Twenty-five syscalls, grouped by purpose.
 
 ### 4.1 Process control
 
@@ -619,6 +626,7 @@ Three syscalls that let a process run with **less** authority than the kernel wo
 export type Capability =
   | 'spawn'           // create child processes
   | 'kill'            // signal a process that is not yours
+  | 'renice'          // move a process that is not yours
   | 'fork'            // cognitive fork
   | 'tool:dangerous'  // call a tool tagged `irreversible`
   | 'ipc:any'         // send to a process that is not yours
@@ -692,12 +700,13 @@ out. See docs/ARCHITECTURE.md §7.
 |---|---|---|
 | `spawn` | creating any child process | — |
 | `kill` | signalling a process that is not your descendant and not in your group | **killing your own children** |
+| `renice` | moving a process that is not your descendant and not in your group | **moving your own processes** |
 | `fork` | cognitive fork | — |
 | `tool:dangerous` | calling a tool the driver tagged `irreversible` | every reversible tool |
 | `ipc:any` | `send` to a process that is not yours | your children, your group, any channel |
 | `admin` | lets `acquire` ignore the grantable pool | — |
 
-The "not required for" column is the design. A supervision tree kills the child that missed its deadline — if that needed `kill`, the capability would be handed out so widely that it would stop meaning anything. The capability governs reaching *across* the tree, not disciplining your own. Likewise a narrowed leaf can still read, compute and call reversible tools; it is structurally unable to touch the outside world.
+The "not required for" column is the design. A supervision tree kills the child that missed its deadline — if that needed `kill`, the capability would be handed out so widely that it would stop meaning anything. The capability governs reaching *across* the tree, not disciplining your own. `renice` is the same case: a supervisor that promotes a child it is starving, or pushes back one that is hogging the queue, is disciplining its own tree — and the permission would have to be handed to every supervisor to allow it, which is exactly when a permission stops meaning anything. Likewise a narrowed leaf can still read, compute and call reversible tools; it is structurally unable to touch the outside world.
 
 #### `acquire(cap: Capability): Promise<void>`
 
@@ -723,6 +732,55 @@ Drop `cap`. Never fails, including for a capability the process never held: givi
 #### `caps(): readonly Capability[]`
 
 The capabilities this process currently holds. Synchronous and unrecorded, like `budget()` (§4.8) — readable introspection is derivable.
+
+### 4.10 Scheduling
+
+The rank a process runs at is the scheduler's own fact, and the scheduler reads it
+**live**: it compares the rank at the moment it picks the next runnable process,
+so a changed rank takes effect at the next dispatch and the run queue does not
+have to be rebuilt. The operator has always been able to change it (`cortex
+renice`, the window's control — docs/PROCESS.md §8.1); `1.1.0` gave the **agent**
+a door too.
+
+#### `renice(pid: ProcessId, nice: number): Promise<NiceChange>`
+
+Move a running process up or down the queue.
+
+```typescript
+interface NiceChange {
+  readonly pid: ProcessId;
+  readonly nice: number;   // the rank it runs at now
+  readonly from: number;   // the rank it was at
+}
+```
+
+- **Allowed states:** RUNNING (the caller)
+- **Returns:** the new rank and the rank it came from
+- **Errors:** `ESRCH` (no such PID), `EPERM` (the target is outside your tree and you do not hold `renice`), `EINVAL` (the rank is outside the kernel's range, or the target has already exited)
+- **Reversibility:** `reversible` — a rank can be moved back
+- **Recording:** the caller's own log carries the `renice` request like any other syscall; the **target's** log carries a `__sched:renice` frame with the ranks it came from and went to, and **who asked** (§6.1)
+
+**The reach rule is the one `kill` and `send` already use.** Your own tree is
+yours: yourself, your descendants, and your own process group can always be
+moved, with no capability at all. Reaching **across** the tree needs the
+`renice` capability (§4.9) — otherwise `EPERM`.
+
+This is deliberate. A supervision tree has to be able to promote a child it is
+starving and push back one that is hogging the queue; if that needed a
+permission, the permission would have to be handed to every supervisor, and a
+permission handed to everyone stops meaning anything. The capability governs
+reaching *across* the tree, not disciplining your own — exactly as `kill` does.
+
+The range is the kernel's: `-20..19`, and **lower runs first**. A rank outside
+it is `EINVAL` — the kernel holds this domain and refuses values it does not
+own, which is the same rule the operator's command follows.
+
+**Two logs, two questions.** The request lives in the **caller's** log, like any
+other syscall; the effect lives in the **target's** log, as a `__sched:renice`
+frame. The effect carries the actor that caused it — `operator` for the host's
+door, `agent:<pid>` for this one — because two different actors can now move a
+rank, and a frame that says "the rank moved" without saying who moved it is a
+fact without an explanation.
 
 ---
 
@@ -793,7 +851,7 @@ signal events rather than user syscalls.
 |---|---|---|
 | `__state` | the process table | `from`, `to`, and the trigger that caused the transition |
 | `__init` | init | `action` — `boot`, `register-daemon`, `reap`, `restart`, `restart-gave-up`, `shutdown` — plus the action's details |
-| `__sched` | the scheduler | `action`, plus `nice` / `blockedOn` / `budgetKind` / `reason` / `from` where they apply |
+| `__sched` | the scheduler | `action`, plus `nice` / `blockedOn` / `budgetKind` / `reason` / `from` / `by` where they apply |
 | `__signal` | the signal manager | `signal`, `signalNumber`, `outcome` (`delivered` / `queued` / `dropped` / `failed`), `from` |
 
 The `__init` frames carry the **name** of the daemon they are about (the
@@ -845,11 +903,12 @@ __sched:exited(reaped-during-quantum)
 ```
 
 `renice` is the one action in that frame that is **not** a scheduler decision:
-it is the **operator** moving a process up or down the queue, and it carries
-the rank the process came from and the rank it went to.
+it is somebody **moving** a process up or down the queue, and it carries the
+rank the process came from and the rank it went to.
 
 ```
-__sched:renice(0->-7)
+__sched:renice(0->-7 by operator)
+__sched:renice(0->-7 by agent:7)
 ```
 
 It is additive in the same way the `__init` frame's names were: the frame's
@@ -858,6 +917,13 @@ meets a frame written by an older kernel finds no name to read. The `from` it
 carries is the old rank — the one number a reader needs to make sense of the
 new one. (A rank that did not move records nothing: a frame that says "the
 rank moved" when it did not is a frame nobody can act on.)
+
+**The `by` says who moved it.** Since `1.1.0` there are two actors that can move
+a rank — the operator (`cortex renice`, the window) and an agent (§4.10) — so
+"the rank moved" alone no longer says why. `by` is `operator` for the host's
+door and `agent:<pid>` for the agent's. It is additive in the same way: a frame
+written before `1.1.0` carries no `by`, and a reader that meets one does not
+guess who did it.
 
 Rendering a record under a longer name is not a change to the record
 (§11) — the same `.crec` file is byte-for-byte identical either way.
@@ -1004,6 +1070,8 @@ export interface CortexContext {
   // 4.5 IPC
   send(target: ProcessId | ChannelId, message: unknown, opts?: SendOptions): Promise<void>;
   recv(source?: ChannelId, opts?: RecvOptions): Promise<Message>;
+  channel_open(opts?: ChannelOpenOptions): Promise<{ channelId: ChannelId }>;
+  channel_close(channel: ChannelId): Promise<void>;
 
   // 4.6 Time and determinism
   sleep(ms: number): Promise<void>;
@@ -1016,12 +1084,20 @@ export interface CortexContext {
   // 4.8 Budgets
   budget(): BudgetCounters;
 
+  // 4.9 Capabilities
+  acquire(cap: Capability): Promise<void>;
+  release(cap: Capability): Promise<void>;
+  caps(): readonly Capability[];
+
+  // 4.10 Scheduling
+  renice(pid: ProcessId, nice: number): Promise<NiceChange>;
+
   // Forkable regions (STATE.md §5.2)
   forkable<T>(fn: () => Promise<T>): Promise<T>;
 }
 ```
 
-**Nineteen syscalls.** Plus identity properties. Plus `forkable()` as a structured wrapper around the reversibility enforcement.
+**Twenty-five syscalls.** Plus identity properties. Plus `forkable()` as a structured wrapper around the reversibility enforcement.
 
 That is the whole kernel surface. Anything else lives in user space.
 
@@ -1071,7 +1147,7 @@ PROCESS.md demoted capabilities to icebox. But some syscalls (`kill` cross-group
 
 **v0 answer:** no capability syscalls. Kernel uses simple group membership rules. v1 introduces `acquire(cap)` / `release(cap)` if real workloads demand it.
 
-**1.0 answer (§4.9):** shipped, as promised — `acquire` / `release` / `caps`, over a closed set of six capabilities (`spawn`, `kill`, `fork`, `tool:dangerous`, `ipc:any`, `admin`). The default is **full privilege**, because defaulting to least privilege would have turned every pre-1.0 agent into an `EPERM` trap; privilege is narrowed explicitly at `spawn` time. Two gates are deliberately *conditional* rather than blanket: `kill` and `ipc:any` apply only to processes that are not your descendant and not in your group, and `tool:dangerous` applies only to `irreversible` tools. Without that, `kill` would have been handed to every supervisor and meant nothing.
+**1.0 answer (§4.9):** shipped, as promised — `acquire` / `release` / `caps`, over a closed set of seven capabilities (`spawn`, `kill`, `renice`, `fork`, `tool:dangerous`, `ipc:any`, `admin`). The default is **full privilege**, because defaulting to least privilege would have turned every pre-1.0 agent into an `EPERM` trap; privilege is narrowed explicitly at `spawn` time. Two gates are deliberately *conditional* rather than blanket: `kill` and `ipc:any` apply only to processes that are not your descendant and not in your group, and `tool:dangerous` applies only to `irreversible` tools. Without that, `kill` would have been handed to every supervisor and meant nothing. `renice` joined them in `1.1.0` (§4.10) under the same conditional shape: your own tree is yours, and reaching across it needs the capability.
 
 ### 9.3 Channel creation — **RESOLVED in 1.0**
 
@@ -1104,6 +1180,8 @@ If we add `llm_stream` in v1, do old recordings still replay?
 A driver returning a malformed `LLMResponse` is `EDRIVER`. But what if the driver is *correctly* implementing an old version of the interface?
 
 **v0 answer:** drivers declare `abiCompat: '^1.0.0'`. Kernel rejects incompatible drivers at load time with `EDRIVER`.
+
+**`1.1.0` does not break a driver.** The `^1.0.0` every driver declares still matches `1.1.0` — the caret covers the whole `1.x` line, and an additive bump cannot change a driver's interface. A driver that wants to insist on the exact `1.0.0` says `1.0.0`, and the kernel rejects that against a `1.1.0` kernel with `EDRIVER` — which is the point of saying it out loud.
 
 ---
 
@@ -1147,16 +1225,33 @@ reversibility tag — was added for the same reason and moved it no more. So was
 the transport's `daemons` command — what the supervised daemons are doing
 right now — and `Kernel.daemons()` beside it.
 
-`Kernel.setNice()` and the transport's `renice` command are the same case:
-the **operator's** verb for moving a running process up or down the queue
-(docs/PROCESS.md §8.1). No syscall was added — an agent still cannot change
-a process's rank, and whether it should be able to is an open question
-(BACKLOG #126) — so the agent surface did not move and neither did the
-version. The one thing that reached the log is a `__sched` frame with a new
-action name, which §6.1 describes: the frame's structure is unchanged and a
-reader that meets it without knowing the name finds nothing to read. That is
-the same treatment the `__init` frame's action names got when the journal
-learned to say *why* it gave up.
+`Kernel.setNice()` and the transport's `renice` command are the **operator's**
+door — the host's own verb for moving a running process up or down the queue
+(docs/PROCESS.md §8.1). They landed before `1.1.0` and did not move the
+version, because the **agent** surface did not move with them: no syscall was
+added, and an agent still could not change a process's rank. The `__sched`
+frame with the action name `renice` was the only thing that reached the log,
+and §6.1 describes it: the frame's structure is unchanged and a reader that
+meets it without knowing the name finds nothing to read. That is the same
+treatment the `__init` frame's action names got when the journal learned to
+say *why* it gave up.
+
+**The agent's door is `1.1.0`.** Until then an agent could not change a
+process's rank at all — not its own, not its child's, not a stranger's — and
+whether it should be able to was an open question (BACKLOG #126). It can now
+(§4.10): its own tree without any permission, a stranger's with the `renice`
+capability (§4.9) — the same reach rule `kill` and `send` already use. A new
+syscall and a new capability are both additive, so the version moved to
+`1.1.0` instead of staying at `1.0.0`. The transport's `renice` command and
+`KERNEL_PROTOCOL_VERSION` did not move: the command was already there, and
+adding a syscall to the agent surface does not change how the transport frames
+anything.
+
+The `__sched:renice` frame grew **who moved the rank** in the same round — `by`
+is `operator` for the host's door and `agent:<pid>` for the agent's (§6.1). It
+is additive in the same way: the frame's structure is unchanged, and a frame
+written before `1.1.0` carries no `by`, so a reader that meets one does not
+guess who did it.
 
 `DaemonSpec` grew an optional `name` in the same round, and that is not an ABI
 change either: it is init's own registration type, internal to the kernel
