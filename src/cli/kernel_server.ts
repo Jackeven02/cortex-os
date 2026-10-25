@@ -79,6 +79,7 @@ import { ALL_SIGNALS } from '../kernel/signals.js';
 import { tokenUsage } from '../token_usage.js';
 import type { Kernel } from '../kernel/boot.js';
 import { type KernelEndpoint } from './kernel_endpoint.js';
+import { describeDriverSurface } from './audit_view.js';
 import {
   encodeFrame,
   LineDecoder,
@@ -497,6 +498,25 @@ async function dispatch(
         ...(call.args !== undefined ? { args: call.args } : {}),
       }));
       return { calls };
+    }
+
+    case 'drivers': {
+      // A read, like `ps` and `openCalls`: the operator asking what this
+      // kernel can call is not something the kernel did, so it is not
+      // recorded. The registry's own bookkeeping answers it — and it is the
+      // *only* place that can: an MCP server's tool list is pulled from the
+      // server when the driver registers, so a second kernel booted to ask
+      // the question would answer about a different set of tools than the
+      // one running the agents.
+      //
+      // The facts and their wording live in `src/cli/audit_view.ts`, because
+      // `cortex audit` answers the same question and the two views must not
+      // be able to disagree about it.
+      const surface = describeDriverSurface(
+        kernel.registry.listAll(),
+        (toolName) => kernel.registry.resolveTool(toolName),
+      );
+      return { surface };
     }
 
     case 'memory': {

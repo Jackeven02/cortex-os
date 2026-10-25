@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 824 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 833 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -406,6 +406,10 @@ The panel re-reads the file rather than trusting a pushed copy of the line, so t
 **And the window says what a checkpoint holds.** A `.csnap` was the one thing you could **restore** but never **look at**: the panel listed your snapshots and gave you a **恢复** button, with no way to see what you were about to restore. Click the chain id now and the window says who the snapshot was of, when it was taken, how long the agent's conversation had been, what it was still waiting on, the memory it carried, what it had spent **next to the ceiling that spend was measured against**, and the byte in the syscall log it was cut at. The conversation itself is counted, not quoted — the prompts and the model answers stay out of the window, as they do out of the event table. `cortex checkpoint --inspect <chainId>` asks the same question in the terminal.
 
 **And a restored process keeps the ceiling it was given.** A snapshot records both halves of a budget — what the process spent and what was left of the ceiling — and the reader was dropping the second one, so every restored process woke up with the *default* envelope. An agent capped at 1,000 tokens came back **unlimited**, silently. It does not any more.
+
+**And the window says what this system can call.** The **工具面** button in the top bar opens the tool surface: every tool driver and the tools it exposes, each with the reversibility the kernel would enforce and whether anybody ever **declared** that tag — plus the model drivers and the memory drivers. `cortex audit` answers the same question, but it boots a kernel of its own, and an MCP server's tool list is pulled from the server when the driver registers: so the surface of the kernel actually running your agents is not the surface of a second one. The window asks the kernel that has them.
+
+The two views read their facts and their words from one module, so they cannot disagree. A tool nobody declared is marked `not-declared` — an MCP server cannot declare reversibility at all, so the driver invents a tag, the invented one is `irreversible`, and a defaulted irreversible tool is refused inside a `forkable()` region without saying why. A tool the kernel cannot resolve is `?`: *we cannot tell* is not *nobody said so*.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

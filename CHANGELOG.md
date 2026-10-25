@@ -42,6 +42,73 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The dashboard says what this system can call.** The operator's window could
+  show what an agent **did** and what it **knew**, and nothing about the system
+  it was running in: which tools existed, which model was driving it, and —
+  the one that bites — which of those tools never said whether they could be
+  undone.
+
+  `cortex audit` answers that, and it always has. But it **boots a kernel of its
+  own** to do it, and the answer it gives is about *that* kernel: an MCP
+  server's tool list is pulled from the server when the driver registers, so
+  the surface of the kernel actually running the agents is not the surface of a
+  second one booted next to it. The terminal was right about its own kernel,
+  and the window had no answer at all.
+
+  So the kernel answers it now. The transport grew a `drivers` command — a
+  **read**, like `ps` and `openCalls`, and like them not recorded, so a window
+  that polls it every second does not grow the kernel's causal history. The
+  dashboard grew a `GET /api/drivers` endpoint and a **工具面** panel (the
+  button in the top bar). Without a live kernel the endpoint answers `409` and
+  says why: the tool list lives in the registry of the kernel that owns it, and
+  there is no on-disk copy to read instead — an empty surface would look like a
+  kernel with no tools at all.
+
+  And the words live in one module (`src/cli/audit_view.ts`), because the
+  terminal and the window ask the same question of the same kernel and must
+  not be able to disagree about it:
+
+  ```console
+  $ cortex audit
+  Tool drivers:
+  --------------------------------------------------------------------------------
+    fs v1.0.0 (forkable=true, twoPhase=false)
+      - fs_read                       idempotent
+      - fs_write                      irreversible
+      - fs_list                       idempotent
+      - fs_glob                       idempotent
+    mcp v1.0.0 (forkable=false, twoPhase=false)
+      - demo/echo                     irreversible   <- not-declared
+      - demo/create_order             irreversible   <- not-declared
+      - demo/search                   irreversible   <- not-declared
+
+  LLM drivers:
+  --------------------------------------------------------------------------------
+    mock                     v1.0.0 (default)  models: mock-1, mock-mini
+
+  Memory drivers:
+  --------------------------------------------------------------------------------
+    inmem                    v1.0.0 (default)
+
+  7 tool(s) across 2 driver(s)
+  3 tool(s) never declared a reversibility tag — they are treated as 'irreversible' and will be refused inside forkable() regions.
+  Set them explicitly (MCP: the 'reversibility' option on mcpTool(), or CORTEX_MCP_* env for the CLI) to let them run inside forkable() regions.
+  ```
+
+  A tool nobody declared is marked `not-declared` — an MCP server cannot
+  declare reversibility at all, so the driver invents a tag, the invented one is
+  `irreversible`, and a defaulted irreversible tool is refused inside a
+  `forkable()` region without saying why.
+
+  A tool the registry cannot resolve is neither declared nor undeclared: it is
+  `?`. "We cannot tell" is not "nobody said so", and it is certainly not
+  "irreversible" — the same rule every other view in this project follows, and
+  the same one the budget views follow when a snapshot does not record what was
+  left of its ceiling.
+
+  Nine new smoke checks cover the transport command, the endpoint, the page,
+  and the two views agreeing on the words.
+
 - **`cortex replay` — a recorded run can be run again.** STATE.md §5.5 has
   promised this since the beginning: *"You can always replay an agent's
   reasoning deterministically."* The recording was always written — every
@@ -1501,6 +1568,17 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   CLI output, not a fixture.
 
 ### Changed
+
+- **`cortex audit` marks an undeclared tool with `not-declared`, and its last
+  sentence no longer overstates what declaring a tag does.** The marker used to
+  read `NOT declared; defaulted`; it is now the same word the dashboard prints,
+  so the terminal and the window say the same thing about the same tool.
+
+  The sentence used to end *"to make them forkable"* — which is not what
+  declaring a tag does. An MCP driver is `forkable = false` whatever its tools
+  are tagged (STATE.md §8.6); declaring a tag makes the tool **allowed to run
+  inside** a `forkable()` region. A sentence that overstates what a knob does
+  sends the operator to the wrong file.
 
 - **The syscall dispatcher is now the only place a syscall is recorded.** The
   recording-ownership work that ABI.md §11 described in stages is finished:

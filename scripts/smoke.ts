@@ -251,6 +251,12 @@ import { cmdTrace, TRACE_SYSCALL_WIDTH, TRACE_HEADER } from '../src/cli/commands
 import { cmdLogs, alreadyShown } from '../src/cli/commands/logs.js';
 import { cmdMemory } from '../src/cli/commands/memory.js';
 import { formatAccess, formatPeers } from '../src/cli/memory_view.js';
+import {
+  describeDriverSurface,
+  formatDeclaration,
+  formatUndeclaredSummary,
+  type DriverSurface,
+} from '../src/cli/audit_view.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
@@ -273,6 +279,7 @@ import {
   unitPathFor,
 } from '../src/cli/commands/daemon.js';
 import { cmdCheckpoint } from '../src/cli/commands/checkpoint.js';
+import { printDriverSurface } from '../src/cli/commands/audit.js';
 
 import {
   InMemMemoryDriver,
@@ -10277,7 +10284,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -11533,6 +11540,193 @@ async function runDashboardChecks(): Promise<void> {
         assert(out === '', 'and prints nothing that looks like a snapshot');
       });
 
+      await checkAsync('the dashboard says what the kernel can call', async () => {
+        // The window could show what an agent **did** and what it **knew**,
+        // and nothing about the system it was running in: which tools
+        // existed, which model was driving it, and — the one that bites —
+        // which of those tools never said whether they could be undone.
+        //
+        // The tool list lives in the registry of the kernel that owns it, so
+        // the window asks *that* kernel (over the transport's `drivers`
+        // command). Booting a second kernel to ask would answer about a
+        // different set of tools: an MCP server's list is pulled from the
+        // server when the driver registers.
+        const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+        await reg.registerTool(
+          mcpTool({ transport: fakeServer(), name: 'demo-mcp', namespace: 'demo' }),
+        );
+        const surface = describeDriverSurface(reg.listAll(), (name) => reg.resolveTool(name));
+
+        const dash = await startDashboard({
+          dir: tmp,
+          port: 0,
+          kernel: {
+            request: async (cmd) => {
+              if (cmd === 'drivers') return { surface };
+              throw new Error(`the dashboard asked for something else: ${cmd}`);
+            },
+            subscribe: async () => () => {},
+          },
+        });
+        try {
+          const res = await fetch(`${dash.url}/api/drivers`);
+          assert(res.status === 200, `status ${res.status}`);
+          const body = (await res.json()) as {
+            toolDrivers: { name: string; tools: { name: string; declaredLabel: string }[] }[];
+            toolCount: number;
+            undeclaredCount: number;
+            summary: string | null;
+          };
+          assert(body.toolCount === surface.toolCount, `the tool count, got ${body.toolCount}`);
+          assert(
+            body.undeclaredCount === surface.undeclaredCount,
+            `the undeclared count, got ${body.undeclaredCount}`,
+          );
+          // The label travels with the tool, so the page never re-implements
+          // the rule — and the window and the terminal mark an undeclared
+          // tool with the same word.
+          const tools = body.toolDrivers[0]!.tools;
+          const read = tools.find((t) => t.name === 'demo/read_file')!;
+          assert(read.declaredLabel === 'not-declared', `the marker, got ${read.declaredLabel}`);
+          // And the sentence is the shared one — the same words `cortex
+          // audit` prints.
+          assert(body.summary === formatUndeclaredSummary(surface), 'the summary is the shared sentence');
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('cortex audit and the window say the same thing about an undeclared tool', async () => {
+        // The terminal and the window answer the same question about the
+        // same kernel, so they must print the same words. The facts and the
+        // sentence live in one module; this check holds the two views to it.
+        const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+        await reg.registerTool(
+          mcpTool({ transport: fakeServer(), name: 'demo-mcp', namespace: 'demo' }),
+        );
+        const surface = describeDriverSurface(reg.listAll(), (name) => reg.resolveTool(name));
+        let out = '';
+        const prevLog = console.log;
+        console.log = (...parts: unknown[]): void => {
+          out += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        try {
+          printDriverSurface(surface);
+        } finally {
+          console.log = prevLog;
+        }
+        assert(out.includes('demo/read_file'), `the tool is named, got: ${out}`);
+        assert(out.includes('not-declared'), `the marker is on the line, got: ${out}`);
+        // The same sentence the window is handed.
+        const summary = formatUndeclaredSummary(surface)!;
+        assert(out.includes(summary), 'the CLI prints the shared sentence');
+      });
+
+      await checkAsync('the dashboard says when it needs a live kernel to answer that', async () => {
+        // The tool list lives in the registry of the kernel that owns it —
+        // there is no on-disk copy to read instead. So the window says so,
+        // rather than showing an empty surface that looks like a kernel with
+        // no tools at all.
+        const dash = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const res = await fetch(`${dash.url}/api/drivers`);
+          assert(res.status === 409, `status ${res.status}`);
+          const body = (await res.json()) as { error?: string };
+          assert(typeof body.error === 'string' && body.error.length > 0, 'the error says why');
+          assert(body.error.includes('no live kernel'), `the error names the reason, got ${body.error}`);
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the window shows what the kernel can call', async () => {
+        // The page is a static file and cannot import the rule, so it renders
+        // what the server sent. The check renders it with the page's own
+        // function, so it cannot drift from what ships.
+        const dash = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const html = await (await fetch(`${dash.url}/`)).text();
+          // The button exists, and it asks for the endpoint that exists.
+          assert(html.includes('openTools'), 'the page has a way to open the tool surface');
+          assert(html.includes('/api/drivers'), 'and it asks for the endpoint that answers');
+          const esc = pageFunction(html, 'esc');
+          const driversBody = pageFunction(html, 'driversBody', { esc });
+          const body = String(driversBody({
+            toolDrivers: [
+              {
+                name: 'demo-mcp',
+                version: '1.0.0',
+                abiCompat: '^1.0.0',
+                forkable: false,
+                twoPhase: false,
+                tools: [
+                  {
+                    name: 'demo/read_file',
+                    reversibility: 'irreversible',
+                    declared: false,
+                    declaredLabel: 'not-declared',
+                    description: 'Read a file.',
+                  },
+                ],
+              },
+            ],
+            llmDrivers: [
+              {
+                name: 'mock',
+                version: '1.0.0',
+                abiCompat: '^1.0.0',
+                isDefault: true,
+                supportedModels: ['mock-1'],
+                streams: false,
+                countsTokens: true,
+              },
+            ],
+            memoryDrivers: [
+              { name: 'inmem', version: '1.0.0', abiCompat: '^1.0.0', isDefault: true },
+            ],
+            toolCount: 1,
+            undeclaredCount: 1,
+            summary: "1 tool(s) never declared a reversibility tag — they are treated as 'irreversible'.",
+          }));
+          assert(body.includes('demo/read_file'), `the tool is named, got: ${body}`);
+          assert(body.includes('irreversible'), 'the tag is shown');
+          assert(body.includes('not-declared'), 'the undeclared tool says so');
+          assert(body.includes('mock'), 'the model driver is shown');
+          assert(body.includes('never declared'), 'and the warning is shown');
+          // A tool nobody can resolve claims nothing: it is not "declared",
+          // and it is not "not declared" either.
+          const unknown = String(driversBody({
+            toolDrivers: [
+              {
+                name: 'ghost',
+                version: '1.0.0',
+                abiCompat: '^1.0.0',
+                forkable: true,
+                twoPhase: false,
+                tools: [
+                  {
+                    name: 'ghost/t',
+                    reversibility: '?',
+                    declared: null,
+                    declaredLabel: '?',
+                    description: '',
+                  },
+                ],
+              },
+            ],
+            llmDrivers: [],
+            memoryDrivers: [],
+            toolCount: 1,
+            undeclaredCount: 0,
+            summary: null,
+          }));
+          assert(!unknown.includes('not-declared'), 'an unknown tool is not called undeclared');
+          assert(!unknown.includes('>declared<'), 'and it does not claim to be declared');
+        } finally {
+          await dash.close();
+        }
+      });
+
       await checkAsync('dashboard ops are disabled by default', async () => {
         const meta = (await (await fetch(`${dash.url}/api/ops`)).json()) as { allowOps?: boolean };
         assert(meta.allowOps === false, 'allowOps defaults to false');
@@ -12370,6 +12564,96 @@ async function runMcpChecks(): Promise<void> {
     assert(d.declaredReversibility['demo/send_email'] === true, 'send_email was declared');
     assert(d.declaredReversibility['demo/read_file'] === false, 'read_file was defaulted');
     assert(isMcpToolDriver(d) === true, 'type guard recognises the driver');
+  });
+
+  await checkAsync('the tool surface says which tools nobody declared', async () => {
+    // BACKLOG #040: *"surface tools that are untagged for reversibility."*
+    //
+    // An MCP server cannot declare reversibility at all, so the driver
+    // invents a tag — and the operator has to be told which ones were
+    // invented. The tag the kernel enforces is the conservative one, which
+    // is exactly why the fact that it was invented is worth saying: a
+    // defaulted `irreversible` refuses to run inside a `forkable()` region,
+    // and the operator finds that out as a puzzling `EREVERSIBLE` days later.
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    await reg.registerTool(
+      mcpTool({ transport: fakeServer(), name: 'demo-mcp', namespace: 'demo' }),
+    );
+    const surface = describeDriverSurface(reg.listAll(), (name) => reg.resolveTool(name));
+    const driver = surface.toolDrivers[0]!;
+    assert(driver.tools.length === 4, `4 tools, got ${driver.tools.length}`);
+    // Nobody declared anything, so every tool was defaulted.
+    assert(surface.undeclaredCount === 4, `4 undeclared, got ${surface.undeclaredCount}`);
+    assert(driver.tools.every((t) => t.declared === false), 'every tool says it was defaulted');
+    assert(
+      driver.tools.every((t) => formatDeclaration(t.declared) === 'not-declared'),
+      'every tool carries the marker',
+    );
+    // And the tag the kernel enforces is the conservative default.
+    assert(
+      driver.tools.every((t) => t.reversibility === 'irreversible'),
+      'the default is irreversible',
+    );
+    const summary = formatUndeclaredSummary(surface);
+    assert(summary !== null, 'there is something to warn about');
+    assert(summary.includes('4 tool(s) never declared'), `the summary counts them, got: ${summary}`);
+  });
+
+  await checkAsync('a tool that was declared says so, and the count follows', async () => {
+    // The other half: declaring one tool must not hide the rest, and the
+    // count must be the count of the tools nobody declared — not of the
+    // tools the operator happened to mention.
+    const reg = new DriverRegistry({ kernelAbiVersion: KERNEL_ABI_VERSION });
+    await reg.registerTool(
+      mcpTool({
+        transport: fakeServer(),
+        name: 'demo-mcp',
+        namespace: 'demo',
+        reversibility: { send_email: 'irreversible' },
+      }),
+    );
+    const surface = describeDriverSurface(reg.listAll(), (name) => reg.resolveTool(name));
+    const driver = surface.toolDrivers[0]!;
+    const send = driver.tools.find((t) => t.name === 'demo/send_email')!;
+    assert(send.declared === true, 'the declared tool says so');
+    assert(formatDeclaration(send.declared) === 'declared', 'and says so with the word');
+    assert(surface.undeclaredCount === 3, `3 undeclared, got ${surface.undeclaredCount}`);
+    assert(
+      formatUndeclaredSummary(surface)!.includes('3 tool(s) never declared'),
+      'the summary counts only the undeclared ones',
+    );
+  });
+
+  await checkAsync('a tool the registry cannot resolve says nothing about itself', async () => {
+    // "We do not know" is not "nobody declared it", and it is certainly not
+    // "irreversible". A tool the registry cannot resolve gets `?` and an
+    // unknown declaration — the same rule every other view in this project
+    // follows: a thing nobody reported is not a zero.
+    const surface = describeDriverSurface(
+      {
+        llm: [],
+        tools: [
+          {
+            name: 'ghost',
+            version: '1.0.0',
+            abiCompat: '^1.0.0',
+            tools: ['ghost/tool'],
+            forkable: true,
+            twoPhase: false,
+          },
+        ],
+        memory: [],
+      },
+      () => undefined,
+    );
+    const tool = surface.toolDrivers[0]!.tools[0]!;
+    assert(tool.reversibility === '?', `an unknown tag, got ${tool.reversibility}`);
+    assert(tool.declared === null, `an unknown declaration, got ${tool.declared}`);
+    assert(formatDeclaration(tool.declared) === '?', 'the label says it does not know');
+    // And an unknown tool is not an *undeclared* one: that would turn "we
+    // cannot tell" into an accusation.
+    assert(surface.undeclaredCount === 0, `nothing undeclared, got ${surface.undeclaredCount}`);
+    assert(formatUndeclaredSummary(surface) === null, 'and there is nothing to warn about');
   });
 
   await checkAsync('isError:true becomes a return-with-error, not a trap', async () => {
@@ -20112,7 +20396,12 @@ async function runTransportChecks(): Promise<void> {
       kernelAbiVersion: KERNEL_ABI_VERSION,
       dir: tmp,
       autoStart: true,
-      loadDrivers: (reg) => reg.registerLLM(mockLLM()),
+      // A tool driver as well as an LLM driver, so "what can this kernel
+      // call" has something to answer about.
+      loadDrivers: async (reg) => {
+        reg.registerLLM(mockLLM());
+        await reg.registerTool(fsTool({ root: tmp }));
+      },
       agentLoader: async () => async (ctx, args) => {
         // A listener: park on recv until something is delivered. Only a
         // timeout is the idle case — anything else means the process is
@@ -20248,6 +20537,59 @@ async function runTransportChecks(): Promise<void> {
           processes.some((p) => p.pid === 1),
           'the live table contains init',
         );
+      });
+
+      await checkAsync('the live kernel says what it can call', async () => {
+        // The operator's question: what can this kernel call, and which of
+        // those calls never said whether they could be undone?
+        //
+        // Only the kernel that *has* the agents can answer it. An MCP
+        // server's tool list is pulled from the server when the driver
+        // registers, so a second kernel booted to ask the question would
+        // answer about a different set of tools than the one running the
+        // agents — which is why `cortex audit` (which boots its own kernel)
+        // could not be the window's answer.
+        const reply = await client!.request('drivers') as { surface: DriverSurface };
+        const surface = reply.surface;
+        assert(surface.toolDrivers.length === 1, `one tool driver, got ${surface.toolDrivers.length}`);
+        const fs = surface.toolDrivers[0]!;
+        assert(fs.name === 'fs', `the fs driver, got ${fs.name}`);
+        assert(fs.tools.length > 0, 'the fs driver exposes tools');
+        assert(surface.toolCount === fs.tools.length, 'the count matches the tools');
+        // The surface is the whole registry, not only the tools: the model
+        // driving the agents is part of what this system can call.
+        assert(surface.llmDrivers.some((d) => d.name === 'mock'), 'the mock LLM driver is listed');
+        // The fs driver states its own tags, so nothing is undeclared.
+        assert(surface.undeclaredCount === 0, `nothing undeclared, got ${surface.undeclaredCount}`);
+        assert(fs.tools.every((t) => t.declared === true), 'the fs driver declares its tags');
+        // And the tag is the one the kernel enforces — not a guess.
+        const read = fs.tools.find((t) => t.name === 'fs_read');
+        assert(read?.reversibility === 'idempotent', `fs_read is idempotent, got ${read?.reversibility}`);
+        const write = fs.tools.find((t) => t.name === 'fs_write');
+        assert(write?.reversibility === 'irreversible', `fs_write is irreversible, got ${write?.reversibility}`);
+      });
+
+      await checkAsync('a remote drivers read leaves no trace in the kernel\'s log', async () => {
+        // A read, like `ps`: the operator *looking* at the registry is not
+        // something the kernel did. A dashboard that polls this every second
+        // must not grow init's causal history.
+        const countFrames = async (): Promise<number> => {
+          let n = 0;
+          for await (const r of readRecords(existingCrecPath(tmp, PID_INIT))) {
+            // The kernel's own bookkeeping (`__sched`, `__state`) moves on
+            // its own; a *read* must not add a frame of its own.
+            if (r.syscall.startsWith('__')) continue;
+            n += 1;
+          }
+          return n;
+        };
+        const before = await countFrames();
+        for (let i = 0; i < 5; i += 1) {
+          const response = await client!.requestRaw('drivers');
+          assert(response.ok === true, `drivers ${i} succeeds, got ${JSON.stringify(response)}`);
+        }
+        const after = await countFrames();
+        assert(after === before, `no frames were written, got ${after - before}`);
       });
 
       await checkAsync('a remote limit reads and sets a live agent\'s budget', async () => {

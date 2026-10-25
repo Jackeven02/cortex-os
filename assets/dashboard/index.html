@@ -191,8 +191,18 @@
     .ck-facts td { height: 30px; border-top: 1px solid #f4f5f7; }
     .ck-facts td:first-child { border-top: 1px solid #f4f5f7; }
     .ck-label { width: 92px; color: #929aa7; font-size: 10px; }
+    /* The tool surface: what this kernel can call, and which of those calls
+       never said whether they can be undone. */
+    .tool-summary { margin-bottom: 13px; padding: 10px 12px; border: 1px solid #f2e3c6; border-radius: 7px; background: #fffaf0; color: #8a6420; font-size: 11px; line-height: 1.55; white-space: pre-line; }
+    .tool-driver { margin-bottom: 15px; }
+    .tool-driver-head { display: flex; align-items: baseline; gap: 9px; margin-bottom: 6px; color: #354052; font-size: 12px; font-weight: 600; }
+    .tool-driver-head .mono { color: #929aa7; font-size: 10px; font-weight: 400; }
+    .tool-flag { color: #929aa7; font-size: 10px; font-weight: 400; }
+    .tool-undeclared { color: #b06a1c; font-weight: 600; }
+    .tool-desc { max-width: 230px; overflow: hidden; color: #8a93a1; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+    .tool-section { margin: 17px 0 7px; color: #929aa7; font-size: 10px; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
     @media (max-width: 1080px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .columns { grid-template-columns: minmax(0, 1.5fr) minmax(235px, .8fr); } .content { padding-right: 22px; padding-left: 22px; } .topbar { padding: 0 22px; } }
-    @media (max-width: 760px) { .sidebar { width: 58px; padding: 16px 8px; } .brand { justify-content: center; padding: 0 0 23px; } .brand-copy, .nav-label, .nav-text, .nav-count, .workspace, .side-footer .version { display: none; } .nav-item { justify-content: center; padding: 11px 0; } .nav-icon { font-size: 17px; } .side-footer { justify-content: center; padding: 12px 0; } .main { margin-left: 58px; } .topbar { height: 52px; padding: 0 15px; } .content { padding: 23px 14px 34px; } .page-heading { align-items: flex-start; } h1 { font-size: 21px; } .columns { grid-template-columns: 1fr; } .heading-actions .button span:not(.button-icon) { display: none; } .heading-actions .button { width: 34px; padding: 0; } .search { width: 115px; } .metrics { gap: 9px; } .metric { min-height: 101px; padding: 13px; } .metric-value { font-size: 22px; } .panel-head { padding: 0 12px; } .table-wrap { max-width: calc(100vw - 84px); } }
+    @media (max-width: 760px) { .sidebar { width: 58px; padding: 16px 8px; } .brand { justify-content: center; padding: 0 0 23px; } .brand-copy, .nav-label, .nav-text, .nav-count, .workspace, .side-footer .version { display: none; } .nav-item { justify-content: center; padding: 11px 0; } .nav-icon { font-size: 17px; } .side-footer { justify-content: center; padding: 12px 0; } .main { margin-left: 58px; } .topbar { height: 52px; padding: 0 15px; } .content { padding: 23px 14px 34px; } .page-heading { align-items: flex-start; } h1 { font-size: 21px; } .columns { grid-template-columns: 1fr; } .heading-actions .button span:not(.button-icon) { display: none; } .heading-actions .button { width: 34px; padding: 0; } .top-actions .button span:not(.button-icon) { display: none; } .top-actions .button { width: 34px; padding: 0; } .search { width: 115px; } .metrics { gap: 9px; } .metric { min-height: 101px; padding: 13px; } .metric-value { font-size: 22px; } .panel-head { padding: 0 12px; } .table-wrap { max-width: calc(100vw - 84px); } }
     @media (max-width: 420px) { .connection { font-size: 0; } .connection .live-dot { width: 8px; height: 8px; } .crumb { font-size: 10px; } .content { padding-right: 10px; padding-left: 10px; } .metric-top { font-size: 10px; } .metric-icon { width: 23px; height: 23px; } .metric-foot { font-size: 9px; } }
   </style>
 </head>
@@ -221,7 +231,7 @@
     <main class="main" data-section="overview">
       <header class="topbar">
         <div class="crumb"><span>Workspace</span><span>›</span><strong id="crumbSection">总览</strong></div>
-        <div class="top-actions"><div class="connection"><span class="live-dot"></span><span id="updated">正在连接</span></div><button class="icon-button" id="refreshTop" title="刷新数据" aria-label="刷新数据">↻</button></div>
+        <div class="top-actions"><div class="connection"><span class="live-dot"></span><span id="updated">正在连接</span></div><button class="button" id="openTools" type="button" title="这套系统能调用什么"><span class="button-icon">⚙</span><span>工具面</span></button><button class="icon-button" id="refreshTop" title="刷新数据" aria-label="刷新数据">↻</button></div>
       </header>
 
       <div class="content">
@@ -681,6 +691,75 @@
       }
     }
 
+    // What this kernel can call.
+    //
+    // The window could show what an agent **did** and what it **knew**, and
+    // nothing about the system it was running in: which tools existed, which
+    // model was driving it, and — the one that bites — which of those tools
+    // never said whether they could be undone. An MCP server cannot declare
+    // reversibility at all, so its tools are *defaulted* to `irreversible`,
+    // and a defaulted irreversible tool is refused inside a `forkable()`
+    // region. That is the kind of thing an operator should be told about
+    // before an agent trips over it.
+    //
+    // Every fact here comes from the server, and the server read it from the
+    // same module `cortex audit` reads — so the terminal and the window
+    // cannot disagree about which tools exist, what tag they carry, and
+    // which of them nobody ever declared. The page is a static file and
+    // cannot import anything, so it renders what it is given.
+    function driversBody(data) {
+      const toolDrivers = Array.isArray(data.toolDrivers) ? data.toolDrivers : [];
+      const llmDrivers = Array.isArray(data.llmDrivers) ? data.llmDrivers : [];
+      const memoryDrivers = Array.isArray(data.memoryDrivers) ? data.memoryDrivers : [];
+      const toolCount = Number(data.toolCount ?? 0);
+
+      // The sentence about the undeclared tools comes from the server: it is
+      // one sentence with one home, and both views print it.
+      const summary = typeof data.summary === 'string' && data.summary.length > 0
+        ? `<div class="tool-summary">${esc(data.summary)}</div>`
+        : '';
+
+      const toolBlocks = toolDrivers.length
+        ? toolDrivers.map((driver) => {
+            const tools = Array.isArray(driver.tools) ? driver.tools : [];
+            const rows = tools.map((tool) => {
+              // The label says whether anybody declared the tag. A tool the
+              // registry cannot resolve says `?` — not "declared" and not
+              // "not declared": nobody can say.
+              const declared = tool.declared === false
+                ? `<span class="tool-undeclared">${esc(tool.declaredLabel ?? 'not-declared')}</span>`
+                : esc(tool.declaredLabel ?? '?');
+              const description = tool.description ?? '';
+              return `<tr><td class="mono">${esc(tool.name)}</td><td class="mono">${esc(tool.reversibility)}</td><td>${declared}</td><td class="tool-desc" title="${esc(description)}">${esc(description)}</td></tr>`;
+            }).join('');
+            return `<div class="tool-driver">
+              <div class="tool-driver-head"><span>${esc(driver.name)}</span><span class="mono">v${esc(driver.version)}</span><span class="tool-flag">${driver.forkable ? 'forkable' : 'not forkable'}</span><span class="tool-flag">${driver.twoPhase ? 'two-phase' : 'one-phase'}</span></div>
+              ${tools.length
+                ? `<table><thead><tr><th>工具</th><th>可逆性</th><th>声明</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table>`
+                : '<div class="empty">这个驱动没有暴露任何工具。</div>'}
+            </div>`;
+          }).join('')
+        : '<div class="empty">这个内核没有注册工具驱动。</div>';
+
+      const llmRows = llmDrivers.map((driver) => `<tr><td>${esc(driver.name)}</td><td class="mono">v${esc(driver.version)}</td><td>${driver.isDefault ? '默认' : '—'}</td><td class="mono">${esc((Array.isArray(driver.supportedModels) ? driver.supportedModels : []).join(', ') || '—')}</td><td>${driver.streams ? '流式' : '—'}</td><td>${driver.countsTokens ? '计 token' : '—'}</td></tr>`).join('');
+
+      const memoryRows = memoryDrivers.map((driver) => `<tr><td>${esc(driver.name)}</td><td class="mono">v${esc(driver.version)}</td><td>${driver.isDefault ? '默认' : '—'}</td><td class="mono">${esc(driver.abiCompat)}</td></tr>`).join('');
+
+      return `${summary}<div class="tool-section">工具驱动 · ${esc(toolCount.toLocaleString())} 个工具</div>${toolBlocks}<div class="tool-section">模型驱动</div>${llmDrivers.length ? `<table><thead><tr><th>名称</th><th>版本</th><th>默认</th><th>模型</th><th>流式</th><th>计 token</th></tr></thead><tbody>${llmRows}</tbody></table>` : '<div class="empty">没有注册模型驱动。</div>'}<div class="tool-section">记忆驱动</div>${memoryDrivers.length ? `<table><thead><tr><th>名称</th><th>版本</th><th>默认</th><th>ABI</th></tr></thead><tbody>${memoryRows}</tbody></table>` : '<div class="empty">没有注册记忆驱动。</div>'}`;
+    }
+
+    async function showDrivers() {
+      openDialog('工具面', '<div class="empty">正在读取工具面…</div>');
+      try {
+        const response = await fetch('/api/drivers');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error ?? '读取失败');
+        openDialog('工具面', driversBody(data));
+      } catch (error) {
+        openDialog('工具面', `<div class="empty">${esc(error.message)}</div>`);
+      }
+    }
+
     async function restoreOps(chain) {
       if (!confirm(`从检查点 ${chain.slice(0, 13)}… 恢复？将在当前目录创建新进程。`)) return;
       $('traceTitle').textContent = '恢复结果';
@@ -1052,6 +1131,7 @@
       setTimeout(() => { $('copyApi').innerHTML = '<span class="button-icon">⌘</span><span>API 地址</span>'; }, 1400);
     });
     $('spawnGo').addEventListener('click', spawnOps);
+    $('openTools').addEventListener('click', showDrivers);
     pollOnce();
     if (sectionCopy[location.hash.slice(1)]) selectSection(location.hash.slice(1));
     if (new URLSearchParams(location.search).get('view') === 'tree') setProcessView('tree');

@@ -88,6 +88,12 @@ export const KERNEL_PROTOCOL_VERSION = 1;
  * whole log to pair the frames — costs O(bytes) for a fact the kernel has in
  * O(processes).
  *
+ * `drivers` is a read of the same shape: "what can this kernel call, and
+ * which of those calls never said whether they can be undone" is a fact the
+ * *registry* already has, and the host's alternative — booting a second
+ * kernel to ask — answers about a different kernel than the one running the
+ * agents. It is a read, so it is not recorded either.
+ *
  * `limit` is a read *and* a write, and it is the operator's own verb on a
  * process's budget: read it, or change the ceiling. It is not a syscall —
  * the ABI has no `set_budget` — so it is answered by the kernel's own
@@ -102,6 +108,7 @@ export type KernelCommand =
   | 'ping'
   | 'ps'
   | 'openCalls'
+  | 'drivers'
   | 'memory'
   | 'send'
   | 'kill'

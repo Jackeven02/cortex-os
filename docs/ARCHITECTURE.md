@@ -2096,6 +2096,49 @@ whenever the log knows better. So the table falls back to the log — through
 the *same* function `cortex top` uses, so the two views cannot end up
 disagreeing about the same agent.
 
+**And the window says what this system can call.** The dashboard could show
+what an agent **did** and what it **knew** — and nothing about the system it
+was running in: which tools existed, which model was driving it, and — the one
+that bites — which of those tools never said whether they could be undone.
+
+`cortex audit` answers that, and it always has. But it **boots a kernel of its
+own** to do it, and the answer it gives is about *that* kernel: an MCP
+server's tool list is pulled from the server when the driver registers, so the
+surface of the kernel actually running the agents is not the surface of a
+second one booted next to it. The terminal was right about its own kernel, and
+the window had no answer at all.
+
+So the kernel answers it. The transport grew a `drivers` command — a **read**,
+like `ps` and `openCalls`, and like them not recorded: the operator *looking*
+at the registry is not something the kernel did, so a window that polls it
+every second must not grow init's causal history. The facts live in one module
+(`src/cli/audit_view.ts`), because the terminal and the window ask the same
+question of the same kernel and must not be able to disagree about it.
+
+**And a defaulted tag is not a declared one.** An MCP server cannot declare
+reversibility at all (ABI.md §5, §7.2), so the driver invents a tag — and the
+invented one is `irreversible`, which is safe and **silent**: a tool nobody
+declared refuses to run inside a `forkable()` region, and the operator finds
+that out as a puzzling `EREVERSIBLE` days later. So the surface says which
+tags were *invented* (`not-declared`), in the terminal and in the window, with
+the same word.
+
+And a tool the registry cannot resolve is neither declared nor undeclared: it
+is `?`. "We cannot tell" is not "nobody said so", and it is certainly not
+"irreversible" — the same rule every other view in this project follows, and
+the same one the budget views follow when a snapshot does not record what was
+left of its ceiling.
+
+One thing the old wording got wrong: declaring a tag does not make a tool
+**forkable**. An MCP driver is `forkable = false` whatever its tools are
+tagged (STATE.md §8.6); declaring a tag makes the tool *allowed to run
+inside* a `forkable()` region. The sentence now says that, because a sentence
+that overstates what a knob does sends the operator to the wrong file.
+
+The window says it plainly when it cannot answer: the tool list lives in the
+registry of the kernel that owns it, there is no on-disk copy to read
+instead, and an empty surface would look like a kernel with no tools at all.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up
@@ -2527,6 +2570,13 @@ report would be telling the operator they do not.
   the thing the live path replaced. And the *process list* is then the disk's:
   a running process has no `meta.json` yet, so it has no row (its log is
   still shown).
+- **The tool surface needs the kernel too.** An MCP server's tool list is
+  pulled from the server when the driver registers, so there is nothing on disk
+  to read instead — and the window says so (a `409`) rather than showing an
+  empty surface that would look like a kernel with no tools. `cortex audit` has
+  no such limit because it boots a kernel of its own; what it cannot do is
+  answer about *another* kernel's drivers, which is the whole reason the
+  transport carries `drivers`.
 - A **queued** signal loses its sender. The pending queue holds the signal
   (`pendingSignals` is part of `ProcessInfo`, and the ABI is frozen), so a
   `SIGUSR2` that had to wait for the target to run again is recorded without

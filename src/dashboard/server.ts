@@ -14,6 +14,12 @@ import { formatCaps, describePendingSignals, readProcessView, formatAge, process
 import { describeOutcome } from '../cli/process_outcome.js';
 import { describeBudget, formatTokenBudget, formatUsdBudget, type BudgetFacts } from '../cli/process_budget.js';
 import { describeCheckpoint, formatCheckpointTokenBudget, formatCheckpointUsdBudget } from '../cli/checkpoint_view.js';
+import {
+  describeDriverSurface,
+  formatDeclaration,
+  formatUndeclaredSummary,
+  type DriverSurface,
+} from '../cli/audit_view.js';
 import { usdToDollars } from '../money.js';
 import { formatTokenUsage, callUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
@@ -819,6 +825,60 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
       }
       if (url.pathname === '/api/checkpoints') {
         json(response, 200, await listCheckpoints(dir));
+        return;
+      }
+      // What this kernel can call.
+      //
+      // The window could show what an agent *did* and what it *knew*, and
+      // nothing about the system it was running in — which tools existed,
+      // which model was driving it, and which of those tools never said
+      // whether they could be undone. `cortex audit` answers that, but it
+      // boots a kernel of its own to do it, and the answer it gives is about
+      // *that* kernel: an MCP server's tool list is pulled from the server
+      // when the driver registers, so the surface of the kernel actually
+      // running the agents is not the surface of a second one.
+      //
+      // So the window asks the kernel that has the agents — over the
+      // transport's `drivers` command, which is a read and is not recorded.
+      // There is no on-disk copy to fall back on: the tool list lives in the
+      // registry of the kernel that owns it, so without one this says so
+      // rather than showing an empty surface that looks like a kernel with
+      // no tools.
+      if (url.pathname === '/api/drivers') {
+        if (options.kernel === undefined) {
+          json(response, 409, {
+            error:
+              "no live kernel: the tool surface belongs to the kernel that registered the drivers — there is no on-disk copy to read instead",
+          });
+          return;
+        }
+        try {
+          const reply = await options.kernel.request('drivers') as { surface: DriverSurface };
+          const surface = reply.surface;
+          json(response, 200, {
+            toolDrivers: surface.toolDrivers.map((driver) => ({
+              ...driver,
+              tools: driver.tools.map((tool) => ({
+                ...tool,
+                // The label travels with the tool so the page never
+                // re-implements the rule — the page is a static file and
+                // cannot import it — and so the window and the terminal
+                // mark an undeclared tool with the same word.
+                declaredLabel: formatDeclaration(tool.declared),
+              })),
+            })),
+            llmDrivers: surface.llmDrivers,
+            memoryDrivers: surface.memoryDrivers,
+            toolCount: surface.toolCount,
+            undeclaredCount: surface.undeclaredCount,
+            // The sentence about the undeclared tools, computed here for
+            // the same reason: it is one sentence with one home, and both
+            // views print it.
+            summary: formatUndeclaredSummary(surface),
+          });
+        } catch (error) {
+          json(response, 502, { error: error instanceof Error ? error.message : String(error) });
+        }
         return;
       }
       if (url.pathname === '/api/stream') {

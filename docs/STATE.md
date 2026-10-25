@@ -500,6 +500,8 @@ A read-only HTTP GET that hits a rate-limited API and burns quota — is that a 
 
 **v0 answer:** if the driver author tags it `irreversible`, we believe them. We provide a `cortex audit` tool to surface untagged tools so authors notice.
 
+The dashboard's **tool surface** says the same thing about the kernel that is actually running the agents — and it asks *that* kernel, because an MCP server's tool list is pulled from the server when the driver registers, so the surface of one kernel is not the surface of another. A tool nobody declared is marked `not-declared`: the tag the kernel enforces was **invented**, not stated, and an invented `irreversible` is the kind of thing that refuses a `forkable()` region without saying why. A tool the kernel cannot resolve is `?` — *we cannot tell* is not *nobody said so*, and it is certainly not *irreversible*.
+
 ---
 
 ## 9. What we will get wrong

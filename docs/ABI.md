@@ -1097,7 +1097,17 @@ since when) and the transport's `openCalls` command were added for exactly
 that reason. Adding a host method does not touch `KERNEL_ABI_VERSION`. The
 transport has its own version, `KERNEL_PROTOCOL_VERSION`, and it moves only
 when the *framing* of an existing command changes — adding a command is
-additive, so `openCalls` did not move it either.
+additive, so `openCalls` did not move it either. The transport's `drivers`
+command — what this kernel can call, and which of those calls never declared a
+reversibility tag — was added for the same reason and moved it no more.
+
+**And a declared tag is not a declared *driver*.** A tool's reversibility tag
+says whether *that call* can be undone. Whether a **driver** can cross a
+cognitive fork is a separate fact, and the kernel does not take the driver's
+word for it: an MCP driver owns a live subprocess, and a cognitive fork copies
+JSON, not processes, so it is `forkable = false` whatever its tools are tagged
+(docs/STATE.md §8.6). Declaring a tag makes a tool *allowed to run inside* a
+`forkable()` region; it does not make the tool or its driver forkable.
 
 **Recording ownership — resolved in stages, because none of it is an ABI change:** the modules `memory.ts`, `ipc.ts`, `fork.ts` and `checkpoint.ts` predate the dispatcher and used to write their own `.crec` frames (`memory_read`, `memory_write`, `send`, `recv`, `fork`, `checkpoint`, `restore`). The on-disk format is identical either way, so this is internal tidying rather than a contract change — which is exactly why it was not allowed to hold the freeze hostage.
 
