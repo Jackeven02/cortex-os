@@ -177,6 +177,12 @@ cortex daemon uninstall watcher
   attempt ended. The live state comes from the kernel that supervises the
   daemons; with no kernel in the directory it says *unknown* and says why,
   because "nobody is running it" and "nobody knows" are different claims.
+- Below the table it prints the **supervisor's own record** of each daemon —
+  the last decision it made, read from the kernel's supervision journal (init's
+  log). The live state says *now*; the journal says *what was decided*. If the
+  two do not match (the kernel remembers a give-up the journal never recorded,
+  or the journal counts restarts the kernel does not), it says so in words
+  rather than leaving you to find the difference by hand.
 - `run` boots a kernel, registers the daemon, and supervises restarts per the
   `RestartPolicy` (`always` / `on-failure` / `never`, exponential backoff capped
   at 60s, `maxRestarts` cap, restart-storm detection). It stays alive until

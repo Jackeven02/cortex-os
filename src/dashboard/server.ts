@@ -25,6 +25,7 @@ import { describeConnection } from './connection_view.js';
 import { listDaemons } from '../cli/daemon_store.js';
 import { agentOf, type DaemonState } from '../kernel/init.js';
 import {
+  describeDaemonDetails,
   describeDaemonNote,
   describeDaemonStatus,
   formatDaemonAgent,
@@ -32,6 +33,7 @@ import {
   formatDaemonPolicy,
   formatDaemonSummary,
   joinDaemons,
+  readDaemonDecisions,
   type DaemonReceipt,
 } from '../cli/daemon_view.js';
 import { usdToDollars } from '../money.js';
@@ -999,10 +1001,17 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           }
         }
         const rows = joinDaemons(receipts, live);
+        // The supervisor's own record of these daemons — the **journal**
+        // beside the live state. The two answer different questions ("now"
+        // and "what was decided"), so they are allowed to differ; what they
+        // are not allowed to do is differ silently.
+        const journal = await readDaemonDecisions(dir);
+        const details = describeDaemonDetails(rows, live, journal);
         json(response, 200, {
           kernelLive: live !== null,
-          daemons: rows.map((row) => {
+          daemons: rows.map((row, index) => {
             const status = describeDaemonStatus(row.status);
+            const detail = details[index];
             return {
               name: row.name,
               role: row.role,
@@ -1019,6 +1028,10 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
               policyLabel: formatDaemonPolicy(row.restart, row.maxRestarts),
               agentLabel: formatDaemonAgent(row.agent),
               note: describeDaemonNote(row),
+              // What the supervisor decided about this daemon, and whether
+              // the two answers agree.
+              decision: detail?.decision ?? null,
+              disagreement: detail?.disagreement ?? null,
             };
           }),
           summary: formatDaemonSummary(rows),

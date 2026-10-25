@@ -38,7 +38,7 @@
  * @module cli/supervision_view
  */
 
-import type { InitAction } from '../kernel/init.js';
+import type { InitAction, InitGiveUpReason } from '../kernel/init.js';
 import type { SyscallRecord } from '../kernel/types.js';
 
 /**
@@ -53,6 +53,14 @@ export interface SupervisionFacts {
   readonly action: InitAction;
   /** The role of the daemon the decision is about. */
   readonly role: string | null;
+  /**
+   * The operator's own name for the daemon, when the kernel was given one.
+   *
+   * It is the join key between the registry and the journal — and between
+   * the journal and the live state, which is why it is a fact here and not
+   * something a view has to dig out of the frame's args.
+   */
+  readonly name: string | null;
   /** The logical daemon's id — the pid it was registered under. */
   readonly daemonId: number | null;
   /** The process the decision is about: the one that died, or the one registered. */
@@ -116,6 +124,23 @@ export const SUPERVISION_ACTIONS: readonly InitAction[] = [
 ];
 
 /**
+ * The reasons the supervisor can give up on a daemon — and the ones this
+ * module can say.
+ *
+ * The kernel's own list lives in `src/kernel/init.ts`
+ * (`INIT_GIVE_UP_REASONS`), and a smoke check holds the two to each other: a
+ * reason the kernel can produce and no view can say is a reason that reaches
+ * the operator as an unexplained row. That is exactly what happened to the
+ * `policy` give-up — the one the *policy* decides — before the journal named
+ * it too.
+ */
+export const SUPERVISION_GIVE_UP_REASONS: readonly InitGiveUpReason[] = [
+  'policy',
+  'max-restarts',
+  'restart-storm',
+];
+
+/**
  * Read one frame's supervision facts — or `undefined` when the frame is not
  * a supervision decision at all.
  *
@@ -141,6 +166,7 @@ export function describeSupervision(record: SyscallRecord): SupervisionFacts | u
   return {
     action: action as InitAction,
     role: asString(args['role']),
+    name: asString(args['name']),
     daemonId: asCount(args['daemonId']),
     pid: asCount(args['pid']),
     newPid: newPid ?? restarted,
@@ -169,14 +195,21 @@ export function describeSupervision(record: SyscallRecord): SupervisionFacts | u
  */
 export function formatSupervision(facts: SupervisionFacts): string {
   const role = facts.role ?? 'daemon';
+  // The operator's own name, when the kernel was given one.
+  //
+  // A role is not an identity — two daemons may share one and differ only by
+  // their module — so a decision that names only the role cannot be
+  // attributed to a daemon. The journal carries the name now, and the
+  // sentence says it.
+  const who = facts.name === null ? `daemon ${role}` : `daemon ${facts.name} (${role})`;
   switch (facts.action) {
     case 'boot':
       return 'kernel booted';
     case 'register-daemon': {
       const policy = facts.policy;
       return policy === null
-        ? `daemon ${role} registered`
-        : `daemon ${role} registered (restart: ${policy})`;
+        ? `${who} registered`
+        : `${who} registered (restart: ${policy})`;
     }
     case 'restart': {
       const attempt = facts.attempt === null ? '' : `attempt ${facts.attempt}`;
@@ -185,7 +218,7 @@ export function formatSupervision(facts: SupervisionFacts): string {
         : `, previous exit: ${facts.previousExitReason}`;
       const pid = facts.newPid === null ? '' : ` as pid ${facts.newPid}`;
       const detail = [attempt, previous.replace(/^, /, '')].filter((part) => part !== '').join(', ');
-      return `daemon ${role} restarted${pid}${detail === '' ? '' : ` (${detail})`}`;
+      return `${who} restarted${pid}${detail === '' ? '' : ` (${detail})`}`;
     }
     case 'reap': {
       const ended = facts.exitCode === null
@@ -201,14 +234,21 @@ export function formatSupervision(facts: SupervisionFacts): string {
       if (facts.reason === 'restart-storm') {
         const count = facts.count === null ? 'many' : String(facts.count);
         const window = facts.windowMs === null ? '' : ` in ${facts.windowMs} ms`;
-        return `daemon ${role} not restarted -> restart storm (${count} restarts${window})`;
+        return `${who} not restarted -> restart storm (${count} restarts${window})`;
       }
       if (facts.reason === 'max-restarts') {
         const cap = facts.maxRestarts === null ? '' : ` (${facts.maxRestarts})`;
         const count = facts.restartCount === null ? '' : ` after ${facts.restartCount} restart(s)`;
-        return `daemon ${role} not restarted -> max restarts reached${cap}${count}`;
+        return `${who} not restarted -> max restarts reached${cap}${count}`;
       }
-      return `daemon ${role} not restarted`;
+      if (facts.reason === 'policy') {
+        // The give-up the **policy** decides. It used to be the one give-up
+        // the journal had no word for: the kernel knew it, the live state
+        // said it, and the supervision journal said only "not restarted".
+        const policy = facts.policy === null ? '' : ` (${facts.policy})`;
+        return `${who} not restarted -> the restart policy says no${policy}`;
+      }
+      return `${who} not restarted`;
     }
     case 'shutdown': {
       const signalled = facts.signalled === null ? 0 : facts.signalled.length;

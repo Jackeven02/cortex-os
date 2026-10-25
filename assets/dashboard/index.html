@@ -127,7 +127,10 @@
     .daemon-note:empty { display: none; }
     .daemon-note-line { display: block; margin-top: 5px; color: #8a93a1; }
     .daemon-note-line:empty { display: none; }
+    .daemon-decisions { color: #6f7988; font-size: 9px; line-height: 1.6; }
+    .daemon-note-title { margin-bottom: 4px; color: #9199a6; font-weight: 620; letter-spacing: .045em; text-transform: uppercase; }
     .daemon-cell-note { margin-top: 4px; max-width: 190px; color: #8a93a1; font-size: 9px; line-height: 1.4; white-space: normal; }
+    .daemon-cell-note.drift { color: var(--red); }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
     .empty { height: 120px; color: #929aa7; text-align: center; }
     .runtime { display: flex; flex-direction: column; }
@@ -288,6 +291,7 @@
             <div class="panel-head"><div><div class="panel-title">守护进程 <span class="nav-count" id="daemonCount"></span></div><div class="panel-note">内核监管的守护进程 · 活状态来自内核</div></div><span class="state" id="daemonKernelState">只读</span></div>
             <div class="table-scroll"><table><thead><tr><th>名称</th><th>角色</th><th>状态</th><th>PID</th><th>重启</th><th>上次结束</th><th>重启策略</th><th>Agent</th></tr></thead><tbody id="daemonRows"><tr><td colspan="8" class="empty">正在读取守护进程…</td></tr></tbody></table></div>
             <div class="panel-note daemon-note"><span id="daemonSummary"></span><span id="daemonNote" class="daemon-note-line"></span></div>
+            <div class="panel-note daemon-note daemon-decisions" id="daemonDecisions" hidden></div>
           </section>
         </div>
 
@@ -694,6 +698,7 @@
       const shared = [...noteCounts.entries()]
         .filter(([, count]) => count === daemonData.length)
         .map(([note]) => note);
+      const decisions = [];
       $('daemonRows').innerHTML = daemonData.length ? daemonData.map((daemon) => {
         const tone = ['live', 'warn', 'dead', 'idle'].includes(daemon.tone) ? daemon.tone : 'idle';
         const label = typeof daemon.statusLabel === 'string' ? daemon.statusLabel : 'unknown';
@@ -702,10 +707,28 @@
         const noteCell = note === '' || shared.includes(note)
           ? ''
           : `<div class="daemon-cell-note">${esc(note)}</div>`;
-        return `<tr><td class="role-cell">${name}</td><td>${esc(daemon.role ?? '—')}</td><td><span class="daemon-state ${tone}">${esc(label)}</span>${noteCell}</td><td class="pid-cell">${esc(daemon.pid ?? '—')}</td><td class="pid-cell">${esc(daemon.restarts ?? '—')}</td><td>${esc(daemon.exitLabel ?? '—')}</td><td>${esc(daemon.policyLabel ?? '—')}</td><td title="${esc(daemon.agentLabel ?? '')}">${esc(daemon.agentLabel ?? '—')}</td></tr>`;
+        // What the supervisor decided about **this** daemon — from the
+        // journal, which outlives the kernel. The live state says "now"; the
+        // journal says "what was decided", and the two belong side by side.
+        //
+        // The sentence goes **under the panel**, not inside the row: a cell
+        // in a narrow column cannot hold it, and a sentence cut into a
+        // two-word column says less than the sentence.
+        const driftCell = typeof daemon.disagreement === 'string' && daemon.disagreement !== ''
+          ? `<div class="daemon-cell-note drift">${esc(daemon.disagreement)}</div>`
+          : '';
+        const decision = typeof daemon.decision === 'string' ? daemon.decision : '';
+        if (decision !== '') {
+          decisions.push(`  ${esc(typeof daemon.name === 'string' && daemon.name !== '' ? daemon.name : '(unnamed)')}  ${esc(decision)}`);
+        }
+        return `<tr><td class="role-cell">${name}</td><td>${esc(daemon.role ?? '—')}</td><td><span class="daemon-state ${tone}">${esc(label)}</span>${noteCell}${driftCell}</td><td class="pid-cell">${esc(daemon.pid ?? '—')}</td><td class="pid-cell">${esc(daemon.restarts ?? '—')}</td><td>${esc(daemon.exitLabel ?? '—')}</td><td>${esc(daemon.policyLabel ?? '—')}</td><td title="${esc(daemon.agentLabel ?? '')}">${esc(daemon.agentLabel ?? '—')}</td></tr>`;
       }).join('') : '<tr><td colspan="8" class="empty">没有守护进程。用 cortex daemon install 注册一个，这里会显示内核眼中的活状态。</td></tr>';
       $('daemonSummary').textContent = daemonSummary;
       $('daemonNote').textContent = shared.join(' · ');
+      $('daemonDecisions').hidden = decisions.length === 0;
+      $('daemonDecisions').innerHTML = decisions.length
+        ? `<div class="daemon-note-title">监管决定（内核的日志）</div>${decisions.join('<br>')}`
+        : '';
     }
 
     // What a snapshot holds.

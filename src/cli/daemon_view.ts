@@ -55,11 +55,19 @@
  */
 
 import { formatOutcomeCode } from './process_outcome.js';
-import type {
-  DaemonAgent,
-  DaemonGiveUpReason,
-  DaemonState,
-  DaemonStatus,
+import { describeSupervision, formatSupervision } from './supervision_view.js';
+import { PID_INIT } from '../kernel/process_table.js';
+import { asProcessId } from '../kernel/types.js';
+import { existingCrecPath, readRecords } from '../kernel/recorder.js';
+import { existsSync } from 'node:fs';
+import type { SyscallRecord } from '../kernel/types.js';
+import {
+  INIT_GIVE_UP_REASONS,
+  type DaemonAgent,
+  type DaemonGiveUpReason,
+  type DaemonState,
+  type DaemonStatus,
+  type InitAction,
 } from '../kernel/init.js';
 
 /**
@@ -148,6 +156,14 @@ export function describeDaemonGiveUp(reason: DaemonGiveUpReason | null): string 
 export interface DaemonFacts {
   /** The operator's name for the daemon, or `null` when it has none. */
   readonly name: string | null;
+  /**
+   * The daemon's stable identity — the pid of its *first* attempt.
+   *
+   * It is the join key between the **live state** and the **journal**: the
+   * kernel's own bookkeeping and init's log both name the daemon this way,
+   * and it survives restarts (a restart mints a fresh pid).
+   */
+  readonly daemonId: number | null;
   readonly role: string;
   /** Whether the registry has an entry for this daemon. */
   readonly installed: boolean;
@@ -208,6 +224,7 @@ export function joinDaemons(
     for (const receipt of receipts) {
       rows.push({
         name: receipt.name,
+        daemonId: null,
         role: receipt.role,
         installed: true,
         status: 'unknown',
@@ -242,6 +259,7 @@ export function joinDaemons(
       // fact: the kernel is right there and it does not have this daemon.
       rows.push({
         name: receipt.name,
+        daemonId: null,
         role: receipt.role,
         installed: true,
         status: 'not-started',
@@ -276,6 +294,7 @@ export function joinDaemons(
 function factsOf(state: DaemonState, installed: boolean): DaemonFacts {
   return {
     name: state.name,
+    daemonId: state.daemonId,
     role: state.role,
     installed,
     status: state.status,
@@ -373,4 +392,282 @@ export function formatDaemonSummary(rows: readonly DaemonFacts[]): string {
   }
   const plural = rows.length === 1 ? 'daemon' : 'daemons';
   return `${rows.length} ${plural}: ${parts.join(', ')}`;
+}
+
+// =============================================================================
+// The journal — what the supervisor said about these daemons
+// =============================================================================
+
+/**
+ * What the supervision journal says about one daemon.
+ *
+ * The journal is init's own log (docs/PROCESS.md §9.1) — the durable record
+ * of every decision the supervisor made. The live state answers **now**; the
+ * journal answers **what was decided**, and it outlives the kernel.
+ *
+ * These are the *decisions* about one daemon: it was registered, it was
+ * restarted, it was given up on. The `reap` frames are not here — a reap is a
+ * process dying, and the decision about what happens next is the frame that
+ * follows it.
+ */
+export interface DaemonDecisions {
+  /** The daemon's stable identity — the pid of its first attempt. */
+  readonly daemonId: number;
+  /** The operator's name for it, when the journal carried one. */
+  readonly name: string | null;
+  readonly role: string;
+  /** The journal saw it registered. */
+  readonly registered: boolean;
+  /** How many restarts the journal recorded. */
+  readonly restarts: number;
+  /** The pid of the last attempt the journal saw start. */
+  readonly lastPid: number | null;
+  /** Which attempt that last restart was. */
+  readonly lastAttempt: number | null;
+  /** Why the supervisor gave up, if the journal says it did. */
+  readonly gaveUpReason: DaemonGiveUpReason | null;
+  /** The last decision, in the wording every view of the journal uses. */
+  readonly lastDecision: string | null;
+  /** Which decision that was. */
+  readonly lastAction: InitAction | null;
+}
+
+/** Is this string one of the reasons the kernel can give up? */
+function isGiveUpReason(value: string | null): value is DaemonGiveUpReason {
+  return value !== null && (INIT_GIVE_UP_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * Fold the supervision journal into one entry per daemon.
+ *
+ * The frames that carry a daemon's identity are its **decisions**: the
+ * registration, the restarts, the give-up. Everything else in the journal is
+ * about the kernel (it booted, it shut down) or about a process that died.
+ *
+ * A frame nobody can read is **not** a decision: `describeSupervision` refuses
+ * an action it does not know, and guessing what a decision meant is how a
+ * view starts lying.
+ */
+export function describeDaemonDecisions(records: readonly SyscallRecord[]): DaemonDecisions[] {
+  const byDaemon = new Map<number, DaemonDecisions>();
+  for (const record of records) {
+    const facts = describeSupervision(record);
+    if (facts === undefined) continue;
+    if (
+      facts.action !== 'register-daemon' &&
+      facts.action !== 'restart' &&
+      facts.action !== 'restart-gave-up'
+    ) {
+      continue;
+    }
+    if (facts.daemonId === null) continue;
+
+    const previous = byDaemon.get(facts.daemonId);
+    const isRestart = facts.action === 'restart';
+    const lastPid = isRestart
+      ? (facts.newPid ?? previous?.lastPid ?? null)
+      : facts.action === 'register-daemon'
+        ? facts.daemonId
+        : (previous?.lastPid ?? null);
+
+    byDaemon.set(facts.daemonId, {
+      daemonId: facts.daemonId,
+      name: facts.name ?? previous?.name ?? null,
+      role: facts.role ?? previous?.role ?? 'daemon',
+      registered: previous?.registered === true || facts.action === 'register-daemon',
+      restarts: (previous?.restarts ?? 0) + (isRestart ? 1 : 0),
+      lastPid,
+      lastAttempt: isRestart ? (facts.attempt ?? previous?.lastAttempt ?? null) : (previous?.lastAttempt ?? null),
+      gaveUpReason:
+        facts.action === 'restart-gave-up' && isGiveUpReason(facts.reason)
+          ? facts.reason
+          : (previous?.gaveUpReason ?? null),
+      lastDecision: formatSupervision(facts),
+      lastAction: facts.action,
+    });
+  }
+  return [...byDaemon.values()].sort((a, b) => a.daemonId - b.daemonId);
+}
+
+/**
+ * The supervision journal in this directory — init's own log.
+ *
+ * The one reader: the log is read with the **same** reader the kernel writes
+ * it with (`readRecords`), so a journal that cannot be read is reported as
+ * *no journal* rather than as an empty one — which would say "the supervisor
+ * decided nothing" about a log nobody managed to read.
+ */
+export async function readDaemonDecisions(dir: string): Promise<DaemonDecisions[]> {
+  const path = existingCrecPath(dir, asProcessId(PID_INIT));
+  if (!existsSync(path)) return [];
+  const records: SyscallRecord[] = [];
+  try {
+    for await (const record of readRecords(path)) records.push(record);
+  } catch {
+    return [];
+  }
+  return describeDaemonDecisions(records);
+}
+
+/** The decisions, keyed by the daemon's stable identity. */
+export function indexDaemonDecisions(
+  decisions: readonly DaemonDecisions[],
+): ReadonlyMap<number, DaemonDecisions> {
+  const index = new Map<number, DaemonDecisions>();
+  for (const entry of decisions) index.set(entry.daemonId, entry);
+  return index;
+}
+
+/**
+ * What the supervisor's own record says about one row — beside what the
+ * kernel says right now.
+ *
+ * Two things, and they are not the same:
+ *
+ *   - the **decision** — the last thing the supervisor did about this daemon,
+ *     from the journal. It is history, and it outlives the kernel.
+ *   - the **disagreement** — the two answers do not match: the kernel
+ *     remembers a give-up the journal never recorded, or the journal counts
+ *     restarts the kernel does not, or one side has never heard of the
+ *     daemon at all.
+ *
+ * A disagreement is never silently dropped: two answers to one question
+ * that differ is exactly what an operator needs to be told, and it is what
+ * nobody could see while the two lived in different places.
+ */
+export interface DaemonDetail {
+  /** The daemon, as the row names it. */
+  readonly who: string;
+  /** The supervisor's last decision, or `null` when the journal has none. */
+  readonly decision: string | null;
+  /** The sentence that says what differs, or `null` when nothing does. */
+  readonly disagreement: string | null;
+}
+
+/**
+ * Pair every row with the supervisor's record of it.
+ *
+ * The join is on the daemon's **identity** — the pid of its first attempt,
+ * which survives restarts — and, for a daemon the kernel is not running, on
+ * its **name**, which the journal carries since the kernel learned it.
+ *
+ * A row the kernel is not running gets no disagreement: the journal's
+ * decisions about it are **history** (an earlier kernel's), not a conflict
+ * with a live state that does not exist.
+ */
+export function describeDaemonDetails(
+  rows: readonly DaemonFacts[],
+  states: readonly DaemonState[] | null,
+  decisions: readonly DaemonDecisions[],
+): DaemonDetail[] {
+  const byDaemon = new Map<number, DaemonDecisions>();
+  const byName = new Map<string, DaemonDecisions>();
+  for (const entry of decisions) {
+    byDaemon.set(entry.daemonId, entry);
+    if (entry.name !== null && !byName.has(entry.name)) byName.set(entry.name, entry);
+  }
+  const statesById = new Map<number, DaemonState>();
+  for (const state of states ?? []) statesById.set(state.daemonId, state);
+
+  return rows.map((row) => {
+    const who = row.name ?? (row.daemonId === null ? '(unnamed)' : `(pid ${row.daemonId})`);
+    if (row.daemonId === null) {
+      const history = row.name === null ? undefined : byName.get(row.name);
+      return {
+        who,
+        decision: history?.lastDecision ?? null,
+        disagreement: null,
+      };
+    }
+    const entry = byDaemon.get(row.daemonId);
+    const comparison = compareDaemonState(statesById.get(row.daemonId), entry);
+    return {
+      who,
+      decision: comparison.agreement === 'agree' ? (entry?.lastDecision ?? null) : null,
+      disagreement:
+        comparison.agreement === 'agree' ? null : (comparison.detail ?? comparison.agreement),
+    };
+  });
+}
+
+/**
+ * Whether the live state and the journal agree about one daemon.
+ *
+ *   - `agree` — they say the same thing;
+ *   - `disagree` — both know the daemon, and they say **different** things;
+ *   - `journal-only` — the journal knows it and the kernel does not (the
+ *     journal may be from an earlier kernel);
+ *   - `state-only` — the kernel knows it and the journal does not (the
+ *     journal may predate this kernel, or the recording failed).
+ *
+ * The last two are not failures: they are what a journal and a kernel from
+ * different runs look like. They are named so that nobody has to guess which
+ * of the two it is.
+ */
+export type DaemonAgreement = 'agree' | 'disagree' | 'journal-only' | 'state-only';
+
+export interface DaemonComparison {
+  readonly agreement: DaemonAgreement;
+  /** The sentence that says what differs, or `null` when they agree. */
+  readonly detail: string | null;
+}
+
+/**
+ * Compare what the kernel says now with what the journal says happened.
+ *
+ * The two answers are about different questions — *now* and *what was
+ * decided* — so they are allowed to differ. What they are **not** allowed to
+ * do is differ silently: a give-up the kernel remembers and the journal never
+ * recorded is a decision nobody can read back, and a restart count the two
+ * sides keep differently is bookkeeping that has drifted.
+ */
+export function compareDaemonState(
+  state: DaemonState | undefined,
+  decisions: DaemonDecisions | undefined,
+): DaemonComparison {
+  if (state === undefined && decisions === undefined) {
+    return { agreement: 'agree', detail: null };
+  }
+  if (state === undefined) {
+    return {
+      agreement: 'journal-only',
+      detail:
+        'the journal knows this daemon, but the kernel does not have it — the journal may be from an earlier kernel',
+    };
+  }
+  if (decisions === undefined) {
+    return {
+      agreement: 'state-only',
+      detail:
+        'the kernel is supervising it, but the journal has no record of it — the journal may predate this kernel',
+    };
+  }
+
+  if (state.gaveUpReason !== null && decisions.gaveUpReason === null) {
+    const reason = describeDaemonGiveUp(state.gaveUpReason) ?? state.gaveUpReason;
+    return {
+      agreement: 'disagree',
+      detail: `the kernel says the supervisor gave up (${reason}), but the journal has no such decision`,
+    };
+  }
+  if (state.gaveUpReason === null && decisions.gaveUpReason !== null) {
+    const reason = describeDaemonGiveUp(decisions.gaveUpReason) ?? decisions.gaveUpReason;
+    return {
+      agreement: 'disagree',
+      detail: `the journal says the supervisor gave up (${reason}), but the kernel does not`,
+    };
+  }
+  if (state.restartCount !== decisions.restarts) {
+    return {
+      agreement: 'disagree',
+      detail: `the kernel counts ${state.restartCount} restart(s), the journal records ${decisions.restarts}`,
+    };
+  }
+  if (decisions.lastPid !== null && state.currentPid !== decisions.lastPid) {
+    return {
+      agreement: 'disagree',
+      detail: `the kernel runs pid ${state.currentPid}, the journal's last attempt was pid ${decisions.lastPid}`,
+    };
+  }
+  return { agreement: 'agree', detail: null };
 }

@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 868 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 876 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -428,6 +428,10 @@ And the push **ends** when the kernel goes away: a stream left open over a dead 
 The kernel has always known. Now it says: there is a **守护进程** panel with each daemon's live state — `running`, `waiting to restart`, `given up`, `not started` — its pid, how many times it has been restarted, how the last attempt ended, and the restart policy that is in force. The live state comes from the kernel that supervises the daemons (as a read, like `ps`), the receipt comes from disk, and the two are joined on the daemon's **name** — the role is not an identity, because two daemons may share one.
 
 And when there is **no kernel to ask**, the panel says *unknown*, and says why. It does not say "not running": a daemon's live state belongs to the kernel that supervises it, so without one nobody knows — and "nobody knows" is a different claim from "it was never started". `cortex daemon list` prints the same words, next to the receipt it always printed.
+
+**And the window shows what the supervisor said about them.** The live state says *now*; the kernel's **journal** says *what was decided* — and the panel shows both, side by side.
+
+The journal had a hole in it, too. It named two of the three ways a supervisor gives up (*max restarts reached*, *restart storm*) and not the third — the one the **policy** decides. So a daemon whose policy said `never` left the log saying only "not restarted", while the live state said "gave up: the restart policy says no": the kernel knew a decision it could not read back. All three give-ups are recorded the same way now, the journal names the daemon it is about, and when the two answers do not match, the row says so in words.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

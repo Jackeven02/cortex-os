@@ -1771,35 +1771,74 @@ The user-facing surface. Should feel like a real OS shell.
   `cortex daemon list` prints the same words next to the receipt it always
   printed.
 
-- [ ] **#113** The daemon's live state and its supervision journal are two
-  answers to one question → **open.**
-  The kernel now answers "what is this daemon doing right now?" as a **read**
+- [x] **#113** The daemon's live state and its supervision journal are two
+  answers to one question → **fixed.**
+  The kernel answers "what is this daemon doing right now?" as a **read**
   (`Kernel.daemons()`, the transport's `daemons` command), and it also keeps
   a **journal** of every decision it made (init's own log, `__init` frames —
-  PROCESS.md §9.1). Two answers, one question, and they can disagree:
+  PROCESS.md §9.1). Two answers, one question — and nothing kept them in step.
 
-  - the read says a daemon is `running`, while the journal's last frame is a
-    `restart-gave-up` — because the read is now and the journal is the past;
-  - the read says `given up`, while the journal says nothing about the
-    decision that gave it up (the `policy` give-up — the one the *policy*
-    decides — is recorded as a decision, but the `__init` frames only carry
-    `restart-gave-up` for the two caps);
-  - the read has no record of **who** asked, while the journal has no record
-    of **whether anybody looked**.
+  **The journal had a hole in it, and the hole was in a decision.** It named
+  two of the three ways a supervisor gives up — *max restarts reached* and
+  *restart storm* — and not the third: the one the **policy** decides. A
+  daemon whose policy said `never` left the log with a `reap` frame and
+  nothing else, so the live state said "gave up: the restart policy says no"
+  and the journal said only "not restarted". The kernel knew a decision it
+  could not read back — and the two answers to one question disagreed.
 
-  The question is not "which one wins" — they answer different questions, and
-  the read is the one that says *now*. It is whether the two are kept in step
-  at all: today nothing checks that a daemon the journal says was registered
-  is a daemon the read knows about, and nothing checks that a give-up in one
-  of them shows up in the other. A check that replays the journal and
-  compares it with the live state would keep the two from drifting — and
-  would say out loud when they cannot be compared (a daemon the kernel has
-  since forgotten, a journal from a previous kernel).
+  So all three give-ups are recorded the same way now (a `restart-gave-up`
+  frame with a `reason`), and the journal names the daemon it is about, so a
+  decision can be attributed to a daemon and not just to a role.
 
-  The decision to make first: whether the `__init` frames should carry the
-  `policy` give-up too, so that "the supervisor gave up" is one kind of frame
-  rather than two, and whether the comparison belongs in the CLI or in the
-  smoke suite alone.
+  **And the two answers are compared, every time a view asks for them.** The
+  read says *now*; the journal says *what was decided*. They are allowed to
+  differ — a daemon that was given up on, and then a new kernel restarted it,
+  is history and not a contradiction — but they are **not** allowed to differ
+  silently:
+
+  - the kernel remembers a give-up the journal never recorded;
+  - the journal counts restarts the kernel does not;
+  - the kernel runs a pid the journal's last attempt does not;
+  - one side has never heard of the daemon at all.
+
+  `src/cli/daemon_view.ts` owns the comparison (`compareDaemonState`) and the
+  pairing (`describeDaemonDetails`), so `cortex daemon list` and the
+  dashboard's **守护进程** panel print the live state **and** the supervisor's
+  last word about it — and say, in words, when the two do not match. The
+  join is on the daemon's **identity** (the pid of its first attempt, which
+  survives restarts), and on its **name** for a daemon the kernel is not
+  running — where the journal's decisions are history, not a conflict.
+
+- [ ] **#114** The daemon's live state says "now" and the journal says "what
+  was decided", but neither says "who asked" → **open.**
+  Two rounds of work have made the kernel's answer to "what is this daemon
+  doing?" reach the operator: the live state (a read) and the journal (init's
+  own log). What neither carries is **who looked**.
+
+  That matters for one question an operator actually asks: *has anybody
+  noticed?* A daemon that was given up on at 03:00, and a window that shows
+  the fact at 09:00, are the same facts — and the difference between them is
+  that the window is now showing them. Today the journal records
+  **decisions** and the live state records **state**, and a look is recorded
+  nowhere: so "was this seen?" has no answer, and a dashboard that has been
+  open since Tuesday is indistinguishable from one opened this morning.
+
+  The fix is not obvious, and the question to decide first is what a "look"
+  **is**:
+
+  - a *read* of the daemon's state — but the transport deliberately does not
+    record reads (`ps`, `openCalls`, `drivers` and `daemons` are reads, and
+    recording them would make a monitoring loop grow the log without doing
+    anything);
+  - a *view* — the dashboard asking, the CLI printing, a human reading the
+    row — which lives outside the kernel and would need the host to report it;
+  - or a *watch* — someone subscribed to the daemon's fate, which the
+    transport already has a shape for (`subscribe`).
+
+  The three cost different things and mean different things. Until that is
+  decided, the honest answer is that a look is not recorded, and no view
+  should pretend otherwise: nothing today says "seen", and nothing should
+  start saying it without saying what a look is.
 
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 

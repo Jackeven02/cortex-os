@@ -249,7 +249,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 868 项断言，0 失败
+npx tsx scripts/smoke.ts                # 876 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -416,6 +416,10 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 内核一直知道。现在它说了：大屏多了一个 **守护进程** 面板，每个守护进程都带着自己的活状态——`running`、`waiting to restart`、`given up`、`not started`——以及它的 pid、重启过几次、上一次怎么结束的、当前生效的重启策略。活状态来自**监管它们的那个内核**（一次读，就像 `ps`），安装回执来自磁盘，两边按守护进程的**名字**对上——角色不是身份：两个守护进程可以共用一个角色。
 
 而当**没有内核可问**的时候，面板说的是 *unknown*，并且说清为什么。它不会说「没在跑」：守护进程的活状态属于监管它的内核，没有内核就没人知道——而「没人知道」和「从来没启动过」是两回事。`cortex daemon list` 打印的是同一套词，就摆在它一直打印的那份回执旁边。
+
+**而且大屏说得出监管者对它们说过什么。** 活状态说的是*现在*，内核的**日志**说的是*决定过什么*——面板把两者并排放着。
+
+日志以前也有个洞：它叫得出监管放弃的三种方式里的两种（*max restarts reached*、*restart storm*），却叫不出第三种——由**策略**决定的那一种。于是策略是 `never` 的守护进程在日志里只留下「not restarted」，而活状态说的是「gave up: the restart policy says no」：内核知道一个自己读不回来的决定。现在三种放弃都用同一种方式记录，日志也点出它说的是哪个守护进程；两个答案对不上时，那一行会明说。
 
 三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
 

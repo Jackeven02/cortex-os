@@ -781,6 +781,20 @@ signal events rather than user syscalls.
 | `__sched` | the scheduler | `action`, plus `nice` / `blockedOn` / `budgetKind` / `reason` where they apply |
 | `__signal` | the signal manager | `signal`, `signalNumber`, `outcome` (`delivered` / `queued` / `dropped` / `failed`), `from` |
 
+The `__init` frames carry the **name** of the daemon they are about (the
+operator's own name for it, when the kernel was given one) and the **reason**
+the supervisor gave up. Both are additive: the frame's structure is unchanged,
+and a reader that meets a frame written by an older kernel simply finds no
+name to read.
+
+A give-up is a decision like any other, so all three of them are recorded the
+same way — a `restart-gave-up` frame with a `reason`: `policy` (the restart
+policy said no), `max-restarts` (the cap was reached), `restart-storm` (too
+many restarts inside the window). The `policy` give-up used to be the one the
+journal had no word for: the kernel remembered it, the live state said it, and
+the log said only "not restarted" — two answers to one question, and they
+disagreed.
+
 The **recorded** names are part of the frozen format: the name on disk is
 the name on disk, and changing it would be a major bump.
 

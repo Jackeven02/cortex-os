@@ -42,6 +42,31 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The supervisor's decisions sit beside the live state.** The kernel answers
+  *"what is this daemon doing right now?"* as a read, and it also keeps a
+  **journal** — every decision the supervisor ever made, in init's own log
+  (docs/PROCESS.md §9.1). The read says **now**; the journal says **what was
+  decided**. Both are true, they answer different questions, and nothing kept
+  them in step.
+
+  Now they are side by side. `cortex daemon list` and the dashboard's
+  **守护进程** panel print the live state **and** the supervisor's last word
+  about it, and when the two do not match they say so in words:
+
+  - `the kernel says the supervisor gave up (max restarts reached), but the
+    journal has no such decision`
+  - `the kernel counts 2 restart(s), the journal records 1`
+  - `the kernel runs pid 4, the journal's last attempt was pid 3`
+
+  The join is on the daemon's **identity** — the pid of its *first* attempt,
+  which survives restarts — and on its **name** for a daemon the kernel is not
+  running, which is what the journal carries now.
+
+  `src/cli/daemon_view.ts` grows the two facts and the comparison:
+  `describeDaemonDecisions()`, `readDaemonDecisions()` (the one reader — the
+  journal is read with the same reader the kernel writes it with),
+  `compareDaemonState()`, `describeDaemonDetails()`.
+
 - **The kernel says what its daemons are doing right now.** The kernel has
   always known: init holds each **logical** daemon — its identity (the pid of
   its *first* attempt), the attempt running right now, how many times it has
@@ -1724,6 +1749,18 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **The journal had no word for the give-up the policy decides.** The
+  supervision journal named two of the three ways a supervisor gives up —
+  *max restarts reached* and *restart storm* — and not the third: the one the
+  **policy** decides. A daemon whose policy said `never` left the log with a
+  `reap` frame and nothing else, so the live state said *"gave up: the
+  restart policy says no"* while the journal said only *"not restarted"*: the
+  kernel knew a decision it could not read back.
+
+  All three give-ups are recorded the same way now — a `restart-gave-up`
+  frame with a `reason` — and the journal names the daemon it is about, so a
+  decision can be attributed to a daemon and not just to a role.
 
 - **`cortex daemon list` reported the installation, not the daemon.** It
   printed the spec — name, role, restart policy, agent — read from

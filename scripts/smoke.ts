@@ -259,7 +259,7 @@ import {
 } from '../src/cli/audit_view.js';
 import { describeKernel, formatKernelLine } from '../src/cli/kernel_view.js';
 import { describeConnection } from '../src/dashboard/connection_view.js';
-import { describeSupervision, formatSupervision, SUPERVISION_ACTIONS } from '../src/cli/supervision_view.js';
+import { describeSupervision, formatSupervision, SUPERVISION_ACTIONS, SUPERVISION_GIVE_UP_REASONS } from '../src/cli/supervision_view.js';
 import {
   describeDaemonNote,
   describeDaemonStatus,
@@ -270,7 +270,13 @@ import {
   joinDaemons,
   type DaemonReceipt,
 } from '../src/cli/daemon_view.js';
-import { INIT_ACTIONS, type DaemonState } from '../src/kernel/init.js';
+import {
+  compareDaemonState,
+  describeDaemonDecisions,
+  describeDaemonDetails,
+  readDaemonDecisions,
+} from '../src/cli/daemon_view.js';
+import { INIT_ACTIONS, INIT_GIVE_UP_REASONS, type DaemonState } from '../src/kernel/init.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
@@ -20979,6 +20985,459 @@ async function runDaemonStateChecks(): Promise<void> {
   }
 }
 
+// The daemon's live state beside the supervisor's journal.
+//
+// BACKLOG #113: the kernel answers "what is this daemon doing right now?"
+// as a read, and it also keeps a **journal** of every decision it made. Two
+// answers, one question — and nothing checked that they said the same thing.
+// The journal did not even *name* the give-up the policy decides, so a
+// daemon that was gone for good could be "given up" in the live state and
+// merely "not restarted" in the log.
+async function runDaemonJournalChecks(): Promise<void> {
+  console.log('\nsmoke check: the daemon journal beside the live state\n');
+  const { mkdtemp, rm, mkdir } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-daemon-journal-'));
+  const tables: ProcessTable[] = [];
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+
+  async function makeTable(opts: { record?: boolean; dir?: string } = {}): Promise<ProcessTable> {
+    const dir = opts.dir ?? tmp;
+    const record = opts.record ?? false;
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...(record
+        ? { recorderFactory: async (pid) => Recorder.open({ pid, dir: join(dir, String(unbrand(pid))) }) }
+        : {}),
+    });
+    tables.push(t);
+    return t;
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+
+  function makeInit(table: ProcessTable): { init: InitProcess; signals: SignalManager } {
+    let init!: InitProcess;
+    const signals = new SignalManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      onZombie: (pid, code, reason) => init.handleZombie(pid, code, reason),
+    });
+    init = new InitProcess({ table, signals, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    return { init, signals };
+  }
+
+  /** Drive an attempt to its end and let init decide what to do about it. */
+  async function dieWith(
+    init: InitProcess,
+    table: ProcessTable,
+    pid: ProcessIdAlias,
+    code: number,
+    reason: string,
+  ): Promise<void> {
+    const entry = table.get(pid)!;
+    if (entry.state === 'new') await table.setState(pid, 'ready', { trigger: 'test' });
+    if (entry.state === 'ready') await table.setState(pid, 'running', { trigger: 'test' });
+    table.setExitOutcome(pid, code, reason);
+    await table.setState(pid, 'exiting', { trigger: 'test-exit' });
+    await table.setState(pid, 'zombie', { trigger: 'test-exit' });
+    await init.handleZombie(pid, code, reason);
+  }
+
+  /** One `__init` frame, shaped the way the kernel writes it. */
+  const frame = (args: Record<string, unknown>): SyscallRecord =>
+    ({
+      byteOffset: 0,
+      timestamp: '2026-10-01T00:00:00.000Z',
+      pid: asProcessId(1),
+      syscall: '__init',
+      callId: 'init-x-0',
+      phase: 'exit',
+      args,
+      stateBefore: 'running',
+      stateAfter: 'running',
+      reversibility: 'idempotent',
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+    }) as unknown as SyscallRecord;
+
+  try {
+    // --- the kernel names every give-up -------------------------------------
+
+    await checkAsync('the journal names every give-up — including the one the policy decides', async () => {
+      // The give-up the *policy* decides used to be the one give-up the
+      // journal had no word for: the kernel knew it, the live state said it,
+      // and the supervision journal said only "not restarted". Two answers to
+      // one question, and they disagreed.
+      const sub = join(tmp, 'journal');
+      await mkdir(sub, { recursive: true });
+      const table = await makeTable({ record: true, dir: sub });
+      const { init } = makeInit(table);
+      await init.boot();
+      const d = await init.registerDaemon({
+        role: 'nightly',
+        name: 'once',
+        agent,
+        restart: { kind: 'never' },
+      });
+      await dieWith(init, table, d, 1, 'boom');
+
+      const recorder = table.recorderFor(PID_INIT)!;
+      await recorder.flush();
+      const records: SyscallRecord[] = [];
+      for await (const r of readRecords(recorder.path)) records.push(r);
+      const giveUps = records
+        .filter((r) => r.syscall === '__init')
+        .map((r) => (r.args ?? {}) as Record<string, unknown>)
+        .filter((a) => a['action'] === 'restart-gave-up');
+      assert(giveUps.length === 1, `one give-up frame, got ${giveUps.length}`);
+      assert(giveUps[0]!['reason'] === 'policy', `the reason, got ${String(giveUps[0]!['reason'])}`);
+      assert(giveUps[0]!['name'] === 'once', `the daemon's name, got ${String(giveUps[0]!['name'])}`);
+      assert(
+        giveUps[0]!['restart'] === 'never',
+        `the policy that said no, got ${String(giveUps[0]!['restart'])}`,
+      );
+    });
+
+    check('every reason the kernel can give up is one the views can say', () => {
+      // A reason the kernel can produce and no view can say is a reason that
+      // reaches the operator as an unexplained row.
+      assert(
+        INIT_GIVE_UP_REASONS.length === SUPERVISION_GIVE_UP_REASONS.length &&
+          INIT_GIVE_UP_REASONS.every((reason) => SUPERVISION_GIVE_UP_REASONS.includes(reason)),
+        `the view knows every reason: ${INIT_GIVE_UP_REASONS.join(', ')}`,
+      );
+    });
+
+    check('the journal names the daemon, not just its role', () => {
+      // A role is not an identity — two daemons may share one — so a decision
+      // that names only the role cannot be attributed to a daemon.
+      const facts = describeSupervision(
+        frame({
+          action: 'restart',
+          daemonId: 2,
+          newPid: 3,
+          role: 'inbox-watcher',
+          name: 'watcher',
+          restartCount: 1,
+          prevExitReason: 'boom',
+        }),
+      );
+      assert(facts !== undefined, 'the frame was read');
+      assert(facts!.name === 'watcher', `the name, got ${String(facts!.name)}`);
+      const sentence = formatSupervision(facts!);
+      // Precisely: the name is *in* the sentence, not merely a substring of
+      // the role ("inbox-watcher" contains "watcher").
+      assert(sentence.includes('daemon watcher ('), `the sentence names the daemon, got: ${sentence}`);
+      assert(sentence.includes('inbox-watcher'), `and its role, got: ${sentence}`);
+    });
+
+    // --- folding the journal ------------------------------------------------
+
+    check('the journal folds into one entry per daemon', () => {
+      const decisions = describeDaemonDecisions([
+        frame({
+          action: 'register-daemon',
+          daemonId: 2,
+          role: 'inbox-watcher',
+          name: 'watcher',
+          restart: 'on-failure',
+        }),
+        frame({
+          action: 'restart',
+          daemonId: 2,
+          newPid: 3,
+          role: 'inbox-watcher',
+          name: 'watcher',
+          restartCount: 1,
+          prevExitReason: 'boom',
+        }),
+        frame({
+          action: 'register-daemon',
+          daemonId: 4,
+          role: 'nightly',
+          name: 'once',
+          restart: 'never',
+        }),
+        frame({
+          action: 'restart-gave-up',
+          daemonId: 4,
+          role: 'nightly',
+          name: 'once',
+          reason: 'policy',
+          restart: 'never',
+          restartCount: 0,
+        }),
+      ]);
+      assert(decisions.length === 2, `two daemons, got ${decisions.length}`);
+      const watcher = decisions.find((d) => d.daemonId === 2)!;
+      assert(watcher.registered === true, 'it was registered');
+      assert(watcher.restarts === 1, `one restart, got ${watcher.restarts}`);
+      assert(watcher.lastPid === 3, `the last attempt, got ${String(watcher.lastPid)}`);
+      assert(watcher.gaveUpReason === null, `it was not given up on, got ${String(watcher.gaveUpReason)}`);
+      assert(
+        watcher.lastDecision !== null && watcher.lastDecision.includes('restarted as pid 3'),
+        `the last decision, got: ${String(watcher.lastDecision)}`,
+      );
+      const once = decisions.find((d) => d.daemonId === 4)!;
+      assert(once.gaveUpReason === 'policy', `the give-up, got ${String(once.gaveUpReason)}`);
+      assert(
+        once.lastDecision !== null && once.lastDecision.includes('the restart policy says no'),
+        `the decision, got: ${String(once.lastDecision)}`,
+      );
+    });
+
+    // --- the two answers, compared ------------------------------------------
+
+    const liveState: DaemonState = {
+      daemonId: 2,
+      name: 'watcher',
+      role: 'inbox-watcher',
+      agent: { kind: 'module', module: './agents/noop.js' },
+      restart: 'on-failure',
+      maxRestarts: null,
+      currentPid: 3,
+      status: 'running',
+      restartCount: 1,
+      lastExitCode: 1,
+      lastExitReason: 'boom',
+      gaveUpReason: null,
+    };
+    const journalFor = (): ReturnType<typeof describeDaemonDecisions> =>
+      describeDaemonDecisions([
+        frame({
+          action: 'register-daemon',
+          daemonId: 2,
+          role: 'inbox-watcher',
+          name: 'watcher',
+          restart: 'on-failure',
+        }),
+        frame({
+          action: 'restart',
+          daemonId: 2,
+          newPid: 3,
+          role: 'inbox-watcher',
+          name: 'watcher',
+          restartCount: 1,
+          prevExitReason: 'boom',
+        }),
+      ]);
+
+    check('the two answers are compared, and a difference is named', () => {
+      const decisions = journalFor();
+      const agree = compareDaemonState(liveState, decisions.find((d) => d.daemonId === 2));
+      assert(agree.agreement === 'agree', `they agree, got ${agree.agreement}`);
+      assert(agree.detail === null, 'and there is nothing to say');
+
+      // The kernel remembers a give-up the journal never recorded: a decision
+      // nobody can read back.
+      const drift = compareDaemonState(
+        { ...liveState, status: 'gave-up', gaveUpReason: 'max-restarts' },
+        decisions.find((d) => d.daemonId === 2),
+      );
+      assert(drift.agreement === 'disagree', `the difference is named, got ${drift.agreement}`);
+      assert(
+        drift.detail !== null && drift.detail.includes('journal has no such decision'),
+        `and it says which side, got: ${String(drift.detail)}`,
+      );
+
+      // The journal knows a daemon the kernel does not: an earlier kernel's.
+      const onlyJournal = compareDaemonState(undefined, decisions.find((d) => d.daemonId === 2));
+      assert(onlyJournal.agreement === 'journal-only', `got ${onlyJournal.agreement}`);
+      // And the kernel knows one the journal does not.
+      const onlyState = compareDaemonState(liveState, undefined);
+      assert(onlyState.agreement === 'state-only', `got ${onlyState.agreement}`);
+    });
+
+    check('a daemon the kernel is not running carries history, not a disagreement', () => {
+      const rows = joinDaemons(
+        [
+          {
+            name: 'watcher',
+            role: 'inbox-watcher',
+            restart: 'on-failure',
+            maxRestarts: null,
+            agent: null,
+          },
+        ],
+        null,
+      );
+      const details = describeDaemonDetails(rows, null, journalFor());
+      assert(details.length === 1, `one detail, got ${details.length}`);
+      // The kernel simply is not running it — that is not a conflict.
+      assert(details[0]!.disagreement === null, `no disagreement, got ${String(details[0]!.disagreement)}`);
+      assert(
+        details[0]!.decision !== null && details[0]!.decision.includes('restarted as pid 3'),
+        `the history is still said, got: ${String(details[0]!.decision)}`,
+      );
+    });
+
+    // --- the whole chain, live -----------------------------------------------
+
+    await checkAsync('a real kernel gives up on a daemon, and the journal says so', async () => {
+      // The whole chain, end to end: the kernel supervises a daemon that
+      // dies, gives up on it, records the decision, and the two answers about
+      // that daemon agree.
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-daemon-live-journal-'));
+      const kernel = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir: home,
+        autoStart: true,
+        agentLoader: async () => async (ctx: { exit: (code: number, reason: string) => void }) => {
+          ctx.exit(1, 'boom');
+        },
+      });
+      try {
+        await kernel.registerDaemon({
+          role: 'nightly',
+          name: 'once',
+          agent: { module: 'test:once' },
+          restart: { kind: 'never' },
+        });
+
+        // Wait for the supervisor to decide.
+        let state: DaemonState | undefined;
+        for (let i = 0; i < 100; i++) {
+          state = kernel.daemons()[0];
+          if (state?.status === 'gave-up') break;
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        assert(state !== undefined, 'the daemon is known');
+        assert(state!.status === 'gave-up', `it was given up on, got ${state!.status}`);
+        assert(state!.gaveUpReason === 'policy', `because of the policy, got ${String(state!.gaveUpReason)}`);
+
+        // And the journal says the same thing.
+        const decisions = await readDaemonDecisions(home);
+        const entry = decisions.find((d) => d.daemonId === state!.daemonId);
+        assert(entry !== undefined, 'the journal knows the daemon');
+        assert(entry!.gaveUpReason === 'policy', `the journal's reason, got ${String(entry!.gaveUpReason)}`);
+        const comparison = compareDaemonState(state, entry);
+        assert(comparison.agreement === 'agree', `the two answers agree, got ${comparison.agreement}`);
+        assert(
+          entry!.lastDecision !== null && entry!.lastDecision.includes('the restart policy says no'),
+          `and the decision says why, got: ${String(entry!.lastDecision)}`,
+        );
+
+        // The window shows the same two answers side by side.
+        const server = await startKernelServer(kernel, { log: () => {} });
+        writeEndpoint(home, server.endpoint);
+        const probe = await probeKernel(home);
+        assert(probe.kind === 'live', 'the kernel is reachable');
+        const client = probe.kind === 'live' ? probe.client : undefined;
+        const dash = await startDashboard({ dir: home, port: 0, kernel: client });
+        try {
+          const res = await fetch(`${dash.url}/api/daemons`);
+          assert(res.status === 200, `status ${res.status}`);
+          const body = (await res.json()) as {
+            daemons: { name: string | null; decision: string | null; disagreement: string | null }[];
+          };
+          assert(body.daemons.length === 1, `one daemon, got ${body.daemons.length}`);
+          const row = body.daemons[0]!;
+          assert(
+            row.decision !== null && row.decision.includes('the restart policy says no'),
+            `the window carries the decision, got: ${String(row.decision)}`,
+          );
+          assert(row.disagreement === null, `and no drift, got: ${String(row.disagreement)}`);
+        } finally {
+          await dash.close();
+          client?.close();
+          await server.close();
+        }
+      } finally {
+        await kernel.shutdown();
+        await rm(home, { recursive: true, force: true }).catch(() => undefined);
+      }
+    });
+
+    await checkAsync('cortex daemon list prints the supervisor\'s decisions beside the live state', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-daemon-list-journal-'));
+      const prevHome = process.env['CORTEX_HOME'];
+      const prevLog = console.log;
+      try {
+        process.env['CORTEX_HOME'] = home;
+        writeDaemon(home, {
+          name: 'once',
+          spec: {
+            role: 'nightly',
+            agent: { module: './agents/noop.js' },
+            restart: { kind: 'never' },
+          },
+          installedAt: new Date().toISOString(),
+        });
+        // The journal: a daemon that was registered and then given up on.
+        const recorder = await Recorder.open({ pid: asProcessId(1), dir: join(home, 'processes', '1') });
+        const base = {
+          pid: asProcessId(1),
+          stateBefore: 'running' as const,
+          stateAfter: 'running' as const,
+          reversibility: 'idempotent' as const,
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        };
+        await recorder.append({
+          ...base,
+          timestamp: '2026-10-01T00:00:00.000Z',
+          syscall: '__init',
+          callId: 'init-register-daemon-0',
+          phase: 'exit',
+          args: {
+            action: 'register-daemon',
+            daemonId: 2,
+            role: 'nightly',
+            name: 'once',
+            restart: 'never',
+            wakeOn: [],
+          },
+        });
+        await recorder.append({
+          ...base,
+          timestamp: '2026-10-01T00:00:01.000Z',
+          syscall: '__init',
+          callId: 'init-restart-gave-up-1',
+          phase: 'exit',
+          args: {
+            action: 'restart-gave-up',
+            daemonId: 2,
+            role: 'nightly',
+            name: 'once',
+            reason: 'policy',
+            restart: 'never',
+            restartCount: 0,
+          },
+        });
+        await recorder.close();
+
+        let out = '';
+        console.log = (...parts: unknown[]): void => {
+          out += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        const code = await cmdDaemon(['list']);
+        console.log = prevLog;
+        assert(code === 0, `exit 0, got ${code}`);
+        assert(out.includes('supervisor decisions'), `the decisions are printed, got: ${out}`);
+        assert(
+          out.includes('the restart policy says no'),
+          `and the decision says why, got: ${out}`,
+        );
+      } finally {
+        console.log = prevLog;
+        if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+        else process.env['CORTEX_HOME'] = prevHome;
+        await rm(home, { recursive: true, force: true }).catch(() => undefined);
+      }
+    });
+  } finally {
+    for (const table of tables) {
+      await table.closeAllRecorders().catch(() => undefined);
+    }
+    await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 async function runDaemonChecks(): Promise<void> {
   const { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync } = await import('node:fs');
   const { join } = await import('node:path');
@@ -23280,6 +23739,7 @@ await runTokenUsageChecks();
 await runKernelGoneChecks();
 await runDaemonChecks();
 await runDaemonStateChecks();
+await runDaemonJournalChecks();
 await runKernelHardeningChecks();
 await runTransportChecks();
 await runBootChecks();

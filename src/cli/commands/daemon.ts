@@ -57,6 +57,7 @@ import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.
 import { formatOutcomeCode } from '../process_outcome.js';
 import { agentOf, type DaemonSpec, type DaemonState } from '../../kernel/init.js';
 import {
+  describeDaemonDetails,
   describeDaemonNote,
   describeDaemonStatus,
   formatDaemonAgent,
@@ -64,6 +65,7 @@ import {
   formatDaemonPolicy,
   formatDaemonSummary,
   joinDaemons,
+  readDaemonDecisions,
   type DaemonReceipt,
 } from '../daemon_view.js';
 import { type AgentSpec, type RestartPolicy, type MemoryRegionPolicy } from '../../kernel/types.js';
@@ -347,6 +349,28 @@ export async function cmdDaemonList(_args: string[]): Promise<number> {
   }
   for (const [note, names] of notes) {
     console.log(`  ${names.join(', ')}: ${note}`);
+  }
+
+  // The supervisor's own record of these daemons — the **journal** beside the
+  // live state.
+  //
+  // The two answer different questions ("now" and "what was decided"), so they
+  // are allowed to differ. What they are not allowed to do is differ
+  // silently: a give-up the kernel remembers and the journal never recorded
+  // is a decision nobody can read back.
+  const journal = await readDaemonDecisions(dir);
+  const details = describeDaemonDetails(rows, live, journal);
+  const journalLines = details
+    .filter((detail) => detail.decision !== null || detail.disagreement !== null)
+    .map((detail) =>
+      detail.disagreement !== null
+        ? `  ${detail.who}: ${detail.disagreement}`
+        : `  ${detail.who}: ${detail.decision}`,
+    );
+  if (journalLines.length > 0) {
+    console.log('');
+    console.log('supervisor decisions (the journal):');
+    for (const line of journalLines) console.log(line);
   }
   return 0;
 }

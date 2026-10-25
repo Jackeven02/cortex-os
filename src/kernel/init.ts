@@ -193,8 +193,24 @@ export interface DaemonSpec {
  * `policy` — the restart policy said no (`never`, or `on-failure` and the run
  * did not fail); `max-restarts` — the total cap was reached; `restart-storm` —
  * too many restarts inside the sliding window (docs/PROCESS.md §10).
+ *
+ * The list is exported so that the views can hold themselves to it: a reason
+ * the kernel can produce and no view can say is a reason that reaches the
+ * operator as an unexplained row.
  */
-export type DaemonGiveUpReason = 'policy' | 'max-restarts' | 'restart-storm';
+export const INIT_GIVE_UP_REASONS = ['policy', 'max-restarts', 'restart-storm'] as const;
+
+/** Why init stopped restarting a daemon. */
+export type InitGiveUpReason = (typeof INIT_GIVE_UP_REASONS)[number];
+
+/**
+ * The same list under the name the views use.
+ *
+ * `DaemonGiveUpReason` is what the live state carries; `InitGiveUpReason` is
+ * what the kernel's own log carries. They are the same three reasons — one
+ * type, two names — so a view cannot read one and mean the other.
+ */
+export type DaemonGiveUpReason = InitGiveUpReason;
 
 /**
  * Where a supervised daemon stands right now.
@@ -895,6 +911,21 @@ export class InitProcess {
       // operator has to hear it: a daemon that died and was not restarted
       // because the policy says `never` is a daemon that is now gone for good.
       rec.gaveUp = 'policy';
+      // And it is **recorded**, like the two caps are. The journal used to
+      // name only "max restarts reached" and "restart storm" as the reasons
+      // the supervisor gave up — so the one give-up the *policy* decides was
+      // the one give-up the journal did not have a word for. The kernel knows
+      // it (the live state says "gave up: the restart policy says no"), and
+      // the journal did not: two answers to one question, and they disagreed.
+      await this.#record('restart-gave-up', {
+        daemonId: daemonIdNum,
+        role: rec.spec.role,
+        ...(rec.spec.name !== undefined ? { name: rec.spec.name } : {}),
+        reason: 'policy',
+        // Which policy said no — `never`, or `on-failure` and it did not fail.
+        restart: policy.kind,
+        restartCount: rec.restartCount,
+      });
       this.#decide({
         kind: 'no-restart',
         daemonId: daemonIdNum,

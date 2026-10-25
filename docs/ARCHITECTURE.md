@@ -2282,6 +2282,35 @@ The wording lives in one module (`src/cli/daemon_view.ts`), so the terminal
 and the window cannot disagree about a daemon that is flapping or dead — and
 so a check can hold them to the same sentence.
 
+**Two answers to one question, and nothing kept them in step.** The kernel
+answers *"what is this daemon doing right now?"* as a read. It also keeps a
+**journal**: every decision the supervisor ever made, in init's own log
+(PROCESS.md §9.1). The read says **now**; the journal says **what was
+decided**. Both are true and they answer different questions — but nothing
+compared them, and one of them was not even complete.
+
+The journal had a hole in it. It named two of the three ways a supervisor
+gives up — *max restarts reached* and *restart storm* — and not the third:
+the one the **policy** decides. A daemon whose policy said `never` left the
+log with a `reap` frame and nothing else. The live state said *"gave up: the
+restart policy says no"*, and the journal said *"not restarted"*: the kernel
+knew a decision it could not read back.
+
+So the give-up is recorded now, like the other two, and the two answers are
+put side by side. `cortex daemon list` and the dashboard's **守护进程** panel
+print the live state **and** the supervisor's last word about it — and when
+the two do not match (the kernel remembers a give-up the journal never
+recorded; the journal counts restarts the kernel does not; one side has never
+heard of the daemon at all), they say so, in words, instead of leaving the
+operator to find the difference by hand.
+
+The join is on the daemon's **identity** — the pid of its *first* attempt,
+which survives restarts — and on its **name** for a daemon the kernel is not
+running, which is what the journal carries now. A daemon that the kernel is
+not running gets no disagreement: the journal's decisions about it are
+**history** (an earlier kernel's), not a conflict with a live state that does
+not exist.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up
