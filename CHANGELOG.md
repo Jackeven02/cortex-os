@@ -42,6 +42,26 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The window's light says what is behind the numbers.** The dashboard's top
+  bar carried a green light and 「实时连接（SSE）」 — a claim about a live kernel
+  feed that nothing had checked (see the fix below). It takes its words from
+  the server now, which asked the kernel.
+
+  `GET /api/node` grew a `connection` block:
+
+  - `tone` — how much to believe the numbers on the screen: `live` (a kernel is
+    behind them), `warn` (they are the disk's records), `dead` (the kernel is
+    gone and this is what the disk still has);
+  - `label` — the words: 「内核实时推送（SSE）」, 「活内核 · 轮询更新」,
+    「磁盘记录 · 目录跟随（SSE）」, 「磁盘记录 · 轮询更新」, 「内核失联 · 只能读磁盘记录」.
+
+  The words and the meaning live in one module
+  (`src/dashboard/connection_view.ts`), so the page — a static file that cannot
+  import the rule — prints what it is given and the meaning cannot drift. The
+  one fact the server cannot check for itself is **how the window is fetching**
+  (a pushed stream or a poll), because that is a fact about the *window*: it
+  says which one it is doing in `?transport=sse`.
+
 - **`GET /api/node` — which node the window is attached to.** The dashboard
   gained an endpoint that answers the question its own chrome used to *assert*
   (see the fix below): the state directory it is serving, and the kernel
@@ -521,8 +541,10 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   "auto-refresh · every 3 seconds" whatever it was doing — and with a live
   kernel it was not polling every 3 seconds at all. It now names the mode:
   "live push (SSE), reconciled every 30 seconds" while the kernel is pushing,
-  "polling every 3 seconds (the live connection is unavailable)" when it is
-  not.
+  "polling every 3 seconds" when it is not. It no longer says *why* the push is
+  gone — "the live connection is unavailable" was a claim the window could not
+  check, because the stream can fail while the kernel is perfectly alive. The
+  top bar says what is behind the numbers instead.
 
   **3 smoke checks** (672 → 675), all three reverse-verified: removing the
   re-read trigger → the table is never pushed again; giving the dashboard its
@@ -1648,6 +1670,35 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **The window's own light claimed a connection it had not checked.** The top
+  bar's green dot said 「实时连接（SSE）」 — always, whatever was behind it:
+
+  - there was **no kernel at all**: the stream that was open was following the
+    *directory*, not a kernel;
+  - the kernel had **died under the window**: the push could not deliver
+    another frame, and the sidebar — one screen over — had already turned red
+    and said 「内核失联」;
+  - and when a poll failed, the dot **stayed red for good**: a window that
+    cannot get back to green has stopped saying anything about the connection
+    at all.
+
+  The bar asks now, and the server answers with what it checked: the kernel's
+  state, and how much to believe the numbers on the screen. The colour is a
+  class now (`live` / `warn` / `dead`), so it can go back to green when the
+  connection comes back.
+
+  And the push **ends** when the kernel goes away. A stream that stays open
+  over a dead socket delivers nothing and looks exactly like a healthy one; so
+  the dashboard listens for the connection ending, ends the stream, and the
+  window falls back to polling, asks the kernel again (it will not answer), and
+  says out loud that what it is showing is what the disk still has.
+
+- **The overview counted the rows it had loaded, not the events there were.**
+  The 「近期事件」 metric and the navigation badge showed the number of event
+  rows on screen — 100, the page size — while the panel right below them said
+  「共 5,000 条」. Two numbers for one fact, in one window, disagreeing. The
+  count the server reported is the count that is true.
 
 - **A kernel said it had started just now, every time it was asked.** The
   transport's `ping` reported `startedAt` as *the moment of the ping*: it read

@@ -1618,6 +1618,70 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE (the window stopped claiming what it had not checked);
   INTEGRATIONS (`/api/node`); CHANGELOG.
 
+- [x] **#109** The window's own light claimed a connection it had not checked →
+  **fixed.**
+  The top bar's green dot said 「实时连接（SSE）」 — always, whatever was behind it.
+  Three separate falsehoods shared one dot:
+
+  - there was **no kernel at all**: the stream that was open was following the
+    *directory*, not a kernel;
+  - the kernel had **died under the window**: the push could not deliver another
+    frame, and the sidebar — one screen over — had already turned red and said
+    「内核失联」;
+  - and when a poll failed, the dot **stayed red for good**: a window that
+    cannot get back to green has stopped saying anything about the connection
+    at all.
+
+  So the bar asks, too. The server answers with what it checked — the kernel's
+  state, and how much to believe the numbers on the screen: `live` (a kernel is
+  behind them), `warn` (they are the disk's records), `dead` (the kernel is gone
+  and this is what the disk still has). The words and the meaning live in one
+  module (`src/dashboard/connection_view.ts`), so the page — a static file that
+  cannot import the rule — prints what it is given. The one fact the server
+  cannot check for itself is **how the window is fetching** (a pushed stream or
+  a poll), because that is a fact about the *window*: it says which one it is
+  doing in `?transport=sse`.
+
+  And the push **ends** when the kernel goes away: a stream that stays open
+  over a dead socket delivers nothing and looks exactly like a healthy one. The
+  dashboard listens for the connection ending, ends the stream, and the window
+  falls back to polling, asks the kernel again (it will not answer), and says
+  out loud that what it is showing is what the disk still has.
+
+  **Also:** the overview counted the rows it had loaded — 100, the page size —
+  while the panel right below it said 「共 5,000 条」. Two numbers for one fact,
+  in one window, disagreeing. The count the server reported is the count that
+  is true.
+
+  **7 new smoke checks** (840 → 847), reverse-verified: with the module
+  pretending every connection is a live push, the indicator check and the two
+  endpoint checks fail; with the server no longer sending `connection`, the
+  endpoint checks fail; with the page writing the old claim itself, the page
+  check fails; with the stream not ending when the kernel goes, the stream
+  check fails (and it fails *fast* — the read is bounded, so a regression
+  cannot hang the suite); and with the metric counting the loaded page again,
+  the overview check fails.
+
+  Browser-verified on a real window: a live kernel shows a green 「内核实时推送
+  （SSE）」; a workspace with no kernel shows an amber 「磁盘记录 · 目录跟随
+  （SSE）」; and after the kernel is stopped underneath it, the bar flips to a
+  red 「内核失联 · 只能读磁盘记录」 and the footer says it fell back to
+  polling — the sidebar says the same thing, so the window no longer
+  contradicts itself.
+
+  Docs: ARCHITECTURE (the window's own light stopped claiming a connection it
+  had not checked); INTEGRATIONS (`/api/node`, the stream); CHANGELOG.
+
+- [ ] **#110** A push makes the window forget the pages the operator loaded.
+  In the pushed path the event table is **replaced** by the newest page on every
+  frame, so an operator who clicked 加载更多 to read back through the history
+  loses those pages the next time the kernel says something. The rows on screen
+  stay true — they are the newest ones — but the window silently drops what was
+  asked for, and the total it shows is only refreshed by the 30-second poll.
+  The fix is to keep the loaded window and merge the pushed page into it
+  (newest first, de-duplicated by run id), and to carry the total in the push
+  itself rather than waiting for the poll.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

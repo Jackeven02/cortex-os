@@ -57,7 +57,10 @@
     .crumb strong { color: #354052; font-weight: 560; }
     .top-actions { display: flex; align-items: center; gap: 12px; }
     .connection { display: flex; align-items: center; gap: 7px; color: #697486; font-size: 11px; }
-    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #25a879; box-shadow: 0 0 0 3px #25a8791c; }
+    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: #97a3b5; box-shadow: 0 0 0 3px #97a3b51c; }
+    .live-dot.live { background: #25a879; box-shadow: 0 0 0 3px #25a8791c; }
+    .live-dot.warn { background: #e0a94b; box-shadow: 0 0 0 3px #e0a94b1c; }
+    .live-dot.dead { background: #d65b62; box-shadow: 0 0 0 3px #d65b621c; }
     .icon-button { display: grid; width: 31px; height: 31px; place-items: center; border: 1px solid var(--line); border-radius: 7px; background: #fff; color: #5e6877; font-size: 15px; }
     .icon-button:hover { border-color: #cbd2de; background: var(--surface-soft); }
     .content { width: min(1440px, 100%); margin: 0 auto; padding: 31px 34px 48px; }
@@ -234,7 +237,7 @@
     <main class="main" data-section="overview">
       <header class="topbar">
         <div class="crumb"><span>Workspace</span><span>›</span><strong id="crumbSection">总览</strong></div>
-        <div class="top-actions"><div class="connection"><span class="live-dot"></span><span id="updated">正在连接</span></div><button class="button" id="openTools" type="button" title="这套系统能调用什么"><span class="button-icon">⚙</span><span>工具面</span></button><button class="icon-button" id="refreshTop" title="刷新数据" aria-label="刷新数据">↻</button></div>
+        <div class="top-actions"><div class="connection"><span class="live-dot" id="connDot"></span><span id="updated">正在连接</span></div><button class="button" id="openTools" type="button" title="这套系统能调用什么"><span class="button-icon">⚙</span><span>工具面</span></button><button class="icon-button" id="refreshTop" title="刷新数据" aria-label="刷新数据">↻</button></div>
       </header>
 
       <div class="content">
@@ -842,6 +845,10 @@
     // all — the kernel pushes — and when the push is gone it *is* polling
     // every 3 seconds. A page that cannot say which one it is doing is a
     // page the operator cannot trust.
+    //
+    // What is left here is the **window's own behaviour**: how it fetches
+    // and when it last fetched. What is *behind* the numbers is the top
+    // bar's business, and that one is checked.
     let lastUpdated = '';
     let refreshMode = '连接中';
     function renderFooter() {
@@ -897,6 +904,40 @@
       $('workspaceName').textContent = labels.dirName;
       const workspace = $('workspaceName').parentElement;
       if (workspace) workspace.title = node && typeof node.dir === 'string' ? node.dir : '';
+      renderConnection(node);
+    }
+
+    // What the top bar is allowed to claim.
+    //
+    // It used to say 「实时连接（SSE）」 with a green dot — always, whatever was
+    // behind it. There was no kernel at all; the kernel had died under the
+    // window (and the sidebar, one screen over, had already turned red and
+    // said 「内核失联」); the stream had failed and the window had fallen back
+    // to polling. And once a poll failed the dot stayed red for good — a
+    // window that cannot get back to green has stopped saying anything at
+    // all about the connection.
+    //
+    // So the words come from the server, which asked the kernel, and the
+    // dot's colour follows the **tone** the server sent: `live` (a kernel is
+    // behind these numbers), `warn` (they are the disk's records), `dead`
+    // (the kernel is gone and this is what the disk still has). The colour
+    // is the page's own palette; the meaning is the server's.
+    //
+    // A payload that says nothing is **pending**, not live: the page does not
+    // fall back to a green dot when the server did not answer.
+    function connectionLabels(node) {
+      const conn = node && typeof node === 'object' && node.connection && typeof node.connection === 'object'
+        ? node.connection
+        : null;
+      const tone = conn && typeof conn.tone === 'string' ? conn.tone : 'pending';
+      const label = conn && typeof conn.label === 'string' ? conn.label : '—';
+      return { tone, label };
+    }
+
+    function renderConnection(node) {
+      const labels = connectionLabels(node);
+      $('connDot').className = `live-dot ${labels.tone}`;
+      $('updated').textContent = labels.label;
     }
 
     function applyData() {
@@ -905,12 +946,19 @@
       $('count').textContent = processData.length.toLocaleString();
       $('running').textContent = active.length.toLocaleString();
       $('tokens').textContent = tokens.toLocaleString();
-      $('eventCount').textContent = eventData.length.toLocaleString();
+      // The number the **server** reported, not the number of rows that
+      // happen to be loaded.
+      //
+      // The overview used to count the loaded page — 100 rows — while the
+      // panel right below it said 「共 5,000 条」. Two numbers for one fact,
+      // in one window, disagreeing. The count the server sent is the count
+      // that is true.
+      const eventTotal = eventsTotal || eventData.length;
+      $('eventCount').textContent = eventTotal.toLocaleString();
       $('navProcessCount').textContent = processData.length;
-      $('navEventCount').textContent = eventData.length;
+      $('navEventCount').textContent = eventTotal;
       $('processCountLabel').textContent = processData.length ? `(${processData.length})` : '';
       $('runtimeTotal').textContent = processData.length.toLocaleString();
-      $('updated').textContent = `已同步 ${new Date().toLocaleTimeString()}`;
       lastUpdated = new Date().toLocaleTimeString();
       renderFooter();
       renderProcesses();
@@ -921,13 +969,21 @@
       if (processView === 'tree') renderTree();
     }
 
+    // How this window is fetching its data.
+    //
+    // A fact about the **window**, not about the world — the server cannot
+    // check it, so the window says so when it asks. What the top bar may
+    // claim depends on it: a pushed stream and a poll are different claims
+    // about the same numbers.
+    let transport = 'poll';
+
     async function pollOnce() {
       try {
         const responses = await Promise.all([
           fetch('/api/processes', { cache: 'no-store' }),
           fetch('/api/checkpoints', { cache: 'no-store' }),
           fetch('/api/ops', { cache: 'no-store' }),
-          fetch('/api/node', { cache: 'no-store' }),
+          fetch(`/api/node?transport=${transport}`, { cache: 'no-store' }),
         ]);
         if (responses.some((response) => !response.ok)) throw new Error('API 请求失败');
         [processData, checkpointData] = await Promise.all([
@@ -936,7 +992,8 @@
         ]);
         const opsData = await responses[2].json();
         // Which node this window is attached to — the sidebar's own claims,
-        // checked rather than assumed.
+        // checked rather than assumed — and what the top bar may say about
+        // the connection behind the numbers.
         renderNode(await responses[3].json());
         opsList = Array.isArray(opsData.ops) ? opsData.ops : (opsData.allowOps === true ? ['restore'] : []);
         opsEnabled = opsList.length > 0;
@@ -948,15 +1005,21 @@
         // printed, so it re-reads the output panel while it is on screen.
         if (activeProcessTab === 'output' && outputPid !== null) await refreshOutput(outputPid);
       } catch (error) {
+        // The window could not reach the dashboard at all. That is the one
+        // claim the page makes on its own — the server cannot answer when it
+        // is the one that is not answering.
         $('updated').textContent = `连接失败：${error.message}`;
-        document.querySelector('.connection .live-dot').style.background = '#d65b62';
+        $('connDot').className = 'live-dot dead';
       }
     }
 
     function startPolling() {
       if (pollTimer === null) pollTimer = setInterval(pollOnce, 3000);
-      refreshMode = '每 3 秒轮询（实时连接不可用）';
+      refreshMode = '每 3 秒轮询';
       renderFooter();
+      // Ask again with the new transport, so the top bar stops claiming a
+      // push that is not there.
+      void pollOnce();
     }
 
     function startStream() {
@@ -975,12 +1038,19 @@
         refreshOutput(outputPid);
       });
       source.onopen = () => {
-        $('updated').textContent = '实时连接（SSE）';
-        document.querySelector('.connection .live-dot').style.background = '#25a879';
+        // The push stream is open, so the window is fetching over SSE — and
+        // the server has to be told, because what the top bar may claim
+        // depends on how the numbers are being fetched.
+        transport = 'sse';
         refreshMode = '实时推送（SSE）· 每 30 秒校准';
         renderFooter();
+        void pollOnce();
       };
-      source.onerror = () => { source.close(); $('updated').textContent = 'SSE 不可用，已回退到轮询'; startPolling(); };
+      // The stream is gone — the kernel died under the window, or the
+      // connection broke. The window falls back to polling and asks the
+      // server again, which asks the kernel again, which does not answer.
+      // The top bar then says what is true instead of what was true.
+      source.onerror = () => { source.close(); transport = 'poll'; startPolling(); };
       setInterval(pollOnce, 30000);
       return true;
     }

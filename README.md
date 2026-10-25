@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 840 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 847 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -414,6 +414,12 @@ The two views read their facts and their words from one module, so they cannot d
 **And the window stopped claiming a connection it had not checked.** The sidebar used to say 「本地节点已连接」 and 「ABI 1.0」 in plain HTML — always, whether a kernel was running or not, and whatever ABI that kernel actually spoke — while two panels inside the same window said out loud that they could not answer without a live kernel. Now the chrome asks the kernel: it names the one it is watching (its pid), the ABI it speaks, how long it has been up, and whether there is a kernel at all. Three states, not two — a kernel that answered, a workspace with no kernel, and a kernel that is there and not answering. `cortex dashboard` says the same thing in the terminal, for the same reason: there is one kernel per project directory, so "a live kernel" does not say which one you are looking at.
 
 The uptime it shows is real, too. The kernel's `ping` used to answer "I started just now" every time it was asked — so "how long has this kernel been up" came back as `0ms` from a kernel that had been running for an hour. The start time is resolved once, when the server starts, and every command that reports it reports the same instant.
+
+**And the window's own light stopped claiming a connection it had not checked.** The top bar carried a green dot and 「实时连接（SSE）」 — always, whatever was behind it. There was no kernel at all: the stream that was open was following the *directory*, not a kernel. The kernel had died under the window: the push could not deliver another frame, while the sidebar — one screen over — had already turned red and said 「内核失联」. And when a poll failed, the dot **stayed red for good**: a light that cannot get back to green has stopped saying anything about the connection at all.
+
+So the bar asks, too. The server answers with what it checked: the kernel's state, and how much to believe the numbers on the screen — `live` (a kernel is behind them), `warn` (they are the disk's records), `dead` (the kernel is gone and this is what the disk still has). The words and the meaning live in one module, so the page prints what it is given. The one fact the server cannot check for itself is **how the window is fetching** — a pushed stream or a poll — because that is a fact about the *window*, so the window says which one it is doing when it asks.
+
+And the push **ends** when the kernel goes away: a stream left open over a dead socket delivers nothing and looks exactly like a healthy one. So the window falls back to polling, asks the kernel again (it will not answer), and says out loud that what it is showing is what the disk still has.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

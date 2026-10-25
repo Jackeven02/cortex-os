@@ -21,6 +21,7 @@ import {
   type DriverSurface,
 } from '../cli/audit_view.js';
 import { describeKernel, type KernelFacts } from '../cli/kernel_view.js';
+import { describeConnection } from './connection_view.js';
 import { usdToDollars } from '../money.js';
 import { formatTokenUsage, callUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
@@ -49,6 +50,16 @@ export interface DashboardKernel {
   request(cmd: KernelCommand, args?: Record<string, unknown>): Promise<unknown>;
   /** Subscribe to the kernel's event stream. Returns an unsubscribe. */
   subscribe(handler: (event: unknown) => void): Promise<() => void>;
+  /**
+   * Be told when the connection to the kernel ends.
+   *
+   * Optional: a kernel that cannot report its own death is a kernel whose
+   * loss shows up in the next read — and the window finds out either way.
+   * But when it *can* report it, the window hears it at once instead of
+   * holding a "live connection" claim for as long as the push stream stays
+   * open over a dead socket.
+   */
+  onClose?(handler: (reason: Error) => void): void;
 }
 
 export interface DashboardOptions {
@@ -844,6 +855,18 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
       // is one of its answers and not an error: the window has to be able to
       // say that. What it does not do is guess — an unreported fact is null,
       // never zero.
+      //
+      // It also answers for the **top bar**: the same rule the sidebar
+      // follows — a view must not claim what it has not checked — used to be
+      // broken there. The bar said 「实时连接（SSE）」 with a green dot when
+      // there was no kernel at all, after the kernel died under the window,
+      // and never went back to green once a poll failed. So the bar's words
+      // are computed here, from the kernel state that was just checked.
+      //
+      // The one thing the server cannot check for itself is **how the window
+      // is fetching** — pushed or polled — because that is a fact about the
+      // window. The window says which it is doing, and the words are still
+      // computed here, so they cannot be two different sentences.
       if (url.pathname === '/api/node') {
         let facts: KernelFacts;
         if (options.kernel === undefined) {
@@ -862,6 +885,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             facts = describeKernel(undefined, error);
           }
         }
+        const transport = url.searchParams.get('transport') === 'sse' ? 'sse' : 'poll';
         json(response, 200, {
           // The state directory this window is serving. The sidebar claims to
           // show "the current working directory", so it had better show the
@@ -869,6 +893,8 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           dir,
           dirName: basename(dir),
           kernel: facts,
+          // What the top bar may claim, and how much to believe it.
+          connection: describeConnection({ transport, kernel: facts.state }),
         });
         return;
       }
@@ -1092,6 +1118,37 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             for (const raw of held) handle(raw);
 
             heartbeat = setInterval(() => { if (!closed) response.write(': ping\n\n'); }, 15000);
+            // The kernel went away.
+            //
+            // The push stream cannot deliver another frame — the socket it
+            // rides on is gone — and a window that keeps saying 「实时连接」 over
+            // a dead socket is claiming something nobody checked. The
+            // sidebar had already turned red and said 「内核失联」 by then,
+            // while the bar right above it still showed a green light.
+            //
+            // So the stream ends. The window falls back to polling, asks the
+            // kernel again (it will not answer), and says out loud that what
+            // it is showing is what the disk still has.
+            // The kernel went away.
+            //
+            // The push stream cannot deliver another frame — the socket it
+            // rides on is gone — and a window that keeps saying 「实时连接」 over
+            // a dead socket is claiming something nobody checked. The
+            // sidebar had already turned red and said 「内核失联」 by then,
+            // while the bar right above it still showed a green light.
+            //
+            // So the stream ends. The window falls back to polling, asks the
+            // kernel again (it will not answer), and says out loud that what
+            // it is showing is what the disk still has.
+            options.kernel.onClose?.(() => {
+              if (closed) return;
+              closed = true;
+              if (heartbeat !== undefined) clearInterval(heartbeat);
+              if (processRefresh !== undefined) clearTimeout(processRefresh);
+              if (outputTimer !== undefined) clearTimeout(outputTimer);
+              unsubscribe?.();
+              response.end();
+            });
             request.on('close', () => {
               closed = true;
               if (heartbeat !== undefined) clearInterval(heartbeat);

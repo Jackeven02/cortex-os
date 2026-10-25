@@ -258,6 +258,7 @@ import {
   type DriverSurface,
 } from '../src/cli/audit_view.js';
 import { describeKernel, formatKernelLine } from '../src/cli/kernel_view.js';
+import { describeConnection } from '../src/dashboard/connection_view.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
@@ -10285,7 +10286,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -11905,6 +11906,245 @@ async function runDashboardChecks(): Promise<void> {
           formatKernelLine(describeKernel(undefined, new Error('boom'))).includes('did not answer'),
           'the unreachable line',
         );
+      });
+
+      // The top bar used to claim a live connection it had never checked —
+      // and it contradicted the sidebar, one screen over, about the same
+      // kernel.
+      await checkAsync('the connection indicator says what is behind the numbers', async () => {
+        const live = describeConnection({ transport: 'sse', kernel: 'live' });
+        assert(live.tone === 'live', `a kernel that answered is live, got ${live.tone}`);
+        assert(live.label === '内核实时推送（SSE）', `the live label, got ${live.label}`);
+        const polled = describeConnection({ transport: 'poll', kernel: 'live' });
+        assert(polled.tone === 'live', 'a polled live kernel is still live');
+        assert(polled.label !== live.label, 'but the bar says how the window is fetching');
+        // No kernel: the stream that is open follows the **directory**. It is
+        // fresh, but it is not a kernel saying anything — and the bar used to
+        // say it was.
+        const none = describeConnection({ transport: 'sse', kernel: 'none' });
+        assert(none.tone === 'warn', `no kernel is a warning, got ${none.tone}`);
+        assert(none.label.includes('磁盘记录'), `the disk label, got ${none.label}`);
+        assert(!none.label.includes('内核实时推送'), 'and it does not claim a kernel push');
+        // A kernel that stopped answering is not a kernel that is pushing.
+        const dead = describeConnection({ transport: 'sse', kernel: 'unreachable' });
+        assert(dead.tone === 'dead', `a lost kernel is dead, got ${dead.tone}`);
+        assert(dead.label.includes('内核失联'), `the lost label, got ${dead.label}`);
+        assert(
+          describeConnection({ transport: 'poll', kernel: 'unreachable' }).tone === 'dead',
+          'a lost kernel is dead however the window fetches',
+        );
+      });
+
+      await checkAsync('the window tells the top bar what the kernel said', async () => {
+        const dash = await startDashboard({
+          dir: tmp,
+          port: 0,
+          kernel: {
+            request: async (cmd) => {
+              if (cmd === 'ping') {
+                return {
+                  abiVersion: '1.0.0',
+                  kernelPid: 4242,
+                  startedAt: '2026-09-28T00:00:00.000Z',
+                  daemons: 1,
+                };
+              }
+              throw new Error(`the dashboard asked for something else: ${cmd}`);
+            },
+            subscribe: async () => () => {},
+          },
+        });
+        try {
+          const live = (await (await fetch(`${dash.url}/api/node?transport=sse`)).json()) as {
+            kernel: { state: string };
+            connection: { tone: string; label: string };
+          };
+          assert(live.kernel.state === 'live', `the state, got ${live.kernel.state}`);
+          assert(live.connection.tone === 'live', `the tone, got ${live.connection.tone}`);
+          assert(live.connection.label === '内核实时推送（SSE）', `the label, got ${live.connection.label}`);
+          // The window says how it is fetching — a fact about the window, not
+          // about the world — and the words follow it.
+          const polled = (await (await fetch(`${dash.url}/api/node?transport=poll`)).json()) as {
+            connection: { tone: string; label: string };
+          };
+          assert(polled.connection.tone === 'live', 'the tone does not change');
+          assert(polled.connection.label !== live.connection.label, 'the words do');
+        } finally {
+          await dash.close();
+        }
+        // And with no kernel at all, the bar must not claim one.
+        const bare = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const body = (await (await fetch(`${bare.url}/api/node?transport=sse`)).json()) as {
+            kernel: { state: string };
+            connection: { tone: string; label: string };
+          };
+          assert(body.kernel.state === 'none', `the state, got ${body.kernel.state}`);
+          assert(body.connection.tone === 'warn', `the tone, got ${body.connection.tone}`);
+          assert(body.connection.label.includes('磁盘记录'), `the label, got ${body.connection.label}`);
+        } finally {
+          await bare.close();
+        }
+      });
+
+      await checkAsync('the window says the kernel is gone when the kernel does not answer', async () => {
+        const dash = await startDashboard({
+          dir: tmp,
+          port: 0,
+          kernel: {
+            request: async () => {
+              throw new Error('the kernel went away');
+            },
+            subscribe: async () => () => {},
+          },
+        });
+        try {
+          const body = (await (await fetch(`${dash.url}/api/node?transport=sse`)).json()) as {
+            kernel: { state: string };
+            connection: { tone: string; label: string };
+          };
+          assert(body.kernel.state === 'unreachable', `the state, got ${body.kernel.state}`);
+          assert(body.connection.tone === 'dead', `the tone, got ${body.connection.tone}`);
+          assert(body.connection.label.includes('内核失联'), `the label, got ${body.connection.label}`);
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the page does not claim a connection it did not check', async () => {
+        const dash = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const html = await (await fetch(`${dash.url}/`)).text();
+          // The claim was in the page's **own script**: it wrote the words and
+          // the colour itself, so it kept saying "live connection" when there
+          // was no kernel, after the kernel died, and never went back to green
+          // once a poll failed.
+          //
+          // The comments come off first: the page explains the old words in a
+          // comment, and a check must look at what **runs**, not at what it
+          // says about itself.
+          const script = html
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/^\s*\/\/[^\n]*$/gm, '');
+          assert(!script.includes('实时连接（SSE）'), 'the page does not write a live-connection claim');
+          assert(!script.includes('SSE 不可用，已回退到轮询'), 'and it does not write its own fallback words');
+          assert(script.includes('connDot'), 'the dot has a slot of its own');
+          assert(script.includes('connection'), 'the page reads the connection the server sent');
+          // The colour is a class now, so it can go back to green.
+          assert(
+            !/\.live-dot['"]\)\.style\.background/.test(script),
+            'the dot colour is not set inline any more',
+          );
+          assert(html.includes('.live-dot.live'), 'and the page has a class for a live connection');
+          assert(html.includes('.live-dot.warn'), 'and one for a warning');
+          assert(html.includes('.live-dot.dead'), 'and one for a dead one');
+          assert(script.includes('live-dot ${'), 'and the dot takes the tone the server sent');
+          // And the page asks the server how it is fetching.
+          assert(script.includes('transport='), 'the page tells the server how it is fetching');
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the page renders the tone the server sent', async () => {
+        const dash = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const html = await (await fetch(`${dash.url}/`)).text();
+          const connectionLabels = pageFunction(html, 'connectionLabels');
+          const live = connectionLabels({
+            connection: { tone: 'live', label: '内核实时推送（SSE）' },
+          }) as Record<string, string>;
+          assert(live['tone'] === 'live', `the tone, got ${live['tone']}`);
+          assert(live['label'] === '内核实时推送（SSE）', `the label, got ${live['label']}`);
+          const dead = connectionLabels({
+            connection: { tone: 'dead', label: '内核失联 · 只能读磁盘记录' },
+          }) as Record<string, string>;
+          assert(dead['tone'] === 'dead', `the tone, got ${dead['tone']}`);
+          // And a payload that says nothing is **pending** — the page must
+          // not fall back to a green dot when the server did not answer.
+          const silent = connectionLabels({}) as Record<string, string>;
+          assert(silent['tone'] === 'pending', `the tone, got ${silent['tone']}`);
+          assert(silent['label'] === '—', `the label, got ${silent['label']}`);
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the push stream ends when the kernel goes away', async () => {
+        // A window that keeps saying "live connection" over a dead socket is
+        // claiming something nobody checked — and the sidebar had already
+        // turned red and said 「内核失联」 by then. So the stream ends, the
+        // window falls back to polling, and the bar says what is true.
+        let closed: ((reason: Error) => void) | undefined;
+        const dash = await startDashboard({
+          dir: tmp,
+          port: 0,
+          kernel: {
+            request: async (cmd) => {
+              if (cmd === 'ping') {
+                return {
+                  abiVersion: '1.0.0',
+                  kernelPid: 4242,
+                  startedAt: '2026-09-28T00:00:00.000Z',
+                  daemons: 0,
+                };
+              }
+              throw new Error(`the dashboard asked for something else: ${cmd}`);
+            },
+            subscribe: async () => () => {},
+            onClose: (handler) => {
+              closed = handler;
+            },
+          },
+        });
+        try {
+          const res = await fetch(`${dash.url}/api/stream?limit=10`);
+          assert(res.status === 200, `status ${res.status}`);
+          const reader = res.body!.getReader();
+          const first = await reader.read();
+          assert(!first.done, 'the stream started');
+          assert(closed !== undefined, 'the dashboard was told how to hear the kernel go');
+          closed!(new Error('the kernel went away'));
+          // **Bounded**: a stream that does not end has to fail this check,
+          // not hang the suite — a check that can hang is a check nobody runs.
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const expiry = new Promise<null>((resolve) => {
+            timer = setTimeout(() => resolve(null), 3000);
+            timer.unref?.();
+          });
+          const ended = await Promise.race([reader.read(), expiry]);
+          if (timer !== undefined) clearTimeout(timer);
+          assert(ended !== null && ended.done, 'the stream ended with the kernel');
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the overview counts the events the server reported', async () => {
+        const dash = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const html = await (await fetch(`${dash.url}/`)).text();
+          // The overview used to count the **loaded page** — 100 rows — while
+          // the panel right below it said 「共 5,000 条」. Two numbers for one
+          // fact, in one window, disagreeing.
+          const at = html.indexOf('function applyData()');
+          assert(at >= 0, 'the page still has applyData()');
+          const body = html.slice(at, html.indexOf('function ', at + 10));
+          assert(
+            body.includes('const eventTotal = eventsTotal || eventData.length;'),
+            'the metric counts what the server reported',
+          );
+          assert(
+            !body.includes("$('eventCount').textContent = eventData.length"),
+            'and not the rows that happen to be loaded',
+          );
+          assert(
+            body.includes("$('navEventCount').textContent = eventTotal;"),
+            'and the badge counts the same number',
+          );
+        } finally {
+          await dash.close();
+        }
       });
 
       await checkAsync('dashboard ops are disabled by default', async () => {

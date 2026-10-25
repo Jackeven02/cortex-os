@@ -1495,9 +1495,13 @@ the rule, because a second rule is a rule that drifts.
 
 And the **footer says which way the page is being refreshed**: "live push
 (SSE), reconciled every 30 seconds" while the kernel is pushing, "polling
-every 3 seconds (the live connection is unavailable)" when it is not. The
-page used to claim "auto-refresh · every 3 seconds" whatever it was doing —
-and in the live case it was not polling every 3 seconds at all.
+every 3 seconds" when it is not. The page used to claim "auto-refresh · every
+3 seconds" whatever it was doing — and in the live case it was not polling
+every 3 seconds at all. The polling line used to add "the live connection is
+unavailable" as well, which is a claim about *why* the push is gone that the
+window cannot check: the stream can fail while the kernel is perfectly alive.
+What is behind the numbers is the **top bar's** business, and the top bar
+asks.
 
 **And the dashboard says what each agent is inside.** The page is the
 operator's window, and it had the same blind spot as the process table
@@ -2182,6 +2186,32 @@ And the window's own directory is named. The sidebar claimed to show *"the
 current working directory"* and showed the string `Cortex workspace` — a brand
 name under a label that promises a path. It shows the directory the window is
 actually reading now, and calls it what it is: the **state directory**.
+
+**And the window's own light stopped claiming a connection it had not
+checked.** The top bar's green dot said 「实时连接（SSE）」 — always, whatever was
+behind it. There was no kernel at all: the stream that was open was following
+the *directory*, not a kernel. The kernel had died under the window: the push
+could not deliver another frame, and the sidebar — one screen over — had
+already turned red and said 「内核失联」. And when a poll failed, the dot
+**stayed red for good**: a window that cannot get back to green has stopped
+saying anything about the connection at all.
+
+So the bar asks, too. The server answers with what it checked: the kernel's
+state, and how much to believe the numbers on the screen — `live` (a kernel is
+behind them), `warn` (they are the disk's records), `dead` (the kernel is gone
+and this is what the disk still has). The words come from one module
+(`src/dashboard/connection_view.ts`), so the page — a static file that cannot
+import the rule — prints what it is given, and the meaning cannot drift.
+
+The one thing the server cannot check for itself is **how the window is
+fetching**: a pushed stream or a poll. That is a fact about the *window*, so
+the window says which it is doing when it asks.
+
+And the push **ends** when the kernel goes away. A stream that stays open over
+a dead socket delivers nothing and looks exactly like a healthy one; so the
+dashboard listens for the connection ending, ends the stream, and the window
+falls back to polling, asks the kernel again (it will not answer), and says out
+loud that what it is showing is what the disk still has.
 
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
