@@ -131,6 +131,9 @@
     .state-fill.stopped { background: #d4767b; }
     .state-number { color: #4c5665; text-align: right; font-variant-numeric: tabular-nums; }
     .runtime-foot { display: flex; align-items: center; justify-content: space-between; margin-top: auto; padding: 11px 16px; border-top: 1px solid #eff0f3; color: #8a93a1; font-size: 9px; }
+    /* A second line in the same foot: one rule, two facts — so the border is
+       drawn once and the second row does not repeat it. */
+    .runtime-foot + .runtime-foot { margin-top: 0; padding-top: 0; border-top: 0; }
     .view-toggle { display: flex; border: 1px solid #e7e9ed; border-radius: 6px; overflow: hidden; }
     .view-toggle button { min-height: 27px; padding: 0 10px; border: 0; background: #fff; color: #6d7684; font-size: 10px; font-weight: 560; }
     .view-toggle button + button { border-left: 1px solid #e7e9ed; }
@@ -224,8 +227,8 @@
         <button class="nav-item" id="refreshNav"><span class="nav-icon">↻</span><span class="nav-text">刷新数据</span></button>
       </nav>
       <div class="side-spacer"></div>
-      <div class="workspace"><div class="workspace-label">当前工作目录</div><div class="workspace-name"><span class="workspace-dot"></span><span id="workspaceName">Cortex workspace</span></div></div>
-      <div class="side-footer"><span class="workspace-dot"></span><span>本地节点已连接</span><span class="version">ABI 1.0</span></div>
+      <div class="workspace"><div class="workspace-label">状态目录</div><div class="workspace-name"><span class="workspace-dot"></span><span id="workspaceName">—</span></div></div>
+      <div class="side-footer"><span class="workspace-dot" id="nodeDot"></span><span id="nodeState">正在连接</span><span class="version" id="nodeAbi">—</span></div>
     </aside>
 
     <main class="main" data-section="overview">
@@ -258,7 +261,8 @@
           <section class="panel runtime">
             <div class="panel-head"><div><div class="panel-title">运行状态</div><div class="panel-note">按进程状态分类</div></div><span class="state">只读监控</span></div>
             <div class="runtime-body"><div class="runtime-total"><strong id="runtimeTotal">—</strong><span>个进程</span></div><div class="state-list" id="stateList"></div></div>
-            <div class="runtime-foot"><span>内核 ABI</span><span class="mono">1.0.0</span></div>
+            <div class="runtime-foot"><span>内核 ABI</span><span class="mono" id="kernelAbi">—</span></div>
+            <div class="runtime-foot"><span>内核已运行</span><span class="mono" id="kernelAge">—</span></div>
           </section>
 
           <section class="panel" id="checkpointsPanel">
@@ -846,6 +850,55 @@
         : refreshMode;
     }
 
+    // Which node this window is attached to.
+    //
+    // The sidebar used to say 「本地节点已连接」 and 「ABI 1.0」 in plain HTML
+    // — always, whether a kernel was running or not, and whatever ABI that
+    // kernel actually spoke. Two panels inside this window say out loud that
+    // they cannot answer without a live kernel, and the chrome said the
+    // opposite. So the kernel is asked, and the chrome says what the answer
+    // was.
+    //
+    // Three states, because "there is no kernel here" and "the kernel here
+    // is not answering" are different facts: the first is a quiet
+    // workspace, the second is a kernel that died under the window.
+    //
+    // Every word here comes from the server. The page hardcodes no ABI
+    // version and claims no connection it has not checked.
+    function nodeLabels(node) {
+      const kernel = node && typeof node === 'object' && node.kernel && typeof node.kernel === 'object'
+        ? node.kernel
+        : null;
+      const state = kernel && typeof kernel.state === 'string' ? kernel.state : 'none';
+      const abi = kernel && typeof kernel.abiVersion === 'string' ? kernel.abiVersion : null;
+      const pid = kernel && typeof kernel.pid === 'number' ? kernel.pid : null;
+      const age = kernel && typeof kernel.uptimeLabel === 'string' ? kernel.uptimeLabel : null;
+      const dirName = node && typeof node.dirName === 'string' ? node.dirName : '';
+      return {
+        state,
+        dot: state === 'live' ? '#92d879' : state === 'unreachable' ? '#d65b62' : '#e0a94b',
+        label: state === 'live'
+          ? (pid === null ? '内核已连接' : `内核 pid ${pid}`)
+          : state === 'unreachable' ? '内核失联' : '无活内核',
+        abi: abi === null ? 'ABI —' : `ABI ${abi}`,
+        kernelAbi: abi === null ? '—' : abi,
+        kernelAge: age === null ? '—' : age,
+        dirName: dirName === '' ? '—' : dirName,
+      };
+    }
+
+    function renderNode(node) {
+      const labels = nodeLabels(node);
+      $('nodeDot').style.background = labels.dot;
+      $('nodeState').textContent = labels.label;
+      $('nodeAbi').textContent = labels.abi;
+      $('kernelAbi').textContent = labels.kernelAbi;
+      $('kernelAge').textContent = labels.kernelAge;
+      $('workspaceName').textContent = labels.dirName;
+      const workspace = $('workspaceName').parentElement;
+      if (workspace) workspace.title = node && typeof node.dir === 'string' ? node.dir : '';
+    }
+
     function applyData() {
       const active = processData.filter((process) => ['running', 'ready', 'blocked'].includes(process.state));
       const tokens = processData.reduce((sum, process) => sum + processTokens(process), 0);
@@ -874,6 +927,7 @@
           fetch('/api/processes', { cache: 'no-store' }),
           fetch('/api/checkpoints', { cache: 'no-store' }),
           fetch('/api/ops', { cache: 'no-store' }),
+          fetch('/api/node', { cache: 'no-store' }),
         ]);
         if (responses.some((response) => !response.ok)) throw new Error('API 请求失败');
         [processData, checkpointData] = await Promise.all([
@@ -881,6 +935,9 @@
           responses[1].json(),
         ]);
         const opsData = await responses[2].json();
+        // Which node this window is attached to — the sidebar's own claims,
+        // checked rather than assumed.
+        renderNode(await responses[3].json());
         opsList = Array.isArray(opsData.ops) ? opsData.ops : (opsData.allowOps === true ? ['restore'] : []);
         opsEnabled = opsList.length > 0;
         $('spawnBar').hidden = !opsList.includes('spawn');

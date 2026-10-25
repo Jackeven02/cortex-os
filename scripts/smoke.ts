@@ -257,13 +257,14 @@ import {
   formatUndeclaredSummary,
   type DriverSurface,
 } from '../src/cli/audit_view.js';
+import { describeKernel, formatKernelLine } from '../src/cli/kernel_view.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import { cmdPs } from '../src/cli/commands/ps.js';
 import { cmdLimit } from '../src/cli/commands/limit.js';
-import { formatCaps } from '../src/cli/process_view.js';
+import { formatCaps, formatAge } from '../src/cli/process_view.js';
 import { readOpenCall, readOpenCallsFromKernel, isDeclaredWait } from '../src/cli/open_call.js';
 import { cmdTop } from '../src/cli/commands/top.js';
 import {
@@ -10284,7 +10285,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -11725,6 +11726,185 @@ async function runDashboardChecks(): Promise<void> {
         } finally {
           await dash.close();
         }
+      });
+
+      await checkAsync('the dashboard says which kernel it is watching', async () => {
+        // The sidebar used to say 「本地节点已连接」 and 「ABI 1.0」 in plain
+        // HTML — always, whether a kernel was running or not, and whatever
+        // ABI that kernel actually spoke. So the window asks.
+        const dash = await startDashboard({
+          dir: tmp,
+          port: 0,
+          kernel: {
+            request: async (cmd) => {
+              if (cmd === 'ping') {
+                return {
+                  abiVersion: '1.0.0',
+                  kernelPid: 4242,
+                  startedAt: new Date(Date.now() - 90_000).toISOString(),
+                  daemons: 2,
+                };
+              }
+              throw new Error(`the dashboard asked for something else: ${cmd}`);
+            },
+            subscribe: async () => () => {},
+          },
+        });
+        try {
+          const res = await fetch(`${dash.url}/api/node`);
+          assert(res.status === 200, `status ${res.status}`);
+          const body = (await res.json()) as {
+            dir: string;
+            dirName: string;
+            kernel: {
+              state: string;
+              abiVersion: string | null;
+              pid: number | null;
+              daemons: number | null;
+              uptimeMs: number | null;
+              uptimeLabel: string | null;
+              error: string | null;
+            };
+          };
+          assert(body.kernel.state === 'live', `the kernel is live, got ${body.kernel.state}`);
+          assert(body.kernel.pid === 4242, `the pid, got ${body.kernel.pid}`);
+          assert(body.kernel.abiVersion === '1.0.0', `the ABI, got ${body.kernel.abiVersion}`);
+          assert(body.kernel.daemons === 2, `the daemon count, got ${body.kernel.daemons}`);
+          // The uptime is printed with the SAME function the process table
+          // prints an age with — a duration that reads `2m` in one panel and
+          // `90000ms` in another is two rules, and two rules drift.
+          assert(
+            body.kernel.uptimeLabel === formatAge(body.kernel.uptimeMs ?? 0),
+            `the uptime is the shared format, got ${body.kernel.uptimeLabel}`,
+          );
+          // And the directory it is serving is the real one.
+          assert(body.dir === tmp, `the dir, got ${body.dir}`);
+          assert(body.dirName.length > 0, 'and it has a name to show');
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the dashboard says so when there is no live kernel', async () => {
+        // "No kernel here" is one of the answers, not an error: the window
+        // has to be able to say it. And an unreported fact is null — never a
+        // zero, and never a made-up ABI version.
+        const dash = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const res = await fetch(`${dash.url}/api/node`);
+          assert(res.status === 200, `status ${res.status}`);
+          const body = (await res.json()) as { kernel: Record<string, unknown> };
+          assert(body.kernel['state'] === 'none', `the state, got ${body.kernel['state']}`);
+          assert(body.kernel['abiVersion'] === null, `no ABI, got ${body.kernel['abiVersion']}`);
+          assert(body.kernel['pid'] === null, `no pid, got ${body.kernel['pid']}`);
+          assert(body.kernel['daemons'] === null, `no daemon count, got ${body.kernel['daemons']}`);
+          assert(body.kernel['uptimeLabel'] === null, `no uptime, got ${body.kernel['uptimeLabel']}`);
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the dashboard says so when the kernel does not answer', async () => {
+        // A kernel that is there and not answering is a different fact from
+        // a kernel that is not there. A view that merges the two will either
+        // claim a connection that is not there or hide one that is.
+        const dash = await startDashboard({
+          dir: tmp,
+          port: 0,
+          kernel: {
+            request: async () => {
+              throw new Error('the kernel went away');
+            },
+            subscribe: async () => () => {},
+          },
+        });
+        try {
+          const res = await fetch(`${dash.url}/api/node`);
+          assert(res.status === 200, `status ${res.status}`);
+          const body = (await res.json()) as { kernel: { state: string; error: string | null } };
+          assert(body.kernel.state === 'unreachable', `the state, got ${body.kernel.state}`);
+          assert(
+            String(body.kernel.error).includes('went away'),
+            `the reason is said, got ${body.kernel.error}`,
+          );
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the window does not claim a connection it has not checked', async () => {
+        // The sidebar used to carry two claims in plain HTML: that the node
+        // was connected, and what ABI it spoke. Both were always there — with
+        // no kernel at all, and whatever the kernel really spoke.
+        const dash = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const html = await (await fetch(`${dash.url}/`)).text();
+          // The claim was in the **markup** — so look at the markup, and not
+          // at the comment that explains why it is gone. (The rendered labels
+          // are checked separately, by the page's own function.)
+          const markup = html
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<script>[\s\S]*?<\/script>/g, '');
+          assert(!markup.includes('本地节点已连接'), 'the page does not claim a connection');
+          assert(!markup.includes('ABI 1.0'), 'the page does not hardcode an ABI version');
+          // And it reads them from the server instead.
+          assert(html.includes('nodeAbi'), 'the page has a slot for the ABI');
+          assert(html.includes('kernelAbi'), 'and one for the kernel panel');
+          assert(html.includes('/api/node'), 'and it asks the endpoint that answers');
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the window says which node it is attached to', async () => {
+        const dash = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const html = await (await fetch(`${dash.url}/`)).text();
+          const nodeLabels = pageFunction(html, 'nodeLabels');
+          const live = nodeLabels({
+            kernel: { state: 'live', pid: 4242, abiVersion: '1.0.0', uptimeLabel: '2m' },
+          }) as Record<string, string>;
+          assert(live['label'] === '内核 pid 4242', `the live label, got ${live['label']}`);
+          assert(live['abi'] === 'ABI 1.0.0', `the ABI label, got ${live['abi']}`);
+          assert(live['kernelAge'] === '2m', `the age label, got ${live['kernelAge']}`);
+          const none = nodeLabels({ kernel: { state: 'none' } }) as Record<string, string>;
+          assert(none['label'] === '无活内核', `the no-kernel label, got ${none['label']}`);
+          assert(none['abi'] === 'ABI —', `and no ABI, got ${none['abi']}`);
+          assert(none['kernelAge'] === '—', `and no age, got ${none['kernelAge']}`);
+          const dead = nodeLabels({ kernel: { state: 'unreachable' } }) as Record<string, string>;
+          assert(dead['label'] === '内核失联', `the unreachable label, got ${dead['label']}`);
+        } finally {
+          await dash.close();
+        }
+      });
+
+      await checkAsync('the terminal names the same kernel the window does', async () => {
+        // The two views read the same facts, so they cannot disagree about
+        // which kernel this is.
+        const now = Date.now();
+        const facts = describeKernel(
+          {
+            abiVersion: '1.0.0',
+            kernelPid: 4242,
+            startedAt: new Date(now - 90_000).toISOString(),
+            daemons: 2,
+          },
+          undefined,
+          now,
+        );
+        const line = formatKernelLine(facts);
+        assert(line.includes('pid 4242'), `the pid, got: ${line}`);
+        assert(line.includes('ABI 1.0.0'), `the ABI, got: ${line}`);
+        assert(line.includes(formatAge(90_000)), `the uptime, got: ${line}`);
+        // And the two states that are not "there is a kernel".
+        assert(
+          formatKernelLine(describeKernel(undefined)).includes('No live kernel'),
+          'the no-kernel line',
+        );
+        assert(
+          formatKernelLine(describeKernel(undefined, new Error('boom'))).includes('did not answer'),
+          'the unreachable line',
+        );
       });
 
       await checkAsync('dashboard ops are disabled by default', async () => {
@@ -20525,6 +20705,31 @@ async function runTransportChecks(): Promise<void> {
         // that path entirely, so a killed agent vanished from `ps` instead of
         // showing up as a zombie with its exit code.
         assert(exits.length > 0, 'the exit hook fired for the signal death');
+      });
+
+      await checkAsync('a remote ping says when the kernel started, not when it was asked', async () => {
+        // The ping used to answer `startedAt` with `new Date()` at the moment
+        // of the ping — so a kernel said it had started *just now*, every
+        // time it was asked, and anything that wanted to know how long it
+        // had been up got `0ms` from a kernel that had been running for an
+        // hour. The endpoint descriptor had the right value all along.
+        const first = await client!.request('ping') as { startedAt: string; abiVersion: string; kernelPid: number };
+        await new Promise((r) => setTimeout(r, 60));
+        const second = await client!.request('ping') as { startedAt: string };
+        assert(
+          first.startedAt === second.startedAt,
+          `the start time does not move: ${first.startedAt} vs ${second.startedAt}`,
+        );
+        // And it is the instant the server published, not the moment of the
+        // ping.
+        const descriptor = readEndpoint(tmp);
+        assert(descriptor !== undefined, 'the endpoint descriptor is there');
+        assert(
+          descriptor!.startedAt === first.startedAt,
+          `the ping and the descriptor agree: ${first.startedAt} vs ${descriptor!.startedAt}`,
+        );
+        // Which means the uptime is real.
+        assert(Date.parse(first.startedAt) <= Date.now(), 'the start time is in the past');
       });
 
       await checkAsync('the live kernel reports its process table over the wire', async () => {

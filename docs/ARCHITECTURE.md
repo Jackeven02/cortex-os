@@ -2139,6 +2139,50 @@ The window says it plainly when it cannot answer: the tool list lives in the
 registry of the kernel that owns it, there is no on-disk copy to read
 instead, and an empty surface would look like a kernel with no tools at all.
 
+**And the window stopped claiming what it had not checked.** The sidebar said
+「本地节点已连接」 and 「ABI 1.0」 — in plain HTML, always, whether a kernel
+was running or not, and whatever ABI that kernel actually spoke. Two panels
+inside the same window said out loud that they could not answer without a
+live kernel, and the chrome around them said the opposite. A window that
+admits *"this one needs a kernel"* in one place and *"the node is connected"*
+in another is a window the operator cannot calibrate.
+
+So the chrome asks. The transport already had the question — `ping` — and the
+probe already sent it and threw the answer away. The answer is **which** kernel
+this is (its pid), **what** it speaks (its ABI), **how long** it has been up,
+and **how many** daemons it supervises.
+
+And the answer was itself wrong. `ping` reported `startedAt` as *the moment of
+the ping*: it read the raw server options, where the value is usually absent,
+and fell back to `new Date()`. So a kernel said it had started **just now**,
+every time it was asked — and "how long has this kernel been up" came back as
+`0ms` from a kernel that had been running for an hour. The endpoint
+descriptor had the right instant all along; the ping did not. The start time
+is now resolved **once**, when the server starts, and every command that
+reports it reports the same instant.
+
+And there are **three** states, not two: a kernel that answered, a workspace
+with no kernel, and a kernel that is there and not answering. Merging the last
+two would either claim a connection that is not there, or hide one that is —
+and "the kernel died under my window" is the fact an operator needs most.
+
+The uptime is printed with the **same** function the process table prints an
+age with (`formatAge`): a duration that reads `2m` in one panel and `90000ms`
+in another is two rules, and two rules drift. And an unreported fact is
+`—`, never a zero: a window with no kernel to ask says `ABI —`, not `ABI
+1.0.0`.
+
+The terminal says the same thing. `cortex dashboard` used to print *"Watching
+a live kernel"* — which does not say **which** one, and there is one kernel
+per project directory (this section). It names the kernel now: its pid, its
+ABI and how long it has been up, read from the same facts the window's
+sidebar reads.
+
+And the window's own directory is named. The sidebar claimed to show *"the
+current working directory"* and showed the string `Cortex workspace` — a brand
+name under a label that promises a path. It shows the directory the window is
+actually reading now, and calls it what it is: the **state directory**.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up

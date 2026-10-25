@@ -18,6 +18,7 @@
 import { parseArgs } from 'node:util';
 import { defaultKernelDir } from '../index.js';
 import { probeKernel } from '../kernel_client.js';
+import { describeKernel, formatKernelLine, type KernelFacts } from '../kernel_view.js';
 import { startDashboard } from '../../dashboard/server.js';
 
 export async function cmdDashboard(args: string[]): Promise<number> {
@@ -76,7 +77,28 @@ NOTES
   });
   console.log(`Cortex dashboard listening at ${dashboard.url}`);
   if (kernel !== undefined) {
-    console.log('Watching a live kernel — running processes and a pushed event stream.');
+    // Which kernel is this? There is one per project directory, so "the live
+    // kernel" is not enough to tell an operator which one the window is
+    // watching. The facts come from the same module the window's sidebar
+    // reads, so the two cannot disagree about it.
+    let facts: KernelFacts;
+    try {
+      facts = describeKernel(
+        (await kernel.request('ping')) as {
+          abiVersion?: unknown;
+          kernelPid?: unknown;
+          startedAt?: unknown;
+          daemons?: unknown;
+        },
+      );
+    } catch (error) {
+      facts = describeKernel(undefined, error);
+    }
+    console.log(formatKernelLine(facts));
+    if (facts.state !== 'live') {
+      console.log('  finished processes, and the logs of everything that ran');
+      console.log("  start one with 'cortex daemon run' to watch agents as they work");
+    }
   } else {
     console.log('No live kernel in this directory — showing what is on disk:');
     console.log('  finished processes, and the logs of everything that ran');

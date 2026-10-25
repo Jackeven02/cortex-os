@@ -1557,6 +1557,67 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE (the window says what this system can call); INTEGRATIONS
   (`/api/drivers`); CHANGELOG.
 
+- [x] **#108** The window claimed a connection it had not checked → **fixed.**
+  The dashboard's sidebar said 「本地节点已连接」 and 「ABI 1.0」 in plain HTML:
+  always, whether a kernel was running or not, and whatever ABI that kernel
+  actually spoke. The 运行状态 panel said 「内核 ABI 1.0.0」 the same way. And
+  the sidebar's own box claimed to show "the current working directory" while
+  showing the string `Cortex workspace` — a brand name under a label that
+  promises a path.
+
+  Meanwhile two panels *inside* that window said out loud that they could not
+  answer without a live kernel. A window that admits "this one needs a kernel"
+  in one place and "the node is connected" in another is a window the operator
+  cannot calibrate.
+
+  So the chrome asks. The transport already had the question (`ping`), and the
+  probe already sent it and threw the answer away: the answer is which kernel
+  this is (its pid), what it speaks, how long it has been up, and how many
+  daemons it supervises.
+
+  **And the answer was itself wrong.** `ping` reported `startedAt` as *the
+  moment of the ping*: it read the raw server options, where the value is
+  usually absent, and fell back to `new Date()`. So a kernel said it had
+  started **just now**, every time it was asked — and "how long has this
+  kernel been up" came back as `0ms` from a kernel that had been running for
+  an hour. The endpoint descriptor had the right instant all along; the ping
+  did not. The start time is now resolved **once**, when the server starts,
+  and every command that reports it reports the same instant. (Found while
+  building the node line: the window faithfully printed `0ms`, because the
+  fact it was handed was wrong.)
+
+  And there are **three** states, not two: a kernel that answered, a workspace
+  with no kernel, and a kernel that is there and not answering. Merging the
+  last two would either claim a connection that is not there, or hide one that
+  is — and "the kernel died under my window" is the fact an operator needs
+  most.
+
+  An unreported fact is `—`, never a zero and never a made-up ABI version,
+  and the uptime is printed with the **same** function the process table
+  prints an age with. The window's own directory is named too: the directory
+  it is actually reading, called what it is — the **state directory**.
+
+  The terminal says the same thing. `cortex dashboard` used to print "Watching
+  a live kernel", which does not say *which* one — and there is one kernel per
+  project directory. It names the kernel now: its pid, its ABI, and how long
+  it has been up.
+
+  **6 new smoke checks** (833 → 839), reverse-verified: with the hardcoded
+  claim put back into the markup, the claim check fails; with "no kernel"
+  reported as a live one, the no-kernel check and the terminal check fail; with
+  "not answering" merged into "not there", the unreachable check and the
+  terminal check fail; with the uptime printed by anything but the shared
+  formatter, the endpoint check and the terminal check fail; with the page
+  inventing its own label, the page check fails; and with the terminal line
+  no longer naming the pid, the terminal check fails.
+
+  Plus **one more** for the ping fix (839 → 840): with the raw server options
+  passed to the connections again, the "says when the kernel started" check
+  fails — the start time moves with the question.
+
+  Docs: ARCHITECTURE (the window stopped claiming what it had not checked);
+  INTEGRATIONS (`/api/node`); CHANGELOG.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

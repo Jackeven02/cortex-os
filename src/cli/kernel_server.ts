@@ -163,11 +163,24 @@ export async function startKernelServer(
   const startedAt = opts.startedAt ?? new Date().toISOString();
   const log = opts.log ?? ((message: string) => process.stderr.write(`${message}\n`));
 
+  // The options the connections run with. `startedAt` is **resolved** here —
+  // once, when the server starts — so every command that reports it reports
+  // the same instant.
+  //
+  // It used to be read from the raw options inside the `ping` handler, where
+  // it was usually *absent*: the answer was then `new Date()` at the moment
+  // of the ping. So a kernel said it had started **just now**, every time it
+  // was asked — and anything that wanted to know how long it had been up
+  // (the dashboard's sidebar) got `0ms` from a kernel that had been running
+  // for an hour. The endpoint descriptor had the right value all along; the
+  // ping did not.
+  const effective: KernelServerOptions = { ...opts, startedAt };
+
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {
     sockets.add(socket);
     socket.once('close', () => sockets.delete(socket));
-    attachConnection(kernel, socket, token, opts, log);
+    attachConnection(kernel, socket, token, effective, log);
   });
 
   await new Promise<void>((resolve, reject) => {
@@ -462,6 +475,12 @@ async function dispatch(
   switch (cmd) {
     case 'ping':
       // Transport-level: deliberately not recorded in the syscall log.
+      //
+      // `startedAt` is the moment the **server** started — resolved once, in
+      // `startKernelServer` — so it is the same instant the endpoint
+      // descriptor publishes. Reading it from the raw options here would
+      // fall back to "now" on every ping, and a kernel would say it had
+      // started just now, every time it was asked.
       return {
         abiVersion: kernel.kernelAbiVersion,
         kernelPid: process.pid,

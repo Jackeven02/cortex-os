@@ -42,6 +42,31 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`GET /api/node` — which node the window is attached to.** The dashboard
+  gained an endpoint that answers the question its own chrome used to *assert*
+  (see the fix below): the state directory it is serving, and the kernel
+  behind it — its pid, the ABI it speaks, how long it has been up, and how
+  many daemons it supervises.
+
+  It always answers `200`. "There is no kernel here" is one of its answers
+  and not an error, because the window has to be able to say it; and every
+  fact it cannot report is `null` — never a zero, and never a made-up ABI
+  version. The kernel's state is one of three: `live`, `none`, or
+  `unreachable` (there is a kernel and it did not answer — with the reason in
+  `kernel.error`).
+
+  `src/cli/kernel_view.ts` (new) holds the facts and the wording, so the
+  terminal and the window cannot disagree about which kernel this is:
+
+  - `describeKernel(ping, error?)` — the facts, three-state, with the uptime
+    printed by the **same** `formatAge` the process table prints an age with.
+  - `formatKernelLine(facts)` — the line the CLI prints.
+
+  `cortex dashboard` now says **which** kernel it is watching — its pid, its
+  ABI and how long it has been up. It used to say "Watching a live kernel",
+  which does not say which one, and there is one kernel per project directory
+  (docs/ARCHITECTURE.md §12.2).
+
 - **The dashboard says what this system can call.** The operator's window could
   show what an agent **did** and what it **knew**, and nothing about the system
   it was running in: which tools existed, which model was driving it, and —
@@ -1623,6 +1648,44 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **A kernel said it had started just now, every time it was asked.** The
+  transport's `ping` reported `startedAt` as *the moment of the ping*: it read
+  the raw server options, where the value is usually absent, and fell back to
+  `new Date()`. So the kernel's answer moved with every question — and
+  "how long has this kernel been up" came back as `0ms` from a kernel that
+  had been running for an hour. The endpoint descriptor had the right instant
+  all along; the ping did not.
+
+  The start time is now resolved **once**, when the server starts, and every
+  command that reports it reports the same instant. Found while building the
+  dashboard's node line: the window faithfully printed `0ms` because the fact
+  it was handed was wrong.
+
+- **The window claimed a connection it had not checked.** The dashboard's
+  sidebar said 「本地节点已连接」 and 「ABI 1.0」 — in plain HTML, always,
+  whether a kernel was running or not, and whatever ABI that kernel actually
+  spoke. The 运行状态 panel said 「内核 ABI 1.0.0」 the same way. Meanwhile two
+  panels *inside* that window said out loud that they could not answer without
+  a live kernel, and the sidebar's own box claimed to show "the current
+  working directory" while showing the string `Cortex workspace` — a brand
+  name under a label that promises a path.
+
+  The chrome now asks. The transport already had the question (`ping`), and
+  the probe already sent it and threw the answer away: the answer is which
+  kernel this is (its pid), what it speaks, how long it has been up, and how
+  many daemons it supervises. And there are **three** states, not two — a
+  kernel that answered, a workspace with no kernel, and a kernel that is there
+  and not answering. Merging the last two would either claim a connection that
+  is not there, or hide one that is, and "the kernel died under my window" is
+  the fact an operator needs most.
+
+  An unreported fact is `—`, never a zero and never a made-up ABI version, and
+  the uptime is printed with the **same** function the process table prints an
+  age with — a duration that reads `2m` in one panel and `90000ms` in another
+  is two rules, and two rules drift. The window's own directory is named too:
+  the directory it is actually reading, called what it is — the **state
+  directory**.
 
 - **Every restored process woke up with no budget ceiling.** A checkpoint
   records **both** halves of a budget — what the process had spent and what

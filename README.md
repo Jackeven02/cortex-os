@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 833 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 840 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -410,6 +410,10 @@ The panel re-reads the file rather than trusting a pushed copy of the line, so t
 **And the window says what this system can call.** The **工具面** button in the top bar opens the tool surface: every tool driver and the tools it exposes, each with the reversibility the kernel would enforce and whether anybody ever **declared** that tag — plus the model drivers and the memory drivers. `cortex audit` answers the same question, but it boots a kernel of its own, and an MCP server's tool list is pulled from the server when the driver registers: so the surface of the kernel actually running your agents is not the surface of a second one. The window asks the kernel that has them.
 
 The two views read their facts and their words from one module, so they cannot disagree. A tool nobody declared is marked `not-declared` — an MCP server cannot declare reversibility at all, so the driver invents a tag, the invented one is `irreversible`, and a defaulted irreversible tool is refused inside a `forkable()` region without saying why. A tool the kernel cannot resolve is `?`: *we cannot tell* is not *nobody said so*.
+
+**And the window stopped claiming a connection it had not checked.** The sidebar used to say 「本地节点已连接」 and 「ABI 1.0」 in plain HTML — always, whether a kernel was running or not, and whatever ABI that kernel actually spoke — while two panels inside the same window said out loud that they could not answer without a live kernel. Now the chrome asks the kernel: it names the one it is watching (its pid), the ABI it speaks, how long it has been up, and whether there is a kernel at all. Three states, not two — a kernel that answered, a workspace with no kernel, and a kernel that is there and not answering. `cortex dashboard` says the same thing in the terminal, for the same reason: there is one kernel per project directory, so "a live kernel" does not say which one you are looking at.
+
+The uptime it shows is real, too. The kernel's `ping` used to answer "I started just now" every time it was asked — so "how long has this kernel been up" came back as `0ms` from a kernel that had been running for an hour. The start time is resolved once, when the server starts, and every command that reports it reports the same instant.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

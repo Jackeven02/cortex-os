@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createInterface } from 'node:readline';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { format } from 'node:util';
 import { asProcessId } from '../kernel/types.js';
 import type { BlockedReason, BudgetLimits, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
@@ -20,6 +20,7 @@ import {
   formatUndeclaredSummary,
   type DriverSurface,
 } from '../cli/audit_view.js';
+import { describeKernel, type KernelFacts } from '../cli/kernel_view.js';
 import { usdToDollars } from '../money.js';
 import { formatTokenUsage, callUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
@@ -825,6 +826,50 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
       }
       if (url.pathname === '/api/checkpoints') {
         json(response, 200, await listCheckpoints(dir));
+        return;
+      }
+      // Which node this window is attached to.
+      //
+      // The sidebar used to say 「本地节点已连接」 and 「ABI 1.0」 in plain
+      // HTML — always, whether a kernel was running or not, and whatever ABI
+      // that kernel actually spoke. The window's chrome was making two
+      // claims it had never checked, while two panels inside it said out
+      // loud that they could not answer without a live kernel.
+      //
+      // So the kernel is asked. `ping` is a transport-level command: it is
+      // not recorded, it costs nothing, and it already answers "which kernel
+      // is this, what does it speak, how long has it been up".
+      //
+      // This endpoint **always** answers, because "there is no kernel here"
+      // is one of its answers and not an error: the window has to be able to
+      // say that. What it does not do is guess — an unreported fact is null,
+      // never zero.
+      if (url.pathname === '/api/node') {
+        let facts: KernelFacts;
+        if (options.kernel === undefined) {
+          facts = describeKernel(undefined);
+        } else {
+          try {
+            facts = describeKernel(
+              (await options.kernel.request('ping')) as {
+                abiVersion?: unknown;
+                kernelPid?: unknown;
+                startedAt?: unknown;
+                daemons?: unknown;
+              },
+            );
+          } catch (error) {
+            facts = describeKernel(undefined, error);
+          }
+        }
+        json(response, 200, {
+          // The state directory this window is serving. The sidebar claims to
+          // show "the current working directory", so it had better show the
+          // directory the window is actually reading.
+          dir,
+          dirName: basename(dir),
+          kernel: facts,
+        });
         return;
       }
       // What this kernel can call.
