@@ -19544,6 +19544,14 @@ async function runDashboardLiveChecks(): Promise<void> {
           await ctx.recv();
           return;
         }
+        if (mode === 'parked') {
+          // A process that stops **on purpose**: a checkpoint with `detach`
+          // parks it (SUSPENDED), and the chain it was parked in is what
+          // brings it back. A table that says only `suspended` reads exactly
+          // like a row whose agent died in the middle of a call.
+          await ctx.checkpoint({ tag: 'before risky edit', detach: true });
+          return;
+        }
         // Alive and doing nothing: the dashboard must still show it.
         await ctx.recv();
         return;
@@ -20050,6 +20058,67 @@ async function runDashboardLiveChecks(): Promise<void> {
         assert(
           !html.includes('自动刷新 · 每 3 秒'),
           'the page does not claim a 3-second refresh it is not doing',
+        );
+      });
+
+      await checkAsync('a parked process says it is parked, and how to bring it back', async () => {
+        // A process that was checkpointed with `detach` is SUSPENDED: it is
+        // not running, not waiting, and not stuck — it is **parked**, and the
+        // chain it was parked in is what brings it back.
+        //
+        // The table used to say `suspended` and nothing else. A row that says
+        // only that reads exactly like a row whose agent died in the middle
+        // of a call, and the operator cannot tell the two apart from the
+        // table they read first — so the kernel's own fact (the chain) had
+        // to reach the table.
+        const pid = await kernel.spawn({
+          role: 'parked',
+          agent: { module: 'test:live', args: { mode: 'parked' } },
+        });
+        // The park takes a moment: the kernel writes the snapshot first, and
+        // then transitions the process.
+        const deadline = Date.now() + 5000;
+        let chain: readonly string[] = [];
+        while (Date.now() < deadline && chain.length === 0) {
+          chain = kernel.table.get(pid)?.checkpointChain ?? [];
+          if (chain.length === 0) await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        assert(chain.length > 0, `the kernel knows the chain it parked the process in, got ${JSON.stringify(chain)}`);
+        const expected = `checkpointed — 'cortex restore --chain ${chain[chain.length - 1]}' brings it back`;
+
+        const result = await capture(() => cmdPs([]));
+        const line = psRow(result.out, unbrand(pid));
+        assert(line !== '', `the parked process is listed, got: ${result.out}`);
+        assert(line.includes(expected), `the row says it is parked and hands over the command, got: ${line}`);
+
+        // The tree says the **same** sentence — one rule, two views.
+        const top = await capture(() => cmdTop([]));
+        const treeLine = topRow(top.out, unbrand(pid));
+        assert(treeLine.includes(expected), `the tree says the same sentence, got: ${treeLine}`);
+
+        // And the window says it too — one rule, three views.
+        const res = await fetch(`${dash.url}/api/processes`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const row = rows.find((r) => r['pid'] === unbrand(pid));
+        assert(
+          row !== undefined,
+          `the window lists the parked process, got: ${JSON.stringify(rows.map((r) => r['pid']))}`,
+        );
+        assert(
+          row!['checkpointLabel'] === expected,
+          `the window says the same sentence, got: ${String(row!['checkpointLabel'])}`,
+        );
+      });
+
+      await checkAsync('the page prints the park it is given', async () => {
+        // The park is the server's wording — the same function `cortex ps`
+        // and `cortex top` use — so the page prints it and does not write a
+        // second version of it.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        assert(html.includes('checkpointLabel'), 'the page prints the park label it is given');
+        assert(
+          !html.includes('cortex restore --chain'),
+          'the page does not write the restore command itself',
         );
       });
 

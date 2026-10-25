@@ -16,7 +16,10 @@
  * 2. **That it has run out of budget.** A process whose ceiling has been
  *    reached cannot go on — and if it is parked, nothing else in the row says
  *    why it is not making progress.
- * 3. **What it is waiting on**, and what is waiting for it.
+ * 3. **That it was parked at a checkpoint**, and the command that brings it
+ *    back. A parked process is not waiting for anything — it is stopped on
+ *    purpose — so this and the next one never both apply.
+ * 4. **What it is waiting on**, and what is waiting for it.
  *
  * The dashboard's page, `cortex ps` and `cortex top` all use this order, so
  * a table, a tree and a page cannot disagree about which fact comes first.
@@ -35,6 +38,14 @@ export interface ProcessNoteParts {
   readonly ending?: string | undefined;
   /** That it has run out of budget, if it has. */
   readonly budget?: string | undefined;
+  /**
+   * That it was parked at a checkpoint, and the command that brings it back.
+   *
+   * The words come from `describeCheckpointPark` (one rule, shared with the
+   * checkpoint command and the dashboard), so a parked process cannot be
+   * described one way in the table and another way in the window.
+   */
+  readonly checkpoint?: string | undefined;
   /** What it is waiting on, and what is waiting for it. */
   readonly waiting?: string | undefined;
 }
@@ -48,6 +59,10 @@ export interface ProcessNoteParts {
 export function processNote(parts: ProcessNoteParts): string {
   const ending = parts.ending ?? '';
   if (ending !== '') return ending;
-  const rest = [parts.budget ?? '', parts.waiting ?? ''].filter((part) => part !== '');
+  const rest = [
+    parts.budget ?? '',
+    parts.checkpoint ?? '',
+    parts.waiting ?? '',
+  ].filter((part) => part !== '');
   return rest.join(' — ');
 }

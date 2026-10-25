@@ -208,6 +208,18 @@ export interface ProcessRow {
    */
   readonly pendingSignals?: readonly Signal[];
   /**
+   * The checkpoints this process was parked at, oldest first.
+   *
+   * A process that was checkpointed with `--detach` is SUSPENDED, and the
+   * chain it was parked in is what brings it back — so this list is the
+   * operator's answer to "can this one be resumed, and from where?".
+   *
+   * Absent means *not reported*: the kernel did not say, because there is no
+   * kernel, or it is too old to know. It does **not** mean "this process was
+   * never checkpointed".
+   */
+  readonly checkpointChain?: readonly string[];
+  /**
    * Whether the kernel still has this process.
    *
    * A process that is *running* has no `meta.json` yet (the kernel writes it
@@ -278,6 +290,14 @@ interface LiveProcessInfo {
    * Absent is *not reported*; it never means "nothing queued".
    */
   readonly pendingSignals?: readonly Signal[];
+  /**
+   * The checkpoints this process was parked at, oldest first.
+   *
+   * Optional, for the same reason `pendingSignals` is: a kernel too old to
+   * carry the field does not have it. Absent is *not reported* — it never
+   * means "this process was never checkpointed".
+   */
+  readonly checkpointChain?: readonly string[];
 }
 
 function rowFromMeta(meta: ProcessMeta): ProcessRow {
@@ -315,6 +335,7 @@ function rowFromLive(info: LiveProcessInfo): ProcessRow {
     blockedOn: info.blockedOn,
     capabilities: info.capabilities,
     ...(info.pendingSignals !== undefined ? { pendingSignals: info.pendingSignals } : {}),
+    ...(info.checkpointChain !== undefined ? { checkpointChain: info.checkpointChain } : {}),
     live: true,
   };
 }

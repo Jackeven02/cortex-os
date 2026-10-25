@@ -131,6 +131,44 @@ export interface CheckpointFacts {
 }
 
 /**
+ * What a view says about a process that was **parked at a checkpoint**.
+ *
+ * The rule: **SUSPENDED means checkpointed.** That is the state a checkpoint
+ * with `--detach` puts a process in (`src/kernel/checkpoint.ts`), and it is
+ * the only thing that puts it there — and `suspended` has no way out except a
+ * restore, which builds a **new** process from the snapshot. So a suspended
+ * process is not stuck and not waiting: it is *parked*, on purpose, and the
+ * chain it was parked in is what brings it back.
+ *
+ * A row that says only `suspended` reads exactly like a row whose agent
+ * died in the middle of a call, and the operator cannot tell the two apart
+ * from the table they read first. So the sentence says both: that the
+ * process is parked, and the command that unparks it — because a table that
+ * says "this one is parked" and then leaves the operator to remember the
+ * syntax is only half a tool.
+ *
+ * A process the kernel did not report a chain for says only that it is
+ * parked: the command needs a chain id, and one that was not reported is not
+ * invented.
+ *
+ * The words live here, next to the rest of the checkpoint wording, so the
+ * table, the tree and the operator's window cannot say different things
+ * about the same parked process.
+ */
+export function describeCheckpointPark(row: {
+  readonly state?: string | undefined;
+  readonly checkpointChain?: readonly string[] | undefined;
+}): string {
+  if (row.state !== 'suspended') return '';
+  const chain = row.checkpointChain;
+  // The chain is oldest first, so the **last** one is the checkpoint the
+  // process was parked at — and the one that restores it to where it is.
+  const latest = chain === undefined || chain.length === 0 ? undefined : chain[chain.length - 1];
+  if (latest === undefined) return 'checkpointed';
+  return `checkpointed — 'cortex restore --chain ${latest}' brings it back`;
+}
+
+/**
  * Take a checkpoint apart into the facts a view can say.
  *
  * The reading itself lives in the kernel (`readCheckpointFile`), so the

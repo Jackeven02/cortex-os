@@ -42,6 +42,24 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **A parked process says it is parked, and hands over the command that brings
+  it back.** A process that was checkpointed with `--detach` is SUSPENDED
+  (docs/PROCESS.md §3.6): it is not running, not waiting, and not stuck — it
+  stopped *on purpose*, and the chain it was parked in is what brings it back.
+  The kernel knows that chain (it is in the process record), and **no view said
+  so**: the table said `suspended` and nothing else, so a process that stopped
+  on purpose read exactly like one whose agent died in the middle of a call —
+  and the operator could not tell the two apart from the table they read first.
+
+  Now the row says `checkpointed — 'cortex restore --chain <id>' brings it
+  back`, in `cortex ps`, in `cortex top` and in the dashboard's process table.
+  The words are **one function** (`describeCheckpointPark`), so the three views
+  cannot say different things about the same parked process, and the page
+  prints the label it is given instead of writing a second version of it. A
+  process whose chain the kernel did not report says only that it is
+  checkpointed: the command needs a chain id, and one that was not reported is
+  not invented.
+
 - **`ActivityStore.count(range)` — how many events the store holds for a
   window.** The count and the rows are one measurement, so the number a view
   shows and the rows behind it cannot be two different answers. It counts

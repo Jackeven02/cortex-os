@@ -2359,6 +2359,27 @@ heartbeat, the feed timer, the process refresh, the output timer, the file
 watcher, the kernel subscription. And no timer is created for a window that
 is already closed.
 
+**A parked process says it is parked.** A process that was checkpointed with
+`--detach` is SUSPENDED (PROCESS.md §3.6): it is not running, not waiting,
+and not stuck — it stopped *on purpose*, and the chain it was parked in is
+what brings it back. The kernel knows the chain (it is in the process
+record: `checkpointChain`), and **no view said so**: the table said
+`suspended` and nothing else, so a process that stopped on purpose read
+exactly like one whose agent died in the middle of a call.
+
+So the row says it: `checkpointed — 'cortex restore --chain <id>' brings it
+back`. The chain id is the kernel's own, and the command is the one that
+actually works — a table that says "this one is parked" and then leaves the
+operator to remember the syntax is only half a tool. The words are **one
+function** (`describeCheckpointPark`), so the table, the tree and the
+operator's window cannot say different things about the same parked process,
+and the page prints the label it is given rather than writing a second
+version of it.
+
+A process whose chain the kernel did not report says only that it is
+checkpointed: the command needs a chain id, and one that was not reported is
+not invented.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up

@@ -1987,6 +1987,73 @@ The user-facing surface. Should feel like a real OS shell.
   **Exit criteria:** every kernel the smoke boots is stopped, and the run ends
   as soon as it has printed its summary.
 
+- [x] **#118** A parked process said nothing about being parked → **fixed.**
+  Found by an audit rather than by a report: a live kernel was booted, and
+  every field of its `ProcessInfo` was compared, field by field, with what the
+  CLI's row and the dashboard's row actually carry. **Two facts the kernel
+  holds reached no view at all** — `nice` and `checkpointChain` — and the
+  second one was the sharper problem.
+
+  A process that was checkpointed with `--detach` is SUSPENDED
+  (PROCESS.md §3.6): it is not running, not waiting, and not stuck — it
+  stopped **on purpose**, and the chain it was parked in is what brings it
+  back. The kernel knows that chain. The table said `suspended` and **nothing
+  else**, so a process that stopped on purpose read exactly like one whose
+  agent died in the middle of a call — and the operator could not tell the two
+  apart from the table they read first. The command that brings it back
+  (`cortex restore --chain <id>`) needs the chain id, and the id was in
+  nobody's view.
+
+  So the row says it: `checkpointed — 'cortex restore --chain <id>' brings it
+  back`, in `cortex ps`, in `cortex top` and in the dashboard's process table.
+  The words are **one function** (`describeCheckpointPark`), so the three
+  views cannot say different things about the same parked process, and the
+  page prints the label it is given rather than writing a second version of
+  it. The chain id is the kernel's own, and it is the one that actually works
+  — a table that says "this one is parked" and then leaves the operator to
+  remember the syntax is only half a tool.
+
+  A process whose chain the kernel did not report says only that it is
+  checkpointed: the command needs a chain id, and one that was not reported is
+  not invented.
+
+  **2 new smoke checks** (885 → 887), reverse-verified: with the chain not
+  carried onto the row, the check fails (and the row degrades to the honest
+  `checkpointed`); with the table dropping the park, it fails; with the
+  window not getting the label, it fails; and with the page writing the
+  restore command itself, the page check fails.
+
+  Browser-verified on a real window over a real kernel: the suspended row
+  reads `checkpointed — 'cortex restore --chain eeac2f96-…' brings it back`,
+  the console is clean, and the 检查点 panel beside it offers the same chain.
+
+- [ ] **#119** The scheduler's priority reaches no view, and has no knob →
+  **open.**
+  The other half of the audit (#118): the kernel's `ProcessInfo` carries a
+  process's **`nice`** (-20..19, lower = higher priority), and the scheduler
+  honours it — among the READY processes it dispatches the lowest `nice`
+  first (PROCESS.md §8.1). So `nice` decides **which of the operator's agents
+  runs first**, and when two of them compete, the one with the lower `nice`
+  wins every time and the other can be starved.
+
+  Nothing shows it. Nothing sets it either: `cortex spawn` has no `--nice`,
+  `cortex daemon install` has no `--nice`, and only an agent can ask for one
+  (`ctx.spawn({ nice })` — the daemon spec carries it, so the supervisor's
+  replacement inherits it). So the operator has a fact that changes the
+  behaviour they observe, with no way to see it and no way to move it.
+
+  The options are a **shape** question, so they need a decision before code:
+  (a) a PRIO column in the tables — which breaks the "the columns keep their
+  positions" rule the flat table has kept since #070; (b) the priority in the
+  NOTE cell, which is a cell about *what the process is doing* and not about
+  how it is ranked; (c) the knob only — `cortex spawn --nice N` and
+  `cortex daemon install --nice N`, so the operator can set a priority
+  without being able to see the one they inherited; (d) both, in a column
+  whose position is chosen deliberately.
+
+  **Exit criteria:** the priority a process runs at is visible, and an
+  operator can change it.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

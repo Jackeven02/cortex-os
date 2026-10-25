@@ -6,14 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { join, basename } from 'node:path';
 import { format } from 'node:util';
 import { asProcessId } from '../kernel/types.js';
-import type { BlockedReason, BudgetLimits, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
+import type { BlockedReason, BudgetCounters, BudgetLimits, ProcessInfo, ProcessState, Signal, SyscallRecord } from '../kernel/types.js';
 import { existingCrecPath, readRecords } from '../kernel/recorder.js';
 import { readCheckpointFile } from '../kernel/checkpoint.js';
 import { readAllMetas, listProcDirs, readOutputEntries, findCheckpointFile } from '../cli/process_store.js';
 import { formatCaps, describePendingSignals, readProcessView, formatAge, processAge, type AgeFacts } from '../cli/process_view.js';
 import { describeOutcome } from '../cli/process_outcome.js';
 import { describeBudget, formatTokenBudget, formatUsdBudget, type BudgetFacts } from '../cli/process_budget.js';
-import { describeCheckpoint, formatCheckpointTokenBudget, formatCheckpointUsdBudget } from '../cli/checkpoint_view.js';
+import { describeCheckpoint, describeCheckpointPark, formatCheckpointTokenBudget, formatCheckpointUsdBudget } from '../cli/checkpoint_view.js';
 import {
   describeDriverSurface,
   formatDeclaration,
@@ -323,21 +323,41 @@ async function listProcesses(dir: string, options: DashboardOptions): Promise<un
     };
   };
 
+  // The labels, in the order they are put on the row. Named steps rather
+  // than one nested call: the chain is long enough that a paren-counting
+  // mistake is easy, and a wrong order is a wrong cell.
+  const decorate = <T extends {
+    pid: number;
+    state: ProcessState;
+    startedAt: string;
+    exitCode: number | null;
+    exitReason: string | null;
+    budgetsSpent: BudgetCounters;
+    budgetsRemaining: BudgetLimits;
+    capabilities?: readonly Capability[];
+    pendingSignals?: readonly Signal[];
+    blockedOn?: BlockedReason | null;
+    checkpointChain?: readonly string[];
+  }>(
+    row: T,
+  ): T & { pendingLabel: string; insideLabel?: string; tokenLabel: string; usdLabel: string; usdSpentDollars: number; capsLabel: string; outcomeLabel: string; budgetLabel: string; checkpointLabel: string; ageLabel: string } => {
+    const pending = withPendingLabel(row);
+    const inside = withInside(pending);
+    const tokens = withTokenLabel(inside);
+    const usd = withUsdLabel(tokens);
+    const dollars = withUsdDollars(usd);
+    const caps = withCapsLabel(dollars);
+    const outcome = withOutcomeLabel(caps);
+    const budget = withBudgetLabel(outcome);
+    const checkpoint = withCheckpointLabel(budget);
+    return withAgeLabel(checkpoint, now);
+  };
+
   if (options.processes !== undefined) {
-    return [...options.processes()].map((row) =>
-      withAgeLabel(
-        withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withUsdLabel(withTokenLabel(withInside(withPendingLabel(row)))))))),
-        now,
-      ),
-    );
+    return [...options.processes()].map((row) => decorate(row));
   }
   const view = await readProcessView(dir, options.kernel);
-  return [...view.rows].map((row) =>
-    withAgeLabel(
-      withBudgetLabel(withOutcomeLabel(withCapsLabel(withUsdDollars(withUsdLabel(withTokenLabel(withInside(withPendingLabel(row)))))))),
-      now,
-    ),
-  );
+  return [...view.rows].map((row) => decorate(row));
 }
 
 /**
@@ -631,6 +651,26 @@ function withBudgetLabel<T extends { budgetsRemaining: BudgetLimits }>(
   row: T,
 ): T & { budgetLabel: string } {
   return { ...row, budgetLabel: describeBudget(row.budgetsRemaining) };
+}
+
+/**
+ * Put the park on the row, in the same words `cortex ps` and `cortex top`
+ * print.
+ *
+ * A process that was checkpointed with `--detach` is SUSPENDED: it is not
+ * running, not waiting, and not stuck — it is parked, and the chain it was
+ * parked in is what brings it back. The window used to show `suspended` and
+ * nothing else, so a process that stopped **on purpose** looked exactly like
+ * one that died in the middle of a call, and the operator had no way to tell
+ * the two apart from the table they read first.
+ *
+ * The words come from the same function the terminal uses, so the window and
+ * the table cannot say different things about the same parked process.
+ */
+function withCheckpointLabel<T extends { state: ProcessState; checkpointChain?: readonly string[] }>(
+  row: T,
+): T & { checkpointLabel: string } {
+  return { ...row, checkpointLabel: describeCheckpointPark(row) };
 }
 
 /** Every write operation the dashboard knows how to perform. */

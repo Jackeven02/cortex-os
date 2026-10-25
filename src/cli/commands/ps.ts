@@ -25,6 +25,7 @@ import { describeWait, readOpenCalls, type OpenCall } from '../open_call.js';
 import { describeOutcome } from '../process_outcome.js';
 import { describeBudget, formatTokenBudget } from '../process_budget.js';
 import { processNote } from '../process_note.js';
+import { describeCheckpointPark } from '../checkpoint_view.js';
 import { probeKernel } from '../kernel_client.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
 import { PROCESS_STATES } from '../../kernel/process_table.js';
@@ -139,6 +140,13 @@ COLUMNS
   one for four minutes reads as 'running', and 'running' is not what the
   operator needs to know.
 
+  It also says when the process was **parked**: a process that was
+  checkpointed with '--detach' is SUSPENDED, and the row says it is
+  checkpointed and hands over the command that brings it back ('cortex
+  restore --chain <id>'). A row that says only 'suspended' reads exactly
+  like a row whose agent died in the middle of a call, and the operator
+  cannot tell the two apart from the table they read first.
+
   For a process that has ENDED, it says how it ended — 'exit 1 (boom)'. The
   kernel knows the code and the reason, and 'zombie' on its own cannot tell a
   finished run from a crash.
@@ -224,6 +232,7 @@ COLUMNS
     return processNote({
       ending,
       budget: describeBudget(p.budgetsRemaining),
+      checkpoint: describeCheckpointPark(p),
       waiting: describePendingSignals(wait, p.pendingSignals),
     });
   };

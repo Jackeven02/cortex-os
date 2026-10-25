@@ -39,6 +39,7 @@ import { findCheckpointFile, listCheckpoints } from '../process_store.js';
 import { readCheckpointFile } from '../../kernel/checkpoint.js';
 import {
   describeCheckpoint,
+  describeCheckpointPark,
   formatCheckpointTokenBudget,
   formatCheckpointUsdBudget,
   type CheckpointFacts,
@@ -197,7 +198,10 @@ EXAMPLES
       console.log(`checkpointed pid ${pid} → chain ${result.chainId}`);
       if (result.path !== null) console.log(`  file: ${result.path}`);
       if (result.detach) {
-        console.log(`  pid ${pid} is SUSPENDED — 'cortex restore --chain ${result.chainId}' brings it back`);
+        // The same words the process table prints for a parked process — one
+        // rule, so the sentence the operator reads here and the one they read
+        // in the table cannot differ.
+        console.log(`  ${describeCheckpointPark({ state: 'suspended', checkpointChain: [result.chainId] })}`);
       }
       return 0;
     } catch (err) {

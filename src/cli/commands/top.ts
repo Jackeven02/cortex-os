@@ -67,6 +67,7 @@ import { probeKernel } from '../kernel_client.js';
 import { formatOutcomeCode, describeOutcome } from '../process_outcome.js';
 import { describeBudget, formatTokenBudget, formatUsdBudget } from '../process_budget.js';
 import { processNote } from '../process_note.js';
+import { describeCheckpointPark } from '../checkpoint_view.js';
 import { formatDollars, usdToDollars } from '../../money.js';
 import { renderHeader, renderRow, ruleUnder, sizeColumns, type ColumnSpec } from '../table.js';
 import { PROCESS_STATES } from '../../kernel/process_table.js';
@@ -410,6 +411,7 @@ function cellsFor(
   const note = processNote({
     ending,
     budget: describeBudget(m.budgetsRemaining),
+    checkpoint: describeCheckpointPark(m),
     waiting: noteWithSignals,
   });
 
@@ -460,7 +462,10 @@ its own process table is merged in, so running agents appear in the tree too.
             (sleep), a child (wait), a model call (llm_call), a tool call
             (tool_call). It also says what is queued for it: a signal the
             kernel has queued for it ('SIGTERM queued') is not delivered
-            until the process runs again
+            until the process runs again. And it says when the process was
+            parked: a process that was checkpointed with '--detach' is
+            SUSPENDED, and the row says it is checkpointed and hands over
+            the command that brings it back ('cortex restore --chain <id>')
 
 NOTES
   "Waiting" and "stuck" are different, and only one of them is in the process

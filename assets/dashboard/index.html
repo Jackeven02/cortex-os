@@ -423,10 +423,19 @@
     // else in the row says so: a `ready` row that will never run again looks
     // exactly like one that is merely waiting.
     const processBudget = (process) => (typeof process.budgetLabel === 'string' ? process.budgetLabel : '');
+    // **That the process was parked at a checkpoint.** The label comes from the
+    // server, which uses the same rule `cortex ps` and `cortex top` print — one
+    // rule, three views. A process that was checkpointed with `--detach` is
+    // SUSPENDED: it is not running, not waiting, and not stuck — it is
+    // *parked*, and the chain it was parked in is what brings it back. The
+    // window used to show `suspended` and nothing else, so a process that
+    // stopped on purpose looked exactly like one that died mid-call.
+    const processCheckpoint = (process) => (typeof process.checkpointLabel === 'string' ? process.checkpointLabel : '');
     let insideKnown = false;
     let pendingKnown = false;
     let outcomeKnown = false;
     let budgetKnown = false;
+    let checkpointKnown = false;
     let processData = [];
     // The events this window is showing: the newest rows, and — when the
     // operator asked for more — the rows they paged back to. A push used to
@@ -440,11 +449,12 @@
       pendingKnown = processData.some((process) => processPending(process) !== '');
       outcomeKnown = processData.some((process) => processOutcome(process) !== '');
       budgetKnown = processData.some((process) => processBudget(process) !== '');
+      checkpointKnown = processData.some((process) => processCheckpoint(process) !== '');
       // The column is hidden when there is nothing at all to put in it: a
       // column of blanks would claim that nothing is inside a call and that
       // no signal is waiting.
-      $('insideHead').hidden = !(insideKnown || pendingKnown || outcomeKnown || budgetKnown);
-      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)} ${processInside(process)} ${processPending(process)} ${processOutcome(process)} ${processBudget(process)}`.toLowerCase().includes(query));
+      $('insideHead').hidden = !(insideKnown || pendingKnown || outcomeKnown || budgetKnown || checkpointKnown);
+      const visible = processData.filter((process) => `${process.pid} ${process.role} ${process.state} ${processCaps(process)} ${processInside(process)} ${processPending(process)} ${processOutcome(process)} ${processBudget(process)} ${processCheckpoint(process)}`.toLowerCase().includes(query));
       $('processRows').innerHTML = visible.length ? visible.map((process) => {
         const initial = String(process.role ?? '?').slice(0, 1).toUpperCase();
         const time = fmtLocal(process.startedAt);
@@ -454,12 +464,13 @@
         const pending = processPending(process);
         const outcome = processOutcome(process);
         const budget = processBudget(process);
+        const checkpoint = processCheckpoint(process);
         // One cell, one order — the same order `cortex ps` prints: how it
-        // ended, then the budget, then what it is waiting on.
-        const detail = [outcome, budget, inside, pending].filter(Boolean).join(' — ');
-        const insideCell = (insideKnown || pendingKnown || outcomeKnown || budgetKnown) ? `<td class="inside-cell" title="${esc(detail)}">${esc(detail || '—')}</td>` : '';
+        // ended, then the budget, then the park, then what it is waiting on.
+        const detail = [outcome, budget, checkpoint, inside, pending].filter(Boolean).join(' — ');
+        const insideCell = (insideKnown || pendingKnown || outcomeKnown || budgetKnown || checkpointKnown) ? `<td class="inside-cell" title="${esc(detail)}">${esc(detail || '—')}</td>` : '';
         return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td>${insideCell}<td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${esc(processTokenLabel(process))}</td><td>${esc(processUsdLabel(process))}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td><td class="mono">${esc(processAgeLabel(process))}</td>${opsCell}</tr>`;
-      }).join('') : `<tr><td colspan="${insideKnown || pendingKnown || outcomeKnown || budgetKnown ? 11 : 10}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
+      }).join('') : `<tr><td colspan="${insideKnown || pendingKnown || outcomeKnown || budgetKnown || checkpointKnown ? 11 : 10}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
       $('processRows').querySelectorAll('tr[data-pid]').forEach((row) => row.addEventListener('click', () => showTrace(row.dataset.pid)));
       $('processRows').querySelectorAll('button[data-kill]').forEach((button) => button.addEventListener('click', (event) => { event.stopPropagation(); killOps(Number(button.dataset.kill)); }));
     }
