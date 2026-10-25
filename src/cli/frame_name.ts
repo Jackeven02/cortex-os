@@ -126,6 +126,9 @@ function stateCause(args: Record<string, unknown> | undefined): string {
  *   and the call id stay in the frame; a column of ids would be a column of
  *   noise.
  * - `exited` — **why it was gone**.
+ * - `renice` — **the rank it moved to, and the one it came from**. "The
+ *   operator moved this process" and "this process now runs at -7" are
+ *   different facts, and the frame carries both.
  *
  * Empty when the frame carries no cause: an older kernel recorded the action
  * without one, and a frame that says nothing is better than one that guesses.
@@ -145,6 +148,14 @@ function schedCause(action: string, args: Record<string, unknown> | undefined): 
   if (action === 'exited') {
     const reason = args['reason'];
     return typeof reason === 'string' ? reason : '';
+  }
+  if (action === 'renice') {
+    const nice = args['nice'];
+    if (typeof nice !== 'number') return '';
+    const from = args['from'];
+    // The shape the other frames use: `__state:running->blocked` says where it
+    // came from and where it went. Here the two numbers are ranks.
+    return typeof from === 'number' ? `${from}->${nice}` : String(nice);
   }
   return '';
 }

@@ -538,8 +538,30 @@ default is the one number that hides the problem.
 An operator sets it when they start the process (`cortex spawn --nice <n>`,
 `cortex daemon install --nice <n>`); the range is the one above, and the
 CLI refuses anything outside it rather than handing it to a kernel that
-would have accepted it. **Changing the rank of a process that is already
-running is not possible**: there is no syscall for it (BACKLOG #125).
+would have accepted it.
+
+**And the rank of a process that is already running can be changed.** The
+scheduler reads `nice` **live** — it compares the number at the moment it
+chooses, not when the process was queued — so a changed rank takes effect at
+the next dispatch and the run queue is never rebuilt. `cortex renice <pid>
+--nice <n>` is the verb, and it needs a live kernel: a rank is a thing a
+*running* process has. A process that has finished keeps the rank it ran at
+(in its record), but there is nothing left to move.
+
+The verb is the **operator's**, not the agent's. It is a host-side command —
+`Kernel.setNice()` and the transport's `renice` — and not a syscall, so the
+frozen ABI did not move (docs/ABI.md §11). Whether an *agent* may move
+another process's rank is a different question and a capability question;
+that one is open (BACKLOG #126).
+
+The change is recorded in the process's own log, as a `__sched` frame with
+the action `renice` and the rank it came from and the rank it went to. The
+rank already has a history in that log — the scheduler writes it on every
+yield — so a change to it belongs beside that history. Without the frame, a
+reader could hold a log that says `-7` and an exit record that says `5`, with
+nothing in between to say which changed first. A move that changes nothing
+records nothing: a frame that says "the rank moved" when it did not is a
+frame nobody can act on.
 
 ### 8.2 Cooperative, not preemptive
 

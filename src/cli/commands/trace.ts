@@ -16,11 +16,11 @@ import { parseArgs } from 'node:util';
 import { existsSync } from 'node:fs';
 import { defaultKernelDir, existingCrecPath } from '../index.js';
 import { readRecords } from '../../kernel/recorder.js';
-import { unbrand, asProcessId, BUDGET_KINDS, BLOCKED_KINDS, type SyscallRecord } from '../../kernel/types.js';
+import { unbrand, asProcessId, BUDGET_KINDS, BLOCKED_KINDS, NICE_MAX, NICE_MIN, type SyscallRecord } from '../../kernel/types.js';
 import { PROCESS_STATES, STATE_TRIGGERS } from '../../kernel/process_table.js';
 import { ALL_SIGNALS, DELIVERY_OUTCOMES } from '../../kernel/signals.js';
 import { INIT_ACTIONS } from '../../kernel/init.js';
-import { DISPATCH_ACTIONS, DISPATCH_EXITS } from '../../kernel/scheduler.js';
+import { DISPATCH_ACTIONS, DISPATCH_EXITS, SCHED_ACTIONS } from '../../kernel/scheduler.js';
 import { renderHeader, renderRow, ruleUnder, type Column } from '../table.js';
 import { frameName } from '../frame_name.js';
 import { callUsage, formatCallUsage, formatTokens } from '../../token_usage.js';
@@ -68,10 +68,20 @@ export const TRACE_SYSCALL_WIDTH = Math.max(
   // `__sched:` + *action* — and, when the frame recorded one, the cause it
   // recorded: which budget ran out, what the process was waiting on, why it
   // was gone. The widest is `__sched:exited(reaped-during-quantum)`.
-  '__sched:'.length + longest(DISPATCH_ACTIONS),
+  '__sched:'.length + longest(SCHED_ACTIONS),
   '__sched:'.length + 'sigxcpu'.length + '('.length + longest(BUDGET_KINDS) + ')'.length,
   '__sched:'.length + 'blocked'.length + '('.length + longest(BLOCKED_KINDS) + ')'.length,
   '__sched:'.length + 'exited'.length + '('.length + longest(DISPATCH_EXITS) + ')'.length,
+  // `__sched:renice(<from>-><nice>)` — two ranks, both of which can be the
+  // widest the kernel holds, so the width is derived from the range rather
+  // than from the numbers that happened to be in a log.
+  '__sched:'.length +
+    'renice'.length +
+    '('.length +
+    String(NICE_MIN).length +
+    '->'.length +
+    String(NICE_MAX).length +
+    ')'.length,
 );
 
 /**

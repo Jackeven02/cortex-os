@@ -1134,6 +1134,51 @@ export class Kernel {
   }
 
   // ---------------------------------------------------------------------------
+  // §4.2c Moving a process up or down the queue (the host-facing primitive)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Change the rank a running process runs at.
+   *
+   * ## Why a host needs this
+   *
+   * The scheduler ranks the processes it dispatches by the kernel's `nice`
+   * (-20..19, **lower runs first**), and it reads that number **live** — the
+   * run queue does not have to be rebuilt for a changed rank to take effect.
+   * But a process's rank was fixed at birth: `cortex spawn --nice` and
+   * `cortex daemon install --nice` set it before the process existed, and
+   * after that there was no way to move a running process at all. An agent
+   * that had been running for an hour at the default could not be promoted,
+   * and one that was hogging the queue could not be pushed back — the only
+   * way to change a running process's rank was to kill it and start it again.
+   *
+   * ## Why it is the host's verb and not a syscall
+   *
+   * The need is the **operator's**, and the host is where an operator acts.
+   * Whether an *agent* may move another process's rank is a different
+   * question — a capability question, and one that has an answer only if the
+   * capability system is asked (docs/ABI.md §4.9). This method is the host's
+   * side of the kernel, which is not part of the frozen contract (ABI.md
+   * §11), so adding it moves neither `KERNEL_ABI_VERSION` nor the transport's
+   * protocol version.
+   *
+   * @param pid  The process to move.
+   * @param nice The rank to move it to: -20..19, and lower runs first.
+   *
+   * @returns The rank the process now runs at, and the rank it was at.
+   *
+   * @throws CortexError ESRCH if the PID is absent, EINVAL if the rank is
+   *         outside the kernel's range, and EINVAL if the process has exited.
+   */
+  async setNice(
+    pid: ProcessId,
+    nice: number,
+  ): Promise<{ readonly nice: number; readonly from: number }> {
+    this.#assertBooted('kernel.setNice');
+    return await this.scheduler.setNice(pid, nice);
+  }
+
+  // ---------------------------------------------------------------------------
   // §4.2b Waiting for a process to end (the host-facing primitive)
   // ---------------------------------------------------------------------------
 

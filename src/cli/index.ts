@@ -70,6 +70,7 @@ import { cmdDiff } from './commands/diff.js';
 import { cmdReplay } from './commands/replay.js';
 import { cmdSend } from './commands/send.js';
 import { cmdLimit } from './commands/limit.js';
+import { cmdRenice } from './commands/renice.js';
 import { cmdAudit } from './commands/audit.js';
 import { cmdExample } from './commands/example.js';
 import { cmdHelp } from './commands/help.js';
@@ -133,6 +134,8 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdSend(rest);
       case 'limit':
         return await cmdLimit(rest);
+      case 'renice':
+        return await cmdRenice(rest);
       case 'audit':
         return await cmdAudit(rest);
       case 'dashboard':

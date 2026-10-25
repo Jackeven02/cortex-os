@@ -283,6 +283,8 @@ import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands
 import { cmdAttach } from '../src/cli/commands/attach.js';
 import { cmdPs } from '../src/cli/commands/ps.js';
 import { cmdLimit } from '../src/cli/commands/limit.js';
+import { cmdRenice } from '../src/cli/commands/renice.js';
+import { frameName } from '../src/cli/frame_name.js';
 import { formatCaps, formatAge, formatNice } from '../src/cli/process_view.js';
 import { readOpenCall, readOpenCallsFromKernel, isDeclaredWait } from '../src/cli/open_call.js';
 import { cmdTop } from '../src/cli/commands/top.js';
@@ -4521,6 +4523,121 @@ async function runSchedulerChecks(): Promise<void> {
       order[0] === unbrand(a) && order[1] === unbrand(b) && order[2] === unbrand(a),
       `round-robin order a,b,a — got ${order.join(',')}`,
     );
+  });
+
+  await checkAsync('a process moved up the queue runs first', async () => {
+    // The kernel was always able to honour a rank — it reads `nice` live at
+    // selection time, so the run queue never had to be rebuilt — but nothing
+    // could *change* one. An agent that had been running for an hour at the
+    // default could not be promoted, and one hogging the queue could not be
+    // pushed back: the only way to change a running process's rank was to
+    // kill it and start it again.
+    const table = await makeTable();
+    const a = await spawn(table, { role: 'a' });
+    const b = await spawn(table, { role: 'b' });
+    const order: number[] = [];
+    const resume: ResumeFn = async (p) => {
+      order.push(unbrand(p));
+    };
+    const { sched } = makeSched(table, { resume });
+    await sched.tick();
+    await sched.tick();
+    await sched.tick();
+    assert(
+      order[0] === unbrand(a) && order[1] === unbrand(b) && order[2] === unbrand(a),
+      `round-robin order a,b,a before the move — got ${order.join(',')}`,
+    );
+
+    // The operator promotes the one that was going second.
+    const moved = await sched.setNice(b, -7);
+    assert(
+      moved.nice === -7 && moved.from === 0,
+      `the move is reported, got ${JSON.stringify(moved)}`,
+    );
+    assert(table.get(b)!.nice === -7, `the table holds the new rank, got ${table.get(b)!.nice}`);
+
+    order.length = 0;
+    await sched.tick();
+    await sched.tick();
+    await sched.tick();
+    assert(
+      order.length === 3 && order.every((p) => p === unbrand(b)),
+      `the promoted process takes the queue — got ${order.join(',')}`,
+    );
+  });
+
+  await checkAsync('a rank outside the kernel\'s range is refused', async () => {
+    // The range is the kernel's own (-20..19), and the kernel is the one that
+    // has to hold it: a rank of 99 would sit in the table, be printed in a
+    // column that cannot hold it, and be compared against ranks it was never
+    // measured on.
+    const table = await makeTable();
+    const pid = await spawn(table);
+    const { sched } = makeSched(table);
+    let errno = '';
+    try {
+      await sched.setNice(pid, 99);
+    } catch (err) {
+      errno = isCortexError(err) ? err.errno : String(err);
+    }
+    assert(errno === 'EINVAL', `expected EINVAL, got ${errno}`);
+    assert(table.get(pid)!.nice === 0, 'the rank did not change');
+  });
+
+  await checkAsync('a process that has exited cannot be moved', async () => {
+    // A rank on a process that is gone is a rank nobody runs at, and the exit
+    // record already says the rank it finished at. Rewriting that would be
+    // rewriting history.
+    const table = await makeTable();
+    const pid = await spawn(table);
+    await table.setState(pid, 'running', { trigger: 'scheduler-dispatch' });
+    await table.setState(pid, 'exiting', { trigger: 'exit' });
+    await table.setState(pid, 'zombie', { trigger: 'cleanup-done' });
+    const { sched } = makeSched(table);
+    let errno = '';
+    try {
+      await sched.setNice(pid, -7);
+    } catch (err) {
+      errno = isCortexError(err) ? err.errno : String(err);
+    }
+    assert(errno === 'EINVAL', `expected EINVAL, got ${errno}`);
+  });
+
+  await checkAsync('the log says the rank moved', async () => {
+    // The rank has a history in the log — the scheduler writes it on every
+    // yield — so a change to it belongs beside that history. Without this
+    // frame a reader could hold a log that says `-7` and an exit record that
+    // says `5`, with nothing in between to say which changed first.
+    const sub = join(tmp, 'sched-renice-records');
+    await mkdir(sub, { recursive: true });
+    const table = await makeTable({ record: true, dir: sub });
+    const pid = await spawn(table, { role: 'moved' });
+    const { sched } = makeSched(table);
+    await sched.setNice(pid, -7);
+
+    const rec = table.recorderFor(pid)!;
+    await rec.flush();
+    const records: SyscallRecord[] = [];
+    for await (const r of readRecords(rec.path)) records.push(r);
+    const renice = records.find((r) => (r.args as { action?: string }).action === 'renice');
+    assert(renice !== undefined, 'a __sched renice record exists');
+    const args = renice!.args as { nice?: number; from?: number };
+    assert(args.nice === -7, `the frame carries the new rank, got ${String(args.nice)}`);
+    assert(args.from === 0, `the frame carries the old rank, got ${String(args.from)}`);
+    assert(
+      frameName(renice!) === '__sched:renice(0->-7)',
+      `the frame is named after what happened, got ${frameName(renice!)}`,
+    );
+
+    // And nothing is recorded when the rank did not move: a frame that says
+    // "the rank moved" when it did not is a frame nobody can act on.
+    await sched.setNice(pid, -7);
+    const rec2 = table.recorderFor(pid)!;
+    await rec2.flush();
+    const after: SyscallRecord[] = [];
+    for await (const r of readRecords(rec2.path)) after.push(r);
+    const renices = after.filter((r) => (r.args as { action?: string }).action === 'renice');
+    assert(renices.length === 1, `one renice frame, got ${renices.length}`);
   });
 
   // --- budgets --------------------------------------------------------------
@@ -23002,6 +23119,142 @@ async function runTransportChecks(): Promise<void> {
         if (!response.ok) {
           assert(response.error.errno === 'ESRCH', `errno ESRCH, got ${response.error.errno}`);
         }
+      });
+
+      await checkAsync('the transport\'s renice command moves a running process', async () => {
+        // The verb the operator was missing: a process that is already running
+        // can be moved up or down the queue. The reply carries the rank the
+        // kernel applied, read back from its own table — not the number that
+        // was asked for.
+        //
+        // The process is moved **twice**, so that the rank it is at when the
+        // second move happens is not the default: a reply that echoed the
+        // request would then be telling a different story from the reply that
+        // read the kernel back.
+        const pid = await kernel.spawn({ role: 'movable', agent: { module: 'test:listener' } });
+        await client!.request('renice', { pid: unbrand(pid), nice: 5 });
+        const reply = await client!.request<{ pid: number; role: string; nice: number; from: number }>(
+          'renice',
+          { pid: unbrand(pid), nice: -7 },
+        );
+        assert(reply.nice === -7, `the reply carries the rank applied, got ${reply.nice}`);
+        assert(reply.from === 5, `the reply carries the rank it was at, got ${reply.from}`);
+        assert(
+          kernel.table.get(pid)?.nice === -7,
+          `the kernel's own table holds it, got ${String(kernel.table.get(pid)?.nice)}`,
+        );
+      });
+
+      await checkAsync('the transport refuses a rank outside the kernel\'s range', async () => {
+        const pid = await kernel.spawn({ role: 'out-of-range', agent: { module: 'test:listener' } });
+        const response = await client!.requestRaw('renice', { pid: unbrand(pid), nice: 99 });
+        assert(response.ok === false, 'the move is refused');
+        if (!response.ok) {
+          assert(response.error.errno === 'EINVAL', `errno EINVAL, got ${response.error.errno}`);
+        }
+        assert(
+          kernel.table.get(pid)?.nice === 0,
+          `the rank did not change, got ${String(kernel.table.get(pid)?.nice)}`,
+        );
+      });
+
+      await checkAsync('cortex renice moves the process and says the rank it applied', async () => {
+        // The command an operator actually types. The negative number is the
+        // natural spelling — a priority is negative more often than not — so
+        // `--nice -7` has to work without the operator knowing that
+        // `--nice=-7` is the form the parser wants.
+        //
+        // The process is moved **first**, so that it is not at the default rank
+        // when the command runs: a command that echoed what it asked for would
+        // then print a different story from the one the kernel's table tells.
+        const pid = await kernel.spawn({ role: 'cli-movable', agent: { module: 'test:listener' } });
+        await client!.request('renice', { pid: unbrand(pid), nice: 5 });
+        const prevHome = process.env['CORTEX_HOME'];
+        process.env['CORTEX_HOME'] = tmp;
+        let out = '';
+        const savedLog = console.log;
+        console.log = (...parts: unknown[]): void => {
+          out += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        try {
+          const code = await cmdRenice([String(unbrand(pid)), '--nice', '-7']);
+          console.log = savedLog;
+          assert(code === 0, `renice failed: ${out}`);
+          assert(out.includes('nice 5 -> -7'), `the command says the rank it applied, got: ${out}`);
+        } finally {
+          console.log = savedLog;
+          if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+          else process.env['CORTEX_HOME'] = prevHome;
+        }
+        assert(
+          kernel.table.get(pid)?.nice === -7,
+          `the kernel's own table holds it, got ${String(kernel.table.get(pid)?.nice)}`,
+        );
+      });
+
+      await checkAsync('cortex renice refuses a rank outside the range', async () => {
+        const pid = await kernel.spawn({ role: 'cli-out-of-range', agent: { module: 'test:listener' } });
+        const prevHome = process.env['CORTEX_HOME'];
+        process.env['CORTEX_HOME'] = tmp;
+        const savedLog = console.log;
+        const savedErr = console.error;
+        let err = '';
+        console.log = () => {};
+        console.error = (...parts: unknown[]): void => {
+          err += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        let code = 0;
+        try {
+          code = await cmdRenice([String(unbrand(pid)), '--nice', '99']);
+        } finally {
+          console.log = savedLog;
+          console.error = savedErr;
+          if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+          else process.env['CORTEX_HOME'] = prevHome;
+        }
+        assert(code === 1, `exit 1 for a rank outside the range, got ${code}`);
+        assert(err.includes('-20'), `the error names the range, got: ${err}`);
+        assert(
+          kernel.table.get(pid)?.nice === 0,
+          `the rank did not change, got ${String(kernel.table.get(pid)?.nice)}`,
+        );
+      });
+
+      await checkAsync('cortex renice says there is no kernel, rather than blaming the pid', async () => {
+        // The reason matters. "There is no kernel here" and "the kernel here
+        // crashed" are different facts, and both are different from "the
+        // kernel does not know that pid" — which the kernel says itself, in
+        // its own errno. A command that blamed the pid for all three would
+        // send the operator looking for a process that was fine.
+        const emptyDir = mkdtempSync(join(tmpdir(), 'cortex-renice-empty-'));
+        const prevHome = process.env['CORTEX_HOME'];
+        process.env['CORTEX_HOME'] = emptyDir;
+        const savedLog = console.log;
+        const savedErr = console.error;
+        let err = '';
+        console.log = () => {};
+        console.error = (...parts: unknown[]): void => {
+          err += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        let code = 0;
+        try {
+          code = await cmdRenice(['2', '--nice', '-7']);
+        } finally {
+          console.log = savedLog;
+          console.error = savedErr;
+          if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+          else process.env['CORTEX_HOME'] = prevHome;
+          rmSync(emptyDir, { recursive: true, force: true });
+        }
+        assert(code === 1, `exit 1 with no kernel, got ${code}`);
+        assert(
+          err.includes('no live kernel'),
+          `the error says there is no kernel, got: ${err}`,
+        );
+        assert(
+          !err.includes('is not running'),
+          `it does not blame the process for the kernel's absence, got: ${err}`,
+        );
       });
 
       await checkAsync('a request with the wrong token is refused', async () => {

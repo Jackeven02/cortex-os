@@ -42,6 +42,39 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **A running process can be moved up or down the queue.** The kernel ranks
+  the processes it dispatches by the kernel's `nice` (-20..19, **lower runs
+  first**) and reads that number **live** — the scheduler compares it at the
+  moment it chooses, so the run queue never has to be rebuilt. But the rank
+  was fixed at birth: `cortex spawn --nice` and `cortex daemon install --nice`
+  set it before the process existed, and after that there was **no way to move
+  a running process at all**. An agent that had been running for an hour at
+  the default could not be promoted, and one hogging the queue could not be
+  pushed back — the only way to change a running process's rank was to kill it
+  and start it again.
+
+  **`cortex renice <pid> --nice <n>`** is the verb. It needs a live kernel (a
+  rank is a thing a *running* process has), and the number it prints is read
+  back from the process table: it reports what the kernel did, not what it was
+  asked to do. The negative number is the natural spelling — `--nice -7` —
+  which Node's argument parser reads as another option, so the pair is
+  rewritten before the parser sees it.
+
+  It is the **operator's** verb, and it is a host-side one — `Kernel.setNice()`
+  and the transport's `renice` command — so the frozen ABI did not move
+  (docs/ABI.md §11): no syscall, no argument, no errno, no `ProcessInfo`
+  field, no `.crec` / `.csnap` format, and no new transport protocol version.
+  An *agent* still cannot move a process's rank; that is an open question and
+  a `1.1.0` conversation (BACKLOG #126).
+
+  The change is **recorded**: a `__sched` frame with the action `renice`,
+  carrying the rank it came from and the rank it went to (`__sched:renice(0->-7)`).
+  The rank already has a history in the process's log — the scheduler writes
+  it on every yield — so a change to it belongs beside that history; without
+  the frame a reader could hold a log that says `-7` and an exit record that
+  says `5`, with nothing in between to say which changed first. A move that
+  changes nothing records nothing.
+
 - **The priority a process runs at is a column, and there is a knob for it.**
   The kernel's `ProcessInfo` has carried a process's **`nice`** (-20..19, lower
   = higher priority) since the beginning, and the scheduler honours it —

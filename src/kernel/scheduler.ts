@@ -64,8 +64,11 @@ import {
   type ProcessState,
   type Timestamp,
   unbrand,
+  NICE_MAX,
+  NICE_MIN,
+  isValidNice,
 } from './types.js';
-import { CortexError, isCortexError } from './errors.js';
+import { CortexError, isCortexError, trap } from './errors.js';
 import { PID_KERNEL, type ProcessTable } from './process_table.js';
 import type { SignalManager } from './signals.js';
 import type { SyscallRecordInput } from './recorder.js';
@@ -158,6 +161,30 @@ export const DISPATCH_ACTIONS = [
 type UnlistedDispatchAction = Exclude<DispatchReason | 'idle', (typeof DISPATCH_ACTIONS)[number]>;
 const _everyDispatchActionIsListed: UnlistedDispatchAction extends never ? true : never = true;
 void _everyDispatchActionIsListed;
+
+/**
+ * Every action a `__sched` frame can carry.
+ *
+ * The dispatch actions, plus `renice` — the one thing the scheduler records
+ * that is not a dispatch decision: an **operator** moved a process up or down
+ * the queue (docs/PROCESS.md §8.1). It belongs here rather than in a frame of
+ * its own because the rank *is* the scheduler's business, and because a reader
+ * of one process's log should find the rank's story in one place.
+ */
+export const SCHED_ACTIONS = [...DISPATCH_ACTIONS, 'renice'] as const;
+
+/**
+ * What a `__sched` frame can say happened.
+ *
+ * `DispatchReason` (why a quantum ended the way it did), `idle` (nothing was
+ * runnable), and `renice` (the operator moved the process in the queue).
+ */
+export type SchedAction = DispatchReason | 'idle' | 'renice';
+
+/** Compile-time proof that the list and the union cannot drift apart. */
+type UnlistedSchedAction = Exclude<SchedAction, (typeof SCHED_ACTIONS)[number]>;
+const _everySchedActionIsListed: UnlistedSchedAction extends never ? true : never = true;
+void _everySchedActionIsListed;
 
 /**
  * Why a dispatched process was gone by the time the scheduler looked again.
@@ -479,6 +506,79 @@ export class Scheduler {
     }
   }
 
+  /**
+   * Move a process up or down the queue.
+   *
+   * ## Why this is here, and not a syscall
+   *
+   * The rank a process runs at is the scheduler's own fact, and the scheduler
+   * reads it **live**: `#selectNext` compares `entry.nice` at the moment it
+   * chooses, so a changed rank takes effect at the next dispatch and the run
+   * queue does not have to be rebuilt. The kernel was already ready for this;
+   * what was missing was a way to ask.
+   *
+   * The way to ask is the **operator's**, not the agent's. An agent that has
+   * been running an hour at the default cannot be promoted by the operator, and
+   * one that is hogging the queue cannot be pushed back — so the verb belongs
+   * to the host (docs/ABI.md §11: the host's side of the kernel is not the
+   * frozen contract). Whether an *agent* may move another process's rank is a
+   * different question, and a capability question; it is not answered here.
+   *
+   * ## What is recorded
+   *
+   * A `__sched` frame with the action `renice`, carrying the rank it was at
+   * and the rank it now has. The rank is a fact the process's log otherwise
+   * only shows at the moments the scheduler happened to write one — and the
+   * exit record says the rank it *finished* at. Without this frame, a reader
+   * could hold a log that says `-7` and a record that says `5`, with nothing
+   * in between to say which changed first.
+   *
+   * @param pid  The process to move.
+   * @param nice The rank to move it to: the kernel's `nice`, -20..19, and
+   *              **lower runs first**.
+   *
+   * @returns The rank the process now runs at, and the one it was at.
+   *
+   * @throws CortexError ESRCH if the PID is absent, EINVAL if the rank is
+   *         outside the kernel's range, and EINVAL if the process has already
+   *         exited — a rank on a process that is gone is a rank nobody runs at.
+   */
+  async setNice(
+    pid: ProcessId,
+    nice: number,
+  ): Promise<{ readonly nice: number; readonly from: number }> {
+    if (!isValidNice(nice)) {
+      trap('EINVAL', 'setNice', {
+        pid: unbrand(pid),
+        nice,
+        range: `${NICE_MIN}..${NICE_MAX}`,
+        reason: 'a priority outside the kernel\'s range is not a priority',
+      });
+    }
+
+    const entry = this.#table.mustGet(pid, 'setNice');
+    if (entry.state === 'exiting' || entry.state === 'zombie') {
+      trap('EINVAL', 'setNice', {
+        pid: unbrand(pid),
+        nice,
+        state: entry.state,
+        reason: 'the process has exited; its rank is fixed',
+      });
+    }
+
+    const from = entry.nice;
+    if (from === nice) {
+      // Nothing changed, so nothing is recorded: a frame that says "the rank
+      // moved" when it did not is a frame nobody can act on. The answer still
+      // comes back, and it is the rank the process runs at.
+      return { nice, from };
+    }
+
+    this.#table.setNice(pid, nice);
+    await this.#recordSched(pid, 'renice', { nice, from });
+    return { nice, from };
+  }
+
   // ---------------------------------------------------------------------------
   // §3.3 The tick
   // ---------------------------------------------------------------------------
@@ -733,7 +833,7 @@ export class Scheduler {
    */
   async #recordSched(
     pid: ProcessId,
-    action: DispatchReason | 'idle',
+    action: SchedAction,
     details: Record<string, unknown>,
   ): Promise<void> {
     const recorder = this.#table.recorderFor(pid);

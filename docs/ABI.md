@@ -793,7 +793,7 @@ signal events rather than user syscalls.
 |---|---|---|
 | `__state` | the process table | `from`, `to`, and the trigger that caused the transition |
 | `__init` | init | `action` — `boot`, `register-daemon`, `reap`, `restart`, `restart-gave-up`, `shutdown` — plus the action's details |
-| `__sched` | the scheduler | `action`, plus `nice` / `blockedOn` / `budgetKind` / `reason` where they apply |
+| `__sched` | the scheduler | `action`, plus `nice` / `blockedOn` / `budgetKind` / `reason` / `from` where they apply |
 | `__signal` | the signal manager | `signal`, `signalNumber`, `outcome` (`delivered` / `queued` / `dropped` / `failed`), `from` |
 
 The `__init` frames carry the **name** of the daemon they are about (the
@@ -843,6 +843,21 @@ __sched:blocked(recv)
 __sched:parked(sleep)
 __sched:exited(reaped-during-quantum)
 ```
+
+`renice` is the one action in that frame that is **not** a scheduler decision:
+it is the **operator** moving a process up or down the queue, and it carries
+the rank the process came from and the rank it went to.
+
+```
+__sched:renice(0->-7)
+```
+
+It is additive in the same way the `__init` frame's names were: the frame's
+structure is unchanged, the action vocabulary widens by one, and a reader that
+meets a frame written by an older kernel finds no name to read. The `from` it
+carries is the old rank — the one number a reader needs to make sense of the
+new one. (A rank that did not move records nothing: a frame that says "the
+rank moved" when it did not is a frame nobody can act on.)
 
 Rendering a record under a longer name is not a change to the record
 (§11) — the same `.crec` file is byte-for-byte identical either way.
@@ -1131,6 +1146,17 @@ command — what this kernel can call, and which of those calls never declared a
 reversibility tag — was added for the same reason and moved it no more. So was
 the transport's `daemons` command — what the supervised daemons are doing
 right now — and `Kernel.daemons()` beside it.
+
+`Kernel.setNice()` and the transport's `renice` command are the same case:
+the **operator's** verb for moving a running process up or down the queue
+(docs/PROCESS.md §8.1). No syscall was added — an agent still cannot change
+a process's rank, and whether it should be able to is an open question
+(BACKLOG #126) — so the agent surface did not move and neither did the
+version. The one thing that reached the log is a `__sched` frame with a new
+action name, which §6.1 describes: the frame's structure is unchanged and a
+reader that meets it without knowing the name finds nothing to read. That is
+the same treatment the `__init` frame's action names got when the journal
+learned to say *why* it gave up.
 
 `DaemonSpec` grew an optional `name` in the same round, and that is not an ABI
 change either: it is init's own registration type, internal to the kernel

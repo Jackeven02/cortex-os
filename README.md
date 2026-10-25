@@ -29,6 +29,11 @@ $ cortex spawn --role urgent --task "page the on-call" --nice -10
 [pid 1235]
   nice: -10 (lower runs first)
 
+# ...and move one that is ALREADY running. The rank is read live, so the
+# change takes effect at the next dispatch — and the log says it happened.
+$ cortex renice 2 --nice -7
+pid 2 (holder): nice 0 -> -7
+
 # Inspect the process tree
 $ cortex ps
 PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE                        NICE
@@ -232,7 +237,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `replay`, `checkpoint`, `restore`, `send`, `limit`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` follows one agent's syscall stream — by push when a live kernel holds the process (median lag 1 ms, and the follow ends by itself when the agent does, with its real exit code), and by tailing the log file when there is no kernel; with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. `cortex top` reads each live process's log the same way `cortex supervise` does, so the view and the command that acts on it cannot disagree — with `--stall-after <ms>` it marks what is over *your* threshold and hands you the command to run. It also says **which signals are queued** for a process: a `kill` aimed at a wedged agent is not delivered but queued, waiting for a wake-up that may never come, and the view says so instead of leaving it to the command that sent it. And `cortex limit` reaches a running agent's budget — a budget is a thing the *kernel* holds, so the command asks the kernel that holds the process rather than a kernel of its own that holds nothing but init — and it names the **ceiling** (what the process may spend in total) apart from what is left of it, because a remainder that shrinks under your feet is not a limit. `--tokens N` sets that ceiling; a finished process refuses to have its budget rewritten, because what it spent is the kernel's record. The tables keep their shape, too: a column is as wide as the widest value in it, a value that does not fit is cut **and marked** (`…`), and `cortex ps` and `cortex top` say the same number for the same spend. And a token count says which part of it the provider served out of its cache — `1.2k (300 cached)` — because those tokens are billed at the cache price rather than the fresh one, and no view used to say so. And the kernel's own frames say **why** — `__state:running->blocked(recv)` is not just a transition, it is a transition with a cause, and `__state:running->exiting(SIGTERM)` names the signal that did it. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
+Most of this works now — `spawn`, `ps`, `kill`, `trace`, `attach`, `fork`, `diff`, `replay`, `checkpoint`, `restore`, `send`, `limit`, `renice`, `audit` and `daemon` are implemented and covered by the smoke suite. `attach` follows one agent's syscall stream — by push when a live kernel holds the process (median lag 1 ms, and the follow ends by itself when the agent does, with its real exit code), and by tailing the log file when there is no kernel; with a live kernel running it also delivers your keystrokes to the agent (`--interactive`); `cortex daemon run` is the real long-lived supervisor (BACKLOG #039) and is what makes a live kernel reachable in the first place — with one, `cortex send` delivers into a running agent, `cortex kill` delivers a real signal, `cortex checkpoint <pid>` snapshots a running agent, `cortex spawn --live` starts a *new* agent inside that kernel, `cortex restore --live` puts a snapshot back into it, `cortex fork <pid>` clones a running agent into a second branch you can drive and diff, and `cortex daemon stop` shuts it down again. `cortex top` reads each live process's log the same way `cortex supervise` does, so the view and the command that acts on it cannot disagree — with `--stall-after <ms>` it marks what is over *your* threshold and hands you the command to run. It also says **which signals are queued** for a process: a `kill` aimed at a wedged agent is not delivered but queued, waiting for a wake-up that may never come, and the view says so instead of leaving it to the command that sent it. And `cortex limit` reaches a running agent's budget — a budget is a thing the *kernel* holds, so the command asks the kernel that holds the process rather than a kernel of its own that holds nothing but init — and it names the **ceiling** (what the process may spend in total) apart from what is left of it, because a remainder that shrinks under your feet is not a limit. `--tokens N` sets that ceiling; a finished process refuses to have its budget rewritten, because what it spent is the kernel's record. The tables keep their shape, too: a column is as wide as the widest value in it, a value that does not fit is cut **and marked** (`…`), and `cortex ps` and `cortex top` say the same number for the same spend. And a token count says which part of it the provider served out of its cache — `1.2k (300 cached)` — because those tokens are billed at the cache price rather than the fresh one, and no view used to say so. And the kernel's own frames say **why** — `__state:running->blocked(recv)` is not just a transition, it is a transition with a cause, and `__state:running->exiting(SIGTERM)` names the signal that did it. All seven drivers (LLM, MCP, filesystem, memory) ship. See [BACKLOG.md](./BACKLOG.md) for what is done and what comes next.
 
 ---
 
@@ -265,7 +270,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 902 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 911 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -447,6 +452,12 @@ The journal had a hole in it, too. It named two of the three ways a supervisor g
 There is a **NICE** column now — in `cortex ps`, in `cortex top`, and in the window (优先级) — and the number is the same in all of them, because they read it through one function. A rank that was **not recorded** says so (`-`) instead of showing the default: `0` is the one number that hides the problem. The rank is kept in the process's record when it ends, so a finished agent's row says it too.
 
 And there is a knob: `cortex spawn --nice <n>` and `cortex daemon install --nice <n>`. The number the command prints is read back from the process table, so it reports what the kernel did — not what it was asked to do.
+
+**And a running process can be moved.** The rank was fixed at birth, and that was the end of it: an agent that had been running for an hour at the default could not be promoted, and one hogging the queue could not be pushed back — the only way to change a running process's rank was to kill it and start it again. **`cortex renice <pid> --nice <n>`** is the verb, and it needs a live kernel (a rank is a thing a *running* process has). It is the operator's own command — no syscall, so the frozen ABI did not move — and the change is written into the process's log, so the history of a process's rank is readable afterwards:
+
+```
+__sched:renice(0->-7)
+```
 
 **And the tree says the same note the table says.** The window has two views of the process table — 表格 and 监督树 — and the tree used to build its note from its own list of facts, which was missing one: the park. A process stopped at a checkpoint read `suspended` in the table and `suspended` in the tree, and only the table said it was parked and handed over the command that brings it back. One function builds the note now, in the order `cortex ps` prints.
 

@@ -68,6 +68,9 @@ import {
   asSyscallOffset,
   unbrand,
   DEFAULT_CAPABILITIES,
+  NICE_MAX,
+  NICE_MIN,
+  isValidNice,
 } from './types.js';
 import { CortexError, isCortexError, trap } from './errors.js';
 import { type Recorder, type SyscallRecordInput } from './recorder.js';
@@ -596,6 +599,20 @@ export class ProcessTable {
       ...DEFAULT_BUDGETS,
       ...opts.budgets,
     };
+
+    // The rank a process is born at has to be one the kernel can hold. The
+    // range is the kernel's own (types.ts), and the kernel is the one that has
+    // to hold it: a rank of 99 would sit in the table, be printed in a column
+    // that cannot hold it, and be compared against ranks it was never
+    // measured on. The CLI refuses one before it gets here; this is the
+    // authority behind that refusal.
+    if (opts.nice !== undefined && !isValidNice(opts.nice)) {
+      trap('EINVAL', 'allocate', {
+        nice: opts.nice,
+        range: `${NICE_MIN}..${NICE_MAX}`,
+        reason: 'a process cannot be born at a priority outside the kernel\'s range',
+      });
+    }
 
     const entry: ProcessEntry = {
       pid,
@@ -1271,6 +1288,24 @@ export class ProcessTable {
     if (patch.spent !== undefined) {
       entry.budgetsSpent = { ...entry.budgetsSpent, ...patch.spent };
     }
+  }
+
+  /**
+   * Change the rank a process runs at.
+   *
+   * Kernel-internal: the table holds the fact, and the caller — the scheduler,
+   * which owns the `__sched` vocabulary — records the change. Like
+   * `setBudgets`, this mutates and says nothing: a table that recorded its own
+   * edits would have two places that know what happened.
+   *
+   * The scheduler reads `nice` **live** at selection time, so a changed rank
+   * takes effect at the next dispatch without the run queue being rebuilt.
+   *
+   * @throws CortexError ESRCH if the PID is absent.
+   */
+  setNice(pid: ProcessId, nice: number): void {
+    const entry = this.mustGet(pid, 'setNice');
+    entry.nice = nice;
   }
 
   // ---------------------------------------------------------------------------

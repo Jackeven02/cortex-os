@@ -101,6 +101,15 @@ export const KERNEL_PROTOCOL_VERSION = 1;
  * budget a *process* sees is still read through the `budget()` syscall
  * (ABI.md §4.8), which the ABI leaves unrecorded on purpose.
  *
+ * `renice` is the operator's verb on a process's **rank**, and it is the same
+ * shape: not a syscall (the ABI has no `renice`), answered by the kernel's
+ * own scheduler. It is not recorded as a *syscall* either — the process did
+ * not do it — but it is recorded as a `__sched` frame, because the rank
+ * already has a history in that log (the scheduler writes the rank on every
+ * yield) and a change to it belongs beside that history. A budget ceiling is
+ * the opposite case: the ABI leaves budgets out of the log on purpose, so a
+ * change to one starts no history and leaves none.
+ *
  * Everything else is answered by the ordinary dispatcher path and therefore
  * is recorded.
  */
@@ -114,6 +123,7 @@ export type KernelCommand =
   | 'send'
   | 'kill'
   | 'limit'
+  | 'renice'
   | 'wait'
   | 'subscribe'
   | 'checkpoint'

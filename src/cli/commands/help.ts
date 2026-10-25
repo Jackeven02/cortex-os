@@ -35,6 +35,7 @@ COMMANDS
   attach       Follow a process's syscall stream (live, by push, with a kernel)
   send         Send an IPC message to a process or channel
   limit        Set or show resource budgets per process
+  renice       Move a running process up or down the queue
   audit        Surface tools untagged for reversibility
   daemon       Register/run long-lived supervised agents (install/list/uninstall/run)
   dashboard   Open the local read-only monitoring UI
@@ -63,6 +64,7 @@ EXAMPLES
   cortex replay 1234
   cortex attach 1234
   cortex limit 1234 --tokens 10000
+  cortex renice 1234 --nice -7
   cortex audit
   cortex example hello
   cortex example supervision-tree

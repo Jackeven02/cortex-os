@@ -2160,32 +2160,147 @@ The user-facing surface. Should feel like a real OS shell.
   **Exit criteria:** the priority a process runs at is visible, and an
   operator can change it. — met.
 
-- [ ] **#125** A running process cannot be moved up or down the queue →
-  **open.**
+- [x] **#125** A running process cannot be moved up or down the queue →
+  **fixed.**
   Found while fixing #119. The operator can give a process a priority when
   they start it (`cortex spawn --nice`, `cortex daemon install --nice`), and
-  they can see the rank every process runs at — but they cannot move one
-  afterwards. An agent that has been running for an hour at the default
-  cannot be promoted, and one that is hogging the queue cannot be pushed
-  back; the only way to change a running process's rank is to kill it and
+  they can see the rank every process runs at — but they could not move one
+  afterwards. An agent that had been running for an hour at the default could
+  not be promoted, and one that was hogging the queue could not be pushed
+  back; the only way to change a running process's rank was to kill it and
   start it again.
 
-  **The kernel is already ready for it.** The scheduler reads `nice` live
+  **The kernel was already ready for it.** The scheduler reads `nice` live
   from the process table at selection time — its own comment says "so a
   future `renice` is honoured without re-queueing" — so the run queue does
   not have to be rebuilt; changing the number is enough.
 
-  What is missing is a **verb**, and a verb is an ABI decision. A new
+  What was missing was a **verb**, and a verb is an ABI decision. A new
   syscall (`renice`) would be an *additive* change and so a `1.1.0`
   conversation (ABI §status), and it would have to answer the capability
   gate too: is changing another process's rank something a process may do
-  to a stranger? The options are (a) a host-only transport command — the
+  to a stranger? The options were (a) a host-only transport command — the
   operator may move a process, an agent may not; (b) a syscall, subject to
   the capability gate; (c) neither — the priority is fixed at birth and the
   operator restarts the process instead.
 
+  **The decision: (a).** The need is the **operator's** — an agent that has
+  been running for an hour at the default cannot be promoted, and that is a
+  thing the operator does, not the agent — and the host is where an operator
+  acts. So the verb is `Kernel.setNice()` and the transport's `renice`
+  command, and `cortex renice <pid> --nice <n>` is the shell's view of it.
+  **The ABI did not move**, and not by accident: the agent surface is `ctx`,
+  and a host method and a transport command are not part of the frozen
+  contract (ABI §11) — the same ground `Kernel.openCalls()`, the transport's
+  `openCalls` and `daemons` commands, and `Kernel.daemons()` stand on. An
+  *agent* still cannot move a process's rank; that question is open and
+  written up as #126.
+
+  **And the verb reports what the kernel did, not what it intended.** The
+  number it prints is read back from the process table, so a move the kernel
+  answered differently from the request says the kernel's answer. The
+  negative number is the natural spelling (`--nice -7`), which Node's
+  argument parser reads as another option — the same problem `--nice` had at
+  birth, and the same rewriting.
+
+  **Measured, not assumed.** On a real kernel: two agents at the same rank
+  took turns (`2,3,2` — round-robin, FIFO within a band). The operator
+  promoted the second one to `-7`, and from then on it took the queue every
+  time (`3,3,3`): the scheduler reads the rank live, so the change landed at
+  the next dispatch and the run queue was never rebuilt. The process's own
+  `.crec` carries `__sched:renice(0->-7)`, and the CLI prints
+  `pid 2 (holder): nice 0 -> -7`. A rank of `99` is refused with `EINVAL`,
+  and the range now lives in one place — the kernel's — instead of being
+  typed out in the CLI, the transport and the kernel.
+
+  **The change is recorded.** The rank already has a history in the
+  process's log (the scheduler writes it on every yield), so a change to it
+  belongs beside that history: a `__sched` frame with the action `renice`,
+  carrying the rank it came from and the rank it went to. Without it, a
+  reader could hold a log that says `-7` and an exit record that says `5`,
+  with nothing in between to say which changed first. A move that changes
+  nothing records nothing.
+
+  9 new smoke checks (902 → 911), all reverse-verified: with the kernel not
+  telling its own table, four checks fail; with the frame not written, the
+  log check fails with `a __sched renice record exists`; with the frame's
+  name losing the two ranks, it fails with `got __sched:renice`; with the
+  range check gone, it fails with `expected EINVAL, got`; with the
+  exited-process check gone, it fails the same way; with the no-op case not
+  short-circuited, it fails with `one renice frame, got 2`; with the
+  transport or the command echoing the request instead of the kernel's
+  answer, it fails with `the command says the rank it applied, got: pid 5
+  (cli-movable): nice 0 -> -7`; and with the command blaming the process for
+  the kernel's absence, it fails with `the error says there is no kernel`.
+
+  **One of those needed a second attempt, and it is the interesting one.**
+  The check that the command reports the kernel's answer rather than its own
+  intention did **not** fail when the command was broken — because the
+  process was at the default rank, and at the default rank "what I asked for"
+  and "what the kernel did" are the same string. The check now moves the
+  process **first**, so the two answers differ, and a command that prints its
+  own intention is caught. A check that cannot tell two stories apart is
+  not a check.
+
   **Exit criteria:** an operator can move a running process up or down the
-  queue, and the change shows in the same column that shows the rank.
+  queue, and the change shows in the same column that shows the rank. — met.
+
+- [ ] **#127** The window can kill a process, but it cannot move one →
+  **open.**
+  Found while fixing #125. The dashboard's write ops are `spawn`, `kill` and
+  `restore`, and they are all there because an operator watching a window
+  needs them: spawn a replacement, stop the one that is misbehaving, put a
+  snapshot back. A **rank** is on the same list — it is the fact that decides
+  which of two agents runs — and the window shows it in its 优先级 column,
+  but there is no way to move a process from the window. The operator has to
+  leave the window and type `cortex renice` in a shell.
+
+  So the window can say "this agent is at `-7` and that one is at `5`" and
+  cannot act on the difference. The verb exists (`Kernel.setNice()`, the
+  transport's `renice`) and the column updates live when it is used — so this
+  is the *control* that is missing, not the plumbing.
+
+  **It is a shape question, because a rank is a number and the other ops are
+  not.** A kill is a button: one action, no argument. A renice needs a
+  number, and a row-level control for it has to answer questions the table
+  does not: is the number typed or picked from a list (-20..19 is forty
+  values), does the button live on every row or in a panel, what does it say
+  when the process is not running, and does a rank change need a confirmation
+  the way a kill does not (it is reversible, and it does not lose work).
+
+  **Exit criteria:** an operator can move a running process up or down the
+  queue from the window, and the 优先级 column shows the new rank.
+
+- [ ] **#126** An agent cannot change a process's rank — not even its own →
+  **open.**
+  Found while fixing #125. The operator can move any running process up or
+  down the queue (`cortex renice <pid> --nice <n>`), but an **agent** has
+  no verb at all: it cannot promote the child it is waiting for, cannot push
+  back a sibling that is hogging the queue, and cannot even raise or lower
+  **its own** rank.
+
+  That last one is the odd gap. A process's own rank is a fact about itself,
+  the way its budgets are — and the ABI already has a syscall for a process
+  to read its own budget (`budget()`, ABI §4.8). There is no equivalent for
+  the rank, and there is no syscall for a process to *set* one either: the
+  rank is set at birth by the spawner and, until #125, never again.
+
+  **It is a 1.1.0 conversation**, because a syscall is additive and the ABI
+  status says additive changes land in a minor bump. The questions it has
+  to answer: (a) may a process change **its own** rank? (b) may it change a
+  **child's**? (c) may it change a **stranger's** — and if so, is that
+  behind a capability (ABI §4.9), and which one? A process that can demote
+  its neighbours is a process that can starve them, which is a denial of
+  service with a nice name.
+
+  The scheduler is already ready for it: it reads `nice` live, so a changed
+  rank takes effect at the next dispatch. What is missing is the verb and the
+  gate.
+
+  **Exit criteria:** an agent can change the rank of a process the
+  capability system says it may, the change is recorded like every other
+  change to a rank, and the ABI's version moves to `1.1.0` with the new
+  syscall and the capability that guards it.
 
 - [x] **#120** The window's state breakdown dropped the states it did not name →
   **fixed.**

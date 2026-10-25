@@ -443,6 +443,29 @@ export type SignalHandler = (ctx: CortexContext) => Promise<void> | void;
 // =============================================================================
 
 /**
+ * The range of the kernel's scheduling priority — the `nice` of a process.
+ *
+ * -20 is the most urgent and 19 the least; **lower runs first** (docs/PROCESS.md
+ * §8.1). The numbers are the kernel's own, so they live here rather than being
+ * typed out in the CLI: a range that exists in two places is a range that will
+ * one day be two different ranges, and the kernel is the one that has to hold
+ * both.
+ */
+export const NICE_MIN = -20;
+export const NICE_MAX = 19;
+
+/**
+ * Whether a number is a priority the kernel can hold.
+ *
+ * The check the kernel applies to a rank it is asked to set. It is a function
+ * rather than a constant so that the range has exactly one home — this one —
+ * and every caller asks the same question.
+ */
+export function isValidNice(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= NICE_MIN && value <= NICE_MAX;
+}
+
+/**
  * Snapshot of a process's state, returned by `ps()`. Read-only.
  *
  * See: docs/PROCESS.md §10

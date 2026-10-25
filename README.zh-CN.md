@@ -29,6 +29,11 @@ $ cortex spawn --role urgent --task "page the on-call" --nice -10
 [pid 1235]
   nice: -10 (lower runs first)
 
+# ...也可以把已经在跑的进程挪一挪。优先级是实时读取的，所以改动
+# 在下一次派发时就生效——而且日志里会记下这一改。
+$ cortex renice 2 --nice -7
+pid 2 (holder): nice 0 -> -7
+
 # 看进程树
 $ cortex ps
 PID  PPID  ROLE            STATE    TOKENS      CAPS  AGE  NOTE                        NICE
@@ -228,7 +233,7 @@ $ cortex daemon stop
 daemon stop requested
 ```
 
-上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`replay`、`checkpoint`、`restore`、`send`、`limit`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 跟着一个 agent 的 syscall 流 —— 有活内核且那个进程还在内核里时，帧是**推**过来的（中位延迟 1 毫秒，而且 agent 一结束，跟随就自己收尾，并报出它真实的退出码）；没有内核时才去 tail 日志文件；有活内核时它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex restore --live` 能把快照**放回**那个内核，`cortex fork <pid>` 能把运行中的 agent 克隆成第二条可以驱动、可以对比的分支，`cortex daemon stop` 还能再把它停下来。`cortex top` 读的是每个活进程自己的日志 —— 读法跟 `cortex supervise` 完全一样，所以这个视图和那个会动手的命令**不可能各说各话**；加上 `--stall-after <ms>`，它会把超过**你的**阈值的进程标出来，顺带把该跑的命令给你。它还会说清楚**哪些信号正在排队**：发给一个卡死 agent 的 `kill` 不会立刻送达，而是排队等着一次可能永远不会来的唤醒 —— 视图会说出来，而不是把这件事只留给刚刚发出它的那条命令。`cortex limit` 也能碰到**运行中** agent 的预算 —— 预算是内核持有的东西，所以这条命令去问真正持有这个进程的内核，而不是自己 boot 一个除了 init 什么都没有的内核；它还把**上限**（这个进程总共可以花多少）和**还剩多少**分开说，因为一个会在你脚底下变小的数字不是上限。`--tokens N` 设的就是这个上限；已经结束的进程会**拒绝**改预算 —— 它花了多少是内核的记录。表格也保住了自己的形状：一列有多宽取决于这一列里最宽的值，放不下的值会被**截断并标记**（`…`），而 `cortex ps` 和 `cortex top` 对同一笔花费说的是同一个数。而且 token 数字会说出其中有多少是服务商从缓存里读的 —— `1.2k (300 cached)` —— 缓存价和新鲜价不是一回事，而以前没有任何视图说这件事。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
+上面这些**大部分现在就能跑** —— `spawn`、`ps`、`kill`、`trace`、`attach`、`fork`、`diff`、`replay`、`checkpoint`、`restore`、`send`、`limit`、`renice`、`audit`、`daemon` 都已实现，并且被冒烟测试套件覆盖。`attach` 跟着一个 agent 的 syscall 流 —— 有活内核且那个进程还在内核里时，帧是**推**过来的（中位延迟 1 毫秒，而且 agent 一结束，跟随就自己收尾，并报出它真实的退出码）；没有内核时才去 tail 日志文件；有活内核时它还能把你敲的每一行**送进运行中的 agent**（`--interactive`）。`cortex daemon run` 才是真正的长命监督者（BACKLOG #039），也是活内核能被连上的原因 —— 有它在，`cortex send` 会真的投递到运行中的 agent，`cortex kill` 会真的发出信号，`cortex checkpoint <pid>` 能给运行中的 agent 做快照，`cortex spawn --live` 能把一个**新** agent 起进那个内核里，`cortex restore --live` 能把快照**放回**那个内核，`cortex fork <pid>` 能把运行中的 agent 克隆成第二条可以驱动、可以对比的分支，`cortex daemon stop` 还能再把它停下来。`cortex top` 读的是每个活进程自己的日志 —— 读法跟 `cortex supervise` 完全一样，所以这个视图和那个会动手的命令**不可能各说各话**；加上 `--stall-after <ms>`，它会把超过**你的**阈值的进程标出来，顺带把该跑的命令给你。它还会说清楚**哪些信号正在排队**：发给一个卡死 agent 的 `kill` 不会立刻送达，而是排队等着一次可能永远不会来的唤醒 —— 视图会说出来，而不是把这件事只留给刚刚发出它的那条命令。`cortex limit` 也能碰到**运行中** agent 的预算 —— 预算是内核持有的东西，所以这条命令去问真正持有这个进程的内核，而不是自己 boot 一个除了 init 什么都没有的内核；它还把**上限**（这个进程总共可以花多少）和**还剩多少**分开说，因为一个会在你脚底下变小的数字不是上限。`--tokens N` 设的就是这个上限；已经结束的进程会**拒绝**改预算 —— 它花了多少是内核的记录。表格也保住了自己的形状：一列有多宽取决于这一列里最宽的值，放不下的值会被**截断并标记**（`…`），而 `cortex ps` 和 `cortex top` 对同一笔花费说的是同一个数。而且 token 数字会说出其中有多少是服务商从缓存里读的 —— `1.2k (300 cached)` —— 缓存价和新鲜价不是一回事，而以前没有任何视图说这件事。七个驱动（LLM、MCP、文件系统、记忆）全部交付。哪些做完了、下一步做什么，见 [BACKLOG.md](./BACKLOG.md)。
 
 ---
 
@@ -256,7 +261,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 902 项断言，0 失败
+npx tsx scripts/smoke.ts                # 911 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -435,6 +440,12 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 现在多了一列 **NICE**——`cortex ps`、`cortex top`、大屏（优先级）都有——而且三处是同一个数字，因为它们问的是同一个函数。**没有记录**的档位就说「没有记录」（`-`），而不是显示默认值：`0` 恰恰是最会藏事的那一个数字。进程结束时，这一档也会留在它的记录里，所以已经结束的那个 agent 的那一行也说得出来。
 
 也有旋钮：`cortex spawn --nice <n>`、`cortex daemon install --nice <n>`。命令打印的数字是从进程表**读回来**的——它报的是内核做了什么，不是别人让它做什么。
+
+**而且已经在跑的进程也能挪。** 优先级以前是出生时定死的，到此为止：一个跑了一个钟头还停在默认档的 agent 提不上去，一个霸着队列的也压不下去——想改一个在跑的进程的优先级，唯一办法是杀掉重来。**`cortex renice <pid> --nice <n>`** 就是这个动词，它需要活内核（优先级是**在跑**的进程才有的东西）。它是运维自己的命令——没有新增 syscall，所以冻结的 ABI 没有动——而且这一改会写进进程自己的日志，于是这个进程的优先级历史事后读得出来：
+
+```
+__sched:renice(0->-7)
+```
 
 **而且监督树和表格说的是同一句备注。** 大屏里进程表有两个视图——表格和监督树——而监督树以前**自己**列事实，漏掉了一条：停靠。于是停在检查点上的进程，在表格里是 `suspended`，在树里也是 `suspended`，只有表格说出它是停着的、还把带它回来的命令交出来。现在备注由**一个函数**拼成，顺序就是 `cortex ps` 的顺序。
 

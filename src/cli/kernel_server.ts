@@ -73,6 +73,9 @@ import {
   type ProcessId,
   type Signal,
   type SpawnOptions,
+  NICE_MAX,
+  NICE_MIN,
+  isValidNice,
 } from '../kernel/types.js';
 import { isCortexError } from '../kernel/errors.js';
 import { ALL_SIGNALS } from '../kernel/signals.js';
@@ -793,6 +796,36 @@ async function dispatch(
         spent: { ...entry.budgetsSpent },
         remaining: { ...entry.budgetsRemaining },
       };
+    }
+
+    case 'renice': {
+      // Move a process up or down the queue.
+      //
+      // The host's verb (docs/ABI.md §11: the host's side of the kernel is not
+      // the frozen contract), on the operator's behalf: a rank is fixed at
+      // birth by `spawn --nice` / `daemon install --nice`, and this is the way
+      // to move a process that is already running.
+      const pid = Number(args['pid']);
+      if (!Number.isInteger(pid)) {
+        throw new WireError('EINVAL', `invalid pid: ${String(args['pid'])}`);
+      }
+      const nice = args['nice'];
+      if (!isValidNice(nice)) {
+        throw new WireError(
+          'EINVAL',
+          `invalid nice: ${String(args['nice'])} (expected an integer from ${NICE_MIN} to ${NICE_MAX})`,
+        );
+      }
+      const target = asProcessId(pid);
+      const entry = kernel.table.get(target);
+      if (entry === undefined) {
+        throw new WireError('ESRCH', `no such process: ${pid}`);
+      }
+      // The kernel is the authority on the rank, so the kernel is told what to
+      // do and then read back: the answer is what the process runs at now, not
+      // what this command asked for.
+      const result = await kernel.setNice(target, nice);
+      return { pid, role: entry.role, nice: result.nice, from: result.from };
     }
 
     case 'wait': {
