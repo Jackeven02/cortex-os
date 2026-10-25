@@ -36,6 +36,16 @@
  * measured against beside it (`formatTokenBudget`, `formatUsdBudget`), and
  * two views of one process cannot disagree about what the ceiling is.
  *
+ * **The wall clock was the one that did not.** Its ceiling was in `cortex
+ * limit` and nowhere else: a table that printed the age printed no limit, so
+ * an agent with ten minutes of wall clock looked exactly like an agent with
+ * all of it, and an operator watching a row had no way to know that the agent
+ * they were watching was about to be stopped. It cannot be printed the way
+ * the other two are — its spend is the age, and the age is not the spend
+ * (the clock pauses while a process is stopped or parked) — so it says the
+ * two things it can say exactly: what is **left** of it, and how much there
+ * was (`describeWallClockBudget`).
+ *
  * ## Why it lives here
  *
  * Two sources answer the same question: a live kernel's process table (for a
@@ -47,6 +57,7 @@
  */
 
 import type { BudgetCounters, BudgetLimits } from '../kernel/types.js';
+import { formatExactDuration } from '../duration.js';
 import { formatDollars, usdToDollars } from '../money.js';
 import { formatTokenUsage, formatTokens, tokenUsage } from '../token_usage.js';
 
@@ -122,14 +133,58 @@ function budgetLine(
  *
  * Empty when the process still has budget: a view that says "out of tokens"
  * about a process with a million tokens left is worse than silence.
+ *
+ * **And a budget that is still running has a ceiling, and the views have to
+ * say that too.**
+ *
+ * The token and money ceilings stand beside their spend in a cell of their
+ * own (`formatTokenBudget`, `formatUsdBudget`). The wall clock has no such
+ * cell, and it cannot have one: its spend is the process's **age**, and the
+ * age is a *different* number — the clock is charged on the kernel's
+ * heartbeat and it **pauses** while a process is stopped or parked
+ * (PROCESS.md §8.3), so a charged second and a lived second are not the same
+ * second. A table that printed "4m of 10m" beside an age of "4m03s" would
+ * invite a comparison the kernel does not make.
+ *
+ * So the wall-clock budget says the two things it can say **exactly**: how
+ * much is **left** of it, and how much there was. Both numbers are the
+ * kernel's own — the remainder, and the ceiling computed from it — and
+ * neither is a comparison with the age beside it. The remainder is printed
+ * exactly (never rounded up to the ceiling it belongs to) and it says *left*,
+ * because a bare "of" would read as a spend, the way the token and money
+ * cells read.
+ *
+ * A budget with no ceiling says nothing: there is no limit to report.
  */
-export function describeBudget(remaining: BudgetLimits): string {
+export function describeBudget(facts: BudgetFacts): string {
   const out: string[] = [];
-  if (remaining.tokens === 0) out.push('tokens');
-  if (remaining.usd === 0) out.push('usd');
-  if (remaining.wallTimeMs === 0) out.push('wallTime');
-  if (out.length === 0) return '';
-  return `out of ${out.join(', ')}`;
+  if (facts.remaining.tokens === 0) out.push('tokens');
+  if (facts.remaining.usd === 0) out.push('usd');
+  if (facts.remaining.wallTimeMs === 0) out.push('wallTime');
+  const parts: string[] = [];
+  if (out.length > 0) parts.push(`out of ${out.join(', ')}`);
+  const wall = describeWallClockBudget(facts);
+  if (wall !== '') parts.push(wall);
+  return parts.join(', ');
+}
+
+/**
+ * The wall-clock budget, in the words a view prints.
+ *
+ * `wall time 9m58s left of 10m` — the remainder, and the ceiling it belongs
+ * to.
+ *
+ * **Nothing when there is no ceiling.** The kernel uses `-1` for an unlimited
+ * budget, and "∞ left of ∞" is a sentence nobody needs.
+ *
+ * **Nothing when it is exhausted.** The cause says it — "out of wallTime" —
+ * and a remainder of zero has nothing left to report.
+ */
+export function describeWallClockBudget(facts: BudgetFacts): string {
+  const ceiling = budgetCeiling(facts.spent.wallTimeMs, facts.remaining.wallTimeMs);
+  if (ceiling === null) return '';
+  if (facts.remaining.wallTimeMs <= 0) return '';
+  return `wall time ${formatExactDuration(facts.remaining.wallTimeMs)} left of ${formatExactDuration(ceiling)}`;
 }
 
 /**

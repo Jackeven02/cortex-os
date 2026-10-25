@@ -405,26 +405,25 @@
     // the kernel did not answer (it is too old to know the command, or there
     // is no kernel), and the column is then hidden rather than filled with
     // blanks — a column of blanks would claim that nothing is inside a call.
-    const processInside = (process) => (typeof process.insideLabel === 'string' ? process.insideLabel : '');
     // **The signals the kernel has queued for this process.** A signal aimed
     // at a process that is not running waits in its queue until the process
     // runs again, so a row that says "blocked" and nothing else hides the
     // fact that this one has already been asked to die. The label comes from
     // the server, in the same words `cortex ps` prints — one rule, three
     // views.
-    const processPending = (process) => (typeof process.pendingLabel === 'string' ? process.pendingLabel : '');
+    function processPending(process) { return typeof process.pendingLabel === 'string' ? process.pendingLabel : ''; }
     // **How the process ended.** The label comes from the server, which uses
     // the same rule `cortex ps` and `cortex top` print — one rule, three views.
     // A finished run and a crashed one used to read as the same word here
     // (`zombie`), so "did it finish, or did it die?" needed the trace view to
     // answer. The kernel knows the code and the reason; the label carries them.
-    const processOutcome = (process) => (typeof process.outcomeLabel === 'string' ? process.outcomeLabel : '');
+    function processOutcome(process) { return typeof process.outcomeLabel === 'string' ? process.outcomeLabel : ''; }
     // **That it has run out of budget.** The label comes from the server, which
     // uses the same rule `cortex ps` and `cortex top` print — one rule, three
     // views. A process whose ceiling has been reached cannot go on, and nothing
     // else in the row says so: a `ready` row that will never run again looks
     // exactly like one that is merely waiting.
-    const processBudget = (process) => (typeof process.budgetLabel === 'string' ? process.budgetLabel : '');
+    function processBudget(process) { return typeof process.budgetLabel === 'string' ? process.budgetLabel : ''; }
     // **That the process was parked at a checkpoint.** The label comes from the
     // server, which uses the same rule `cortex ps` and `cortex top` print — one
     // rule, three views. A process that was checkpointed with `--detach` is
@@ -432,7 +431,34 @@
     // *parked*, and the chain it was parked in is what brings it back. The
     // window used to show `suspended` and nothing else, so a process that
     // stopped on purpose looked exactly like one that died mid-call.
-    const processCheckpoint = (process) => (typeof process.checkpointLabel === 'string' ? process.checkpointLabel : '');
+    function processCheckpoint(process) { return typeof process.checkpointLabel === 'string' ? process.checkpointLabel : ''; }
+    // **What it is waiting on.** The label comes from the server, which uses
+    // the same rule `cortex ps` and `cortex top` print.
+    function processInside(process) { return typeof process.insideLabel === 'string' ? process.insideLabel : ''; }
+
+    // **The note on a row — one order, one rule.**
+    //
+    // The table and the supervision tree show the same facts about the same
+    // process, so they build the note the same way: one function, so they
+    // cannot drift.
+    //
+    // The order is the order `cortex ps` prints: how it ended, then the
+    // budget, then the park, then what it is waiting on.
+    //
+    // The tree used to leave the park out — a process stopped at a checkpoint
+    // read `suspended` in the table and `suspended` in the tree, and only the
+    // table said it was parked and handed over the command that brings it
+    // back. A second copy of the order is a second rule, and the second rule
+    // is the one that goes missing.
+    function processDetail(process) {
+      return [
+        processOutcome(process),
+        processBudget(process),
+        processCheckpoint(process),
+        processInside(process),
+        processPending(process),
+      ].filter(Boolean).join(' — ');
+    }
     let insideKnown = false;
     let pendingKnown = false;
     let outcomeKnown = false;
@@ -467,9 +493,10 @@
         const outcome = processOutcome(process);
         const budget = processBudget(process);
         const checkpoint = processCheckpoint(process);
-        // One cell, one order — the same order `cortex ps` prints: how it
-        // ended, then the budget, then the park, then what it is waiting on.
-        const detail = [outcome, budget, checkpoint, inside, pending].filter(Boolean).join(' — ');
+        // One cell, one order — the same order `cortex ps` prints, built by the
+        // same function the tree builds it with: how it ended, then the budget,
+        // then the park, then what it is waiting on.
+        const detail = processDetail(process);
         const insideCell = (insideKnown || pendingKnown || outcomeKnown || budgetKnown || checkpointKnown) ? `<td class="inside-cell" title="${esc(detail)}">${esc(detail || '—')}</td>` : '';
         return `<tr data-pid="${esc(process.pid)}"><td class="role-cell"><div class="role-wrap"><span class="role-avatar">${esc(initial)}</span>${esc(process.role)}</div></td><td><span class="state state-${esc(process.state)}">${esc(process.state)}</span></td>${insideCell}<td class="pid-cell">${esc(process.pid)}</td><td class="pid-cell">${esc(process.ppid ?? '—')}</td><td>${esc(processTokenLabel(process))}</td><td>${esc(processUsdLabel(process))}</td><td class="caps-cell" title="${esc(processCaps(process))}">${esc(processCaps(process))}</td><td>${esc(time)}</td><td class="mono">${esc(processAgeLabel(process))}</td>${opsCell}</tr>`;
       }).join('') : `<tr><td colspan="${insideKnown || pendingKnown || outcomeKnown || budgetKnown || checkpointKnown ? 11 : 10}" class="empty">${processData.length ? '没有匹配的进程' : '尚无进程记录。接入 Agent 后，运行状态会显示在这里。'}</td></tr>`;
@@ -665,7 +692,10 @@
         const pending = processPending(process);
         const outcome = processOutcome(process);
         const budget = processBudget(process);
-        const detail = [outcome, budget, inside, pending].filter(Boolean).join(' — ');
+        // The same note the table prints, built by the same function — one
+        // order, one rule. The tree used to leave the park out, so a process
+        // stopped at a checkpoint read the same in both views.
+        const detail = processDetail(process);
         const insideSpan = detail ? `<span class="tree-inside">${esc(detail)}</span>` : '';
         return `<div class="tree-node" data-pid="${esc(process.pid)}" style="margin-left:${depth * 16}px"><span class="role-avatar">${esc(String(process.role ?? '?').slice(0, 1).toUpperCase())}</span><span class="tree-role">${esc(process.role ?? '—')}</span><span class="tree-pid">#${esc(process.pid)}</span><span class="state state-${esc(process.state)}">${esc(process.state)}</span><span class="tree-meta"><span>${esc(processCaps(process))}</span><span>${esc(processTokenLabel(process))} tok</span><span>${esc(processUsdLabel(process))}</span><span>${esc(processAgeLabel(process))}</span>${insideSpan}</span></div>${children}`;
       };

@@ -646,11 +646,19 @@ function withOutcomeLabel<T extends { state: ProcessState; exitCode: number | nu
  * row says so: a `ready` row that will never run again looks exactly like one
  * that is merely waiting. The kernel knows which budget ran out (the
  * remainder is zero), and the label says it.
+ *
+ * The wall clock's **ceiling** comes with it: a process with ten minutes of
+ * wall clock left has a deadline the operator can see, and a row that printed
+ * only the age said nothing about it. The label is the same one the CLI
+ * prints — one rule, three views — and the page prints it as it is given.
  */
-function withBudgetLabel<T extends { budgetsRemaining: BudgetLimits }>(
+function withBudgetLabel<T extends { budgetsSpent: BudgetCounters; budgetsRemaining: BudgetLimits }>(
   row: T,
 ): T & { budgetLabel: string } {
-  return { ...row, budgetLabel: describeBudget(row.budgetsRemaining) };
+  return {
+    ...row,
+    budgetLabel: describeBudget({ spent: row.budgetsSpent, remaining: row.budgetsRemaining }),
+  };
 }
 
 /**

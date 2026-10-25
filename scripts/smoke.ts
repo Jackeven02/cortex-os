@@ -355,7 +355,7 @@ import {
 } from '../src/cli/replay_core.js';
 import { processOutcome, formatOutcomeCode, describeOutcome } from '../src/cli/process_outcome.js';
 import { formatTokenUsage, formatTokens, tokenUsage, callUsage } from '../src/token_usage.js';
-import { formatTokenBudget, formatUsdBudget } from '../src/cli/process_budget.js';
+import { formatTokenBudget, formatUsdBudget, describeBudget } from '../src/cli/process_budget.js';
 import type { CortexContext, LLMResponse, Timestamp } from '../src/kernel/types.js';
 import { OutputCapture } from '../src/cli/output_capture.js';
 import { bootCliKernel } from '../src/cli/index.js';
@@ -10304,7 +10304,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents' | 'stateBreakdown' | 'stateLabel' | 'processOutcome' | 'processBudget' | 'processCheckpoint' | 'processInside' | 'processPending' | 'processDetail',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -19961,6 +19961,143 @@ async function runDashboardLiveChecks(): Promise<void> {
         // prints what it is given.
         const html = await (await fetch(`${dash.url}/`)).text();
         assert(html.includes('budgetLabel'), 'the page prints the label it is given');
+      });
+
+      check('the remainder is never rounded up to its ceiling', () => {
+        // The wall clock's remainder is printed to the second, so two numbers
+        // printed that way can only be equal when they really are. A budget
+        // that reads "10m left of 10m" while it is nearly empty is a budget
+        // nobody acts on.
+        const spent = { tokensIn: 0, tokensOut: 0, tokensCached: 0, usdSpent: 0, wallTimeMs: 1, syscallCount: 0 };
+        const facts = { spent, remaining: { tokens: -1, usd: -1, wallTimeMs: 599_999 } };
+        assert(
+          describeBudget(facts) === 'wall time 9m59s left of 10m',
+          `the wall clock says what is left, got ${describeBudget(facts)}`,
+        );
+        // A budget with no ceiling says nothing: there is no limit to report.
+        assert(
+          describeBudget({ spent, remaining: { tokens: -1, usd: -1, wallTimeMs: -1 } }) === '',
+          'an unlimited budget says nothing',
+        );
+        // And an exhausted one says the cause — the kernel's own word for it.
+        assert(
+          describeBudget({ spent, remaining: { tokens: -1, usd: -1, wallTimeMs: 0 } }) === 'out of wallTime',
+          'the cause is named the way the kernel names it',
+        );
+        // The budgets that have a cell of their own are unchanged.
+        assert(
+          describeBudget({ spent, remaining: { tokens: 0, usd: 0, wallTimeMs: -1 } }) === 'out of tokens, usd',
+          'the other budgets still name themselves',
+        );
+      });
+
+      await checkAsync('a process with a wall-clock budget says how much of it is left', async () => {
+        // The wall clock's ceiling was in `cortex limit` and nowhere else: a
+        // table that printed the age printed no limit, so an agent with ten
+        // minutes of wall clock looked exactly like an agent with all of it —
+        // and the operator watching the row had no way to know that the agent
+        // they were watching was about to be stopped.
+        const pid = await kernel.spawn({
+          role: 'wall-capped',
+          agent: { module: 'test:live', args: { mode: 'alive' } },
+        });
+        const loosePid = await kernel.spawn({
+          role: 'wall-loose',
+          agent: { module: 'test:live', args: { mode: 'alive' } },
+        });
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        // The same call `cortex limit --wall-time 600000` makes: the ceiling is
+        // the number the operator asked for, counted from the start of the
+        // process's life.
+        await client.request('limit', { pid: unbrand(pid), wallTimeMs: 600_000 });
+
+        const result = await capture(() => cmdPs([]));
+        const line = psRow(result.out, unbrand(pid));
+        assert(line !== '', `the capped process is listed, got: ${result.out}`);
+        assert(
+          /wall time \S+ left of 10m/.test(line),
+          `the row says how much wall clock is left, got: ${line}`,
+        );
+        // And the tree says the same sentence — one rule, two views.
+        const top = await capture(() => cmdTop([]));
+        const treeLine = topRow(top.out, unbrand(pid));
+        assert(
+          /wall time \S+ left of 10m/.test(treeLine),
+          `the tree says the same sentence, got: ${treeLine}`,
+        );
+        // A process with no wall-clock budget says nothing about one: a note
+        // on every row would be noise, and noise is what a view is not for.
+        const looseLine = psRow(result.out, unbrand(loosePid));
+        assert(
+          !looseLine.includes('wall time'),
+          `a process with no wall-clock budget says nothing about one, got: ${looseLine}`,
+        );
+      });
+
+      await checkAsync('the window says the same thing about the wall clock', async () => {
+        // One rule, three views: the window's row carries the same sentence
+        // the terminal prints, and it gets it from the server rather than
+        // working the wording out for itself.
+        const res = await fetch(`${dash.url}/api/processes`);
+        const rows = (await res.json()) as Array<Record<string, unknown>>;
+        const capped = rows.find((r) => r['role'] === 'wall-capped');
+        assert(capped !== undefined, 'the capped process is in the window');
+        const label = String(capped!['budgetLabel']);
+        assert(
+          /wall time \S+ left of 10m/.test(label),
+          `the window says how much wall clock is left, got: ${label}`,
+        );
+        const loose = rows.find((r) => r['role'] === 'wall-loose');
+        assert(loose !== undefined, 'the loose process is in the window');
+        assert(
+          !String(loose!['budgetLabel']).includes('wall time'),
+          `a process with no wall-clock budget says nothing about one, got: ${String(loose!['budgetLabel'])}`,
+        );
+        // The page prints the label it is given.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        assert(html.includes('budgetLabel'), 'the page prints the label it is given');
+        assert(!html.includes('left of'), 'the page does not phrase the wall clock itself');
+      });
+
+      await checkAsync('the tree says the same note the table says', async () => {
+        // The table and the supervision tree show the same facts about the
+        // same process, so they build the note the same way. The tree used to
+        // leave the park out: a process stopped at a checkpoint read
+        // `suspended` in the table and `suspended` in the tree, and only the
+        // table said it was parked and handed over the command that brings it
+        // back.
+        const html = await (await fetch(`${dash.url}/`)).text();
+        const processDetail = pageFunction(html, 'processDetail', {
+          processOutcome: pageFunction(html, 'processOutcome'),
+          processBudget: pageFunction(html, 'processBudget'),
+          processCheckpoint: pageFunction(html, 'processCheckpoint'),
+          processInside: pageFunction(html, 'processInside'),
+          processPending: pageFunction(html, 'processPending'),
+        });
+        const detail = String(processDetail({
+          outcomeLabel: 'exit 0 (done)',
+          budgetLabel: '',
+          checkpointLabel: "checkpointed — 'cortex restore --chain abc' brings it back",
+          insideLabel: '',
+          pendingLabel: 'SIGTERM queued',
+        }));
+        assert(detail.includes('checkpointed'), `the note says it is parked, got: ${detail}`);
+        assert(detail.includes('SIGTERM queued'), `and what is waiting on it, got: ${detail}`);
+        // And the order is the rule: the ending, then the budget, then the
+        // park, then the wait — the order `cortex ps` prints.
+        assert(
+          detail.indexOf('exit 0') < detail.indexOf('checkpointed')
+            && detail.indexOf('checkpointed') < detail.indexOf('SIGTERM queued'),
+          `the order is the rule, got: ${detail}`,
+        );
+        // One order in the page: the table and the tree both build the note
+        // with the same function, so there is no second copy of the rule to go
+        // missing.
+        assert(html.includes('processDetail(process)'), 'the page builds the note with one function');
+        assert(
+          !html.includes('[outcome, budget, inside, pending]'),
+          'and there is no second order in the page',
+        );
       });
 
       await checkAsync('the process table follows what the kernel says happened', async () => {

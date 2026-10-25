@@ -1167,18 +1167,52 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE (a spend says the ceiling); STATE §2.4 (the ceiling and
   the remainder); CHANGELOG.
 
-- [ ] **#099** The wall-clock budget's ceiling has no view of its own → **open.**
+- [x] **#099** The wall-clock budget's ceiling has no view of its own →
+  **fixed.**
   The token and money ceilings now stand beside their spend in every table,
-  but the wall-clock budget does not: `cortex ps` prints the process's **AGE**
-  and the ceiling is only in `cortex limit`. Pairing them is not as simple as
-  it looks — the budget is charged on the kernel's heartbeat (PROCESS.md §8.3),
-  so the charged time and the wall-clock age are the same number only to
-  within a tick, and a table that printed "4m of 10m" would invite a
-  comparison the kernel does not quite make. The options are: print the
-  **charged** wall time beside the age, print the ceiling in the NOTE column
-  when the process is close to it, or leave the wall clock to `cortex limit`.
-  This needs a decision about what the AGE column is *for* before it is
-  changed.
+  but the wall-clock budget did not: `cortex ps` prints the process's **AGE**
+  and the ceiling was only in `cortex limit`. An agent with ten minutes of wall
+  clock looked exactly like an agent with all of it — and an operator watching
+  a row had no way to know that the agent they were watching was about to be
+  stopped.
+
+  Pairing it with the age was not as simple as it looked, and the reason is
+  worth keeping: the budget is charged on the kernel's heartbeat
+  (PROCESS.md §8.3), and the clock **pauses** while a process is stopped or
+  parked, so the charged time and the wall-clock age are not the same number
+  at all. A table that printed "4m of 10m" beside an age of "4m03s" would
+  invite a comparison the kernel does not make.
+
+  So the wall clock says the two things it can say **exactly**: how much is
+  **left** of it, and how much there was — `wall time 9m58s left of 10m`. Both
+  numbers are the kernel's own (the remainder, and the ceiling computed from
+  it), and neither is a comparison with the age beside it. The remainder is
+  printed to the second and never rounded up, because a remainder that rounds
+  up to its ceiling reads as a budget that is still full when it is nearly
+  empty; and it says *left*, because a bare "of" would read as a spend, the
+  way the token and money cells read. A budget with no ceiling says nothing —
+  there is no limit to report — and an exhausted one says the cause instead
+  (`out of wallTime`).
+
+  The wording is **one function** (`describeBudget`, in
+  `src/cli/process_budget.ts`), so `cortex ps`, `cortex top` and the
+  dashboard's row cannot say different things about the same budget, and the
+  page prints the label it is given. The durations are one rule too
+  (`src/duration.ts`, next to `src/money.ts`): an **age** is rounded and a
+  **remainder** is not.
+
+  **4 new smoke checks** (889 → 893), reverse-verified: with the wall clock
+  left out of the budget, the three checks that ask for it fail; with the
+  remainder rounded like an age, the check fails on `wall time 10m left of
+  10m` — the exact lie the rule exists to prevent; with the window not knowing
+  what the process spent, its ceiling comes out as `9m59s left of 9m59s` and
+  its check fails; and with the tree building its own note again, the page's
+  check fails on the second order.
+
+  Browser-verified on a real window over a real kernel: the table row reads
+  `wall time 9m37s left of 10m — waiting on a channel for 52.1s`, the
+  supervision tree says the same, a process with no wall-clock budget says
+  nothing about one, and the console is clean.
 
   Docs: STATE §2.4; PROCESS.md §8.3.
 
@@ -2115,6 +2149,34 @@ The user-facing surface. Should feel like a real OS shell.
 
   **Exit criteria:** the number next to the table says one thing, and that thing
   is true of the table it sits on.
+
+- [ ] **#122** A spawned agent cannot be given a wall-clock ceiling →
+  **open.**
+  Found while fixing #099: the ceiling now reaches the operator's tables, but
+  there is almost nothing to give one. `cortex spawn` has `--token-budget` and
+  **no wall-clock knob**, and the dashboard's spawn endpoint takes a
+  `tokenBudget` and no wall clock (and the page's 启动机器人 form offers no
+  budget field at all).
+
+  `cortex limit <pid> --wall-time <ms>` can set one — but it needs a **live**
+  kernel, and `cortex spawn` runs in a short-lived kernel of its own, so by the
+  time the operator could set it, the process is over. The one way to cap an
+  agent's runtime from the outside is to run it under a long-lived kernel
+  (`cortex daemon run`, or `cortex spawn --live`) and set the budget from
+  another shell.
+
+  An agent can ask for one for its children (`ctx.spawn({ budgets: {
+  wallTimeMs } })`), so the knob exists on the inside and not on the outside —
+  the same shape as #119's `nice`.
+
+  The fix is small and has an obvious shape: `--wall-time-budget <ms>` next to
+  `--token-budget` in `cortex spawn`, which the kernel already honours. What
+  is worth a decision is the **name** (`--wall-time-budget` against
+  `--budget-wall-ms` against `--max-runtime`), and whether the dashboard's
+  spawn should offer it in the form too.
+
+  **Exit criteria:** an operator can cap how long an agent may run, from the
+  command that starts it.
 
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 

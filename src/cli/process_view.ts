@@ -30,6 +30,7 @@ import {
 } from './process_store.js';
 import { probeKernel } from './kernel_client.js';
 import type { KernelCommand } from './kernel_protocol.js';
+import { formatDuration } from '../duration.js';
 import {
   unbrand,
   CAPABILITIES,
@@ -146,12 +147,13 @@ export function processAge(row: AgeFacts, now: number): number {
  * hours with one decimal — which is the precision a human reading "how long
  * has this been running" wants, and the precision the kernel's own wall clock
  * is charged at.
+ *
+ * The rule itself lives in [`src/duration.ts`](../../duration.ts), next to the
+ * other way a duration is printed — the one a **budget's remainder** is
+ * printed in, which must not round a remainder up to its ceiling.
  */
 export function formatAge(ms: number): string {
-  if (ms < 0 || ms < 1000) return `${Math.max(ms, 0)}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(0)}s`;
-  if (ms < 3_600_000) return `${(ms / 60_000).toFixed(0)}m`;
-  return `${(ms / 3_600_000).toFixed(1)}h`;
+  return formatDuration(ms);
 }
 
 /**

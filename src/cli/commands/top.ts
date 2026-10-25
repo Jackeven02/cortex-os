@@ -410,7 +410,7 @@ function cellsFor(
   // first, then the budget, then what the process is waiting on.
   const note = processNote({
     ending,
-    budget: describeBudget(m.budgetsRemaining),
+    budget: describeBudget({ spent: m.budgetsSpent, remaining: m.budgetsRemaining }),
     checkpoint: describeCheckpointPark(m),
     waiting: noteWithSignals,
   });

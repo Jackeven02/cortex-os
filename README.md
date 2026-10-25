@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 889 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 893 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -432,6 +432,10 @@ And when there is **no kernel to ask**, the panel says *unknown*, and says why. 
 **And the window shows what the supervisor said about them.** The live state says *now*; the kernel's **journal** says *what was decided* — and the panel shows both, side by side.
 
 The journal had a hole in it, too. It named two of the three ways a supervisor gives up (*max restarts reached*, *restart storm*) and not the third — the one the **policy** decides. So a daemon whose policy said `never` left the log saying only "not restarted", while the live state said "gave up: the restart policy says no": the kernel knew a decision it could not read back. All three give-ups are recorded the same way now, the journal names the daemon it is about, and when the two answers do not match, the row says so in words.
+
+**And the window says how much wall clock is left.** The token and money ceilings stand beside their spend in every table. The wall clock's did not: it was in `cortex limit` and nowhere else, so an agent with ten minutes of wall clock looked exactly like an agent with all of it — and an operator watching a row had no way to know that the agent they were watching was about to be stopped. It cannot be printed the way the other two are (its spend is the age, and the age is a *different* number — the clock pauses while a process is stopped or parked), so it says the two things it can say **exactly**: how much is **left** of it, and how much there was — `wall time 9m58s left of 10m`. The remainder is printed to the second and never rounded up: a remainder that rounds up to its ceiling reads as a budget that is still full when it is nearly empty.
+
+**And the tree says the same note the table says.** The window has two views of the process table — 表格 and 监督树 — and the tree used to build its note from its own list of facts, which was missing one: the park. A process stopped at a checkpoint read `suspended` in the table and `suspended` in the tree, and only the table said it was parked and handed over the command that brings it back. One function builds the note now, in the order `cortex ps` prints.
 
 **And the window's state breakdown accounts for every process.** The **运行状态** panel says 「按进程状态分类」 — a classification — and it named five states. The kernel has nine, so a process in any of the other four — one parked at a checkpoint, one that had not run yet, one on its way out — was in the panel's total and in **no row**. Four processes on the panel's own total, and rows that added up to three: the numbers did not add up, while `cortex top`, counting the states it finds, said something different about the very same processes.
 

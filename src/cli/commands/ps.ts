@@ -231,7 +231,7 @@ COLUMNS
     }
     return processNote({
       ending,
-      budget: describeBudget(p.budgetsRemaining),
+      budget: describeBudget({ spent: p.budgetsSpent, remaining: p.budgetsRemaining }),
       checkpoint: describeCheckpointPark(p),
       waiting: describePendingSignals(wait, p.pendingSignals),
     });

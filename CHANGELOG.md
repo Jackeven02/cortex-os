@@ -42,6 +42,50 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The wall clock's ceiling reaches the operator's tables.** The token and
+  money ceilings stand beside their spend in every table. The wall clock's did
+  not: its ceiling was in `cortex limit` and nowhere else — so an agent with
+  ten minutes of wall clock looked exactly like an agent with all of it, and
+  an operator watching a row had no way to know that the agent they were
+  watching was about to be stopped.
+
+  It cannot be printed the way the other two are. Their spend is their spend;
+  the wall clock's spend is the process's **age**, and the age is a *different*
+  number — the clock is charged on the kernel's heartbeat and it **pauses**
+  while a process is stopped or parked (docs/PROCESS.md §8.3), so a charged
+  second and a lived second are not the same second. A table that printed
+  "4m of 10m" beside an age of "4m03s" would invite a comparison the kernel
+  does not make.
+
+  So it says the two things it can say **exactly**: how much is **left** of it,
+  and how much there was — `wall time 9m58s left of 10m`. Both numbers are the
+  kernel's own (the remainder, and the ceiling computed from it), and neither
+  is a comparison with the age beside it. The remainder is printed to the
+  second and never rounded up — a remainder that rounds up to its ceiling reads
+  as a budget that is still full when it is nearly empty — and it says *left*,
+  because a bare "of" would read as a spend, the way the token and money cells
+  read. A budget with no ceiling says nothing (there is no limit to report),
+  and an exhausted one says the cause instead (`out of wallTime`), which is
+  the kernel's own word for it.
+
+  The wording is **one function** (`describeBudget`, in
+  `src/cli/process_budget.ts`), so `cortex ps`, `cortex top` and the
+  dashboard's row cannot say different things about the same budget, and the
+  page prints the label it is given. The durations are one rule too
+  (`src/duration.ts`, next to `src/money.ts`): an **age** is rounded ("3m" for
+  "how long has this been running"), and a **remainder** is not — a remainder
+  is a number the operator acts on, and rounding it turns "9m58s left" into
+  "10m left".
+
+- **The supervision tree says the same note the table says.** The window has
+  two views of the process table — 表格 and 监督树 — and the tree used to build
+  its note from its own list of facts, which was missing one: the park. A
+  process stopped at a checkpoint read `suspended` in the table and `suspended`
+  in the tree, and only the table said it was parked and handed over the
+  command that brings it back. The two views now build the note with **one
+  function** (`processDetail`, on the page), in the order `cortex ps` prints:
+  how it ended, then the budget, then the park, then what it is waiting on.
+
 - **The window's state breakdown accounts for every process it lists.** The
   dashboard's 运行状态 panel says 「按进程状态分类」 — a classification — and it
   named five states: running, ready, blocked, stopped, zombie. A process in any
