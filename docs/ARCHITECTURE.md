@@ -2311,6 +2311,54 @@ not running gets no disagreement: the journal's decisions about it are
 **history** (an earlier kernel's), not a conflict with a live state that does
 not exist.
 
+**The window used to forget what the operator asked for.** The event table is
+a window onto the history, and the operator's request for it — *show me more,
+further back* — is part of that window's state. A push **replaced** the table
+with the newest page, and the 30-second poll did the same: so an operator who
+clicked 加载更多 to read back through the history lost those pages the next
+time the kernel said something. The rows on screen stayed true — they were the
+newest ones — but the window silently dropped what had been asked for, and the
+count under the table was only refreshed by the poll that dropped it.
+
+Three things hold it together now, and they are one thing: **the window's
+state belongs to the window.**
+
+- The push carries the **rows and the count together** (`{"events": [...],
+  "total": N}`), measured by the same reader the read endpoint uses — so
+  `total` is the same number `GET /api/events` reports in `x-total-count`, and
+  the number under the table is as fresh as the rows above it. When the server
+  cannot count the window it was asked about, it says so (`total: null`)
+  instead of sending a number it did not measure.
+- The stream answers about the **window it was asked about**: it takes the
+  same range the read takes. The read took a range and the push ignored it, so
+  a window filtered to one hour was fed the whole history and the filter was a
+  decoration.
+- The page **merges** what the server sends into the window it is showing.
+  The pushed page and the loaded window are two slices of one history, so the
+  merged window is the pushed rows followed by the loaded rows the pushed page
+  does not carry — nothing dropped, nothing shown twice, newest first. When
+  the two do not meet — the server's page reached past everything the window
+  holds, so the rows in between were never seen — the page asks again rather
+  than show a gap it cannot see.
+
+**And the window's timers die with the window.** An open event stream keeps
+one repeating timer: the 15-second heartbeat that keeps the connection warm.
+That timer belongs to the window, and when the window is gone — nobody left
+to answer — it has to go with it.
+
+It used not to. The stream handler **awaits the disk twice** before it
+starts that heartbeat (once for the process table, once to seed the feed), and
+a window that hung up in that gap left the handler running: it then started a
+heartbeat for a connection that was already closed. Nothing would ever stop
+that timer, so it kept the whole process alive — every run of the dashboard
+hung at the end, and so did every run of the smoke that drove it.
+
+So the close handler is armed **before the first await**, it is the one place
+that ends the window, and it clears everything the handler owns: the
+heartbeat, the feed timer, the process refresh, the output timer, the file
+watcher, the kernel subscription. And no timer is created for a window that
+is already closed.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up

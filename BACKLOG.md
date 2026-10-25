@@ -1672,15 +1672,66 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE (the window's own light stopped claiming a connection it
   had not checked); INTEGRATIONS (`/api/node`, the stream); CHANGELOG.
 
-- [ ] **#110** A push makes the window forget the pages the operator loaded.
-  In the pushed path the event table is **replaced** by the newest page on every
-  frame, so an operator who clicked 加载更多 to read back through the history
-  loses those pages the next time the kernel says something. The rows on screen
-  stay true — they are the newest ones — but the window silently drops what was
-  asked for, and the total it shows is only refreshed by the 30-second poll.
-  The fix is to keep the loaded window and merge the pushed page into it
-  (newest first, de-duplicated by run id), and to carry the total in the push
-  itself rather than waiting for the poll.
+- [x] **#110** A push makes the window forget the pages the operator loaded →
+  **fixed.**
+  In the pushed path the event table was **replaced** by the newest page on
+  every frame, so an operator who clicked 加载更多 to read back through the
+  history lost those pages the next time the kernel said something. The rows
+  on screen stayed true — they were the newest ones — but the window silently
+  dropped what was asked for, and the total it shows was only refreshed by the
+  30-second poll.
+
+  It was worse than the entry said. The **poll** did the same thing: every
+  30 seconds (every 3, in the polling fallback) the table was reset to the
+  newest page, so 「加载更多」 bought half a minute of extra rows and no more.
+  And the pushed rows and the polled rows were **different feeds**: the push
+  carried the kernel's frames, while the read carried the kernel's frames
+  *and* the LangChain callback lines. Two answers to one question.
+
+  So the fix is one idea — **the window's state belongs to the window**:
+
+  - The `events` frame carries the **rows and the count together**:
+    `{"events": [...], "total": N}`. The count is measured by the same reader
+    the read endpoint uses (`ActivityStore.count(range)`), so it is the same
+    number `GET /api/events` reports in `x-total-count`. When the server
+    cannot count the window it was asked about — the window reaches back past
+    the oldest event the store kept — it says so (`total: null`) instead of
+    sending a number it did not measure; the window keeps the count it has
+    until the next read replaces it.
+  - `GET /api/stream` takes the same range the read takes (`from`, `to`). The
+    read took a range and the push ignored it, so a window filtered to one
+    hour was fed the whole history and the filter was a decoration.
+  - The page **merges** what the server sends into the window it is showing.
+    The pushed page and the loaded window are two slices of one history, so
+    the merged window is the pushed rows followed by the loaded rows the
+    pushed page does not carry — nothing dropped, nothing shown twice, newest
+    first. When the two do not meet — the server's page reached past
+    everything the window holds, so the rows in between were never seen — the
+    page asks again rather than show a gap it cannot see.
+  - Both paths read the **activity store**, so the pushed feed and the polled
+    feed are the same feed: a LangChain callback line now shows up in the
+    push as well as in the read.
+
+  **8 new smoke checks** (876 → 884), reverse-verified: with the count no
+  longer carried, the two payload checks fail; with the push ignoring the
+  range, the window check fails; with the page replacing the window again,
+  the merge check fails **and** the gap check fails; with the gap never
+  noticed, the gap check fails; with the older rows put on top, the order
+  check fails; with the old wiring back in the page, the wiring check fails;
+  and with the store's count ignoring the window, the count check fails. (One
+  of the first attempts at the merge check **passed with the page replacing
+  the window** — the pushed page happened to contain every row the window had,
+  so the two cases were indistinguishable. The check now uses a pushed window
+  that is *deeper* than the loaded one, which is the case that actually
+  happens.)
+
+  Browser-verified on a real window: an operator loads more rows, the kernel
+  says something, and the loaded rows are still there — with the count under
+  the table moving with them.
+
+  Fixing it also surfaced a bug of its own — the dashboard's heartbeat
+  outliving the window it was keeping warm (#116) — which is why the smoke
+  run had stopped ending.
 
 - [x] **#111** The window dropped every supervisory decision the kernel had
   made → **fixed.**
@@ -1839,6 +1890,102 @@ The user-facing surface. Should feel like a real OS shell.
   decided, the honest answer is that a look is not recorded, and no view
   should pretend otherwise: nothing today says "seen", and nothing should
   start saying it without saying what a look is.
+
+- [ ] **#115** The count under the table says how many events there are, but it
+  counts what the window can still reach → **open.**
+  The count the window shows — and now the count the push carries with the
+  rows (#110) — is the number of events the activity store holds for the
+  window. The store keeps the newest **5,000** of each kind (`MAX_EVENTS`), so
+  past that the number stops growing: a workspace with 50,000 events says
+  「共 10,000 条」, and the operator cannot tell 10,000 from 50,000. The
+  number is used for two things at once — it is the *size of the history* in
+  the header, and it is the *yardstick* the 「加载更多」 button is compared
+  against — and only the first of those is a lie.
+
+  The server **knows** the difference: the store remembers the oldest event it
+  dropped (`ActivityStore.covers()` is false once it has), so it could say
+  *at least* N. What it should say is a wording question with a measurement
+  behind it:
+
+  - **「共 10,000 条」** — the count of what the window can serve. Simple, and
+    it reads as the size of the history, which it is not.
+  - **「至少 10,000 条」** — honest about the ceiling, for one extra word. But
+    then the number is no longer a count, and the 「加载更多」 button — which
+    compares it against the rows loaded — has to be reasoned about separately:
+    a window that has loaded 10,000 rows out of *at least* 10,000 has not
+    reached the end, and the button must not go dark.
+  - **the size of the history** — read from the disk. The disk knows the size
+    of a file, but the size of an *event count* means reading every frame,
+    which is the O(history) cost the store was built to remove.
+
+  There is a fourth question underneath the wording one, and it is the real
+  one: should the number be the count of **the history** (so it is the truth
+  about everything that happened) or the count of **the window on screen** (so
+  it is the truth about what the operator is looking at)? Today it is the
+  first, capped by the store, and it is used for the second as well — which is
+  where the ambiguity lives.
+
+  **Exit criteria:** the number under the table says one thing, and that thing
+  is true.
+
+- [x] **#116** The dashboard's heartbeat outlived the window it was keeping
+  warm → **fixed.**
+  Found while fixing #110, and it is the reason the smoke run had stopped
+  ending: the run printed its summary and then **never ended**. The process
+  was still alive, holding one repeating timer — the dashboard's heartbeat, the
+  15-second ping that keeps an open event stream warm.
+
+  It was a race, and the window lost it. The stream handler **awaits the disk
+  twice** before it starts that heartbeat: once to read the process table,
+  once to seed the feed. A window that hung up in that gap — a closed browser
+  tab, a closed dashboard, a client that read its first frame and went — left
+  the handler running, and the handler then started a heartbeat **for a
+  connection that was already closed**. The close handler had already run, so
+  nothing would ever stop that timer: it kept the process alive forever, and
+  every run of the dashboard (and every run of the smoke that drove it) hung
+  at the end.
+
+  The fix is one rule — **nothing the handler owns may outlive the window**:
+
+  - The close handler is armed **before the first await**, so a window that
+    hangs up at any moment is still noticed. It is the one place that ends the
+    window, and it clears everything the handler owns: the heartbeat, the feed
+    timer, the process refresh, the output timer, the file watcher and the
+    kernel subscription.
+  - Every timer is only created while the window is still open — the
+    heartbeat, the feed, the process refresh and the output timer all ask
+    first.
+  - The kernel subscription is given back if the window hung up while the
+    kernel was being asked to follow it.
+
+  **1 new smoke check** (884 → 885): the dashboard's repeating timers are
+  counted — the dashboard is the only thing in the tree that opens one — and
+  the count has to be back to zero once the dashboard is closed.
+  Reverse-verified: with the guard removed, the check fails with *the
+  dashboard left 1 repeating timer(s) behind*.
+
+  The smoke now also **says what is holding it open** if it lingers, so a run
+  that does not end ends in a name instead of in silence.
+
+- [ ] **#117** The smoke run keeps going for a while after its summary → **open.**
+  The run prints its summary and then does not end for a while — it takes about
+  a minute and a quarter all told, and the tail is the part after the summary.
+  The handles it is holding are the **kernel scheduler's 10 ms tick**, from the
+  kernels the smoke boots and never stops: a scheduler that is still started
+  keeps re-arming its tick, and a pending timer keeps the process alive — so
+  the run ends when the last of those kernels is finally stopped, not when it
+  has said everything it has to say.
+
+  It is not what it was a moment ago: the dashboard's heartbeat used to keep
+  the run alive **forever** (#116), which is what this was found through. What
+  is left is a tail — and a tail is a test run that keeps going after it has
+  finished talking.
+
+  The measurement is in place: the run now names what is holding it open if it
+  is still going two minutes after the summary.
+
+  **Exit criteria:** every kernel the smoke boots is stopped, and the run ends
+  as soon as it has printed its summary.
 
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 

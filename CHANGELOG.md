@@ -42,6 +42,12 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **`ActivityStore.count(range)` — how many events the store holds for a
+  window.** The count and the rows are one measurement, so the number a view
+  shows and the rows behind it cannot be two different answers. It counts
+  without building the list: a view that only needs the number should not have
+  to build the rows to learn how long they are.
+
 - **The supervisor's decisions sit beside the live state.** The kernel answers
   *"what is this daemon doing right now?"* as a read, and it also keeps a
   **journal** — every decision the supervisor ever made, in init's own log
@@ -1749,6 +1755,63 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **A push made the window forget what the operator had loaded.** The event
+  table is a window onto the history, and *"show me more, further back"* is
+  part of that window's state. A push **replaced** the table with the newest
+  page — and so did the 30-second poll — so an operator who clicked 加载更多 to
+  read back through the history lost those pages the next time the kernel said
+  something. The rows on screen stayed true (they were the newest ones), but
+  the window silently dropped what had been asked for, and the count under the
+  table was only refreshed by the poll that dropped it.
+
+  Three things, one idea — **the window's state belongs to the window**:
+
+  - The `events` frame now carries the **rows and the count together**:
+    `{"events": [...], "total": N}`. The count is measured by the same reader
+    the read endpoint uses, so it is the same number `GET /api/events` reports
+    in `x-total-count` — one fact, one answer. When the server cannot count
+    the window it was asked about (the window reaches back past the oldest
+    event the store kept), it says so (`total: null`) instead of sending a
+    number it did not measure; the window keeps the count it has until the
+    next read replaces it.
+  - `GET /api/stream` takes the same range the read takes (`from`, `to`), so
+    the push answers about the window it was asked about. The filter used to
+    be a decoration: the read took a range and the push ignored it, so a
+    window filtered to one hour was fed the whole history.
+  - The page **merges** what the server sends into the window it is showing
+    instead of replacing it. The pushed page and the loaded window are two
+    slices of one history, so the merged window is the pushed rows followed by
+    the loaded rows the pushed page does not carry — nothing dropped, nothing
+    shown twice, newest first. When the two do not meet (the server's page
+    reached past everything the window holds, so the rows in between were
+    never seen), the page asks again rather than show a gap it cannot see.
+
+  The pushed feed and the polled feed are now also the *same* feed: both read
+  the activity store, so a LangChain callback line shows up in the push as
+  well as in the read.
+
+- **The dashboard's heartbeat outlived the window it was keeping warm.** Found
+  while fixing the push above: the smoke run printed its summary and then
+  **never ended**. The process was still alive, holding one repeating timer —
+  the dashboard's heartbeat, the 15-second ping that keeps an open event
+  stream warm.
+
+  It was a race, and the window lost it. The stream handler **awaits the disk
+  twice** before it starts that heartbeat: once to read the process table, once
+  to seed the feed. A window that hung up in that gap — a closed browser tab, a
+  closed dashboard, a client that read its first frame and went — left the
+  handler running, and the handler then started a heartbeat **for a connection
+  that was already closed**. The close handler had already run, so nothing would
+  ever stop that timer: it kept the process alive forever, and every run of the
+  dashboard (and every run of the smoke) hung at the end.
+
+  One rule now: **nothing the handler owns may outlive the window.** The close
+  handler is armed *before* the first await, so a window that hangs up at any
+  moment is still noticed; it is the one place that ends the window and clears
+  everything the handler owns (the heartbeat, the feed timer, the process
+  refresh, the output timer, the file watcher, the kernel subscription); and
+  every timer is only created while the window is still open.
 
 - **The journal had no word for the give-up the policy decides.** The
   supervision journal named two of the three ways a supervisor gives up —

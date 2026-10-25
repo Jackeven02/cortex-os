@@ -239,6 +239,55 @@ const byNewest = (a: unknown, b: unknown): number =>
   Date.parse(String((b as { at?: string }).at ?? '')) - Date.parse(String((a as { at?: string }).at ?? ''));
 
 /**
+ * The events for a range, and how many there are — one reader for both.
+ *
+ * The number the window shows and the rows it shows must never be two
+ * different measurements of the same history, so they are measured together,
+ * from the same read.
+ *
+ * The store answers for the window it can answer for. When it cannot — the
+ * window reaches back past the oldest event it kept — the disk is asked,
+ * because a shorter answer than the disk holds is a truncation nobody can
+ * see.
+ */
+async function eventsForRange(
+  dir: string,
+  store: ActivityStore,
+  range: TimeRange,
+): Promise<{ events: readonly unknown[]; total: number }> {
+  await store.refresh(dir);
+  if (store.covers(range)) {
+    const events = store.read(range).events;
+    return { events, total: events.length };
+  }
+  const [callbacks, syscalls] = await Promise.all([
+    readEvents(dir, range),
+    readSyscallEvents(dir, range),
+  ]);
+  const merged = [...callbacks, ...syscalls].sort(byNewest);
+  return { events: merged, total: merged.length };
+}
+
+/**
+ * The same answer, but only when the store can give it.
+ *
+ * The push path asks for this. It runs every few hundred milliseconds, and
+ * the fallback in {@link eventsForRange} reads the whole history off the
+ * disk — which is exactly what the store was built to stop doing. So when
+ * the store cannot answer for the window, the push says **so** (`total:
+ * null`) instead of paying for a scan: the window keeps the count the read
+ * gave it, and the next read replaces it.
+ */
+function storeWindow(
+  store: ActivityStore,
+  range: TimeRange,
+): { events: readonly unknown[]; total: number } | undefined {
+  if (!store.covers(range)) return undefined;
+  const events = store.read(range).events;
+  return { events, total: events.length };
+}
+
+/**
  * The processes the dashboard shows.
  *
  * The same view `cortex ps` shows: a live kernel's own process table for
@@ -786,21 +835,13 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         };
         // The feed is read once and then followed, so this is the cost of
         // what is *new*, not of the whole history.
-        await store.refresh(dir);
-        let merged: readonly unknown[];
-        if (store.covers(range)) {
-          merged = store.read(range).events;
-        } else {
-          // The window reaches back past what the store kept. The disk still
-          // has it, so the disk is asked — a shorter answer than the disk
-          // gives would be a truncation nobody can see.
-          const [callbacks, syscalls] = await Promise.all([
-            readEvents(dir, range),
-            readSyscallEvents(dir, range),
-          ]);
-          merged = [...callbacks, ...syscalls].sort(byNewest);
-        }
-        response.setHeader('x-total-count', String(merged.length));
+        //
+        // The rows and the count come from the same read, and the push
+        // answers with the same helper — so the number this endpoint
+        // reports and the number the window is told are the same number,
+        // measured the same way.
+        const { events: merged, total } = await eventsForRange(dir, store, range);
+        response.setHeader('x-total-count', String(total));
         json(response, 200, merged.slice(offset, offset + limit));
         return;
       }
@@ -1040,6 +1081,19 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
       }
       if (url.pathname === '/api/stream') {
         const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 100));
+        // The window the stream is about.
+        //
+        // The read endpoint takes a range, and the push did not: so a window
+        // that was filtered to one hour was fed every event in the history,
+        // and the filter was a decoration. The push now answers the same
+        // question the read does — the same rows, the same count — because
+        // the window asked for a window and the server pushes a window.
+        const fromMs = Date.parse(url.searchParams.get('from') ?? '');
+        const toMs = Date.parse(url.searchParams.get('to') ?? '');
+        const range: TimeRange = {
+          ...(Number.isFinite(fromMs) ? { from: fromMs } : {}),
+          ...(Number.isFinite(toMs) ? { to: toMs } : {}),
+        };
         response.writeHead(200, {
           'content-type': 'text/event-stream; charset=utf-8',
           'cache-control': 'no-store',
@@ -1049,10 +1103,59 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         let watcher: FSWatcher | undefined;
         let debounce: ReturnType<typeof setTimeout> | undefined;
         let heartbeat: ReturnType<typeof setInterval> | undefined;
+        let outputTimer: ReturnType<typeof setTimeout> | undefined;
+        let feedTimer: ReturnType<typeof setTimeout> | undefined;
+        let processRefresh: ReturnType<typeof setTimeout> | undefined;
         let unsubscribe: (() => void) | undefined;
         const send = (event: string, data: unknown): void => {
           if (!closed) response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
         };
+
+        // --- the end of this window -------------------------------------------
+        //
+        // One place decides that the window is gone, and it clears every
+        // timer this handler owns.
+        //
+        // A timer created *after* that moment has nobody left to clear it:
+        // it keeps the process alive forever, and the run that started it
+        // never ends. That is not a hypothetical. The seed below awaits the
+        // disk, and a window that hung up while the seed was still reading
+        // used to leave the heartbeat behind — created a moment too late, for
+        // a connection that was already closed.
+        //
+        // So the handler is armed **before** the first await: a window that
+        // hangs up at any moment is still noticed, and nothing this handler
+        // owns outlives it.
+        const shutdown = (): void => {
+          closed = true;
+          if (heartbeat !== undefined) {
+            clearInterval(heartbeat);
+            heartbeat = undefined;
+          }
+          if (debounce !== undefined) {
+            clearTimeout(debounce);
+            debounce = undefined;
+          }
+          if (outputTimer !== undefined) {
+            clearTimeout(outputTimer);
+            outputTimer = undefined;
+          }
+          if (feedTimer !== undefined) {
+            clearTimeout(feedTimer);
+            feedTimer = undefined;
+          }
+          if (processRefresh !== undefined) {
+            clearTimeout(processRefresh);
+            processRefresh = undefined;
+          }
+          watcher?.close();
+          watcher = undefined;
+          unsubscribe?.();
+          unsubscribe = undefined;
+        };
+        request.on('close', () => {
+          shutdown();
+        });
 
         // --- something was printed -------------------------------------------
         //
@@ -1071,8 +1174,10 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         // table is: a chatty agent prints a line at a time, and a debounce
         // that waited for the silence would never see the busy period at all.
         const outputPids = new Set<number>();
-        let outputTimer: ReturnType<typeof setTimeout> | undefined;
         const outputChanged = (pid: number): void => {
+          // The window is gone: a timer created now would outlive the
+          // connection that nothing will ever clear it.
+          if (closed) return;
           outputPids.add(pid);
           if (outputTimer !== undefined) return;
           outputTimer = setTimeout(() => {
@@ -1084,17 +1189,73 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         };
 
         // --- the live path: the kernel pushes ------------------------------
-        // Nothing is re-read. The frames arrive as the kernel writes them,
-        // and the process list comes from the kernel's own table. This is
-        // the difference between watching a kernel and watching a
-        // directory: the disk path re-reads *every* log on *every* change.
+        //
+        // The kernel says **that** something happened; the store says
+        // **what**. The store is the same reader the disk path uses and the
+        // same one the read endpoint uses, so the pushed feed and the
+        // polled feed cannot be two different feeds — and the rows the
+        // window is looking at are a **prefix of the history**: the newest
+        // ones, with nothing missing between them and the row the operator
+        // paged back to.
+        //
+        // The store reads only what was written since the last time, so
+        // following the kernel is cheap: the history is not read again.
         if (options.kernel !== undefined) {
           // Frames that arrive while the history is being read are held, so
           // that nothing is lost and nothing is shown twice.
           const held: unknown[] = [];
           let ready = false;
-          let recent: unknown[] = [];
-          const seeded = new Set<string>();
+
+          // --- the feed -------------------------------------------------------
+          //
+          // The rows and the count travel **together**, measured once: the
+          // window used to learn how many events there were from a poll 30
+          // seconds later, so the number under the table was half a minute
+          // stale while the rows above it were live. Two answers for one
+          // fact, and the older one won.
+          //
+          // The push is **throttled, not debounced**, for the same reason
+          // the process table is: a busy kernel says something every few
+          // milliseconds, and a debounce that waited for the silence would
+          // never see any — the feed would sit frozen through exactly the
+          // busy period it exists for.
+          const pushFeed = async (): Promise<void> => {
+            try {
+              await store.refresh(dir);
+              const window = storeWindow(store, range);
+              if (window === undefined) {
+                // The store cannot answer for this window, and the fallback
+                // reads the whole history off the disk — the very thing the
+                // store exists to stop. So the push says it does not know
+                // (`total: null`) rather than paying for a scan: the window
+                // keeps the count the read gave it, and the next read
+                // replaces it.
+                send('events', {
+                  events: [...store.read(range).events].slice(0, limit),
+                  total: null,
+                });
+                return;
+              }
+              send('events', {
+                events: [...window.events].slice(0, limit),
+                total: window.total,
+              });
+            } catch {
+              // Transient read failure: keep the stream alive.
+            }
+          };
+          const scheduleFeed = (): void => {
+            // The window is gone: nothing to feed, and a timer nobody will
+            // clear.
+            if (closed) return;
+            // Already scheduled: let it fire. Resetting the timer on every
+            // event would starve it.
+            if (feedTimer !== undefined) return;
+            feedTimer = setTimeout(() => {
+              feedTimer = undefined;
+              void pushFeed();
+            }, PROCESS_REFRESH_DEBOUNCE_MS);
+          };
 
           // --- the process table has to hear what happened ------------------
           //
@@ -1113,9 +1274,11 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           // thing that happens schedules a re-read a quarter of a second
           // later, and everything that happens in the meantime rides along
           // with it.
-          let processRefresh: ReturnType<typeof setTimeout> | undefined;
           let refreshSeq = 0;
           const refreshProcesses = (immediate: boolean): void => {
+            // The window is gone: there is no table left to refresh, and a
+            // timer nobody will clear.
+            if (closed) return;
             const run = (): void => {
               const seq = ++refreshSeq;
               void listProcesses(dir, options)
@@ -1145,6 +1308,8 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
           };
 
           const handle = (raw: unknown): void => {
+            // The window is gone: there is nobody to tell.
+            if (closed) return;
             const event = raw as { kind?: string; pid?: number; record?: unknown };
             if (event.kind === 'record') {
               // Something happened to a process: its state may have
@@ -1153,12 +1318,10 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
               // show, because `__state` is how the kernel says a process
               // changed state.
               refreshProcesses(false);
-              const converted = toDashboardEvent(event.record as SyscallRecord, event.pid ?? 0);
-              if (converted === undefined) return;
-              // A frame that was already in the history is not new.
-              if (converted.runId !== undefined && seeded.has(converted.runId)) return;
-              recent = [converted, ...recent].slice(0, limit);
-              send('events', recent);
+              // And the feed has to hear it. The frame is already on the
+              // disk — the recorder writes it before it tells anybody — so
+              // the store can read it now.
+              scheduleFeed();
               return;
             }
             if (event.kind === 'process-start' || event.kind === 'process-exit') {
@@ -1184,7 +1347,39 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             unsubscribe = undefined;
           }
 
+          if (closed) {
+            // The window hung up while the kernel was being asked to follow
+            // it. Give the subscription back: nothing is listening, and a
+            // subscription nobody drops keeps the kernel talking to a window
+            // that is not there.
+            unsubscribe?.();
+            unsubscribe = undefined;
+            return;
+          }
+
           if (unsubscribe !== undefined) {
+            // The kernel can tell the window that it is gone.
+            //
+            // The push stream cannot deliver another frame — the socket it
+            // rides on is gone — and a window that keeps saying 「实时连接」 over
+            // a dead socket is claiming something nobody checked. The
+            // sidebar had already turned red and said 「内核失联」 by then,
+            // while the bar right above it still showed a green light.
+            //
+            // So the stream ends. The window falls back to polling, asks the
+            // kernel again (it will not answer), and says out loud that what
+            // it is showing is what the disk still has.
+            //
+            // This is registered **before** anything is sent: the window
+            // reads the first frame and asks "did the kernel go?" in the
+            // same breath, and a registration that waited for a read to
+            // finish would leave that question unanswered for a moment.
+            options.kernel.onClose?.(() => {
+              if (closed) return;
+              shutdown();
+              response.end();
+            });
+
             // Seed the panel from the disk, so it is not empty when the
             // dashboard opens: the kernel only carries what happens from
             // now on.
@@ -1192,56 +1387,17 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             // The seed comes from the store, which has already read the logs
             // once and follows them from there — so a page that reconnects
             // does not re-read the whole history of every process.
-            await store.refresh(dir);
-            recent = [...store.read({}).events].slice(0, limit);
-            for (const event of recent) {
-              const runId = (event as { runId?: string }).runId;
-              if (runId !== undefined) seeded.add(runId);
-            }
             send('processes', await listProcesses(dir, options));
-            send('events', recent);
+            await pushFeed();
+
+            // The window may have hung up while the seed was still reading.
+            // Nothing below may start a timer for a connection that is gone.
+            if (closed) return;
+
             ready = true;
             for (const raw of held) handle(raw);
 
             heartbeat = setInterval(() => { if (!closed) response.write(': ping\n\n'); }, 15000);
-            // The kernel went away.
-            //
-            // The push stream cannot deliver another frame — the socket it
-            // rides on is gone — and a window that keeps saying 「实时连接」 over
-            // a dead socket is claiming something nobody checked. The
-            // sidebar had already turned red and said 「内核失联」 by then,
-            // while the bar right above it still showed a green light.
-            //
-            // So the stream ends. The window falls back to polling, asks the
-            // kernel again (it will not answer), and says out loud that what
-            // it is showing is what the disk still has.
-            // The kernel went away.
-            //
-            // The push stream cannot deliver another frame — the socket it
-            // rides on is gone — and a window that keeps saying 「实时连接」 over
-            // a dead socket is claiming something nobody checked. The
-            // sidebar had already turned red and said 「内核失联」 by then,
-            // while the bar right above it still showed a green light.
-            //
-            // So the stream ends. The window falls back to polling, asks the
-            // kernel again (it will not answer), and says out loud that what
-            // it is showing is what the disk still has.
-            options.kernel.onClose?.(() => {
-              if (closed) return;
-              closed = true;
-              if (heartbeat !== undefined) clearInterval(heartbeat);
-              if (processRefresh !== undefined) clearTimeout(processRefresh);
-              if (outputTimer !== undefined) clearTimeout(outputTimer);
-              unsubscribe?.();
-              response.end();
-            });
-            request.on('close', () => {
-              closed = true;
-              if (heartbeat !== undefined) clearInterval(heartbeat);
-              if (processRefresh !== undefined) clearTimeout(processRefresh);
-              if (outputTimer !== undefined) clearTimeout(outputTimer);
-              unsubscribe?.();
-            });
             return;
           }
           // No live stream after all: fall through to the disk path.
@@ -1255,14 +1411,34 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
             // every agent — paid again, and again, for the operator's window.
             await store.refresh(dir);
             send('processes', await listProcesses(dir, options));
-            send('events', [...store.read({}).events].slice(0, limit));
+            const window = storeWindow(store, range);
+            if (window === undefined) {
+              send('events', {
+                events: [...store.read(range).events].slice(0, limit),
+                total: null,
+              });
+              return;
+            }
+            // The rows and the count, from one read — the same payload the
+            // live path sends, so the window cannot tell which path it is
+            // being fed by.
+            send('events', {
+              events: [...window.events].slice(0, limit),
+              total: window.total,
+            });
           } catch {
             // Transient read failure: keep the stream alive.
           }
         };
+        // The close handler is already armed above: it was registered before
+        // the first await, so a window that hung up in the meantime still
+        // clears what this path owns.
         void push();
         try {
           watcher = watch(dir, { recursive: true }, (_eventType, filename) => {
+            // The window is gone: a timer created now would outlive the
+            // connection that nothing will ever clear it.
+            if (closed) return;
             // A line was printed: the output panel has to hear it, even
             // though no kernel is pushing anything here.
             const printed = filename === null || filename === undefined
@@ -1279,14 +1455,18 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         } catch {
           // fs.watch (recursive) unsupported on this platform — client falls back.
         }
-        heartbeat = setInterval(() => { if (!closed) response.write(': ping\n\n'); }, 15000);
-        request.on('close', () => {
-          closed = true;
-          if (heartbeat !== undefined) clearInterval(heartbeat);
-          if (debounce !== undefined) clearTimeout(debounce);
-          if (outputTimer !== undefined) clearTimeout(outputTimer);
+        // The window may have hung up while the first read was still going.
+        // A watcher started now would have nobody to close it, and an open
+        // watcher keeps the whole process alive.
+        if (closed) {
           watcher?.close();
-        });
+          watcher = undefined;
+        }
+        // The window may have hung up while the first read was still going.
+        // A heartbeat started now would have nobody to stop it.
+        if (!closed) {
+          heartbeat = setInterval(() => { if (!closed) response.write(': ping\n\n'); }, 15000);
+        }
         return;
       }
       const match = /^\/api\/trace\/(\d+)$/.exec(url.pathname);

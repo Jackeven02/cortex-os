@@ -428,6 +428,10 @@
     let outcomeKnown = false;
     let budgetKnown = false;
     let processData = [];
+    // The events this window is showing: the newest rows, and — when the
+    // operator asked for more — the rows they paged back to. A push used to
+    // **replace** this list, so anything the operator had paged back to was
+    // gone the next time the kernel said something.
     let eventData = [];
 
     function renderProcesses() {
@@ -495,6 +499,48 @@
     function reversibilityLabel(value) {
       if (value === undefined || value === null || value === '') return '—';
       return String(value);
+    }
+
+    // One row's identity.
+    //
+    // The same row must not be shown twice, and the rows this window loaded
+    // have to be recognised in the page the server pushes. The kernel's
+    // frames carry the call id; a callback line carries its run id; a line
+    // that named nothing is identified by what it says and when it said it.
+    function eventKey(event) {
+      const runId = event && typeof event.runId === 'string' ? event.runId : '';
+      if (runId !== '') return `run:${runId}`;
+      const pid = event && typeof event.pid === 'number' ? event.pid : '';
+      const at = event && typeof event.at === 'string' ? event.at : '';
+      const type = event && typeof event.type === 'string' ? event.type : '';
+      const name = event && typeof event.name === 'string' ? event.name : '';
+      return `row:${pid}|${at}|${type}|${name}`;
+    }
+
+    // Merge what the server sent into the window the operator loaded.
+    //
+    // Both are prefixes of one history: the pushed page is the newest rows,
+    // the loaded window is an older slice of the same list. So the merged
+    // window is the pushed rows followed by the loaded rows the pushed page
+    // does not carry — nothing is dropped, nothing is shown twice, and the
+    // order stays newest first.
+    //
+    // `overlap` says whether the two met. When they did not, the server's
+    // page reached past everything this window holds: the rows in between
+    // were never seen, and the window has to ask again rather than show a
+    // gap it cannot see.
+    function mergeEvents(loaded, pushed) {
+      const pushedKeys = new Set(pushed.map(eventKey));
+      const kept = loaded.filter((event) => !pushedKeys.has(eventKey(event)));
+      return { rows: pushed.concat(kept), overlap: kept.length !== loaded.length };
+    }
+
+    // The rows of a page this window does not have yet, in the order the
+    // page gave them — for the page the operator asked to load *more* of,
+    // which is older than what is already on screen.
+    function appendEvents(loaded, page) {
+      const keys = new Set(loaded.map(eventKey));
+      return loaded.concat(page.filter((event) => !keys.has(eventKey(event))));
     }
 
     function renderEvents() {
@@ -646,9 +692,25 @@
     let daemonSummary = '';
     let daemonKernelLive = false;
     let pollTimer = null;
+    // The push stream, and the slow poll that checks it.
+    //
+    // The stream is about one window of the history, so it is opened again
+    // when the window changes — and it is kept here so it can be closed.
+    let streamSource = null;
+    let calibrationTimer = null;
     let opsEnabled = false;
     let opsList = [];
+    // How many rows of the history this window covers, and how many there
+    // are.
+    //
+    // The window covers a **prefix** of the history — the newest rows, then
+    // the ones the operator paged back to — so the count of covered rows is
+    // also the offset the next page starts at.
     let eventsOffset = 0;
+    // How many rows the history holds for the window being shown. It comes
+    // from the server, with the rows: the window used to learn it from a
+    // poll 30 seconds later, so the number under the table was half a
+    // minute stale while the rows above it were live.
     let eventsTotal = 0;
     const EVENTS_PAGE = 100;
 
@@ -917,8 +979,9 @@
       }
     }
 
-    function eventQuery(offset) {
-      const params = new URLSearchParams({ limit: String(EVENTS_PAGE), offset: String(offset) });
+    // The window of the history the page is asking about.
+    function rangeParams() {
+      const params = new URLSearchParams();
       const from = $('eventFrom').value;
       const to = $('eventTo').value;
       if (from) params.set('from', new Date(from).toISOString());
@@ -926,12 +989,87 @@
       return params;
     }
 
-    async function loadEvents(append) {
-      const res = await fetch(`/api/events?${eventQuery(eventsOffset)}`, { cache: 'no-store' });
+    function eventQuery(offset) {
+      const params = new URLSearchParams({ limit: String(EVENTS_PAGE), offset: String(offset) });
+      rangeParams().forEach((value, key) => params.set(key, value));
+      return params;
+    }
+
+    // The same window, for the stream.
+    //
+    // The push has to answer the question the read answers. It did not: the
+    // read took a range and the push ignored it, so a window filtered to one
+    // hour was fed every event in the history and the filter was a
+    // decoration.
+    function rangeQuery() {
+      const text = rangeParams().toString();
+      return text === '' ? '' : `&${text}`;
+    }
+
+    // What the server sent, merged into the window.
+    //
+    // Returns whether the server's page and this window **met**. When they
+    // did not, the rows in between were never seen — the server's page
+    // reached past everything this window holds — and the window keeps what
+    // it has and asks again, rather than showing a gap it cannot see.
+    function applyEvents(rows, total) {
+      const merged = mergeEvents(eventData, rows);
+      const met = merged.overlap || eventData.length === 0;
+      if (met) {
+        eventData = merged.rows;
+        eventsOffset = eventData.length;
+      }
+      if (typeof total === 'number' && Number.isFinite(total)) eventsTotal = total;
+      return met;
+    }
+
+    // The window lost the thread: ask again for the rows it should be
+    // showing, in the pages it was showing them in.
+    async function refillWindow(depth) {
+      try {
+        const rows = [];
+        for (let offset = 0; offset < depth; offset += EVENTS_PAGE) {
+          const res = await fetch(`/api/events?${eventQuery(offset)}`, { cache: 'no-store' });
+          if (!res.ok) throw new Error('事件读取失败');
+          eventsTotal = Number(res.headers.get('x-total-count') ?? 0);
+          const page = await res.json();
+          rows.push(...page);
+        }
+        eventData = rows;
+        eventsOffset = rows.length;
+        applyData();
+      } catch {
+        // The window could not be put back together. What it shows stays
+        // what the server last sent, and the next read tries again.
+      }
+    }
+
+    // A different window of the history: the rows that were loaded belong
+    // to the window that was asked for, not to this one.
+    function resetWindow() {
+      eventData = [];
+      eventsOffset = 0;
+      eventsTotal = 0;
+    }
+
+    async function loadEvents(mode) {
+      // 'more' — the page the operator asked to load more of: older rows,
+      // appended below what is on screen.
+      // 'refresh' — the newest page, **merged** into what is already here.
+      // A read is not a replacement: the rows the operator paged back to
+      // are still rows the operator asked for.
+      const offset = mode === 'more' ? eventsOffset : 0;
+      const res = await fetch(`/api/events?${eventQuery(offset)}`, { cache: 'no-store' });
       if (!res.ok) throw new Error('事件读取失败');
       eventsTotal = Number(res.headers.get('x-total-count') ?? 0);
       const page = await res.json();
-      eventData = append ? eventData.concat(page) : page;
+      if (mode === 'more') {
+        eventData = appendEvents(eventData, page);
+        eventsOffset = eventData.length;
+        return;
+      }
+      const depth = eventsOffset;
+      if (!applyEvents(page, eventsTotal)) await refillWindow(depth);
     }
 
     // What the footer says about how fresh the page is.
@@ -1101,8 +1239,11 @@
         opsList = Array.isArray(opsData.ops) ? opsData.ops : (opsData.allowOps === true ? ['restore'] : []);
         opsEnabled = opsList.length > 0;
         $('spawnBar').hidden = !opsList.includes('spawn');
-        eventsOffset = 0;
-        await loadEvents(false);
+        // A read is a merge, not a replacement. The poll used to reset the
+        // table to the newest page every time — so the rows the operator had
+        // paged back to were gone within thirty seconds, and 「加载更多」 was
+        // a button that bought three seconds.
+        await loadEvents('refresh');
         applyData();
         // The polling fallback has no push to tell it that a line was
         // printed, so it re-reads the output panel while it is on screen.
@@ -1127,9 +1268,24 @@
 
     function startStream() {
       if (typeof EventSource === 'undefined') return false;
-      const source = new EventSource('/api/stream?limit=100');
+      // The stream is about a **window of the history**, so it is asked for
+      // the window the page is showing — and it answers with the rows *and*
+      // the count, so the number under the table is as fresh as the rows
+      // above it.
+      const source = new EventSource(`/api/stream?limit=${EVENTS_PAGE}${rangeQuery()}`);
+      streamSource = source;
       source.addEventListener('processes', (event) => { processData = JSON.parse(event.data); applyData(); });
-      source.addEventListener('events', (event) => { eventData = JSON.parse(event.data); eventsTotal = Math.max(eventsTotal, eventData.length); applyData(); });
+      source.addEventListener('events', (event) => {
+        const payload = JSON.parse(event.data);
+        const rows = payload && Array.isArray(payload.events) ? payload.events : [];
+        const total = payload && typeof payload.total === 'number' ? payload.total : null;
+        const depth = eventsOffset;
+        // A push is a **merge**, not a replacement: the rows the operator
+        // paged back to are still rows the operator asked for, and the
+        // pushed page is the newest slice of the same history.
+        if (!applyEvents(rows, total)) void refillWindow(depth);
+        applyData();
+      });
       // Something was printed. The message says *that* it changed, not *what*
       // was printed — the page re-reads the file, so the window and the log
       // cannot say different things about the same line.
@@ -1153,9 +1309,34 @@
       // connection broke. The window falls back to polling and asks the
       // server again, which asks the kernel again, which does not answer.
       // The top bar then says what is true instead of what was true.
-      source.onerror = () => { source.close(); transport = 'poll'; startPolling(); };
-      setInterval(pollOnce, 30000);
+      source.onerror = () => {
+        source.close();
+        // A stream we already replaced (the window changed) is not a failure:
+        // only the current one may take the window back to polling.
+        if (streamSource !== source) return;
+        streamSource = null;
+        transport = 'poll';
+        startPolling();
+      };
+      if (calibrationTimer === null) calibrationTimer = setInterval(pollOnce, 30000);
       return true;
+    }
+
+    // The window of the history changed, so the stream is about a different
+    // window now and is asked again.
+    //
+    // The rows that were loaded belong to the window that was asked for —
+    // they are dropped here, and the new window is read from the start.
+    // When the window is not being pushed (the stream is gone and the page
+    // is polling), there is no stream to restart: the poll asks with the
+    // new window by itself.
+    function restartStream() {
+      if (transport !== 'sse') return false;
+      if (streamSource !== null) {
+        streamSource.close();
+        streamSource = null;
+      }
+      return startStream();
     }
 
     // One frame in the syscall timeline — the window's second view of the
@@ -1332,11 +1513,15 @@
     $('viewTree').addEventListener('click', () => setProcessView('tree'));
     ['refreshTop', 'refreshPage', 'processRefresh', 'refreshNav'].forEach((id) => $(id).addEventListener('click', pollOnce));
     $('closeDialog').addEventListener('click', () => $('traceDialog').close());
-    $('eventFilter').addEventListener('click', pollOnce);
-    $('eventClear').addEventListener('click', () => { $('eventFrom').value = ''; $('eventTo').value = ''; pollOnce(); });
+    // A different window of the history: the rows that were loaded belong to
+    // the window that was asked for, and the stream is about that window
+    // too — so both are dropped and asked again.
+    $('eventFilter').addEventListener('click', () => { resetWindow(); restartStream(); void pollOnce(); });
+    $('eventClear').addEventListener('click', () => { $('eventFrom').value = ''; $('eventTo').value = ''; resetWindow(); restartStream(); void pollOnce(); });
     $('eventMore').addEventListener('click', async () => {
-      eventsOffset += EVENTS_PAGE;
-      try { await loadEvents(true); renderEvents(); } catch { eventsOffset = Math.max(0, eventsOffset - EVENTS_PAGE); }
+      // The page the operator asked for more of: older rows, below what is
+      // already on screen.
+      try { await loadEvents('more'); renderEvents(); } catch { /* the window stays as it was */ }
     });
     const sectionCopy = {
       overview: ['Agent 总览', '查看进程状态、资源使用和最近的执行记录。'],

@@ -403,6 +403,31 @@ export class ActivityStore {
   }
 
   /**
+   * How many events the store holds for this range.
+   *
+   * The same number {@link ActivityStore.read} would answer with — the count
+   * of the rows, not the rows themselves. A view that only needs the number
+   * (the window's header says how many events there are, and the push says
+   * how many there are now) should not have to build the list to learn how
+   * long it is.
+   *
+   * One measurement, two readers: `count(range)` and `read(range).events.length`
+   * are the same number, because the merge the read does drops nothing.
+   */
+  count(range: TimeRange = {}): number {
+    const filtering = range.from !== undefined || range.to !== undefined;
+    const inRange = (at: number): boolean =>
+      (range.from === undefined || at >= range.from) && (range.to === undefined || at <= range.to);
+    const syscalls = filtering
+      ? this.#syscalls.filter((e) => inRange(e.at)).length
+      : this.#syscalls.length;
+    const callbacks = filtering
+      ? this.#callbacks.filter((e) => inRange(e.at)).length
+      : this.#callbacks.length;
+    return syscalls + callbacks;
+  }
+
+  /**
    * Whether the store holds everything the disk holds for this range.
    *
    * The store keeps the newest {@link MAX_EVENTS} of each kind. A window that

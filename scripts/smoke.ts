@@ -10304,7 +10304,7 @@ type PageFn = (...args: unknown[]) => unknown;
  */
 function pageFunction(
   html: string,
-  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels',
+  name: 'esc' | 'fmtUsd' | 'eventLabel' | 'fmtLocal' | 'callSummary' | 'traceItem' | 'reversibilityLabel' | 'outputItem' | 'checkpointBody' | 'driversBody' | 'nodeLabels' | 'connectionLabels' | 'eventKey' | 'mergeEvents' | 'appendEvents',
   deps?: Readonly<Record<string, PageFn>>,
 ): PageFn {
   const isConst = name === 'esc' || name === 'fmtUsd';
@@ -12710,6 +12710,244 @@ async function runDashboardStoreChecks(): Promise<void> {
       } finally {
         await dash.close();
       }
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+// =============================================================================
+// Dashboard feed checks (#110)
+// =============================================================================
+
+/**
+ * The feed the window keeps.
+ *
+ * A push used to **replace** the event table with the newest page, so an
+ * operator who clicked 加载更多 to read back through the history lost those
+ * pages the next time the kernel said something — and the count under the
+ * table came only from a poll 30 seconds later, so the number was half a
+ * minute stale while the rows above it were live.
+ *
+ * Three things have to hold, and the checks below hold each of them:
+ *
+ *   1. the push carries the **rows and the count together**, measured by the
+ *      same reader the read endpoint uses;
+ *   2. the push answers the **same window** the read answers — the range is
+ *      part of the question, so it travels with the stream;
+ *   3. the page **merges** what the server sends into the window it is
+ *      showing, instead of replacing it.
+ */
+async function runDashboardFeedChecks(): Promise<void> {
+  console.log('\nsmoke check: dashboard feed\n');
+  const { mkdtempSync, rmSync, mkdirSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const tmp = mkdtempSync(join(tmpdir(), 'cortex-dashfeed-'));
+
+  const base = {
+    pid: asProcessId(2),
+    stateBefore: 'running' as const,
+    stateAfter: 'running' as const,
+    reversibility: 'reversible' as const,
+    kernelAbiVersion: KERNEL_ABI_VERSION,
+  };
+
+  /** One event in a real `.crec` under `root`. */
+  const writeEvent = async (root: string, callId: string, at: string): Promise<Recorder> => {
+    const dir = join(root, 'processes', '2');
+    mkdirSync(dir, { recursive: true });
+    const rec = await Recorder.open({ pid: asProcessId(2), dir });
+    await rec.append({
+      ...base,
+      timestamp: at,
+      syscall: 'memory_read',
+      callId,
+      phase: 'exit',
+      durationMs: 1,
+    } as never);
+    return rec;
+  };
+
+  /** The `events` frames of a stream, parsed. */
+  type FeedFrame = { events?: unknown[]; total?: number | null };
+  const readFeedFrames = async (url: string, wanted: number): Promise<FeedFrame[]> => {
+    const res = await fetch(url);
+    assert(res.status === 200, `status ${res.status}`);
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    const frames: FeedFrame[] = [];
+    let text = '';
+    try {
+      const deadline = Date.now() + 5000;
+      while (frames.length < wanted && Date.now() < deadline) {
+        const timer = new Promise<null>((resolve) => setTimeout(() => resolve(null), 200));
+        const chunk = await Promise.race([reader.read(), timer]);
+        if (chunk === null) continue;
+        if (chunk.done) break;
+        text += decoder.decode(chunk.value, { stream: true });
+        let cut = text.indexOf('\n\n');
+        while (cut >= 0) {
+          const frame = text.slice(0, cut);
+          text = text.slice(cut + 2);
+          if (frame.includes('event: events')) {
+            const data = frame
+              .split('\n')
+              .filter((line) => line.startsWith('data: '))
+              .map((line) => line.slice(6))
+              .join('');
+            frames.push(JSON.parse(data) as FeedFrame);
+          }
+          cut = text.indexOf('\n\n');
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+    return frames;
+  };
+
+  try {
+    const root = join(tmp, 'feed');
+    const rec = await writeEvent(root, 'c1', '2026-09-28T00:00:01.000Z');
+    await rec.append({
+      ...base,
+      timestamp: '2026-09-28T00:00:02.000Z',
+      syscall: 'memory_read',
+      callId: 'c2',
+      phase: 'exit',
+      durationMs: 1,
+    } as never);
+    await rec.close();
+
+    const dash = await startDashboard({ dir: root, port: 0 });
+    try {
+      await checkAsync('the push carries the rows and the count together', async () => {
+        const frames = await readFeedFrames(`${dash.url}/api/stream?limit=10`, 1);
+        assert(frames.length === 1, `the stream pushed a frame, got ${frames.length}`);
+        const frame = frames[0]!;
+        assert(Array.isArray(frame.events), `the push carries the rows, got ${JSON.stringify(frame)}`);
+        assert(typeof frame.total === 'number', `the push carries the count, got ${JSON.stringify(frame)}`);
+        assert(frame.events!.length === 2, `the push carries both events, got ${frame.events!.length}`);
+        assert(frame.total === 2, `the count is how many events there are, got ${frame.total}`);
+        // The read endpoint reports the same number — one fact, one answer.
+        const res = await fetch(`${dash.url}/api/events?limit=10`);
+        const readTotal = Number(res.headers.get('x-total-count') ?? 0);
+        assert(
+          readTotal === frame.total,
+          `the push and the read report one count: push=${frame.total} read=${readTotal}`,
+        );
+      });
+
+      await checkAsync('the push answers the window the read answers', async () => {
+        // The window is part of the question. The read takes a range; the
+        // push used to ignore it, so a window filtered to one hour was fed
+        // every event in the history and the filter was a decoration.
+        const frames = await readFeedFrames(
+          `${dash.url}/api/stream?limit=10&from=2026-09-28T00:00:02.000Z&to=2026-09-28T00:00:03.000Z`,
+          1,
+        );
+        assert(frames.length === 1, `the stream pushed a frame, got ${frames.length}`);
+        const frame = frames[0]!;
+        assert(
+          frame.events!.length === 1,
+          `the push answered the window it was asked about, got ${frame.events!.length} rows`,
+        );
+        assert(frame.total === 1, `the count is the window's count, got ${frame.total}`);
+        const res = await fetch(
+          `${dash.url}/api/events?limit=10&from=2026-09-28T00:00:02.000Z&to=2026-09-28T00:00:03.000Z`,
+        );
+        const readTotal = Number(res.headers.get('x-total-count') ?? 0);
+        assert(
+          readTotal === frame.total,
+          `the push and the read agree on the window: push=${frame.total} read=${readTotal}`,
+        );
+      });
+
+      const html = await (await fetch(`${dash.url}/`)).text();
+
+      await checkAsync('the page keeps the rows the operator loaded', async () => {
+        // The pushed page and the loaded window are two slices of one
+        // history. The page merges them: the rows the operator paged back
+        // to are still rows the operator asked for.
+        const eventKey = pageFunction(html, 'eventKey');
+        const mergeEvents = pageFunction(html, 'mergeEvents', { eventKey });
+        const row = (id: string, at: string): Record<string, unknown> => ({
+          runId: id,
+          at,
+          type: 'kernel.memory_read',
+          pid: 2,
+        });
+        const loaded = [row('b', '2026-09-28T00:00:02.000Z'), row('a', '2026-09-28T00:00:01.000Z')];
+        // The push carries a **deeper** window than the one on screen — the
+        // newest rows, two of which the window already has and one of which
+        // it has not. A window that *replaced* what it had would lose the
+        // row the operator paged back to.
+        const pushed = [
+          row('d', '2026-09-28T00:00:04.000Z'),
+          row('c', '2026-09-28T00:00:03.000Z'),
+          row('b', '2026-09-28T00:00:02.000Z'),
+        ];
+        const merged = mergeEvents(loaded, pushed) as { rows: Array<{ runId?: string }>; overlap: boolean };
+        assert(merged.overlap === true, 'the two windows met');
+        assert(merged.rows.length === 4, `the merged window has 4 rows, got ${merged.rows.length}`);
+        assert(merged.rows[0]?.runId === 'd', 'the newest row is first');
+        assert(merged.rows[2]?.runId === 'b', 'a row both windows carry is shown once');
+        assert(merged.rows[3]?.runId === 'a', 'the row the operator loaded is still there');
+      });
+
+      await checkAsync('the page says when the two windows did not meet', async () => {
+        // The server's page reached past everything the window holds: the
+        // rows in between were never seen. The page must notice — a window
+        // that shows a gap it cannot see is showing a history that never
+        // happened.
+        const eventKey = pageFunction(html, 'eventKey');
+        const mergeEvents = pageFunction(html, 'mergeEvents', { eventKey });
+        const row = (id: string, at: string): Record<string, unknown> => ({ runId: id, at, type: 'kernel.memory_read', pid: 2 });
+        const merged = mergeEvents(
+          [row('z', '2026-09-28T00:00:09.000Z')],
+          [row('c', '2026-09-28T00:00:03.000Z')],
+        ) as { overlap: boolean };
+        assert(merged.overlap === false, 'the gap is noticed');
+      });
+
+      await checkAsync('the page puts the older rows below, not above', async () => {
+        // 「加载更多」 asks for rows that are **older** than what is on
+        // screen. A page that put them on top would show the history
+        // backwards.
+        const eventKey = pageFunction(html, 'eventKey');
+        const appendEvents = pageFunction(html, 'appendEvents', { eventKey });
+        const row = (id: string, at: string): Record<string, unknown> => ({ runId: id, at, type: 'kernel.memory_read', pid: 2 });
+        const loaded = [row('b', '2026-09-28T00:00:02.000Z'), row('a', '2026-09-28T00:00:01.000Z')];
+        const appended = appendEvents(loaded, [row('z', '2026-09-28T00:00:00.500Z')]) as Array<{ runId?: string }>;
+        assert(appended.length === 3, `the older page was added, got ${appended.length} rows`);
+        assert(appended[2]?.runId === 'z', 'the older row is at the bottom');
+      });
+
+      await checkAsync('the page does not replace the window with what the server sends', async () => {
+        // The wiring. The page used to do exactly this: `eventData =
+        // JSON.parse(event.data)` — the pushed page *was* the table, and
+        // whatever the operator had paged back to was gone.
+        assert(html.includes('mergeEvents'), 'the page merges what the server sends');
+        assert(!html.includes('eventData = JSON.parse'), 'the page does not replace the window with the pushed page');
+        assert(html.includes('rangeQuery()'), 'the stream asks for the window the page is showing');
+      });
+    } finally {
+      await dash.close();
+    }
+
+    await checkAsync('the store counts the rows it holds', async () => {
+      // The count the push carries and the rows it carries come from the
+      // same read, so the number a view shows and the rows behind it are
+      // one measurement.
+      const store = new ActivityStore();
+      await store.refresh(root);
+      assert(
+        store.count({}) === store.read({}).events.length,
+        `the count is the number of rows the read gives: ${store.count({})} vs ${store.read({}).events.length}`,
+      );
+      const ranged = store.count({ from: Date.parse('2026-09-28T00:00:02.000Z') });
+      assert(ranged === 1, `the count answers for the window, got ${ranged}`);
     });
   } finally {
     rmSync(tmp, { recursive: true, force: true });
@@ -19208,6 +19446,45 @@ function lastTransitionOf(sse: string, pid: number): string | undefined {
   return all[all.length - 1];
 }
 
+/**
+ * Watch the repeating timers the dashboard opens.
+ *
+ * The dashboard keeps one repeating timer per open stream: the heartbeat
+ * that keeps the connection warm. A timer created for a window that is
+ * **already gone** has nobody left to stop it — it keeps the whole process
+ * alive, and the run that started it never ends.
+ *
+ * The dashboard is the only thing in the tree that opens a repeating timer,
+ * so counting them is enough to see whether one was left behind. The stack
+ * is what tells the dashboard's timers apart from anyone else's.
+ */
+function watchDashboardIntervals(): { pending: () => number; restore: () => void } {
+  const open = new Set<unknown>();
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  const fromDashboard = (): boolean => /dashboard[\\/]server/.test(new Error().stack ?? '');
+  globalThis.setInterval = ((
+    fn: (...args: unknown[]) => void,
+    ms?: number,
+    ...rest: unknown[]
+  ): unknown => {
+    const handle = realSetInterval(fn as never, ms as never, ...(rest as never[]));
+    if (fromDashboard()) open.add(handle);
+    return handle;
+  }) as unknown as typeof globalThis.setInterval;
+  globalThis.clearInterval = ((handle: unknown): void => {
+    open.delete(handle);
+    (realClearInterval as (h: unknown) => void)(handle);
+  }) as unknown as typeof globalThis.clearInterval;
+  return {
+    pending: () => open.size,
+    restore: () => {
+      globalThis.setInterval = realSetInterval;
+      globalThis.clearInterval = realClearInterval;
+    },
+  };
+}
+
 async function runDashboardLiveChecks(): Promise<void> {
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { join } = await import('node:path');
@@ -19215,10 +19492,12 @@ async function runDashboardLiveChecks(): Promise<void> {
   const tmp = mkdtempSync(join(tmpdir(), 'cortex-dashlive-'));
   const kernels: Kernel[] = [];
   const servers: { close: () => Promise<void> }[] = [];
+  const clients: KernelClient[] = [];
 
   const prevHome = process.env['CORTEX_HOME'];
   const prevLog = console.log;
   const prevErr = console.error;
+  const intervals = watchDashboardIntervals();
 
   try {
     const kernel = await bootKernel({
@@ -19280,6 +19559,10 @@ async function runDashboardLiveChecks(): Promise<void> {
     const probe = await probeKernel(tmp);
     assert(probe.kind === 'live', `probe finds the kernel, got ${probe.kind}`);
     const client = probe.kind === 'live' ? probe.client : undefined;
+    // The client holds a socket open. Without closing it the run prints its
+    // summary and then **lingers** — the socket keeps the event loop alive,
+    // and a test run that does not end is a test run nobody runs.
+    clients.push(client!);
 
     const dash = await startDashboard({ dir: tmp, port: 0, kernel: client! });
     try {
@@ -19463,6 +19746,57 @@ async function runDashboardLiveChecks(): Promise<void> {
         }
       });
 
+      await checkAsync('the live push carries the rows and the count together', async () => {
+        // The same payload as the disk path: the rows **and** the count,
+        // measured by the same reader. A window that is pushed to has to be
+        // able to say how many events there are without waiting for the next
+        // poll — otherwise the number under the table is half a minute
+        // stale while the rows above it are live.
+        const res = await fetch(`${dash.url}/api/stream?limit=50`);
+        assert(res.status === 200, `status ${res.status}`);
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let text = '';
+        try {
+          const deadline = Date.now() + 5000;
+          let payload: { events?: unknown[]; total?: number | null } | undefined;
+          while (payload === undefined && Date.now() < deadline) {
+            const timer = new Promise<null>((resolve) => setTimeout(() => resolve(null), 200));
+            const chunk = await Promise.race([reader.read(), timer]);
+            if (chunk === null) continue;
+            if (chunk.done) break;
+            text += decoder.decode(chunk.value, { stream: true });
+            const frame = text.split('\n\n').find((part) => part.includes('event: events'));
+            if (frame === undefined) continue;
+            const data = frame
+              .split('\n')
+              .filter((line) => line.startsWith('data: '))
+              .map((line) => line.slice(6))
+              .join('');
+            payload = JSON.parse(data) as { events?: unknown[]; total?: number | null };
+          }
+          assert(payload !== undefined, `the stream pushed a frame, got: ${text.slice(0, 300)}`);
+          assert(Array.isArray(payload!.events), `the push carries the rows, got ${JSON.stringify(payload)}`);
+          assert(typeof payload!.total === 'number', `the push carries the count, got ${JSON.stringify(payload)}`);
+          // The count covers the rows it came with: the number under the
+          // table can never be smaller than the rows above it.
+          assert(
+            payload!.total! >= payload!.events!.length,
+            `the count covers the rows: count=${payload!.total} rows=${payload!.events!.length}`,
+          );
+          // And it never goes backwards: the read is at least as fresh as
+          // the push, so it cannot report fewer events than the push did.
+          const read = await fetch(`${dash.url}/api/events?limit=50`);
+          const readTotal = Number(read.headers.get('x-total-count') ?? 0);
+          assert(
+            readTotal >= payload!.total!,
+            `the count does not go backwards: push=${payload!.total} read=${readTotal}`,
+          );
+        } finally {
+          await reader.cancel().catch(() => undefined);
+        }
+      });
+
       await checkAsync('the dashboard shows the history of a process that is still running', async () => {
         const pid = await kernel.spawn({
           role: 'historian',
@@ -19591,17 +19925,21 @@ async function runDashboardLiveChecks(): Promise<void> {
         // never run again looked exactly like one that was merely waiting. The
         // label comes from the server, which uses the same rule `cortex ps`
         // and `cortex top` print.
+        console.error('[probe] before spawn');
         await kernel.spawn({
           role: 'dry',
           agent: { module: 'test:dry', args: { mode: 'ok' } },
           budgets: { tokens: -1, usd: -1, wallTimeMs: 0 },
         });
+        console.error('[probe] after spawn');
         await new Promise((resolve) => setTimeout(resolve, 100));
+        console.error('[probe] after sleep');
 
         const dry = kernel.table.list().find((info) => info.role === 'dry');
         assert(dry !== undefined, 'the process is in the table');
 
         const res = await fetch(`${dash.url}/api/processes`);
+        console.error('[probe] after fetch');
         assert(res.status === 200, `status ${res.status}`);
         const rows = (await res.json()) as Array<Record<string, unknown>>;
         const row = rows.find((r) => r['pid'] === unbrand(dry!.pid));
@@ -19741,9 +20079,30 @@ async function runDashboardLiveChecks(): Promise<void> {
       await dash.close();
       client?.close();
     }
+
+    await checkAsync('the dashboard leaves no timer behind when its window is gone', async () => {
+      // The heartbeat is the dashboard's only repeating timer, and it exists
+      // to keep an open window warm. When the window is gone there is
+      // nothing to keep warm — and a timer that nobody stops keeps the
+      // whole process alive: the smoke would print its summary and then
+      // hang there forever, and a test run that does not end is a test run
+      // nobody runs.
+      //
+      // The last check above closes the dashboard while a stream is still
+      // open, which is exactly the moment the bug used to hide in: the
+      // window hung up while the seed was still reading the disk, and the
+      // heartbeat was created a moment too late — for a connection that was
+      // already closed.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert(
+        intervals.pending() === 0,
+        `the dashboard left ${intervals.pending()} repeating timer(s) behind`,
+      );
+    });
   } finally {
     console.log = prevLog;
     console.error = prevErr;
+    intervals.restore();
     for (const server of servers) {
       try {
         await server.close();
@@ -19754,6 +20113,13 @@ async function runDashboardLiveChecks(): Promise<void> {
     for (const k of kernels) {
       try {
         await k.shutdown();
+      } catch {
+        /* teardown is best-effort */
+      }
+    }
+    for (const client of clients) {
+      try {
+        client.close();
       } catch {
         /* teardown is best-effort */
       }
@@ -23718,6 +24084,7 @@ await runLLMTapChecks();
 await runWrapChecks();
 await runDashboardChecks();
 await runDashboardStoreChecks();
+await runDashboardFeedChecks();
 await runDashboardLiveChecks();
 await runAttachPushChecks();
 await runFsChecks();
@@ -23749,3 +24116,19 @@ await runRecordChecks();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
+
+// If the run does not end, say what is holding it open.
+//
+// The timer is unref'd: it never keeps the process alive by itself, so a
+// run that ends normally never prints anything — and a run that lingers
+// names the handle that is keeping it, instead of just hanging there.
+// A test run that does not end is a test run nobody runs.
+//
+// The threshold is well past what a normal run takes (about a minute for
+// the whole run, tail included), so this only ever fires on a run that is
+// genuinely stuck.
+const linger = setTimeout(() => {
+  const resources = (process as unknown as { getActiveResourcesInfo?: () => string[] }).getActiveResourcesInfo?.() ?? [];
+  console.error(`[still running] holding: ${resources.join(', ')}`);
+}, 120000);
+(linger as unknown as { unref?: () => void }).unref?.();
