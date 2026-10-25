@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 847 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 850 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -420,6 +420,8 @@ The uptime it shows is real, too. The kernel's `ping` used to answer "I started 
 So the bar asks, too. The server answers with what it checked: the kernel's state, and how much to believe the numbers on the screen — `live` (a kernel is behind them), `warn` (they are the disk's records), `dead` (the kernel is gone and this is what the disk still has). The words and the meaning live in one module, so the page prints what it is given. The one fact the server cannot check for itself is **how the window is fetching** — a pushed stream or a poll — because that is a fact about the *window*, so the window says which one it is doing when it asks.
 
 And the push **ends** when the kernel goes away: a stream left open over a dead socket delivers nothing and looks exactly like a healthy one. So the window falls back to polling, asks the kernel again (it will not answer), and says out loud that what it is showing is what the disk still has.
+
+**And the window says what the supervisor did.** The kernel records every supervisory decision in **init's own log** — the supervision journal: a daemon was registered; an attempt died; the supervisor started a new one; the supervisor gave up. And the window dropped **all** of it, because the feed's rule was "the kernel's own `__`-prefixed frames are not the agent's work" — right for the per-process bookkeeping, wrong for a journal of decisions. So a daemon crashing three times looked like a daemon nobody was helping: the supervisor had restarted it twice and then deliberately given up, and the window said nothing. Now it says: `daemon crasher restarted as pid 3 (attempt 1, previous exit: boom)`, `pid 2 reaped (exit 3: boom) -> restarted as pid 3`, `daemon crasher not restarted -> max restarts reached (2) after 2 restart(s)`.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

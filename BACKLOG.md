@@ -1682,6 +1682,74 @@ The user-facing surface. Should feel like a real OS shell.
   (newest first, de-duplicated by run id), and to carry the total in the push
   itself rather than waiting for the poll.
 
+- [x] **#111** The window dropped every supervisory decision the kernel had
+  made → **fixed.**
+  The kernel records every supervisory decision in **init's own log** — the
+  supervision journal (PROCESS.md §9.1, ABI.md §6.1): a daemon was registered;
+  an attempt died; the supervisor started a new one; the supervisor gave up;
+  the kernel booted; the kernel shut down. Each is a `__init` frame, carrying
+  the decision in its `action` and the details in its `args`.
+
+  And the window dropped **all** of it. The activity feed's rule was *"the
+  kernel's own `__`-prefixed frames are not the agent's work"* — right for the
+  per-process bookkeeping (`__state`, `__sched`, `__signal`, which restate what
+  a process's own row already says) and wrong for init's journal, which is a
+  record of **decisions**.
+
+  So an operator's window showed a daemon crashing three times and said nothing
+  about the fact that the supervisor had restarted it twice and then
+  deliberately given up. Found by running it: a crashing daemon under a live
+  kernel, and the feed held three `kernel.exit` rows and not one word about
+  the supervisor.
+
+  The rule is the sharper one now: the **bookkeeping** stays out, the
+  **journal** comes in. The decisions arrive as `kernel.supervision` events
+  whose `name` is the sentence: `daemon crasher restarted as pid 3 (attempt 1,
+  previous exit: boom)`, `pid 2 reaped (exit 3: boom) -> restarted as pid 3`,
+  `daemon crasher not restarted -> max restarts reached (2) after 2 restart(s)`.
+
+  The wording lives in one module (`src/cli/supervision_view.ts`), so the
+  terminal and the window cannot disagree about what the supervisor did — and
+  an action nobody knows is **not** turned into a fact: guessing what a
+  decision meant is how a view starts lying.
+
+  **3 new smoke checks** (847 → 850), reverse-verified: with the journal
+  dropped again, the feed check fails; with the sentence no longer naming the
+  pid, the view check and the feed check fail; with the page no longer marking
+  the kind, the page check fails.
+
+  Browser-verified on a real window over a real crashing daemon: the feed
+  reads, top to bottom — registered; attempt 1 died and was restarted as pid 3;
+  attempt 2 died and was restarted as pid 4; attempt 3 died and was **not**
+  restarted, because the cap was reached.
+
+  Docs: ARCHITECTURE (the window says what the supervisor did);
+  INTEGRATIONS (the feed); CHANGELOG.
+
+- [ ] **#112** `cortex daemon list` reports the installation, not the daemon →
+  **open.**
+  The command prints the **spec** — name, role, restart policy, agent — read
+  from `daemons.json`. It is the install receipt, and it reads like the truth
+  about the daemon: an operator who runs it cannot tell whether the daemon is
+  running, whether it is flapping, whether the kernel already gave up on it, or
+  whether it was never started at all.
+
+  The kernel knows all of that — init holds each logical daemon, its current
+  pid, its restart count and its last exit — and none of it is on the way out.
+  `cortex daemon run` prints the decisions live (it is the host that drives
+  them), but a *dashboard* watching the same directory, and a `daemon list` run
+  from another terminal, hear nothing.
+
+  The fix has a wrinkle worth deciding first: the kernel's daemon record knows
+  the **role**, not the **name** the operator installed it under (the name
+  lives in `daemons.json`), so the two lists have no join key but the role.
+  Either the kernel learns the name (`DaemonSpec` is internal to init, so
+  this is not an ABI change), or the view joins on the role and says so when
+  two daemons share one. Then the live state reaches the CLI the way it
+  reached the window: as a read (`Kernel.daemons()`, then a `daemons` transport
+  command, like `ps` and `drivers`), so no view has to rebuild what the kernel
+  already holds.
+
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 
 ---

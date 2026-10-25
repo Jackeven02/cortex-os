@@ -249,7 +249,7 @@ npx cortex-agent-os help
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # 回落到确定性的 mock 驱动
-npx tsx scripts/smoke.ts                # 847 项断言，0 失败
+npx tsx scripts/smoke.ts                # 850 项断言，0 失败
 ```
 
 > **npm 上的包名是 `cortex-agent-os`，不是 `cortex-os`。** npm 认为后者与已存在的 `cortexos` 太相似而拒绝上架 —— 两者去掉标点后完全相同。仓库名没变，命令名也没变：你敲的仍然是 `cortex`。
@@ -408,6 +408,8 @@ $ cortex dashboard --ops spawn,kill,restore   # 允许这三个操作
 现在顶栏也问。服务端答的是它**核对过**的东西：内核的状态，以及屏幕上的数字该信几分——`live`（背后有内核）、`warn`（这些是磁盘上的记录）、`dead`（内核没了，这是磁盘还剩的）。措辞和含义都在一个模块里，页面只负责照着印。服务端唯一核对不了的是**窗口自己怎么取数**（推送还是轮询），因为那是关于窗口的事实，所以窗口在问的时候顺便说明。
 
 而且内核一死，推送就**结束**：一条挂在死 socket 上的流什么都送不出来，看上去和健康的一模一样。所以窗口会退回轮询、重新问内核（问不到），然后直说：现在看到的是磁盘上还剩的东西。
+
+**而且大屏说得出内核做了什么监管决定。** 内核把自己的每一个监管决定都记在 **init 自己的日志** 里——那是监管日志：注册了一个守护进程；一次尝试死了；监管器拉起了新的一个；监管器放弃了。窗口以前把这些**全丢了**，因为 feed 的规则是「内核自己的 `__` 前缀帧不是 agent 的工作」——对逐进程的记账帧是对的，对一份记着**决定**的日志是错的。于是守护进程连崩三次，看上去像没人管它：监管器其实重启了它两次、然后主动放弃，窗口一个字都没说。现在它说了：`daemon crasher restarted as pid 3 (attempt 1, previous exit: boom)`、`pid 2 reaped (exit 3: boom) -> restarted as pid 3`、`daemon crasher not restarted -> max restarts reached (2) after 2 restart(s)`。
 
 三个会改状态的操作都要显式授权，因为它们确实需要 boot 一个真内核去干活：
 

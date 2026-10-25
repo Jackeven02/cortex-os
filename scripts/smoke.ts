@@ -259,6 +259,8 @@ import {
 } from '../src/cli/audit_view.js';
 import { describeKernel, formatKernelLine } from '../src/cli/kernel_view.js';
 import { describeConnection } from '../src/dashboard/connection_view.js';
+import { describeSupervision, formatSupervision, SUPERVISION_ACTIONS } from '../src/cli/supervision_view.js';
+import { INIT_ACTIONS } from '../src/kernel/init.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
@@ -12142,6 +12144,169 @@ async function runDashboardChecks(): Promise<void> {
             body.includes("$('navEventCount').textContent = eventTotal;"),
             'and the badge counts the same number',
           );
+        } finally {
+          await dash.close();
+        }
+      });
+
+      // The kernel records every supervisory decision in init's journal, and
+      // the feed used to drop all of it.
+      await checkAsync('the supervision view says what each decision was', async () => {
+        // The kernel records six kinds of decision; the view has to know all
+        // of them, or a decision would be made and never said.
+        assert(
+          INIT_ACTIONS.length === SUPERVISION_ACTIONS.length &&
+            INIT_ACTIONS.every((action) => SUPERVISION_ACTIONS.includes(action)),
+          `the view knows every action the kernel records: ${INIT_ACTIONS.join(', ')}`,
+        );
+        const record = (args: Record<string, unknown>): SyscallRecord => ({
+          byteOffset: 0,
+          timestamp: '2026-10-01T00:00:00.000Z',
+          pid: asProcessId(1),
+          syscall: '__init',
+          callId: 'init-x-0',
+          phase: 'exit',
+          args,
+          stateBefore: 'running',
+          stateAfter: 'running',
+          reversibility: 'idempotent',
+          kernelAbiVersion: KERNEL_ABI_VERSION,
+        } as unknown as SyscallRecord);
+
+        const restart = describeSupervision(record({
+          action: 'restart', daemonId: 2, newPid: 3, role: 'crasher', restartCount: 1, prevExitReason: 'boom',
+        }));
+        assert(restart !== undefined, 'the restart was read');
+        assert(restart!.role === 'crasher', `the role, got ${String(restart!.role)}`);
+        assert(restart!.newPid === 3, `the new pid, got ${String(restart!.newPid)}`);
+        assert(restart!.attempt === 1, `the attempt, got ${String(restart!.attempt)}`);
+        assert(restart!.previousExitReason === 'boom', `the previous exit, got ${String(restart!.previousExitReason)}`);
+        const sentence = formatSupervision(restart!);
+        assert(sentence.includes('restarted as pid 3'), `the sentence says what happened, got: ${sentence}`);
+        assert(sentence.includes('boom'), `and why the previous attempt ended, got: ${sentence}`);
+
+        // The reap that ties the dead process to its replacement.
+        const reap = describeSupervision(record({
+          action: 'reap', pid: 2, exitCode: 3, exitReason: 'boom', restarted: 3, reaped: true, reparented: [], sigchld: false,
+        }));
+        assert(reap !== undefined, 'the reap was read');
+        assert(reap!.newPid === 3, `the replacement, got ${String(reap!.newPid)}`);
+        assert(reap!.exitCode === 3, `the exit code, got ${String(reap!.exitCode)}`);
+        const reapSentence = formatSupervision(reap!);
+        assert(reapSentence.includes('pid 2'), `the dead pid is named, got: ${reapSentence}`);
+        assert(reapSentence.includes('restarted as pid 3'), `and what replaced it, got: ${reapSentence}`);
+
+        // The give-up: the decision an operator most needs to hear.
+        const gaveUp = describeSupervision(record({
+          action: 'restart-gave-up', daemonId: 2, role: 'crasher', reason: 'max-restarts', restartCount: 2, maxRestarts: 2,
+        }));
+        assert(gaveUp !== undefined, 'the give-up was read');
+        assert(
+          formatSupervision(gaveUp!).includes('max restarts'),
+          `the give-up says why, got: ${formatSupervision(gaveUp!)}`,
+        );
+        // A storm is a different reason, and it says so.
+        const storm = describeSupervision(record({
+          action: 'restart-gave-up', daemonId: 2, role: 'crasher', reason: 'restart-storm', count: 3, windowMs: 60000,
+        }));
+        assert(storm !== undefined, 'the storm was read');
+        assert(
+          formatSupervision(storm!).includes('restart storm'),
+          `the storm says why, got: ${formatSupervision(storm!)}`,
+        );
+        // An action nobody knows is **not** turned into a fact: guessing what
+        // a decision meant is how a view starts lying.
+        assert(
+          describeSupervision(record({ action: 'something-new' })) === undefined,
+          'an unknown action is not read',
+        );
+        // And a frame that is not init's is not a supervision decision.
+        assert(
+          describeSupervision({ ...record({ action: 'restart' }), syscall: '__state' } as SyscallRecord) === undefined,
+          'a state frame is not a decision',
+        );
+      });
+
+      await checkAsync('the window says what the supervisor decided', async () => {
+        // The feed's rule was "the kernel's own `__` frames are not the
+        // agent's work" — right for the per-process bookkeeping, wrong for
+        // init's journal, which is a record of **decisions**. So the operator
+        // saw a daemon crashing three times and never heard that the
+        // supervisor restarted it and then gave up.
+        const dir = await mkdtemp(join(tmpdir(), 'cortex-smoke-supervision-'));
+        try {
+          const rec = await Recorder.open({ pid: asProcessId(1), dir: join(dir, 'processes', '1') });
+          const base = {
+            pid: asProcessId(1),
+            stateBefore: 'running' as const,
+            stateAfter: 'running' as const,
+            reversibility: 'idempotent' as const,
+            kernelAbiVersion: KERNEL_ABI_VERSION,
+          };
+          await rec.append({ ...base, timestamp: '2026-10-01T00:00:00.000Z', syscall: '__init', callId: 'init-boot-0', phase: 'exit', args: { action: 'boot', pid: 1 } });
+          await rec.append({ ...base, timestamp: '2026-10-01T00:00:01.000Z', syscall: '__init', callId: 'init-register-daemon-1', phase: 'exit', args: { action: 'register-daemon', daemonId: 2, role: 'crasher', restart: 'on-failure', wakeOn: [] } });
+          await rec.append({ ...base, timestamp: '2026-10-01T00:00:02.000Z', syscall: '__init', callId: 'init-restart-2', phase: 'exit', args: { action: 'restart', daemonId: 2, newPid: 3, role: 'crasher', restartCount: 1, prevExitReason: 'boom' } });
+          await rec.append({ ...base, timestamp: '2026-10-01T00:00:03.000Z', syscall: '__init', callId: 'init-restart-gave-up-3', phase: 'exit', args: { action: 'restart-gave-up', daemonId: 2, role: 'crasher', reason: 'max-restarts', restartCount: 2, maxRestarts: 2 } });
+          // A per-process bookkeeping frame: still not the agent's work.
+          await rec.append({ ...base, timestamp: '2026-10-01T00:00:04.000Z', syscall: '__state', callId: 'st-1', phase: 'exit', args: { from: 'running', to: 'blocked', trigger: 'recv' } });
+          await rec.close();
+
+          const sup = await startDashboard({ dir, port: 0 });
+          try {
+            const res = await fetch(`${sup.url}/api/events?limit=50`);
+            assert(res.status === 200, `status ${res.status}`);
+            const events = (await res.json()) as Array<Record<string, unknown>>;
+            const supervision = events.filter((event) => event['type'] === 'kernel.supervision');
+            assert(
+              supervision.length === 4,
+              `the four decisions are in the feed, got ${supervision.length}`,
+            );
+            const names = supervision.map((event) => String(event['name'] ?? ''));
+            assert(
+              names.some((name) => name.includes('restarted as pid 3')),
+              `the restart is said, got ${JSON.stringify(names)}`,
+            );
+            assert(
+              names.some((name) => name.includes('max restarts')),
+              `the give-up is said, got ${JSON.stringify(names)}`,
+            );
+            // And the bookkeeping frame is still out of the feed.
+            assert(
+              events.length === 4,
+              `and nothing else came in, got ${events.length} events`,
+            );
+          } finally {
+            await sup.close();
+          }
+        } finally {
+          await rm(dir, { recursive: true, force: true });
+        }
+      });
+
+      await checkAsync('the page marks a supervision decision as one', async () => {
+        const dash = await startDashboard({ dir: tmp, port: 0 });
+        try {
+          const html = await (await fetch(`${dash.url}/`)).text();
+          const esc = pageFunction(html, 'esc');
+          const eventLabel = pageFunction(html, 'eventLabel');
+          assert(
+            String(eventLabel({ type: 'kernel.supervision' })) === '监管',
+            `the supervision kind, got ${String(eventLabel({ type: 'kernel.supervision' }))}`,
+          );
+          assert(
+            String(eventLabel({ type: 'kernel.exit' })) === 'Agent',
+            'and the other kinds are unchanged',
+          );
+          // And the row renders it: the sentence is the name cell.
+          const row = renderDashboardEventRow(html, {
+            type: 'kernel.supervision',
+            at: '2026-10-01T00:00:02.000Z',
+            pid: 1,
+            name: 'daemon crasher restarted as pid 3 (attempt 1, previous exit: boom)',
+          });
+          assert(row.includes('监管'), `the row says what kind it is, got: ${row}`);
+          assert(row.includes('restarted as pid 3'), `and what happened, got: ${row}`);
+          assert(esc('a & b') === 'a &amp; b', 'the escaper still works');
         } finally {
           await dash.close();
         }

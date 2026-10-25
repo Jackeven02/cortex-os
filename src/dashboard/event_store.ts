@@ -44,6 +44,7 @@ import { existingCrecPath, LogTail } from '../kernel/recorder.js';
 import { asProcessId, type Reversibility, type SyscallRecord } from '../kernel/types.js';
 import { listProcDirs, readAllMetas } from '../cli/process_store.js';
 import { callUsage } from '../token_usage.js';
+import { describeSupervision, formatSupervision } from '../cli/supervision_view.js';
 
 /**
  * How many events of each kind the store keeps.
@@ -153,9 +154,40 @@ export function safeErrorMessage(message: string): string {
  * Two rules, and they are the same rules the log view uses: a call's `enter`
  * frame is not an event (the `exit` frame is), and the kernel's own
  * `__`-prefixed bookkeeping frames are not the agent's work.
+ *
+ * **Except init's journal.** The bookkeeping frames (`__state`, `__sched`,
+ * `__signal`) restate what a process's own row already says, so they stay
+ * out. But `__init` is not bookkeeping: it is the **supervision journal** —
+ * the record of the kernel's decisions (docs/PROCESS.md §9.1). A daemon was
+ * registered; an attempt died; the supervisor started a new one; the
+ * supervisor gave up.
+ *
+ * And the feed dropped all of it, so the operator's window showed a daemon
+ * crashing three times and said nothing about the fact that the supervisor
+ * had restarted it twice and then deliberately given up. The decisions were
+ * made, they were recorded, and they reached nobody.
  */
 export function toActivityEvent(record: SyscallRecord, pid: number): ActivityEvent | undefined {
-  if (record.phase === 'enter' || record.syscall.startsWith('__')) return undefined;
+  if (record.phase === 'enter') return undefined;
+  if (record.syscall === '__init') {
+    const facts = describeSupervision(record);
+    if (facts === undefined) return undefined;
+    return {
+      type: 'kernel.supervision',
+      at: record.timestamp,
+      runId: record.callId,
+      // The log that carried the frame — init's. The decision was init's, and
+      // the feed drops a process's events when that process's log goes away;
+      // init's log does not go away.
+      pid,
+      // The sentence that says what was decided, from the module that owns
+      // the wording — so the window and the terminal cannot disagree about
+      // what the supervisor did.
+      name: formatSupervision(facts),
+      ...(record.reversibility !== undefined ? { reversibility: record.reversibility } : {}),
+    };
+  }
+  if (record.syscall.startsWith('__')) return undefined;
   const type =
     record.syscall === 'llm_call'
       ? 'llm.call'

@@ -42,6 +42,27 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The window says what the supervisor decided.** The kernel records every
+  supervisory decision in **init's own log** — the supervision journal
+  (docs/PROCESS.md §9.1, docs/ABI.md §6.1): a daemon was registered, an
+  attempt died, the supervisor started a new one, the supervisor gave up, the
+  kernel booted, the kernel shut down. Each is a `__init` frame carrying the
+  decision in its `action` and the details in its `args`.
+
+  Those frames arrive in the dashboard's activity feed now, as events of type
+  `kernel.supervision`, with the sentence that says the decision in `name`:
+  `daemon crasher restarted as pid 3 (attempt 1, previous exit: boom)`,
+  `pid 2 reaped (exit 3: boom) -> restarted as pid 3`,
+  `daemon crasher not restarted -> max restarts reached (2) after 2 restart(s)`,
+  `daemon crasher registered (restart: on-failure)`, `kernel booted`.
+
+  `src/cli/supervision_view.ts` (new) holds the facts and the wording:
+  - `describeSupervision(record)` — the facts, every unreported one `null`.
+  - `formatSupervision(facts)` — the sentence, in one home.
+
+  An action nobody knows is **not** turned into a fact: guessing what a
+  decision meant is how a view starts lying.
+
 - **The window's light says what is behind the numbers.** The dashboard's top
   bar carried a green light and 「实时连接（SSE）」 — a claim about a live kernel
   feed that nothing had checked (see the fix below). It takes its words from
@@ -1670,6 +1691,21 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **The window dropped every supervisory decision the kernel had made.** The
+  activity feed's rule was *"the kernel's own `__`-prefixed frames are not the
+  agent's work"* — right for the per-process bookkeeping (`__state`,
+  `__sched`, `__signal`, which restate what a process's own row already says)
+  and wrong for **init's journal**, which is a record of *decisions*.
+
+  So an operator watching a daemon crash three times was never told that the
+  supervisor had restarted it twice and then deliberately given up: the log
+  said `__init:restart` and `__init:restart-gave-up`, and the feed had no
+  rows for either. "My daemon keeps dying" and "my daemon was restarted twice
+  and then abandoned" are different situations, and only one of them was true.
+
+  The rule is the sharper one now: the **bookkeeping** stays out, the
+  **journal** comes in.
 
 - **The window's own light claimed a connection it had not checked.** The top
   bar's green dot said 「实时连接（SSE）」 — always, whatever was behind it:

@@ -165,6 +165,7 @@
     .event-kind { display: inline-flex; align-items: center; min-width: 76px; padding: 4px 7px; border-radius: 5px; background: var(--blue-soft); color: #536bd1; font-size: 9px; font-weight: 560; }
     .event-kind.tool { background: var(--amber-soft); color: #a3650c; }
     .event-kind.chain { background: #f0ebff; color: #7855bb; }
+    .event-kind.supervision { background: var(--green-soft); color: var(--green); }
     .event-kind.error { background: #fff0f0; color: var(--red); }
     .event-time { color: #929aa6; font-size: 9px; }
     .duration { color: #536071; font-variant-numeric: tabular-nums; }
@@ -287,7 +288,7 @@
         </section>
 
         <section class="panel events-panel" id="events">
-          <div class="panel-head"><div><div class="panel-title">最近执行事件</div><div class="panel-note">Cortex 模型 / 工具 / syscall 与 LangChain 回调 · 不含 prompt 内容</div></div><span class="nav-count" id="eventTotal"></span><button class="text-button" id="eventMore">加载更多</button></div>
+          <div class="panel-head"><div><div class="panel-title">最近执行事件</div><div class="panel-note">Cortex 模型 / 工具 / syscall / 内核监管决定 与 LangChain 回调 · 不含 prompt 内容</div></div><span class="nav-count" id="eventTotal"></span><button class="text-button" id="eventMore">加载更多</button></div>
           <div class="event-filters"><span>时间范围</span><input type="datetime-local" id="eventFrom" aria-label="开始时间"><span>→</span><input type="datetime-local" id="eventTo" aria-label="结束时间"><button class="button" id="eventFilter" type="button">筛选</button><button class="text-button" id="eventClear" type="button">清除</button></div>
           <div class="table-scroll"><table class="event-table"><thead><tr><th>类型</th><th>名称 / 关联记录</th><th>PID</th><th>耗时</th><th>可逆性</th><th>Token / 模型</th><th>时间</th><th>错误</th></tr></thead><tbody id="eventRows"><tr><td colspan="8" class="empty">暂无调用记录。运行 Agent 后，这里会显示真实的内核调用轨迹。</td></tr></tbody></table></div>
         </section>
@@ -453,6 +454,10 @@
       if (type.startsWith('tool.')) return '工具';
       if (type.startsWith('chain.')) return 'Chain';
       if (type.startsWith('retriever.')) return '检索';
+      // The kernel's own **decisions** — the supervision journal. Not the
+      // agent's work, but the operator's business: a daemon that was
+      // restarted, a daemon the supervisor gave up on.
+      if (type === 'kernel.supervision') return '监管';
       if (type.includes('error')) return '错误';
       return 'Agent';
     }
@@ -478,7 +483,7 @@
       $('eventMore').disabled = eventData.length >= eventsTotal;
       $('eventRows').innerHTML = rows.length ? rows.map((event) => {
         const label = eventLabel(event);
-        const kind = label === '工具' ? 'tool' : label === 'Chain' ? 'chain' : label === '错误' ? 'error' : '';
+        const kind = label === '工具' ? 'tool' : label === 'Chain' ? 'chain' : label === '错误' ? 'error' : label === '监管' ? 'supervision' : '';
         const time = event.at ? fmtLocal(event.at) : '—';
         const audit = (event.audit && typeof event.audit === 'object') ? event.audit : null;
         const auditText = audit ? Object.entries(audit).slice(0, 3).map(([k, v]) => `${k}=${String(v).slice(0, 12)}`).join(' · ') : '';

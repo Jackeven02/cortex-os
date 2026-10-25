@@ -2213,6 +2213,33 @@ dashboard listens for the connection ending, ends the stream, and the window
 falls back to polling, asks the kernel again (it will not answer), and says out
 loud that what it is showing is what the disk still has.
 
+**And the window says what the supervisor did.** The kernel records every
+supervisory decision in **init's own log** — the supervision journal
+(PROCESS.md §9.1, ABI.md §6.1): a daemon was registered; an attempt died; the
+supervisor started a new one; the supervisor gave up; the kernel booted; the
+kernel shut down. Each of those is a `__init` frame, and each carries the
+decision in its `action` and the details in its `args`.
+
+And the window dropped **all** of it. The activity feed's rule was *"the
+kernel's own `__`-prefixed frames are not the agent's work"* — which is right
+for the per-process bookkeeping (`__state`, `__sched`, `__signal` restate what
+a process's own row already says) and wrong for init's journal, which is a
+record of **decisions**. So the operator's window showed a daemon crashing
+three times and said nothing about the fact that the supervisor had restarted
+it twice and then deliberately given up: the log said `__init:restart` and
+`__init:restart-gave-up`, and the feed had no rows for either.
+
+The rule is the sharper one now: the **bookkeeping** stays out, the **journal**
+comes in. A decision the kernel made is a fact the operator is owed — "my
+daemon keeps dying" and "my daemon was restarted twice and then abandoned" are
+different situations, and only one of them is true.
+
+The wording lives in one module (`src/cli/supervision_view.ts`), so the
+terminal and the window cannot disagree about what the supervisor did, and a
+check can hold them to the same sentence. And an action nobody knows is
+**not** turned into a fact: guessing what a decision meant is how a view
+starts lying.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up
