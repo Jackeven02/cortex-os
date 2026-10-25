@@ -154,6 +154,20 @@ export const DEFAULT_RESTART_STORM_THRESHOLD = 100;
 export interface DaemonSpec {
   readonly role: string;
   readonly agent: AgentSpec;
+  /**
+   * The name the operator installed this daemon under.
+   *
+   * The registry's key (`daemons.json`), not the role: two daemons may share a
+   * role and differ only by their module, and a role is not an identity. The
+   * daemon's identity across restarts is its `daemonId` — the pid it was
+   * registered under — and this is the *human* half of it, so a view can say
+   * which daemon it is talking about.
+   *
+   * Absent when a host registers a daemon directly, without a registry behind
+   * it: then the daemon has a role and a pid and no name, and a view says so
+   * rather than inventing one.
+   */
+  readonly name?: string;
   /** Restart policy. Defaults to `{ kind: 'never' }` (spawn once, no restart). */
   readonly restart?: RestartPolicy;
   readonly budgets?: Partial<BudgetLimits>;
@@ -167,6 +181,86 @@ export interface DaemonSpec {
    * CLI/daemon.json can round-trip it; the wake routing lands with drivers.
    */
   readonly wakeOn?: readonly string[];
+}
+
+// =============================================================================
+// §2b. The daemon's live state
+// =============================================================================
+
+/**
+ * Why init stopped restarting a daemon.
+ *
+ * `policy` — the restart policy said no (`never`, or `on-failure` and the run
+ * did not fail); `max-restarts` — the total cap was reached; `restart-storm` —
+ * too many restarts inside the sliding window (docs/PROCESS.md §10).
+ */
+export type DaemonGiveUpReason = 'policy' | 'max-restarts' | 'restart-storm';
+
+/**
+ * Where a supervised daemon stands right now.
+ *
+ *   - `running` — the current attempt is alive;
+ *   - `dying` — the attempt has ended and the supervisor has not decided yet
+ *     (the window between the death and the decision);
+ *   - `backing-off` — the supervisor decided to restart, and the next attempt
+ *     is waiting on a backoff timer;
+ *   - `gave-up` — the supervisor decided **not** to restart (see
+ *     `DaemonGiveUpReason`);
+ *   - `stopped` — the kernel is shutting down, so the daemon is not coming
+ *     back.
+ *
+ * These are the supervisor's own words about its own work. A view must not
+ * rebuild them from a log: "the daemon is alive" and "the daemon was given up
+ * on" look the same in a directory listing and mean opposite things.
+ */
+export type DaemonStatus = 'running' | 'dying' | 'backing-off' | 'gave-up' | 'stopped';
+
+/**
+ * Which agent a daemon runs.
+ *
+ * The two shapes of `AgentSpec`, split so a view can say "module:…" or
+ * "system:…" without re-deriving the union.
+ */
+export type DaemonAgent =
+  | { readonly kind: 'module'; readonly module: string }
+  | { readonly kind: 'system'; readonly system: string };
+
+/**
+ * What init knows about one logical daemon, right now.
+ *
+ * A **logical** daemon is the thing an operator installed: it keeps its
+ * identity (`daemonId`, the pid of its *first* attempt) across restarts, and
+ * its `currentPid` is the attempt running at this moment.
+ *
+ * Every field here is a fact init already holds — this is a *read*, not a
+ * reconstruction: the alternative (reading the supervision journal and
+ * replaying it) is O(bytes of log) for a fact init has in O(daemons), and it
+ * cannot tell "not started yet" from "started and gave up" — the journal only
+ * records what happened, never what did not.
+ */
+export interface DaemonState {
+  /** The daemon's stable identity: the pid of its first attempt. */
+  readonly daemonId: number;
+  /** The name the operator installed it under, or `null` if it has none. */
+  readonly name: string | null;
+  readonly role: string;
+  readonly agent: DaemonAgent;
+  /** The restart policy's kind (`always` / `on-failure` / `never`). */
+  readonly restart: RestartPolicy['kind'];
+  /** The total restart cap, or `null` when it is unlimited. */
+  readonly maxRestarts: number | null;
+  /** The pid of the attempt running right now (the first attempt's pid while
+   *  the daemon is between attempts). */
+  readonly currentPid: number;
+  readonly status: DaemonStatus;
+  /** How many times the daemon has been restarted. */
+  readonly restartCount: number;
+  /** The exit code of the attempt that just ended, or `null` if none has. */
+  readonly lastExitCode: number | null;
+  /** The reason that attempt ended, or `null` if none has. */
+  readonly lastExitReason: string | null;
+  /** Why the supervisor gave up, or `null` if it has not given up. */
+  readonly gaveUpReason: DaemonGiveUpReason | null;
 }
 
 // =============================================================================
@@ -326,6 +420,18 @@ interface DaemonRecord {
    * starts the code is no longer in scope anywhere else.
    */
   lastExitCode: number | null;
+  /**
+   * The reason that attempt ended. Kept next to the code for the same reason:
+   * a deferred restart has to be able to say what it is replacing.
+   */
+  lastExitReason: string | null;
+  /**
+   * Set when the supervisor decided **not** to restart this daemon. It is the
+   * difference between "the daemon died and nobody has decided yet" and "the
+   * daemon died and init gave up on it" — and the second one is a daemon that
+   * is never coming back, which an operator has to be told about.
+   */
+  gaveUp: DaemonGiveUpReason | null;
   /** Epoch-ms of each restart, pruned to the sliding window. */
   restartTimestamps: number[];
   /** Pending backoff timer, if a restart is scheduled but not yet fired. */
@@ -427,6 +533,31 @@ export class InitProcess {
     return this.#daemons.get(unbrand(daemonId))?.restartCount ?? 0;
   }
 
+  /**
+   * What init knows about every logical daemon, right now.
+   *
+   * A **read**: the operator asking how the daemons are doing is not
+   * something a daemon did, so it is not recorded (the same rule as `ps`).
+   *
+   * Why the kernel answers this instead of a view replaying the supervision
+   * journal: init already holds each daemon's identity, its current attempt,
+   * its restart count and its last exit — so the answer is O(daemons). The
+   * journal can only say what *happened*, never what did not: a daemon that
+   * was installed and never started leaves no trace in it at all, and a
+   * daemon the kernel gave up on looks exactly like a daemon that is merely
+   * between attempts unless you replay the whole log and get the policy right.
+   *
+   * The result is the kernel's own answer, so a view cannot disagree with the
+   * thing it is describing.
+   */
+  daemonStates(): DaemonState[] {
+    const states: DaemonState[] = [];
+    for (const rec of this.#daemons.values()) {
+      states.push(this.#stateOf(rec));
+    }
+    return states;
+  }
+
   // ---------------------------------------------------------------------------
   // §6.1 Lifecycle
   // ---------------------------------------------------------------------------
@@ -490,6 +621,8 @@ export class InitProcess {
       currentPid: pid,
       restartCount: 0,
       lastExitCode: null,
+      lastExitReason: null,
+      gaveUp: null,
       restartTimestamps: [],
       restartTimer: null,
     };
@@ -499,6 +632,12 @@ export class InitProcess {
     await this.#record('register-daemon', {
       daemonId: unbrand(pid),
       role: spec.role,
+      // The operator's name for this daemon, when the host knows one. It is
+      // the **join key**: the registry (`daemons.json`) and the kernel used to
+      // have nothing in common but the role, and a role is not an identity —
+      // two daemons may share one. With the name in the record, the journal
+      // and the registry can be lined up without guessing.
+      ...(spec.name !== undefined ? { name: spec.name } : {}),
       restart: spec.restart?.kind ?? 'never',
       wakeOn: spec.wakeOn ?? [],
     });
@@ -750,10 +889,12 @@ export class InitProcess {
     // backoff timer, and the code has to survive until the new attempt
     // starts (so the operator can be told what it replaced).
     rec.lastExitCode = exitCode;
+    rec.lastExitReason = prevExitReason;
     if (!shouldRestartFromCode(policy.kind, exitCode)) {
       // The policy says no. That is a decision like any other, and the
       // operator has to hear it: a daemon that died and was not restarted
       // because the policy says `never` is a daemon that is now gone for good.
+      rec.gaveUp = 'policy';
       this.#decide({
         kind: 'no-restart',
         daemonId: daemonIdNum,
@@ -762,8 +903,7 @@ export class InitProcess {
         previousExitCode: exitCode,
         previousExitReason: prevExitReason,
         detail:
-          policy.kind === 'never'
-            ? 'the restart policy is "never"'
+          policy.kind === 'never'            ? 'the restart policy is "never"'
             : `the restart policy is "${policy.kind}" and this run did not fail`,
       });
       return null;
@@ -782,10 +922,12 @@ export class InitProcess {
       await this.#record('restart-gave-up', {
         daemonId: daemonIdNum,
         role: rec.spec.role,
+        ...(rec.spec.name !== undefined ? { name: rec.spec.name } : {}),
         reason: 'max-restarts',
         restartCount: rec.restartCount,
         maxRestarts,
       });
+      rec.gaveUp = 'max-restarts';
       this.#decide({
         kind: 'no-restart',
         daemonId: daemonIdNum,
@@ -814,10 +956,12 @@ export class InitProcess {
       await this.#record('restart-gave-up', {
         daemonId: daemonIdNum,
         role: rec.spec.role,
+        ...(rec.spec.name !== undefined ? { name: rec.spec.name } : {}),
         reason: 'restart-storm',
         count: rec.restartTimestamps.length,
         windowMs,
       });
+      rec.gaveUp = 'restart-storm';
       this.#decide({
         kind: 'no-restart',
         daemonId: daemonIdNum,
@@ -880,6 +1024,7 @@ export class InitProcess {
       daemonId: unbrand(rec.daemonId),
       newPid: unbrand(newPid),
       role: rec.spec.role,
+      ...(rec.spec.name !== undefined ? { name: rec.spec.name } : {}),
       restartCount: rec.restartCount,
       prevExitReason,
     });
@@ -933,6 +1078,51 @@ export class InitProcess {
   // ---------------------------------------------------------------------------
   // §6.4 Helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * The live state of one logical daemon.
+   *
+   * The order of the questions matters, because they are not independent:
+   * a daemon that is shutting down is not "gave up" (nobody gave up — the
+   * kernel is stopping), and a daemon waiting on a backoff timer is not
+   * "dying" (the supervisor already decided; it is waiting its turn).
+   */
+  #stateOf(rec: DaemonRecord): DaemonState {
+    const policy = rec.spec.restart ?? { kind: 'never' };
+    const entry = this.#table.get(rec.currentPid);
+    // A reaped pid is gone from the table; a zombie is still in it but has
+    // already ended.
+    const alive = entry !== undefined && entry.state !== 'zombie';
+
+    let status: DaemonStatus;
+    if (this.#shuttingDown) {
+      status = 'stopped';
+    } else if (rec.gaveUp !== null) {
+      status = 'gave-up';
+    } else if (rec.restartTimer !== null) {
+      status = 'backing-off';
+    } else if (alive) {
+      status = 'running';
+    } else {
+      // The attempt has ended and the supervisor has not decided yet.
+      status = 'dying';
+    }
+
+    return {
+      daemonId: unbrand(rec.daemonId),
+      name: rec.spec.name ?? null,
+      role: rec.spec.role,
+      agent: agentOf(rec.spec.agent),
+      restart: policy.kind,
+      maxRestarts: policy.maxRestarts ?? null,
+      currentPid: unbrand(rec.currentPid),
+      status,
+      restartCount: rec.restartCount,
+      lastExitCode: rec.lastExitCode,
+      lastExitReason: rec.lastExitReason,
+      gaveUpReason: rec.gaveUp,
+    };
+  }
 
   /**
    * Epoch-ms derived from the injected clock, so the storm window and the
@@ -1013,6 +1203,18 @@ export class InitProcess {
 // =============================================================================
 // §7. Module helpers
 // =============================================================================
+
+/**
+ * The two shapes of `AgentSpec`, as the `DaemonAgent` the views read.
+ *
+ * Exported so a view never has to re-derive the union — and so the rule
+ * "which agent is this?" has exactly one answer in the codebase.
+ */
+export function agentOf(spec: AgentSpec): DaemonAgent {
+  return 'module' in spec
+    ? { kind: 'module', module: spec.module }
+    : { kind: 'system', system: spec.system };
+}
 
 /**
  * Pure restart decision from a policy kind and an exit code. `on-failure`

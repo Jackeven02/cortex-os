@@ -22,6 +22,18 @@ import {
 } from '../cli/audit_view.js';
 import { describeKernel, type KernelFacts } from '../cli/kernel_view.js';
 import { describeConnection } from './connection_view.js';
+import { listDaemons } from '../cli/daemon_store.js';
+import { agentOf, type DaemonState } from '../kernel/init.js';
+import {
+  describeDaemonNote,
+  describeDaemonStatus,
+  formatDaemonAgent,
+  formatDaemonExit,
+  formatDaemonPolicy,
+  formatDaemonSummary,
+  joinDaemons,
+  type DaemonReceipt,
+} from '../cli/daemon_view.js';
 import { usdToDollars } from '../money.js';
 import { formatTokenUsage, callUsage } from '../token_usage.js';
 import { frameName } from '../cli/frame_name.js';
@@ -950,6 +962,67 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         } catch (error) {
           json(response, 502, { error: error instanceof Error ? error.message : String(error) });
         }
+        return;
+      }
+      // What the supervised daemons are doing right now.
+      //
+      // The window could show what an agent *did* and what it *knew*, and
+      // nothing about the daemons the kernel supervises. The only list the
+      // operator had was the **install receipt** (`daemons.json`) — which says
+      // a daemon was written down, and nothing about whether it is running,
+      // flapping, or already given up on.
+      //
+      // The live answer belongs to the kernel that owns the daemons, so the
+      // window asks it over the transport's `daemons` command (a read, like
+      // `ps` and `drivers`). The receipt is read from disk and the two are
+      // joined on the **name** — the role is not an identity.
+      //
+      // And when there is no kernel to ask, the answer is *unknown*, with the
+      // reason: not "not running", which would be a different claim.
+      if (url.pathname === '/api/daemons') {
+        const receipts: DaemonReceipt[] = listDaemons(dir).map((d) => ({
+          name: d.name,
+          role: d.spec.role,
+          restart: d.spec.restart?.kind ?? 'never',
+          maxRestarts: d.spec.restart?.maxRestarts ?? null,
+          agent: agentOf(d.spec.agent),
+        }));
+        let live: DaemonState[] | null = null;
+        if (options.kernel !== undefined) {
+          try {
+            const reply = (await options.kernel.request('daemons')) as { daemons?: DaemonState[] };
+            live = reply.daemons ?? [];
+          } catch {
+            // The kernel is there but did not answer. That is still *unknown*,
+            // not "not running" — so the rows say so rather than guessing.
+            live = null;
+          }
+        }
+        const rows = joinDaemons(receipts, live);
+        json(response, 200, {
+          kernelLive: live !== null,
+          daemons: rows.map((row) => {
+            const status = describeDaemonStatus(row.status);
+            return {
+              name: row.name,
+              role: row.role,
+              installed: row.installed,
+              status: row.status,
+              // The words are computed here: the page is a static file and
+              // cannot import the module that owns them, and two views must
+              // not be able to phrase the same daemon differently.
+              statusLabel: status.label,
+              tone: status.tone,
+              pid: row.pid,
+              restarts: row.restarts,
+              exitLabel: formatDaemonExit(row.lastExitCode, row.lastExitReason) || '—',
+              policyLabel: formatDaemonPolicy(row.restart, row.maxRestarts),
+              agentLabel: formatDaemonAgent(row.agent),
+              note: describeDaemonNote(row),
+            };
+          }),
+          summary: formatDaemonSummary(rows),
+        });
         return;
       }
       if (url.pathname === '/api/stream') {

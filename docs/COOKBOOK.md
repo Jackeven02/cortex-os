@@ -161,7 +161,7 @@ cortex daemon install watcher \
     --module ./examples/checkpoint-agent.ts \
     --restart on-failure --max-restarts 5
 
-cortex daemon list           # show the registry
+cortex daemon list           # show the registry + the live state of each daemon
 cortex daemon run watcher    # run it as a supervised, long-lived process
 cortex daemon uninstall watcher
 ```
@@ -171,6 +171,12 @@ cortex daemon uninstall watcher
   darwin; Windows prints an `schtasks` command). It does **not** enable it for
   you — it prints the exact `systemctl --user enable --now` / `launchctl load`
   command, because enabling needs your session or root.
+- `list` prints the **install receipt** (name, role, restart policy, agent) and
+  the **live state** of each daemon — `running`, `waiting to restart`,
+  `given up`, `not started` — with its pid, its restart count and how the last
+  attempt ended. The live state comes from the kernel that supervises the
+  daemons; with no kernel in the directory it says *unknown* and says why,
+  because "nobody is running it" and "nobody knows" are different claims.
 - `run` boots a kernel, registers the daemon, and supervises restarts per the
   `RestartPolicy` (`always` / `on-failure` / `never`, exponential backoff capped
   at 60s, `maxRestarts` cap, restart-storm detection). It stays alive until

@@ -1726,29 +1726,80 @@ The user-facing surface. Should feel like a real OS shell.
   Docs: ARCHITECTURE (the window says what the supervisor did);
   INTEGRATIONS (the feed); CHANGELOG.
 
-- [ ] **#112** `cortex daemon list` reports the installation, not the daemon →
-  **open.**
-  The command prints the **spec** — name, role, restart policy, agent — read
-  from `daemons.json`. It is the install receipt, and it reads like the truth
-  about the daemon: an operator who runs it cannot tell whether the daemon is
-  running, whether it is flapping, whether the kernel already gave up on it, or
-  whether it was never started at all.
+- [x] **#112** `cortex daemon list` reports the installation, not the daemon →
+  **fixed.**
+  The command printed the **spec** — name, role, restart policy, agent — read
+  from `daemons.json`. It is the install receipt, and it read like the truth
+  about the daemon: an operator who ran it could not tell whether the daemon
+  was running, whether it was flapping, whether the kernel had already given
+  up on it, or whether it was never started at all.
 
-  The kernel knows all of that — init holds each logical daemon, its current
-  pid, its restart count and its last exit — and none of it is on the way out.
-  `cortex daemon run` prints the decisions live (it is the host that drives
-  them), but a *dashboard* watching the same directory, and a `daemon list` run
-  from another terminal, hear nothing.
+  The kernel knew all of that — init holds each logical daemon, its current
+  pid, its restart count and its last exit — and none of it was on the way
+  out. `cortex daemon run` printed the decisions live (it is the host that
+  drives them), but a *dashboard* watching the same directory, and a `daemon
+  list` run from another terminal, heard nothing.
 
-  The fix has a wrinkle worth deciding first: the kernel's daemon record knows
-  the **role**, not the **name** the operator installed it under (the name
-  lives in `daemons.json`), so the two lists have no join key but the role.
-  Either the kernel learns the name (`DaemonSpec` is internal to init, so
-  this is not an ABI change), or the view joins on the role and says so when
-  two daemons share one. Then the live state reaches the CLI the way it
-  reached the window: as a read (`Kernel.daemons()`, then a `daemons` transport
-  command, like `ps` and `drivers`), so no view has to rebuild what the kernel
+  **The wrinkle was decided the way the issue suggested it could be: the
+  kernel learned the name.** `DaemonSpec.name` (new, optional) is the
+  operator's own name for the daemon, and it is internal to init — so this is
+  not an ABI change, and `KERNEL_ABI_VERSION` did not move. `cortex daemon
+  run` passes it at registration, and the journal's records carry it too, so
+  the registry and the kernel can be lined up without guessing. The join is
+  on the **name** and not the role, because a role is not an identity: two
+  daemons may share one and differ only by their module.
+
+  **The live state reaches the CLI and the window the way it reached every
+  other kernel answer: as a read.** `InitProcess.daemonStates()` holds the
+  facts, `Kernel.daemons()` is the host-side door, and the transport's
+  `daemons` command carries it — like `ps`, `openCalls` and `drivers`, and
+  like them a read that is not recorded. No view rebuilds what the kernel
   already holds.
+
+  What the views say is held in one module (`src/cli/daemon_view.ts`), so the
+  terminal and the window cannot phrase the same daemon differently:
+
+  - `running` / `just ended` / `waiting to restart` / `given up` / `stopped`
+    — the supervisor's own words about its own work;
+  - `not started` — a live kernel is there and does not have this daemon;
+  - `unknown` — **there is no kernel to ask**, and the row says why. It is
+    not "not running": that is a different claim, and only one of them is
+    true.
+
+  The window has a **守护进程** panel fed by `GET /api/daemons` (the live
+  state from the kernel, the receipt from disk, joined by name), and
+  `cortex daemon list` prints the same words next to the receipt it always
+  printed.
+
+- [ ] **#113** The daemon's live state and its supervision journal are two
+  answers to one question → **open.**
+  The kernel now answers "what is this daemon doing right now?" as a **read**
+  (`Kernel.daemons()`, the transport's `daemons` command), and it also keeps
+  a **journal** of every decision it made (init's own log, `__init` frames —
+  PROCESS.md §9.1). Two answers, one question, and they can disagree:
+
+  - the read says a daemon is `running`, while the journal's last frame is a
+    `restart-gave-up` — because the read is now and the journal is the past;
+  - the read says `given up`, while the journal says nothing about the
+    decision that gave it up (the `policy` give-up — the one the *policy*
+    decides — is recorded as a decision, but the `__init` frames only carry
+    `restart-gave-up` for the two caps);
+  - the read has no record of **who** asked, while the journal has no record
+    of **whether anybody looked**.
+
+  The question is not "which one wins" — they answer different questions, and
+  the read is the one that says *now*. It is whether the two are kept in step
+  at all: today nothing checks that a daemon the journal says was registered
+  is a daemon the read knows about, and nothing checks that a give-up in one
+  of them shows up in the other. A check that replays the journal and
+  compares it with the live state would keep the two from drifting — and
+  would say out loud when they cannot be compared (a daemon the kernel has
+  since forgotten, a journal from a previous kernel).
+
+  The decision to make first: whether the `__init` frames should carry the
+  `policy` give-up too, so that "the supervisor gave up" is one kind of frame
+  rather than two, and whether the comparison belongs in the CLI or in the
+  smoke suite alone.
 
 **Exit criteria:** the demo from `README.md` runs end-to-end on a laptop.
 

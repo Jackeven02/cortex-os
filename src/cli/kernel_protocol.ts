@@ -109,6 +109,7 @@ export type KernelCommand =
   | 'ps'
   | 'openCalls'
   | 'drivers'
+  | 'daemons'
   | 'memory'
   | 'send'
   | 'kill'

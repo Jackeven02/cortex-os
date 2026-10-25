@@ -166,6 +166,7 @@ import {
   InitProcess,
   type DaemonSpec,
   type DaemonDecision,
+  type DaemonState,
   type InitAlarm,
   type OnAlarmHook,
   type ShutdownReport,
@@ -1237,6 +1238,22 @@ export class Kernel {
    */
   openCalls(): ReadonlyMap<number, OpenCallRecord> {
     return this.dispatcher.openCalls();
+  }
+
+  /**
+   * The live state of every daemon this kernel supervises.
+   *
+   * The host-facing version of init's bookkeeping. init already holds each
+   * logical daemon's identity, its current attempt, its restart count and its
+   * last exit — so the answer is O(daemons), while the alternative (reading
+   * the supervision journal and replaying it) is O(bytes of log) and still
+   * cannot say "this daemon was installed and never started".
+   *
+   * A **read**, like `ps`: an operator asking how the daemons are doing is
+   * not something a daemon did, so it is not recorded.
+   */
+  daemons(): DaemonState[] {
+    return this.init.daemonStates();
   }
 
   /**

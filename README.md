@@ -258,7 +258,7 @@ Working on Cortex itself instead? Clone it and run the suite:
 git clone https://github.com/Jackeven02/cortex-os
 cd cortex-os && npm install
 unset OPENAI_API_KEY DEEPSEEK_API_KEY   # fall back to the deterministic mock
-npx tsx scripts/smoke.ts                # 850 assertions, 0 failures
+npx tsx scripts/smoke.ts                # 868 assertions, 0 failures
 ```
 
 > **The npm package is `cortex-agent-os`, not `cortex-os`.** npm refuses the
@@ -422,6 +422,12 @@ So the bar asks, too. The server answers with what it checked: the kernel's stat
 And the push **ends** when the kernel goes away: a stream left open over a dead socket delivers nothing and looks exactly like a healthy one. So the window falls back to polling, asks the kernel again (it will not answer), and says out loud that what it is showing is what the disk still has.
 
 **And the window says what the supervisor did.** The kernel records every supervisory decision in **init's own log** — the supervision journal: a daemon was registered; an attempt died; the supervisor started a new one; the supervisor gave up. And the window dropped **all** of it, because the feed's rule was "the kernel's own `__`-prefixed frames are not the agent's work" — right for the per-process bookkeeping, wrong for a journal of decisions. So a daemon crashing three times looked like a daemon nobody was helping: the supervisor had restarted it twice and then deliberately given up, and the window said nothing. Now it says: `daemon crasher restarted as pid 3 (attempt 1, previous exit: boom)`, `pid 2 reaped (exit 3: boom) -> restarted as pid 3`, `daemon crasher not restarted -> max restarts reached (2) after 2 restart(s)`.
+
+**And the window says what the daemons are doing.** The only list of daemons an operator had was the **install receipt** — `daemons.json` — which says a daemon was *written down* and nothing about whether it runs. It read like the truth about the daemon: a running daemon, a flapping one, one the supervisor had already given up on, and one that was never started all looked the same.
+
+The kernel has always known. Now it says: there is a **守护进程** panel with each daemon's live state — `running`, `waiting to restart`, `given up`, `not started` — its pid, how many times it has been restarted, how the last attempt ended, and the restart policy that is in force. The live state comes from the kernel that supervises the daemons (as a read, like `ps`), the receipt comes from disk, and the two are joined on the daemon's **name** — the role is not an identity, because two daemons may share one.
+
+And when there is **no kernel to ask**, the panel says *unknown*, and says why. It does not say "not running": a daemon's live state belongs to the kernel that supervises it, so without one nobody knows — and "nobody knows" is a different claim from "it was never started". `cortex daemon list` prints the same words, next to the receipt it always printed.
 
 The three mutating operations are gated because they *do* boot a real kernel to do the work:
 

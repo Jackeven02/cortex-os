@@ -55,7 +55,17 @@ import {
 } from '../index.js';
 import { parseMemoryArg, mergeRegionPolicies, MemoryArgError } from '../regions.js';
 import { formatOutcomeCode } from '../process_outcome.js';
-import { type DaemonSpec } from '../../kernel/init.js';
+import { agentOf, type DaemonSpec, type DaemonState } from '../../kernel/init.js';
+import {
+  describeDaemonNote,
+  describeDaemonStatus,
+  formatDaemonAgent,
+  formatDaemonExit,
+  formatDaemonPolicy,
+  formatDaemonSummary,
+  joinDaemons,
+  type DaemonReceipt,
+} from '../daemon_view.js';
 import { type AgentSpec, type RestartPolicy, type MemoryRegionPolicy } from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
 import {
@@ -67,6 +77,7 @@ import {
 import { startKernelServer } from '../kernel_server.js';
 import { KernelCommandError, probeKernel } from '../kernel_client.js';
 import { clearEndpoint, endpointPath, writeEndpoint } from '../kernel_endpoint.js';
+import { renderHeader, renderRow, ruleUnder, sizeColumns } from '../table.js';
 
 // =============================================================================
 // Subcommand dispatch
@@ -253,21 +264,89 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
 
 export async function cmdDaemonList(_args: string[]): Promise<number> {
   const dir = defaultKernelDir();
-  const daemons = listDaemons(dir);
-  if (daemons.length === 0) {
+  const receipts: DaemonReceipt[] = listDaemons(dir).map((d) => ({
+    name: d.name,
+    role: d.spec.role,
+    restart: d.spec.restart?.kind ?? 'never',
+    maxRestarts: d.spec.restart?.maxRestarts ?? null,
+    agent: agentOf(d.spec.agent),
+  }));
+  if (receipts.length === 0) {
     console.log('no registered daemons (use `cortex daemon install <name> ...`)');
     return 0;
   }
-  console.log('NAME                ROLE                RESTART     AGENT');
-  console.log('-'.repeat(72));
-  for (const d of daemons) {
-    const agent = d.spec.agent;
-    const agentDesc = 'module' in agent
-      ? `module:${agent.module.replace(/^file:\/\//, '')}`
-      : `system:${(agent.system ?? '').slice(0, 24)}${(agent.system ?? '').length > 24 ? '…' : ''}`;
-    console.log(
-      `${d.name.padEnd(19)} ${d.spec.role.padEnd(19)} ${(d.spec.restart?.kind ?? 'never').padEnd(11)} ${agentDesc}`,
+
+  // The kernel is the only one who knows whether a daemon is running.
+  //
+  // The list above is the *install receipt* — it says the daemon was written
+  // down. It used to be the whole answer, and it read like the truth: an
+  // operator could not tell a running daemon from a flapping one, from one the
+  // supervisor had already given up on, or from one that was never started.
+  // So the kernel is asked what it is actually doing with them.
+  const probe = await probeKernel(dir);
+  const client = probe.kind === 'live' ? probe.client : undefined;
+  let live: DaemonState[] | null = null;
+  try {
+    if (client !== undefined) {
+      const reply = (await client.request('daemons')) as { daemons?: DaemonState[] };
+      live = reply.daemons ?? [];
+    }
+  } catch (err) {
+    // A kernel that cannot answer is a kernel that cannot say — and the
+    // honest answer to "is it running?" is then *unknown*, not "no".
+    console.error(
+      `cortex daemon list: the live kernel did not answer (${err instanceof Error ? err.message : String(err)}); ` +
+        `the live state of the daemons is unknown`,
     );
+  } finally {
+    client?.close();
+  }
+
+  const rows = joinDaemons(receipts, live);
+  const cells = rows.map((row) => [
+    row.name ?? '(unnamed)',
+    row.role,
+    describeDaemonStatus(row.status).label,
+    row.pid === null ? '—' : String(row.pid),
+    row.restarts === null ? '—' : String(row.restarts),
+    formatDaemonExit(row.lastExitCode, row.lastExitReason) || '—',
+    formatDaemonPolicy(row.restart, row.maxRestarts),
+    formatDaemonAgent(row.agent),
+  ]);
+  const columns = sizeColumns(
+    [
+      { header: 'NAME', max: 20, gap: 2 },
+      { header: 'ROLE', max: 20, gap: 2 },
+      { header: 'STATE', max: 18, gap: 2 },
+      { header: 'PID', max: 6, gap: 2 },
+      { header: 'RESTARTS', max: 8, gap: 2 },
+      { header: 'LAST EXIT', max: 28, gap: 2 },
+      { header: 'RESTART', max: 18, gap: 2 },
+      { header: 'AGENT', max: 28, gap: 2 },
+    ],
+    cells,
+  );
+  const header = renderHeader(columns);
+  console.log(header);
+  console.log(ruleUnder(header));
+  for (const row of cells) {
+    console.log(renderRow(columns, row));
+  }
+  console.log('');
+  console.log(formatDaemonSummary(rows));
+  // The notes, one line per **reason** — not per row. Two daemons with the
+  // same reason (no kernel to ask) have one thing to say, and repeating the
+  // same sentence under every row is noise that hides the rows that differ.
+  const notes = new Map<string, string[]>();
+  for (const row of rows) {
+    const note = describeDaemonNote(row);
+    if (note === null) continue;
+    const bucket = notes.get(note);
+    if (bucket === undefined) notes.set(note, [row.name ?? '(unnamed)']);
+    else bucket.push(row.name ?? '(unnamed)');
+  }
+  for (const [note, names] of notes) {
+    console.log(`  ${names.join(', ')}: ${note}`);
   }
   return 0;
 }
@@ -432,7 +511,12 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
   try {
     for (const d of targets) {
       if (d === undefined) continue;
-      const pid = await kernel.registerDaemon(d.spec);
+      // The name goes with the registration: it is the operator's name for
+      // this daemon, and it is the **join key** between the registry and the
+      // kernel (the role is not an identity — two daemons may share one).
+      // Without it, the kernel could say "a daemon with role X died" and the
+      // operator could not work out which of their daemons that was.
+      const pid = await kernel.registerDaemon({ ...d.spec, name: d.name });
       daemonNames.set(unbrand(pid), d.name);
       console.log(`[daemon ${d.name} pid ${unbrand(pid)}] running (restart=${d.spec.restart?.kind ?? 'never'})`);
     }

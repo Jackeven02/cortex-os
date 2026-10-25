@@ -260,7 +260,17 @@ import {
 import { describeKernel, formatKernelLine } from '../src/cli/kernel_view.js';
 import { describeConnection } from '../src/dashboard/connection_view.js';
 import { describeSupervision, formatSupervision, SUPERVISION_ACTIONS } from '../src/cli/supervision_view.js';
-import { INIT_ACTIONS } from '../src/kernel/init.js';
+import {
+  describeDaemonNote,
+  describeDaemonStatus,
+  formatDaemonAgent,
+  formatDaemonExit,
+  formatDaemonPolicy,
+  formatDaemonSummary,
+  joinDaemons,
+  type DaemonReceipt,
+} from '../src/cli/daemon_view.js';
+import { INIT_ACTIONS, type DaemonState } from '../src/kernel/init.js';
 import { cmdWait } from '../src/cli/commands/wait.js';
 import { cmdWatch } from '../src/cli/commands/watch.js';
 import { cmdSupervise, decideAuthority, nextDeadline } from '../src/cli/commands/supervise.js';
@@ -20521,6 +20531,454 @@ async function runKernelGoneChecks(): Promise<void> {
 // CLI daemon checks (#039)
 // =============================================================================
 
+// The kernel's answer about the daemons it supervises, and the views that
+// print it.
+//
+// BACKLOG #112: `cortex daemon list` printed the **install receipt** — the
+// spec, read from `daemons.json` — and nothing else. It read like the truth
+// about the daemon: an operator could not tell a running daemon from a
+// flapping one, from one the supervisor had already given up on, or from one
+// that was never started at all. The kernel has always known; this is the
+// round where it says so, and where the views are held to the same words.
+async function runDaemonStateChecks(): Promise<void> {
+  console.log('\nsmoke check: daemon live state\n');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const tmp = await mkdtemp(join(tmpdir(), 'cortex-smoke-daemon-state-'));
+  const tables: ProcessTable[] = [];
+
+  let fakeNow = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const clock = () => new Date(fakeNow).toISOString();
+  const advance = (ms = 1000): void => {
+    fakeNow += ms;
+  };
+
+  async function makeTable(opts: { record?: boolean; dir?: string } = {}): Promise<ProcessTable> {
+    const dir = opts.dir ?? tmp;
+    const record = opts.record ?? false;
+    const t = new ProcessTable({
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      ...(record
+        ? { recorderFactory: async (pid) => Recorder.open({ pid, dir: join(dir, String(unbrand(pid))) }) }
+        : {}),
+    });
+    tables.push(t);
+    return t;
+  }
+
+  const agent = { module: './agents/noop.js' } as const;
+
+  /** Wire signals <-> init the way boot.ts does. */
+  function makeInit(table: ProcessTable): { init: InitProcess; signals: SignalManager } {
+    let init!: InitProcess;
+    const signals = new SignalManager({
+      table,
+      kernelAbiVersion: KERNEL_ABI_VERSION,
+      now: clock,
+      onZombie: (pid, code, reason) => init.handleZombie(pid, code, reason),
+    });
+    init = new InitProcess({ table, signals, kernelAbiVersion: KERNEL_ABI_VERSION, now: clock });
+    return { init, signals };
+  }
+
+  /** Drive an attempt to its end and let init decide what to do about it. */
+  async function dieWith(
+    init: InitProcess,
+    table: ProcessTable,
+    pid: ProcessIdAlias,
+    code: number,
+    reason: string,
+  ): Promise<void> {
+    const entry = table.get(pid)!;
+    if (entry.state === 'new') await table.setState(pid, 'ready', { trigger: 'test' });
+    if (entry.state === 'ready') await table.setState(pid, 'running', { trigger: 'test' });
+    table.setExitOutcome(pid, code, reason);
+    await table.setState(pid, 'exiting', { trigger: 'test-exit' });
+    await table.setState(pid, 'zombie', { trigger: 'test-exit' });
+    await init.handleZombie(pid, code, reason);
+  }
+
+  try {
+    // --- the kernel's own answer ---------------------------------------------
+
+    await checkAsync('the kernel reports a daemon\'s live state', async () => {
+      const table = await makeTable();
+      const { init } = makeInit(table);
+      await init.boot();
+      const pid = await init.registerDaemon({
+        role: 'inbox-watcher',
+        name: 'watcher',
+        agent,
+        restart: { kind: 'on-failure', maxRestarts: 3 },
+      });
+      const states = init.daemonStates();
+      assert(states.length === 1, `one daemon, got ${states.length}`);
+      const state = states[0]!;
+      // The operator's own name — the join key between the registry and the
+      // kernel. Without it, "a daemon with role X died" is not actionable.
+      assert(state.name === 'watcher', `the name, got ${String(state.name)}`);
+      assert(state.role === 'inbox-watcher', `the role, got ${state.role}`);
+      assert(state.daemonId === unbrand(pid), `the stable identity, got ${state.daemonId}`);
+      assert(state.currentPid === unbrand(pid), `the running attempt, got ${state.currentPid}`);
+      assert(state.status === 'running', `the status, got ${state.status}`);
+      assert(state.restartCount === 0, `no restarts yet, got ${state.restartCount}`);
+      assert(state.gaveUpReason === null, `nothing gave up, got ${String(state.gaveUpReason)}`);
+      // No attempt has ended, so there is no ending to report. A zero here
+      // would be a claim ("it exited cleanly") that nobody made.
+      assert(state.lastExitCode === null, `no exit yet, got ${String(state.lastExitCode)}`);
+      assert(state.lastExitReason === null, `no exit reason yet, got ${String(state.lastExitReason)}`);
+      assert(state.maxRestarts === 3, `the cap, got ${String(state.maxRestarts)}`);
+      assert(state.agent.kind === 'module', `the agent, got ${state.agent.kind}`);
+    });
+
+    await checkAsync('a daemon registered without a name has none', async () => {
+      // A host can register a daemon directly, with no registry behind it.
+      // The kernel does not invent a name for it: a view says there is none.
+      const table = await makeTable();
+      const { init } = makeInit(table);
+      await init.boot();
+      await init.registerDaemon({ role: 'anon', agent });
+      const state = init.daemonStates()[0]!;
+      assert(state.name === null, `no name is invented, got ${String(state.name)}`);
+    });
+
+    await checkAsync('a restarted daemon reports the restart count and the last exit', async () => {
+      const table = await makeTable();
+      const { init } = makeInit(table);
+      await init.boot();
+      const pid = await init.registerDaemon({
+        role: 'd',
+        name: 'flapper',
+        agent,
+        restart: { kind: 'on-failure', backoffMs: 0 },
+      });
+      await dieWith(init, table, pid, 3, 'boom');
+      const state = init.daemonStates()[0]!;
+      assert(state.status === 'running', `the new attempt is running, got ${state.status}`);
+      assert(state.restartCount === 1, `one restart, got ${state.restartCount}`);
+      assert(state.lastExitCode === 3, `the exit code, got ${String(state.lastExitCode)}`);
+      assert(state.lastExitReason === 'boom', `the exit reason, got ${String(state.lastExitReason)}`);
+      assert(state.currentPid !== unbrand(pid), 'the new attempt has a new pid');
+      // ...and the daemon is the same daemon: the identity does not move.
+      assert(state.daemonId === unbrand(pid), 'the identity does not move');
+    });
+
+    await checkAsync('a daemon the supervisor gave up on says so — and says why', async () => {
+      const table = await makeTable();
+      const { init } = makeInit(table);
+      await init.boot();
+      const pid = await init.registerDaemon({
+        role: 'd',
+        name: 'doomed',
+        agent,
+        restart: { kind: 'on-failure', backoffMs: 0, maxRestarts: 0 },
+      });
+      await dieWith(init, table, pid, 3, 'boom');
+      const state = init.daemonStates()[0]!;
+      assert(state.status === 'gave-up', `the status, got ${state.status}`);
+      assert(state.gaveUpReason === 'max-restarts', `the reason, got ${String(state.gaveUpReason)}`);
+      assert(state.restartCount === 0, `no restart happened, got ${state.restartCount}`);
+    });
+
+    await checkAsync('a daemon the policy said not to restart gives up with that reason', async () => {
+      const table = await makeTable();
+      const { init } = makeInit(table);
+      await init.boot();
+      const pid = await init.registerDaemon({ role: 'd', name: 'once', agent, restart: { kind: 'never' } });
+      await dieWith(init, table, pid, 3, 'boom');
+      const state = init.daemonStates()[0]!;
+      assert(state.status === 'gave-up', `the status, got ${state.status}`);
+      assert(state.gaveUpReason === 'policy', `the reason, got ${String(state.gaveUpReason)}`);
+    });
+
+    // --- the view: joining the receipt with the live state -------------------
+
+    const receipt: DaemonReceipt = {
+      name: 'watcher',
+      role: 'inbox-watcher',
+      restart: 'on-failure',
+      maxRestarts: null,
+      agent: { kind: 'module', module: './agents/noop.js' },
+    };
+    const liveState: DaemonState = {
+      daemonId: 2,
+      name: 'watcher',
+      role: 'inbox-watcher',
+      agent: { kind: 'module', module: './agents/noop.js' },
+      restart: 'on-failure',
+      maxRestarts: null,
+      currentPid: 3,
+      status: 'running',
+      restartCount: 2,
+      lastExitCode: 1,
+      lastExitReason: 'boom',
+      gaveUpReason: null,
+    };
+
+    check('the view joins the receipt with the live state by name', () => {
+      const rows = joinDaemons([receipt], [liveState]);
+      assert(rows.length === 1, `one row, got ${rows.length}`);
+      const row = rows[0]!;
+      assert(row.name === 'watcher', `the name, got ${String(row.name)}`);
+      assert(row.status === 'running', `the status, got ${row.status}`);
+      assert(row.pid === 3, `the pid, got ${String(row.pid)}`);
+      assert(row.restarts === 2, `the restarts, got ${String(row.restarts)}`);
+      assert(row.lastExitCode === 1, `the last exit, got ${String(row.lastExitCode)}`);
+      assert(row.installed === true, 'the receipt is there');
+    });
+
+    check('with no kernel to ask, the state is unknown — not "not started"', () => {
+      // "Nobody is running it" and "nobody knows" are different claims, and
+      // only one of them is true when there is no kernel to ask.
+      const rows = joinDaemons([receipt], null);
+      assert(rows.length === 1, `one row, got ${rows.length}`);
+      assert(rows[0]!.status === 'unknown', `the status, got ${rows[0]!.status}`);
+      // Nothing is invented: no pid, no restart count, no exit.
+      assert(rows[0]!.pid === null, 'no pid is invented');
+      assert(rows[0]!.restarts === null, 'no restart count is invented');
+      assert(rows[0]!.lastExitCode === null, 'no exit code is invented');
+      const note = describeDaemonNote(rows[0]!);
+      assert(note !== null && note.includes('no live kernel'), `the note says why, got ${String(note)}`);
+    });
+
+    check('a live kernel that does not have the daemon says "not started"', () => {
+      // The kernel is right there and it does not have this daemon. That is a
+      // fact, and it is a different one from "unknown".
+      const rows = joinDaemons([receipt], []);
+      assert(rows.length === 1, `one row, got ${rows.length}`);
+      assert(rows[0]!.status === 'not-started', `the status, got ${rows[0]!.status}`);
+    });
+
+    check('a daemon the registry has no entry for is still shown', () => {
+      const rows = joinDaemons([], [{ ...liveState, name: null }]);
+      assert(rows.length === 1, `one row, got ${rows.length}`);
+      assert(rows[0]!.status === 'running', `the status, got ${rows[0]!.status}`);
+      assert(rows[0]!.installed === false, 'the registry has no entry for it');
+      assert(describeDaemonNote(rows[0]!) !== null, 'and the row says so');
+    });
+
+    check('two daemons under one name are both shown', () => {
+      // Dropping one would hide a running daemon behind a duplicate.
+      const rows = joinDaemons([receipt], [liveState, { ...liveState, currentPid: 4 }]);
+      assert(rows.length === 2, `two rows, got ${rows.length}`);
+      assert(rows[0]!.pid === 3 && rows[1]!.pid === 4, 'both attempts are shown');
+    });
+
+    // --- the words ------------------------------------------------------------
+
+    check('the status labels are one set of words', () => {
+      assert(describeDaemonStatus('running').label === 'running', 'running');
+      assert(describeDaemonStatus('running').tone === 'live', 'a running daemon is live');
+      assert(describeDaemonStatus('gave-up').tone === 'dead', 'a daemon that was given up on is dead');
+      assert(describeDaemonStatus('gave-up').label === 'given up', 'given up');
+      assert(describeDaemonStatus('unknown').label === 'unknown', 'unknown');
+      // A status nobody knows is not a status this module may claim to read.
+      assert(describeDaemonStatus('nonsense').label === 'unknown', 'an unknown status is not guessed at');
+    });
+
+    check('an unknown exit code is a question, not a zero', () => {
+      assert(formatDaemonExit(null, null) === '', 'no exit, no sentence');
+      assert(formatDaemonExit(null, 'boom') === 'exit ? (boom)', `got ${formatDaemonExit(null, 'boom')}`);
+      assert(formatDaemonExit(3, 'boom') === 'exit 3 (boom)', `got ${formatDaemonExit(3, 'boom')}`);
+      assert(formatDaemonExit(3, null) === 'exit 3', `got ${formatDaemonExit(3, null)}`);
+    });
+
+    check('the restart policy is said with its cap', () => {
+      assert(formatDaemonPolicy('on-failure', 3) === 'on-failure (max 3)', 'with the cap');
+      assert(formatDaemonPolicy('always', null) === 'always', 'without a cap');
+      assert(formatDaemonAgent(null) === '—', 'an unknown agent is not invented');
+    });
+
+    check('the summary counts the states', () => {
+      const summary = formatDaemonSummary(joinDaemons([receipt], [liveState]));
+      assert(summary.includes('1 running'), `got ${summary}`);
+      assert(formatDaemonSummary([]) === 'no daemons', 'no daemons');
+    });
+
+    // --- the terminal ---------------------------------------------------------
+
+    await checkAsync('cortex daemon list says "unknown" when there is no kernel to ask', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-daemon-list-'));
+      const prevHome = process.env['CORTEX_HOME'];
+      const prevLog = console.log;
+      const prevErr = console.error;
+      try {
+        process.env['CORTEX_HOME'] = home;
+        writeDaemon(home, {
+          name: 'watcher',
+          spec: { role: 'inbox-watcher', agent: { module: './agents/noop.js' }, restart: { kind: 'on-failure' } },
+          installedAt: new Date().toISOString(),
+        });
+        let out = '';
+        console.log = (...parts: unknown[]): void => {
+          out += parts.map((p) => String(p)).join(' ') + '\n';
+        };
+        const code = await cmdDaemon(['list']);
+        console.log = prevLog;
+        console.error = prevErr;
+        assert(code === 0, `exit 0, got ${code}`);
+        // The receipt is still printed — the daemon exists.
+        assert(out.includes('watcher'), `the name is listed, got: ${out}`);
+        assert(out.includes('inbox-watcher'), `the role is listed, got: ${out}`);
+        // And the state is *unknown*, not "not started" and not "not running".
+        assert(out.includes('unknown'), `the state is unknown, got: ${out}`);
+        assert(!out.includes('not started'), `it does not claim the daemon was never started, got: ${out}`);
+        assert(out.includes('no live kernel'), `and it says why, got: ${out}`);
+      } finally {
+        console.log = prevLog;
+        console.error = prevErr;
+        if (prevHome === undefined) delete process.env['CORTEX_HOME'];
+        else process.env['CORTEX_HOME'] = prevHome;
+        await rm(home, { recursive: true, force: true });
+      }
+    });
+
+    // --- the whole chain, live -----------------------------------------------
+
+    await checkAsync('a live kernel answers "daemons" over the wire, and the window prints it', async () => {
+      // The whole chain, end to end: the kernel holds the daemon, the
+      // transport carries the answer, the window shows it.
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-daemon-live-'));
+      const kernel = await bootKernel({
+        kernelAbiVersion: KERNEL_ABI_VERSION,
+        dir: home,
+        autoStart: true,
+        agentLoader: async () => async () => {
+          // A daemon that parks: it stays alive, so the state is "running".
+          await new Promise((r) => setTimeout(r, 60_000));
+        },
+      });
+      const server = await startKernelServer(kernel, { log: () => {} });
+      try {
+        const pid = await kernel.registerDaemon({
+          role: 'inbox-watcher',
+          name: 'watcher',
+          agent: { module: 'test:watcher' },
+          restart: { kind: 'on-failure' },
+        });
+        writeEndpoint(home, server.endpoint);
+
+        const probe = await probeKernel(home);
+        assert(probe.kind === 'live', `the kernel is reachable, got ${probe.kind}`);
+        const client = probe.kind === 'live' ? probe.client : undefined;
+        assert(client !== undefined, 'a client exists');
+        try {
+          const reply = (await client!.request('daemons')) as { daemons: readonly DaemonState[] };
+          assert(Array.isArray(reply.daemons), 'the reply is a list');
+          assert(reply.daemons.length === 1, `one daemon, got ${reply.daemons.length}`);
+          const state = reply.daemons[0]!;
+          assert(state.name === 'watcher', `the name travels, got ${String(state.name)}`);
+          assert(state.role === 'inbox-watcher', `the role travels, got ${state.role}`);
+          assert(state.currentPid === unbrand(pid), `the pid travels, got ${state.currentPid}`);
+          assert(state.status === 'running', `the status travels, got ${state.status}`);
+
+          // And the window asks the same kernel for the same thing.
+          const dash = await startDashboard({
+            dir: home,
+            port: 0,
+            kernel: {
+              request: async (cmd) => {
+                if (cmd === 'daemons') return reply;
+                if (cmd === 'ping') return { abiVersion: KERNEL_ABI_VERSION, kernelPid: 1, startedAt: new Date().toISOString(), daemons: 1 };
+                throw new Error(`the dashboard asked for something else: ${cmd}`);
+              },
+              subscribe: async () => () => {},
+            },
+          });
+          try {
+            const res = await fetch(`${dash.url}/api/daemons`);
+            assert(res.status === 200, `status ${res.status}`);
+            const body = (await res.json()) as {
+              kernelLive: boolean;
+              summary: string;
+              daemons: {
+                name: string | null;
+                status: string;
+                statusLabel: string;
+                tone: string;
+                pid: number | null;
+                note: string | null;
+              }[];
+            };
+            assert(body.kernelLive === true, 'the window knows there is a kernel');
+            assert(body.daemons.length === 1, `one daemon, got ${body.daemons.length}`);
+            const row = body.daemons[0]!;
+            assert(row.name === 'watcher', `the name, got ${String(row.name)}`);
+            assert(row.status === 'running', `the status, got ${row.status}`);
+            // The words are the server's, so the page and the terminal cannot
+            // phrase the same daemon differently.
+            assert(row.statusLabel === 'running', `the label, got ${row.statusLabel}`);
+            assert(row.tone === 'live', `the tone, got ${row.tone}`);
+            assert(row.pid === unbrand(pid), `the pid, got ${String(row.pid)}`);
+            assert(body.summary.includes('1 running'), `the summary, got ${body.summary}`);
+          } finally {
+            await dash.close();
+          }
+        } finally {
+          client?.close();
+        }
+      } finally {
+        await server.close();
+        await kernel.shutdown();
+        await rm(home, { recursive: true, force: true });
+      }
+    });
+
+    await checkAsync('the window has a panel for the daemons, and it asks for the endpoint that answers', async () => {
+      const dash = await startDashboard({ dir: tmp, port: 0 });
+      try {
+        const html = await (await fetch(`${dash.url}/`)).text();
+        assert(html.includes('daemonRows'), 'the panel has a body to fill');
+        assert(html.includes('/api/daemons'), 'and it asks for the endpoint that answers');
+        // The panel says where the numbers come from, so an operator knows
+        // they are the kernel's answer and not the receipt's.
+        assert(html.includes('活状态来自内核'), 'the panel says the state comes from the kernel');
+      } finally {
+        await dash.close();
+      }
+    });
+
+    await checkAsync('the window says "unknown" for the daemons when there is no kernel', async () => {
+      const home = await mkdtemp(join(tmpdir(), 'cortex-smoke-daemon-nokernel-'));
+      try {
+        writeDaemon(home, {
+          name: 'watcher',
+          spec: { role: 'inbox-watcher', agent: { module: './agents/noop.js' }, restart: { kind: 'on-failure' } },
+          installedAt: new Date().toISOString(),
+        });
+        const dash = await startDashboard({ dir: home, port: 0 });
+        try {
+          const res = await fetch(`${dash.url}/api/daemons`);
+          assert(res.status === 200, `status ${res.status}`);
+          const body = (await res.json()) as {
+            kernelLive: boolean;
+            daemons: { name: string | null; status: string; statusLabel: string; note: string | null }[];
+          };
+          assert(body.kernelLive === false, 'there is no kernel');
+          assert(body.daemons.length === 1, `one daemon, got ${body.daemons.length}`);
+          const row = body.daemons[0]!;
+          // Not "not started": nobody was asked.
+          assert(row.status === 'unknown', `the status, got ${row.status}`);
+          assert(row.statusLabel === 'unknown', `the label, got ${row.statusLabel}`);
+          assert(row.note !== null && row.note.includes('no live kernel'), `the note says why, got ${String(row.note)}`);
+        } finally {
+          await dash.close();
+        }
+      } finally {
+        await rm(home, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    for (const table of tables) {
+      await table.closeAllRecorders().catch(() => undefined);
+    }
+    await rm(tmp, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
 async function runDaemonChecks(): Promise<void> {
   const { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, existsSync } = await import('node:fs');
   const { join } = await import('node:path');
@@ -22821,6 +23279,7 @@ await runTopChecks();
 await runTokenUsageChecks();
 await runKernelGoneChecks();
 await runDaemonChecks();
+await runDaemonStateChecks();
 await runKernelHardeningChecks();
 await runTransportChecks();
 await runBootChecks();

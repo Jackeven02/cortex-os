@@ -42,6 +42,39 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **The kernel says what its daemons are doing right now.** The kernel has
+  always known: init holds each **logical** daemon — its identity (the pid of
+  its *first* attempt), the attempt running right now, how many times it has
+  been restarted, how the last attempt ended, and whether the supervisor gave
+  up on it. None of that was on the way out, so the only list an operator had
+  was the **install receipt**.
+
+  It goes out now, as a **read** — not a reconstruction:
+
+  - `InitProcess.daemonStates()` — the facts init holds, one per daemon:
+    `daemonId`, `name`, `role`, `agent`, `restart`, `maxRestarts`,
+    `currentPid`, `status` (`running` / `dying` / `backing-off` / `gave-up` /
+    `stopped`), `restartCount`, `lastExitCode`, `lastExitReason`,
+    `gaveUpReason`.
+  - `Kernel.daemons()` (host side) and the transport's `daemons` command —
+    like `ps`, `openCalls` and `drivers`, and like them a read that is **not**
+    recorded.
+  - `DaemonSpec.name` (new, optional) — the operator's own name for a daemon,
+    passed at registration by `cortex daemon run` and carried in the journal's
+    records. It is the **join key** between the registry and the kernel: the
+    role is not an identity, because two daemons may share one.
+  - `src/cli/daemon_view.ts` (new) — the facts, the labels and the sentences
+    in one home: `joinDaemons()` (receipt × live), `describeDaemonStatus()`,
+    `formatDaemonExit()`, `formatDaemonPolicy()`, `describeDaemonNote()`,
+    `formatDaemonSummary()`.
+  - `GET /api/daemons` — the window's answer: the live state from the kernel,
+    the receipt from disk, joined by name.
+
+  **No kernel to ask means `unknown`, not "not running".** A daemon's live
+  state belongs to the kernel that supervises it; without one there is nothing
+  to ask, so the views say *unknown* and say why. A live kernel that does not
+  have the daemon is a different fact, and a different word: *not started*.
+
 - **The window says what the supervisor decided.** The kernel records every
   supervisory decision in **init's own log** — the supervision journal
   (docs/PROCESS.md §9.1, docs/ABI.md §6.1): a daemon was registered, an
@@ -1691,6 +1724,19 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   rollback would prove nothing.
 
 ### Fixed
+
+- **`cortex daemon list` reported the installation, not the daemon.** It
+  printed the spec — name, role, restart policy, agent — read from
+  `daemons.json`, and that is the *install receipt*: it says the daemon was
+  written down, and nothing more. It read exactly like the truth about the
+  daemon, and it was not: an operator could not tell whether the daemon was
+  running, whether it was flapping, whether the kernel had already given up
+  on it, or whether it was never started at all.
+
+  The command now asks the kernel that supervises the daemons and prints the
+  live state next to the receipt — `STATE`, `PID`, `RESTARTS`, `LAST EXIT` —
+  and it says *unknown*, with the reason, when there is no kernel to ask. It
+  does not say "not running", which is a different claim.
 
 - **The window dropped every supervisory decision the kernel had made.** The
   activity feed's rule was *"the kernel's own `__`-prefixed frames are not the

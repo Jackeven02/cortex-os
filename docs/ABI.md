@@ -1099,7 +1099,18 @@ transport has its own version, `KERNEL_PROTOCOL_VERSION`, and it moves only
 when the *framing* of an existing command changes — adding a command is
 additive, so `openCalls` did not move it either. The transport's `drivers`
 command — what this kernel can call, and which of those calls never declared a
-reversibility tag — was added for the same reason and moved it no more.
+reversibility tag — was added for the same reason and moved it no more. So was
+the transport's `daemons` command — what the supervised daemons are doing
+right now — and `Kernel.daemons()` beside it.
+
+`DaemonSpec` grew an optional `name` in the same round, and that is not an ABI
+change either: it is init's own registration type, internal to the kernel
+(ARCHITECTURE.md §4.9), and no agent can observe it. The name is the operator's
+own name for a daemon, and it is the join key between the registry
+(`daemons.json`) and the kernel — a role is not an identity, because two
+daemons may share one. The `.crec` format did not change either: the name
+travels in the `args` of the `__init` records that were already there, and a
+record that carries no name simply does not have one.
 
 **And a declared tag is not a declared *driver*.** A tool's reversibility tag
 says whether *that call* can be undone. Whether a **driver** can cross a

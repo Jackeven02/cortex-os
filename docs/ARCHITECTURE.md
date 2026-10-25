@@ -2240,6 +2240,48 @@ check can hold them to the same sentence. And an action nobody knows is
 **not** turned into a fact: guessing what a decision meant is how a view
 starts lying.
 
+**An installed daemon is not a running daemon.** `cortex daemon list` printed
+the **spec** — name, role, restart policy, agent — read from `daemons.json`.
+That file is the *install receipt*: it says the daemon was written down, and
+nothing else. It reads exactly like the truth about the daemon, and it is
+not. An operator who ran it could not tell whether the daemon was running,
+whether it was flapping, whether the kernel had already given up on it, or
+whether it was never started at all.
+
+The kernel knows all of that. init holds each **logical** daemon: its
+identity (the pid of its *first* attempt), the attempt running right now, how
+many times it has been restarted, how the last attempt ended, and whether the
+supervisor gave up — and the reason it gave up. None of it was on the way out.
+
+So it goes out now, the way the kernel's other answers go out: as a **read**,
+not a reconstruction. `Kernel.daemons()` on the host side, `daemons` on the
+transport — like `ps`, `openCalls` and `drivers`, and like them a read that is
+*not* recorded. The answer is O(daemons); replaying the supervision journal
+would be O(bytes of log), and worse: a journal can only say what *happened*.
+A daemon that was installed and never started leaves no trace in it at all,
+and a daemon the kernel gave up on looks exactly like one that is merely
+between attempts unless you replay the whole log and get the policy right.
+
+**And the two lists finally have a join key.** The registry and the kernel
+used to have nothing in common but the role — and a role is not an identity:
+two daemons may share one and differ only by their module. So the kernel
+*learns* the name: `DaemonSpec.name` (internal to init, so not an ABI
+change), passed at registration by `cortex daemon run`, and carried in the
+journal's records as well. The operator's own name for the daemon is what
+the registry and the kernel are lined up on.
+
+**No kernel to ask means the answer is unknown — not "not running".** A
+daemon's live state belongs to the kernel that supervises it; without one
+there is nothing to ask, so the view says *unknown* and says why. It does
+not fall back to "not started", which is a different claim: it would say the
+daemon was never started, when in fact nobody knows. (A live kernel that does
+*not* have the daemon **is** a fact, and a different one — that daemon was
+never started by that kernel.)
+
+The wording lives in one module (`src/cli/daemon_view.ts`), so the terminal
+and the window cannot disagree about a daemon that is flapping or dead — and
+so a check can hold them to the same sentence.
+
 **A queued signal is not a delivered signal.** `SIGTERM`'s default action is
 "terminate", but the queuing rule (PROCESS.md §7.2) means a signal aimed at
 a process that is *not running* sits in its pending queue until it wakes up

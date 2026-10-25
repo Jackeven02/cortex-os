@@ -538,6 +538,20 @@ async function dispatch(
       return { surface };
     }
 
+    case 'daemons': {
+      // A read, like `ps`, `openCalls` and `drivers`: the operator asking how
+      // the supervised daemons are doing is not something a daemon did, so it
+      // is not recorded.
+      //
+      // The kernel is the only place that can answer it. init holds each
+      // logical daemon's identity, its current attempt, its restart count and
+      // its last exit — and, just as importantly, it knows about a daemon that
+      // was **never started**, which the supervision journal cannot say,
+      // because a journal only records what happened.
+      const daemons = kernel.daemons();
+      return { daemons };
+    }
+
     case 'memory': {
       const pid = Number(args['pid']);
       if (!Number.isInteger(pid)) {

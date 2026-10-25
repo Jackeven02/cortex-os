@@ -118,6 +118,16 @@
     .state-blocked { background: var(--amber-soft); color: var(--amber); }
     .state-stopped { background: #fff0f0; color: var(--red); }
     .state-zombie, .state-exiting, .state-suspended { background: #f0f1f3; color: #737b87; }
+    .daemon-state { display: inline-flex; align-items: center; gap: 6px; padding: 4px 7px; border-radius: 5px; background: #f1f3f6; color: #667181; font-size: 9px; font-weight: 560; }
+    .daemon-state::before { width: 5px; height: 5px; border-radius: 50%; background: currentColor; content: ""; }
+    .daemon-state.live { background: var(--green-soft); color: var(--green); }
+    .daemon-state.warn { background: var(--amber-soft); color: var(--amber); }
+    .daemon-state.dead { background: #fff0f0; color: var(--red); }
+    .daemon-note { padding: 10px 16px; border-top: 1px solid #eff0f3; }
+    .daemon-note:empty { display: none; }
+    .daemon-note-line { display: block; margin-top: 5px; color: #8a93a1; }
+    .daemon-note-line:empty { display: none; }
+    .daemon-cell-note { margin-top: 4px; max-width: 190px; color: #8a93a1; font-size: 9px; line-height: 1.4; white-space: normal; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
     .empty { height: 120px; color: #929aa7; text-align: center; }
     .runtime { display: flex; flex-direction: column; }
@@ -272,6 +282,12 @@
           <section class="panel" id="checkpointsPanel">
             <div class="panel-head"><div><div class="panel-title">检查点</div><div class="panel-note">.csnap 快照 · 按 PID 分组</div></div><span class="state">只读</span></div>
             <div class="table-scroll"><table><thead><tr><th>PID</th><th>创建时间</th><th>Chain</th><th>大小</th><th>操作</th></tr></thead><tbody id="checkpointRows"><tr><td colspan="5" class="empty">正在读取…</td></tr></tbody></table></div>
+          </section>
+
+          <section class="panel" id="daemonsPanel">
+            <div class="panel-head"><div><div class="panel-title">守护进程 <span class="nav-count" id="daemonCount"></span></div><div class="panel-note">内核监管的守护进程 · 活状态来自内核</div></div><span class="state" id="daemonKernelState">只读</span></div>
+            <div class="table-scroll"><table><thead><tr><th>名称</th><th>角色</th><th>状态</th><th>PID</th><th>重启</th><th>上次结束</th><th>重启策略</th><th>Agent</th></tr></thead><tbody id="daemonRows"><tr><td colspan="8" class="empty">正在读取守护进程…</td></tr></tbody></table></div>
+            <div class="panel-note daemon-note"><span id="daemonSummary"></span><span id="daemonNote" class="daemon-note-line"></span></div>
           </section>
         </div>
 
@@ -617,6 +633,14 @@
     }
 
     let checkpointData = [];
+    // The supervised daemons, and what the kernel says about them.
+    //
+    // The words are the server's: the page is a static file and cannot
+    // compute "given up" or "waiting to restart" itself, and the terminal
+    // says the same sentences. So the panel prints what it is given.
+    let daemonData = [];
+    let daemonSummary = '';
+    let daemonKernelLive = false;
     let pollTimer = null;
     let opsEnabled = false;
     let opsList = [];
@@ -638,6 +662,50 @@
       }).join('') : '<tr><td colspan="5" class="empty">暂无检查点。对进程执行 cortex checkpoint &lt;pid&gt; 后会显示在这里。</td></tr>';
       $('checkpointRows').querySelectorAll('button[data-chain]').forEach((button) => button.addEventListener('click', () => restoreOps(button.dataset.chain)));
       $('checkpointRows').querySelectorAll('button[data-ck]').forEach((button) => button.addEventListener('click', () => showCheckpoint(button.dataset.ck)));
+    }
+
+    // The supervised daemons.
+    //
+    // The only list the window had before this was the **install receipt** —
+    // which says a daemon was written down, and nothing about whether it is
+    // running, flapping, or already given up on. A receipt that reads like the
+    // truth about a daemon is the kind of thing an operator acts on.
+    //
+    // So the live state comes from the kernel that owns the daemons, and the
+    // receipt comes from disk; the two are joined on the daemon's **name**,
+    // because the role is not an identity. The words are the server's — the
+    // page prints them as they arrive.
+    //
+    // And when there is no kernel to ask, the state is **unknown**, with the
+    // reason under the row. It is not "not running": that is a different
+    // claim, and this window does not make claims it has not checked.
+    function renderDaemons() {
+      $('daemonCount').textContent = daemonData.length ? `(${daemonData.length})` : '';
+      $('daemonKernelState').textContent = daemonKernelLive ? '活内核' : '无活内核';
+      // A note that every row shares is said **once**, under the panel: two
+      // rows with the same reason have one thing to say, and repeating it
+      // under each row turns the panel into a wall of the same sentence.
+      const noteCounts = new Map();
+      for (const daemon of daemonData) {
+        const note = typeof daemon.note === 'string' ? daemon.note : '';
+        if (note === '') continue;
+        noteCounts.set(note, (noteCounts.get(note) ?? 0) + 1);
+      }
+      const shared = [...noteCounts.entries()]
+        .filter(([, count]) => count === daemonData.length)
+        .map(([note]) => note);
+      $('daemonRows').innerHTML = daemonData.length ? daemonData.map((daemon) => {
+        const tone = ['live', 'warn', 'dead', 'idle'].includes(daemon.tone) ? daemon.tone : 'idle';
+        const label = typeof daemon.statusLabel === 'string' ? daemon.statusLabel : 'unknown';
+        const note = typeof daemon.note === 'string' ? daemon.note : '';
+        const name = typeof daemon.name === 'string' && daemon.name !== '' ? esc(daemon.name) : '未命名';
+        const noteCell = note === '' || shared.includes(note)
+          ? ''
+          : `<div class="daemon-cell-note">${esc(note)}</div>`;
+        return `<tr><td class="role-cell">${name}</td><td>${esc(daemon.role ?? '—')}</td><td><span class="daemon-state ${tone}">${esc(label)}</span>${noteCell}</td><td class="pid-cell">${esc(daemon.pid ?? '—')}</td><td class="pid-cell">${esc(daemon.restarts ?? '—')}</td><td>${esc(daemon.exitLabel ?? '—')}</td><td>${esc(daemon.policyLabel ?? '—')}</td><td title="${esc(daemon.agentLabel ?? '')}">${esc(daemon.agentLabel ?? '—')}</td></tr>`;
+      }).join('') : '<tr><td colspan="8" class="empty">没有守护进程。用 cortex daemon install 注册一个，这里会显示内核眼中的活状态。</td></tr>';
+      $('daemonSummary').textContent = daemonSummary;
+      $('daemonNote').textContent = shared.join(' · ');
     }
 
     // What a snapshot holds.
@@ -971,6 +1039,7 @@
       renderEvents();
       renderBudgets();
       renderCheckpoints();
+      renderDaemons();
       if (processView === 'tree') renderTree();
     }
 
@@ -989,6 +1058,7 @@
           fetch('/api/checkpoints', { cache: 'no-store' }),
           fetch('/api/ops', { cache: 'no-store' }),
           fetch(`/api/node?transport=${transport}`, { cache: 'no-store' }),
+          fetch('/api/daemons', { cache: 'no-store' }),
         ]);
         if (responses.some((response) => !response.ok)) throw new Error('API 请求失败');
         [processData, checkpointData] = await Promise.all([
@@ -1000,6 +1070,11 @@
         // checked rather than assumed — and what the top bar may say about
         // the connection behind the numbers.
         renderNode(await responses[3].json());
+        // The daemons the kernel supervises, and what it says about them.
+        const daemonPayload = await responses[4].json();
+        daemonData = Array.isArray(daemonPayload.daemons) ? daemonPayload.daemons : [];
+        daemonSummary = typeof daemonPayload.summary === 'string' ? daemonPayload.summary : '';
+        daemonKernelLive = daemonPayload.kernelLive === true;
         opsList = Array.isArray(opsData.ops) ? opsData.ops : (opsData.allowOps === true ? ['restore'] : []);
         opsEnabled = opsList.length > 0;
         $('spawnBar').hidden = !opsList.includes('spawn');
