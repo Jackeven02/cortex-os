@@ -210,8 +210,20 @@ const after = ctx.budget();
 console.log(`spent ${after.tokensIn + after.tokensOut} tokens`);
 ```
 
+```ts
+await ctx.set_intent('ship the merge', 'both values survive');
+await Promise.all([
+  ctx.llm_call({ messages, timeoutMs: 30_000 }),
+  ctx.llm_call({ messages: followUp }),
+]);
+```
+
 ```bash
 cortex spawn --role coder --task "..." --token-budget 20000 --wall-time-budget 60000
+cortex fork 2 --budgets split          # the child gets half of what the parent has left
+cortex gc                              # print old checkpoints; nothing is deleted
+cortex gc --apply                      # keep each process's newest checkpoint, delete the older ones
+cortex doctor                          # say which forkable drivers can show their state
 cortex limit 1234 --tokens 10000 --usd 0.50 --wall-time 60000
 cortex limit 1234                      # show current limits
 cortex spawn --role hoarder --task "..." --max-region-entries 500  # global cap: every region stops at 500 writes (ENOMEM beyond it; omit = unlimited)

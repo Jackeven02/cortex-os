@@ -28,7 +28,7 @@ This directory holds the technical specifications. **Read them in this order:**
 |---|---|
 | STATE.md | **drafted v0** — §8 decided |
 | PROCESS.md | **drafted v0** — §11 decided |
-| ABI.md | **FROZEN since 1.0.0**, currently `1.2.0` — 25 syscalls; §9.2 and §9.3 resolved in 1.0 |
+| ABI.md | **FROZEN since 1.0.0**, currently `1.3.0` — 26 syscalls; §9.2 and §9.3 resolved in 1.0 |
 | ARCHITECTURE.md | **drafted v0** — §12 decided |
 | CRITIQUE.md | live, 1 entry |
 | HACKING.md | drafted (Phase 5) |

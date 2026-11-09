@@ -297,6 +297,8 @@ That is 24 syscalls, up from 19. **From here:** breaking changes need a major bu
 
 **`1.2.0` closes the birth-authority hole.** A narrowed parent that does not hold `admin` can no longer hand a child capabilities it does not hold; omitting the sets inherits them. A fork copies them, a checkpoint carries them, and `cortex daemon install --cap` writes them onto the daemon so a restart does not drop them. An agent that was minting a richer child now gets `EPERM`. No syscall was added.
 
+**`1.3.0` adds `set_intent`.** An agent names a goal and the condition that says it is done. A queued signal's sender is on the process record. A model or tool call that never returns is cut off by the kernel. That is 26 syscalls.
+
 **Phase 0 — Design (complete).** Four documents drafted v0: `STATE.md` (the hard part), `PROCESS.md` (lifecycle), `ABI.md` (syscall contract), `ARCHITECTURE.md` (kernel modules). The questions those documents left open are decided; what was named as later work is in the icebox.
 
 **Phases 1–3 — largely complete.** The kernel boots; all thirteen kernel modules plus the driver registry are in; all seven drivers ship (mock / deepseek / openai LLM, MCP and filesystem tools, inmem and sqlite memory); most of the CLI works. `cortex spawn → llm_call → exit → reap` runs, and checkpoint/restore survives across separate CLI invocations. Known v0 gaps are recorded honestly in [BACKLOG.md](./BACKLOG.md), not hidden.
@@ -497,7 +499,7 @@ See **[BACKLOG.md](./BACKLOG.md)** for the full list, prioritized.
 | [MANIFESTO.md](./MANIFESTO.md) | Why cortex exists. Start here. |
 | [docs/STATE.md](./docs/STATE.md) | **The hard part.** What agent state is, what gets copied on fork, what cannot be copied at all. |
 | [docs/PROCESS.md](./docs/PROCESS.md) | Agent lifecycle: 9 states, the legal-transition table, signals, scheduling |
-| [docs/ABI.md](./docs/ABI.md) | Syscall contract: 25 syscalls, 3 driver interfaces, error model, recording format |
+| [docs/ABI.md](./docs/ABI.md) | Syscall contract: 26 syscalls, 3 driver interfaces, error model, recording format |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Kernel modules and data flow: 13 modules, syscall lifecycle, persistence layout, concurrency model |
 | [docs/HACKING.md](./docs/HACKING.md) | Contributor guide: dev setup, conventions, how to write a driver / agent / syscall, testing. |
 | [docs/COOKBOOK.md](./docs/COOKBOOK.md) | Recipes: supervision trees, pause-and-resume, fork-and-compare, daemons, tools, IPC (+ explicit channels), budgets, least privilege (capabilities), testing. |

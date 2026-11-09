@@ -92,9 +92,14 @@ export function formatCaps(caps: readonly Capability[] | undefined): string {
 export function describePendingSignals(
   text: string,
   pending: readonly Signal[] | undefined,
+  from?: readonly (number | null)[] | undefined,
 ): string {
   if (pending === undefined || pending.length === 0) return text;
-  const queued = `${pending.join(',')} queued`;
+  const names = pending.map((signal, index) => {
+    const sender = from?.[index];
+    return sender === undefined || sender === null ? signal : `${signal} from ${sender}`;
+  });
+  const queued = `${names.join(',')} queued`;
   return text === '' ? queued : `${text} — ${queued}`;
 }
 
@@ -228,6 +233,8 @@ export interface ProcessRow {
    * know. It does **not** mean "nothing is queued".
    */
   readonly pendingSignals?: readonly Signal[];
+  /** Who queued each pending signal, in the same order. */
+  readonly pendingSignalFrom?: readonly (number | null)[];
   /**
    * The checkpoints this process was parked at, oldest first.
    *
@@ -321,6 +328,7 @@ interface LiveProcessInfo {
    * Absent is *not reported*; it never means "nothing queued".
    */
   readonly pendingSignals?: readonly Signal[];
+  readonly pendingSignalFrom?: readonly (number | null)[];
   /**
    * The checkpoints this process was parked at, oldest first.
    *
@@ -375,6 +383,7 @@ function rowFromLive(info: LiveProcessInfo): ProcessRow {
     blockedOn: info.blockedOn,
     capabilities: info.capabilities,
     ...(info.pendingSignals !== undefined ? { pendingSignals: info.pendingSignals } : {}),
+    ...(info.pendingSignalFrom !== undefined ? { pendingSignalFrom: info.pendingSignalFrom } : {}),
     ...(info.checkpointChain !== undefined ? { checkpointChain: info.checkpointChain } : {}),
     ...(info.nice !== undefined ? { nice: info.nice } : {}),
     live: true,

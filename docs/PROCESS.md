@@ -438,6 +438,8 @@ This means an agent that is blocked inside an LLM or tool call and receives SIGT
 
 A default **terminate** (`SIGTERM`, `SIGINT`, `SIGXFSZ`, `SIGSYS`) aimed at a process blocked on `recv` or `wait` is delivered immediately. Those waits can last forever, and a signal that waits with them never arrives. `SIGKILL` is unchanged: it is immediate from any state. A custom handler still queues, because running the handler needs the process to be RUNNING.
 
+A queued signal remembers who sent it. `pendingSignals` stays a list of signal names. `pendingSignalFrom` is the same length and names the sender, or `null` when the sender was not named. A second copy of the same signal coalesces and does not replace the first sender. `cortex ps` prints `SIGTERM from 4`.
+
 `SIGUSR2` is no exception to the queue for a model call: a "checkpoint now" waits until the call returns, and the snapshot is of the agent as it is *then*, not as it was when the signal arrived.
 
 **And the operator's views say so.** The queue is the kernel's own, and the
@@ -896,6 +898,7 @@ export interface ProcessInfo {
   readonly exitReason: string | null;
   readonly checkpointChain: ChainId[];
   readonly pendingSignals: readonly Signal[];
+  readonly pendingSignalFrom: readonly (ProcessId | null)[];
 }
 
 export interface WaitResult {
@@ -935,7 +938,7 @@ If an LLM driver hangs (no response, no timeout), the process is BLOCKED forever
 
 **Default answer:** every LLM and tool call has a driver-level timeout (default 60s, configurable). On timeout, the syscall returns `ETIMEDOUT`. The agent decides what to do.
 
-**Decision:** no second ceiling. The driver's timeout is the timeout. A call that hangs past it returns `ETIMEDOUT`, and the agent decides what to do.
+**Decision:** the driver's timeout still applies, and a caller may ask for less. The kernel will not leave the process parked longer than 120 seconds, including when the driver ignores its abort and never returns. That wait ends with `ETIMEDOUT`. The agent decides what to do. A caller who needs a shorter cap sets it on the call, or the kernel is booted with a lower ceiling.
 
 ### 11.2 SIGKILL semantics for groups
 
@@ -957,11 +960,7 @@ For most uses this does not matter. For some (e.g. "resume the inbox watcher dae
 
 Should a single agent process be able to run "parallel thoughts"? E.g. one process, multiple concurrent LLM calls?
 
-Unix has threads. Cortex v0 does not. An agent that wants concurrency spawns children.
-
-**Why:** threads introduce shared mutable state within a process, which complicates the state model in STATE.md §2 enormously. Children are cleaner.
-
-We may revisit in v1 if real workloads demand it.
+**Decision:** one process still has one body, and it still has no threads. That body may have two model or tool calls in flight at once (`Promise.all` of two `llm_call`s, or a tool call beside a model call). The process stays blocked until the last of those calls returns. Anything else — a second body, a thread the scheduler runs while the first is parked on `recv` — is still a child process.
 
 ### 11.5 PID namespaces (multi-tenant)
 
@@ -978,9 +977,7 @@ A process that is BLOCKED on an LLM call when the kernel dies — what happens o
 - If checkpointed recently, restore gives a slightly stale process
 - If not, the process is gone
 
-**v0 answer:** kernel restart kills all non-suspended processes. The supervisor's restart policy decides what comes back. Long-running agents should checkpoint periodically (e.g. on a timer, or on SIGUSR2 from a cron job).
-
-**v1 may add:** automatic checkpointing on graceful kernel shutdown.
+**Decision:** the kernel appends a recovery line when an agent starts, and a "gone" line when it exits. A boot reads that log. A process whose last line is still "live" comes back: from its newest checkpoint when it has one, otherwise the same agent starts again from the top under a new PID. The call that was in flight is lost. `cortex daemon run` also writes a checkpoint of each running or blocked agent every 60 seconds, and again before a stop it was asked for. A short-lived `cortex spawn` does not take those snapshots.
 
 ### 11.7 Auto-reap and SIGCHLD ordering
 

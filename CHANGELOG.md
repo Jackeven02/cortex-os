@@ -2040,6 +2040,27 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   `enter` frame has to land, or the send would never be prepared and the
   rollback would prove nothing.
 
+### Added
+
+- **Shared memory merges, intent has a shape, and a crash can come back.**
+  Two writes to one shared key are combined: lines and object keys are
+  kept, and a value that cannot be combined is stored as both sides.
+  `set_intent(goal, doneWhen)` is the shape of an intent (ABI `1.3.0`).
+  A model or tool call that never returns is cut off by the kernel at
+  120 seconds. One process may have two of those calls in flight. A queued
+  signal's sender is on the process record (`pendingSignalFrom`). The
+  kernel writes a recovery log, and the next boot restores a checkpoint
+  or starts the same agent again. `cortex daemon run` also checkpoints
+  living agents every 60 seconds.
+
+- **`cortex gc` and `cortex doctor`.** `gc` prints checkpoint files older than
+  the newest one for that process, and deletes them with `--apply`. Syscall
+  logs stay. `doctor` says whether a driver that claims to survive a fork
+  also offers serialize and restore. It does not call them. A queued signal
+  keeps the sender that first asked, and names that sender when it is
+  delivered. `cortex daemon run` writes a checkpoint of each living agent
+  before it stops the kernel. A crash still loses what was only in memory.
+
 ### Fixed
 
 - **The five open checklist items.** The event table says 「窗口内 N 条」 when

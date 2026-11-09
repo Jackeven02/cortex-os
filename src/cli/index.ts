@@ -72,6 +72,8 @@ import { cmdSend } from './commands/send.js';
 import { cmdLimit } from './commands/limit.js';
 import { cmdRenice } from './commands/renice.js';
 import { cmdAudit } from './commands/audit.js';
+import { cmdDoctor } from './commands/doctor.js';
+import { cmdGc } from './commands/gc.js';
 import { cmdExample } from './commands/example.js';
 import { cmdHelp } from './commands/help.js';
 import { cmdDashboard } from './commands/dashboard.js';
@@ -138,6 +140,10 @@ export async function main(argv: string[]): Promise<number> {
         return await cmdRenice(rest);
       case 'audit':
         return await cmdAudit(rest);
+      case 'doctor':
+        return await cmdDoctor(rest);
+      case 'gc':
+        return await cmdGc(rest);
       case 'dashboard':
         return await cmdDashboard(rest);
       case 'example':
@@ -410,6 +416,13 @@ export async function bootCliKernel(
      * (docs/PROCESS.md §9).
      */
     readonly onDaemonDecision?: (decision: DaemonDecision) => void;
+    /**
+     * Write a checkpoint of each living agent before the kernel stops them.
+     * `cortex daemon run` asks for this. A short-lived `cortex spawn` does not.
+     */
+    readonly checkpointOnShutdown?: boolean;
+    /** How often a long-running kernel snapshots living agents. */
+    readonly checkpointIntervalMs?: number;
   } = {},
 ): Promise<Kernel> {
   ensureKernelDirs(dir);
@@ -458,6 +471,10 @@ export async function bootCliKernel(
     ...(opts.replay !== undefined ? { replay: opts.replay } : {}),
     ...(opts.onDaemonDecision !== undefined ? { onDaemonDecision: opts.onDaemonDecision } : {}),
     autoStart: true,
+    ...(opts.checkpointOnShutdown === true ? { checkpointOnShutdown: true } : {}),
+    ...(opts.checkpointIntervalMs !== undefined
+      ? { checkpointIntervalMs: opts.checkpointIntervalMs }
+      : {}),
     // The kernel's default restoreContext reads an in-memory per-PID map that
     // is empty in a fresh CLI invocation, so cross-invocation `cortex restore`
     // would trap EINVAL ("no agent metadata"). The `.csnap` body deliberately

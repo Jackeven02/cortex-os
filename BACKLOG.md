@@ -2679,7 +2679,7 @@ Things we want, but not yet:
 - Sandbox fork (STATE.md §3.2) — copy-on-write filesystem overlay
 - Shadow process (STATE.md §3.4) — same state, different driver config
 - Two-phase tool pattern (`stage` / `commit`) for irreversible actions
-- `cortex doctor` to probe driver fork-safety claims
+- ~~`cortex doctor` to probe driver fork-safety claims~~ → **shipped** as a check that a `forkable` driver offers serialize and restore. It does not execute them.
 - CRDT-backed shared memory regions (if last-write-wins hurts)
 
 **From the long-term vision:**

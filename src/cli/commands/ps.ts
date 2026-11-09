@@ -261,7 +261,7 @@ COLUMNS
       ending,
       budget: describeBudget({ spent: p.budgetsSpent, remaining: p.budgetsRemaining }),
       checkpoint: describeCheckpointPark(p),
-      waiting: describePendingSignals(wait, p.pendingSignals),
+      waiting: describePendingSignals(wait, p.pendingSignals, p.pendingSignalFrom),
     });
   };
 

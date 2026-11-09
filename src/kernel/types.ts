@@ -171,6 +171,13 @@ export interface PendingCall {
  */
 export interface CognitiveSnapshot {
   readonly messages: readonly Message[];
+  /**
+   * What the agent is trying to do.
+   *
+   * A string, so a snapshot written before the shape existed still loads.
+   * When the agent used `set_intent`, the string is JSON:
+   * `{ "goal", "doneWhen" }`. A plain sentence is a goal with no done-when.
+   */
   readonly intent: string | null;
   readonly pendingCalls: readonly PendingCall[];
 }
@@ -522,6 +529,12 @@ export interface ProcessInfo {
   readonly exitReason: string | null;
   readonly checkpointChain: readonly ChainId[];
   readonly pendingSignals: readonly Signal[];
+  /**
+   * Who queued each pending signal, in the same order. `null` means the
+   * sender was not named. Added in ABI `1.3.0`. The signal names themselves
+   * stay a list of names.
+   */
+  readonly pendingSignalFrom: readonly (ProcessId | null)[];
   /**
    * Capabilities this process currently holds (docs/ABI.md §4.9). Every
    * capability when the spawner said nothing — see `DEFAULT_CAPABILITIES`.
@@ -1302,6 +1315,16 @@ export interface CortexContext {
   // §4.3 Cognition
   // ---------------------------------------------------------------------------
   llm_call(req: LLMRequest): Promise<LLMResponse>;
+  /**
+   * Say what this process is trying to do.
+   *
+   * `goal` is the outcome. `doneWhen` is how the agent will know it got
+   * there. Both are stored on the process and travel with a checkpoint.
+   */
+  set_intent(goal: string, doneWhen?: string | null): Promise<{
+    readonly goal: string;
+    readonly doneWhen: string | null;
+  }>;
   tool_call(
     name: string,
     args: unknown,

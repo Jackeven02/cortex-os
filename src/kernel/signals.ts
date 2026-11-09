@@ -419,15 +419,20 @@ export class SignalManager {
       const cur = this.#table.get(pid);
       if (cur === undefined) break;
       if (cur.state !== 'running') {
-        // Push the un-delivered tail back onto the queue, preserving order.
+        // Push the un-delivered tail back onto the queue, preserving order
+        // and the sender that was recorded when each one was first queued.
         const idx = drained.indexOf(sig);
         for (let i = idx; i < drained.length; i++) {
           const remaining = drained[i];
-          if (remaining !== undefined) this.#table.queueSignal(pid, remaining);
+          if (remaining !== undefined) {
+            this.#table.queueSignal(pid, remaining, this.#table.queuedFrom(pid, remaining));
+          }
         }
         break;
       }
-      const outcome = await this.#applyDelivered(pid, sig);
+      const from = this.#table.queuedFrom(pid, sig);
+      const outcome = await this.#applyDelivered(pid, sig, from);
+      this.#table.forgetQueuedFrom(pid, sig);
       outcomes.push(outcome);
     }
     return outcomes;
@@ -477,7 +482,7 @@ export class SignalManager {
       if (state === 'running') {
         return await this.#applyDelivered(pid, signal, from);
       }
-      this.#table.queueSignal(pid, signal);
+      this.#table.queueSignal(pid, signal, from);
       await this.#record(pid, signal, from, 'queued', {
         disposition: { kind: 'default' },
         action: 'stop',
@@ -503,7 +508,7 @@ export class SignalManager {
 
     // All other signals: queue if not RUNNING (§7.2).
     if (state !== 'running') {
-      this.#table.queueSignal(pid, signal);
+      this.#table.queueSignal(pid, signal, from);
       await this.#record(pid, signal, from, 'queued', {
         disposition: this.#table.getDisposition(pid, signal),
         action: DEFAULT_ACTIONS[signal],
@@ -598,7 +603,7 @@ export class SignalManager {
     if (entry.state !== 'running') {
       // Cannot stop a non-running process; queue instead. (Defensive — the
       // dispatcher should have routed through queueSignal already.)
-      this.#table.queueSignal(pid, signal);
+      this.#table.queueSignal(pid, signal, from);
       await this.#record(pid, signal, from, 'queued', {
         disposition: { kind: 'default' },
         action: 'stop',
@@ -733,7 +738,7 @@ export class SignalManager {
     if (!isLegalTransition(entry.state, 'exiting')) {
       // NEW / READY / CHECKPOINTING cannot terminate directly. Queue and
       // wait for the next RUNNING transition.
-      this.#table.queueSignal(pid, signal);
+      this.#table.queueSignal(pid, signal, from);
       await this.#record(pid, signal, from, 'queued', {
         disposition: { kind: 'default' },
         action: graceful ? 'terminate' : 'kill',

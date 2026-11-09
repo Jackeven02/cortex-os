@@ -37,6 +37,8 @@ COMMANDS
   limit        Set or show resource budgets per process
   renice       Move a running process up or down the queue
   audit        Surface tools untagged for reversibility
+  doctor       Check fork claims the kernel would trust
+  gc           Drop checkpoint files older than the newest one
   daemon       Register/run long-lived supervised agents (install/list/uninstall/run/ack)
   dashboard   Open the local read-only monitoring UI
   example      Run one of the agent modules bundled with cortex

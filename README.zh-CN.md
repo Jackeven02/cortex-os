@@ -283,6 +283,8 @@ syscall 从 19 个变成 24 个。**从此以后**：破坏性变更需要大版
 
 **`1.1.0` 是第一次「新增式」推进，而它是宿主自己的命令反复证明的那个缺口。** agent 以前**完全**改不了档位 —— 改不了自己的、改不了孩子的、改不了陌生人的 —— 而运维侧明明有一条干这件事的命令。现在 agent 有了自己的门（`renice` syscall，§4.10），用的是 `kill` 和 `send` 早就用的那套 reach 规则：自己人随便改，别人的档位要新的 `renice` 能力（§4.9）。没有删除、没有改名、没有重新定义，所以按 `1.0.0` 写的 agent 照样跑 —— 它只是以前不知道自己能改档位。现在是 25 个 syscall。
 
+**`1.3.0` 加上了 `set_intent`。** Agent 要写出目标和怎样算做成。排队信号的发送者写在进程记录上。模型或工具调用一直不回来时，内核会自己停掉这次等待。现在是 26 个 syscall。
+
 **Phase 0 — 设计（完成）。** 四份文档 v0 落地：`STATE.md`（最难的那份）、`PROCESS.md`（生命周期）、`ABI.md`（syscall 契约）、`ARCHITECTURE.md`（内核模块）。这些文档末尾曾经敞开的问题已经定了；标成以后再做的，在冰盒里。
 
 **Phase 1–3 —— 大体完成。** 内核能启动；十三个内核模块加上驱动注册表都在；七个驱动全部交付（mock / deepseek / openai 三个 LLM，MCP 与文件系统两个工具驱动，inmem 与 sqlite 两个记忆驱动）；CLI 大部分可用。`cortex spawn → llm_call → exit → reap` 能跑，checkpoint/restore 能跨不同的 CLI 调用存活。v0 的已知缺口都诚实地记录在 [BACKLOG.md](./BACKLOG.md) 里，没有藏。
@@ -483,7 +485,7 @@ __sched:renice(0->-7)
 | [MANIFESTO.md](./MANIFESTO.md) | cortex 为什么存在。先读这个。（[中文](./MANIFESTO.zh-CN.md)） |
 | [docs/STATE.md](./docs/STATE.md) | **最难的部分。** agent state 是什么，fork 时复制什么，什么根本不能复制。（[中文](./docs/STATE.zh-CN.md)） |
 | [docs/PROCESS.md](./docs/PROCESS.md) | agent 生命周期：9 个状态、合法转换表、signals、调度 |
-| [docs/ABI.md](./docs/ABI.md) | syscall 契约：25 个 syscall、3 个 driver 接口、错误模型、记录格式 |
+| [docs/ABI.md](./docs/ABI.md) | syscall 契约：26 个 syscall、3 个 driver 接口、错误模型、记录格式 |
 | [docs/INTEGRATIONS.md](./docs/INTEGRATIONS.md) | 将 LangChain 事件和只读 Dashboard 接入现有 Node.js 项目 |
 | [docs/DRIVERS.md](./docs/DRIVERS.md) | 内置 LLM 驱动（mock / deepseek / openai）：选择顺序、环境变量、端点覆盖 |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 内核模块和数据流：12 个模块、syscall 生命周期、持久化布局、并发模型 |

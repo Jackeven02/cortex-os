@@ -111,6 +111,7 @@ import {
   unbrand,
 } from './types.js';
 import { CortexError, isCortexError, trap, wrapDriverError } from './errors.js';
+import { mergeValues } from './memory_merge.js';
 import type { ProcessTable } from './process_table.js';
 import type { SyscallRecordInput } from './recorder.js';
 
@@ -258,6 +259,12 @@ export class MemoryManager {
   #refCounts = new Map<string, number>();
   /** physical key → approximate write count (for ENOMEM). */
   #sizes = new Map<string, number>();
+  /**
+   * One shared key is written by one caller at a time. The next writer
+   * sees the merged result of the previous one, instead of both reading
+   * the old value and the later write erasing the earlier.
+   */
+  #writeTails = new Map<string, Promise<unknown>>();
   #uid = 0;
 
   constructor(opts: MemoryManagerOptions) {
@@ -590,13 +597,26 @@ export class MemoryManager {
       // before this branch's first write mutates it.
       await this.#maybeCowDuplicate(pid, region, binding, driver);
 
-      await driver.write(
-        binding.physical,
-        key,
-        value,
-        // exactOptionalPropertyTypes: only forward opts when present.
-        ...(opts !== undefined ? [opts] : []),
-      );
+      const writeOne = async (): Promise<void> => {
+        let stored = value;
+        if (binding.policy.kind === 'shared') {
+          const existing = await driver.read(binding.physical, { key });
+          const current = existing[0]?.value;
+          if (existing.length > 0) stored = mergeValues(current, value).value;
+        }
+        await driver.write(
+          binding.physical,
+          key,
+          stored,
+          // exactOptionalPropertyTypes: only forward opts when present.
+          ...(opts !== undefined ? [opts] : []),
+        );
+      };
+      if (binding.policy.kind === 'shared') {
+        await this.#exclusiveWrite(`${binding.physical}\0${key}`, writeOne);
+      } else {
+        await writeOne();
+      }
       this.#sizes.set(binding.physical, (this.#sizes.get(binding.physical) ?? 0) + 1);
     } catch (err) {
       if (isCortexError(err)) throw err; // already recorded above
@@ -635,6 +655,28 @@ export class MemoryManager {
 
     const map = this.#bindings.get(unbrand(pid));
     if (map !== undefined) map.set(region, binding);
+  }
+
+  /**
+   * Run `fn` only after every earlier write to this key has finished.
+   * Callers on one kernel are concurrent Promises, not threads, so a chain
+   * is the lock.
+   */
+  async #exclusiveWrite(id: string, fn: () => Promise<void>): Promise<void> {
+    const previous = this.#writeTails.get(id) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => gate);
+    this.#writeTails.set(id, tail);
+    await previous.catch(() => {});
+    try {
+      await fn();
+    } finally {
+      release();
+      if (this.#writeTails.get(id) === tail) this.#writeTails.delete(id);
+    }
   }
 
   #mustBind(pid: ProcessId, region: string, syscall: string): RegionBinding {

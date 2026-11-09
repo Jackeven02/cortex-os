@@ -72,6 +72,7 @@ import {
   NICE_MIN,
   isValidNice,
 } from './types.js';
+import type { Intent } from './intent.js';
 import { CortexError, isCortexError, trap } from './errors.js';
 import { type Recorder, type SyscallRecordInput } from './recorder.js';
 import { tokenUsage } from '../token_usage.js';
@@ -286,6 +287,14 @@ export interface ProcessEntry {
   exitReason: string | null;
   checkpointChain: ChainId[];
   pendingSignals: Signal[];
+  /**
+   * Who queued each entry of `pendingSignals`, in the same order.
+   * `null` is a signal whose sender was not named. This is part of the
+   * process record a `ps` snapshot returns.
+   */
+  pendingSignalFrom: (ProcessId | null)[];
+  /** What this process is trying to do. Null until `set_intent`. */
+  intent: Intent | null;
   signalDispositions: Map<Signal, SignalDisposition>;
   daemon: boolean;
   autoReap: boolean;
@@ -639,6 +648,8 @@ export class ProcessTable {
       exitReason: null,
       checkpointChain: [],
       pendingSignals: [],
+      pendingSignalFrom: [],
+      intent: null,
       signalDispositions: new Map(Object.entries(opts.signals ?? {}) as [Signal, SignalDisposition][]),
       daemon: opts.daemon ?? false,
       autoReap: opts.autoReap ?? false,
@@ -787,6 +798,7 @@ export class ProcessTable {
       ledger.set(unbrand(pid), result);
     }
 
+    this.clearQueuedFrom(pid);
     this.#entries.delete(unbrand(pid));
     this.#recorders.delete(unbrand(pid));
     // The reaped process's own ledger is now unreachable — a dead parent cannot
@@ -1069,16 +1081,62 @@ export class ProcessTable {
   // ---------------------------------------------------------------------------
 
   /**
+   * Who queued a signal, keyed beside `pendingSignals`.
+   *
+   * `pendingSignals` is part of `ProcessInfo` and stays a list of signal
+   * names. The sender is not a field on that list. It lives here so a signal
+   * that has to wait can still name who sent it when it is finally delivered.
+   * The first sender wins: a second copy of the same signal coalesces, and
+   * does not replace the sender.
+   */
+  #queuedFrom = new Map<string, ProcessId | undefined>();
+
+  #fromKey(pid: ProcessId, signal: Signal): string {
+    return `${unbrand(pid)}:${signal}`;
+  }
+
+  /**
    * Queue a signal for later delivery. The table does not decide *when* or
    * *whether* to deliver — that is signals.ts. Coalescing (collapsing
    * duplicate pending signals of the same type, per docs/PROCESS.md §11.7)
-   * happens here.
+   * happens here. `from` is the first sender; a later copy of the same
+   * signal does not replace it.
    */
-  queueSignal(pid: ProcessId, signal: Signal): void {
+  queueSignal(pid: ProcessId, signal: Signal, from?: ProcessId): void {
     const entry = this.mustGet(pid, 'queueSignal');
     // Coalesce: if the same signal is already pending, do not duplicate.
     if (!entry.pendingSignals.includes(signal)) {
       entry.pendingSignals.push(signal);
+      entry.pendingSignalFrom.push(from ?? null);
+      this.#queuedFrom.set(this.#fromKey(pid, signal), from);
+    }
+  }
+
+  /** What this process last said it was trying to do. */
+  intentOf(pid: ProcessId): Intent | null {
+    return this.mustGet(pid, 'intent').intent;
+  }
+
+  /** Replace the intent. The caller has already checked the shape. */
+  setIntent(pid: ProcessId, intent: Intent): void {
+    this.mustGet(pid, 'set_intent').intent = intent;
+  }
+
+  /** The sender recorded when `signal` was queued, if one was named. */
+  queuedFrom(pid: ProcessId, signal: Signal): ProcessId | undefined {
+    return this.#queuedFrom.get(this.#fromKey(pid, signal));
+  }
+
+  /** Drop the sender once the signal has been delivered. */
+  forgetQueuedFrom(pid: ProcessId, signal: Signal): void {
+    this.#queuedFrom.delete(this.#fromKey(pid, signal));
+  }
+
+  /** Drop every sender recorded for a process that is leaving the table. */
+  clearQueuedFrom(pid: ProcessId): void {
+    const prefix = `${unbrand(pid)}:`;
+    for (const key of this.#queuedFrom.keys()) {
+      if (key.startsWith(prefix)) this.#queuedFrom.delete(key);
     }
   }
 
@@ -1090,6 +1148,7 @@ export class ProcessTable {
     const entry = this.mustGet(pid, 'drainSignals');
     const drained = entry.pendingSignals;
     entry.pendingSignals = [];
+    entry.pendingSignalFrom = [];
     return drained;
   }
 
@@ -1467,6 +1526,7 @@ function entryToInfo(entry: ProcessEntry): ProcessInfo {
     exitReason: entry.exitReason,
     checkpointChain: [...entry.checkpointChain],
     pendingSignals: [...entry.pendingSignals],
+    pendingSignalFrom: [...entry.pendingSignalFrom],
     capabilities:
       entry.capabilities === null ? DEFAULT_CAPABILITIES : [...entry.capabilities],
   };

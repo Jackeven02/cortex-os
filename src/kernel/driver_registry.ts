@@ -679,6 +679,27 @@ export class DriverRegistry {
     return { llm, tools, memory };
   }
 
+  /**
+   * What each tool driver claims about surviving a fork, and whether it
+   * offers the two methods that claim would need.
+   *
+   * Doctor reads this. The kernel still trusts `forkable` when it forks;
+   * this only says whether the claim can be shown.
+   */
+  forkClaims(): readonly {
+    name: string;
+    forkable: boolean;
+    canSerialize: boolean;
+    canRestore: boolean;
+  }[] {
+    return [...this.#toolDrivers.values()].map((driver) => ({
+      name: driver.name,
+      forkable: driver.forkable === true,
+      canSerialize: typeof driver.serializeState === 'function',
+      canRestore: typeof driver.restoreState === 'function',
+    }));
+  }
+
   // ---------------------------------------------------------------------------
   // §4.7 Unload + shutdown
   // ---------------------------------------------------------------------------

@@ -5130,7 +5130,7 @@ async function runReniceSyscallChecks(): Promise<void> {
       // written against `1.0.0` still runs.
       assert(SYSCALL_NAMES.includes('renice'), "the syscall is in the ABI's list");
       assert(CAPABILITIES.includes('renice'), "the capability is in the ABI's list");
-      assert(KERNEL_ABI_VERSION === '1.2.0', `the ABI version moved, got ${KERNEL_ABI_VERSION}`);
+      assert(KERNEL_ABI_VERSION === '1.3.0', `the ABI version moved, got ${KERNEL_ABI_VERSION}`);
     });
   } finally {
     await kernel.shutdown();
@@ -6034,8 +6034,8 @@ async function runDispatcherChecks(): Promise<void> {
 
   // --- constants / policy tables -------------------------------------------
 
-  check('dispatcher exports 25 syscall names, no duplicates', () => {
-    assert(SYSCALL_NAMES.length === 25, `expected 25 syscalls, got ${SYSCALL_NAMES.length}`);
+  check('dispatcher exports 26 syscall names, no duplicates', () => {
+    assert(SYSCALL_NAMES.length === 26, `expected 26 syscalls, got ${SYSCALL_NAMES.length}`);
     const uniq = new Set(SYSCALL_NAMES);
     assert(uniq.size === SYSCALL_NAMES.length, 'duplicate syscall names');
     // The v1 promises from docs/ABI.md §9: capabilities (§9.2) and the

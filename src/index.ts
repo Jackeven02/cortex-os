@@ -74,8 +74,12 @@ export const VERSION = readPackageVersion();
  * it holds, a fork keeps the parent's capabilities, and a checkpoint carries
  * them. An agent that relied on the hole now gets `EPERM`. Drivers that
  * declare `abiCompat: '^1.0.0'` still match.
+ *
+ * `1.3.0` adds `set_intent`, names the sender of a queued signal on the
+ * process record, and caps a model or tool call at the kernel ceiling.
+ * Nothing was removed. Drivers that declare `abiCompat: '^1.0.0'` still match.
  */
-export const KERNEL_ABI_VERSION = '1.2.0' as const;
+export const KERNEL_ABI_VERSION = '1.3.0' as const;
 
 // Re-export the kernel public surface (types + errors + boot).
 export * from './kernel/index.js';

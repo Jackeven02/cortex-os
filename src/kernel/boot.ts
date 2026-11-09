@@ -109,11 +109,15 @@
  * @module kernel/boot
  */
 
+import { decodeIntent, encodeIntent } from './intent.js';
+import { RecoveryLog } from './recovery.js';
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
+import { readdir, stat } from 'node:fs/promises';
 
 import {
   type AgentSpec,
+  asChainId,
   asProcessId,
   type BudgetCounters,
   type BudgetLimits,
@@ -578,6 +582,30 @@ export interface KernelOptions {
    * docs/ARCHITECTURE.md §8 step 3f is then the caller's `kernel.start()`.
    */
   readonly autoStart?: boolean;
+
+  /**
+   * Before a graceful shutdown kills living processes, write a checkpoint
+   * of each one that is running or blocked.
+   *
+   * A crash still loses whatever was only in memory. This is the stop the
+   * operator asked for — `cortex daemon` shutting down — not a recovery log.
+   * Defaults to false so a test kernel does not write a snapshot on the way
+   * out. A crash is covered by the recovery log, not by this flag.
+   */
+  readonly checkpointOnShutdown?: boolean;
+
+  /**
+   * While the kernel is up, write a checkpoint of each running or blocked
+   * agent this often. `cortex daemon run` sets it. Absent means the only
+   * automatic snapshot is the one at shutdown, if that was asked for.
+   */
+  readonly checkpointIntervalMs?: number;
+
+  /**
+   * Hard cap on how long one model or tool call may park a process.
+   * Defaults to the kernel ceiling (120s).
+   */
+  readonly kernelCallCeilingMs?: number;
 }
 
 // =============================================================================
@@ -788,6 +816,8 @@ export class Kernel {
 
   #booted = false;
   #shutdownReport: ShutdownReport | null = null;
+  #recovery: RecoveryLog;
+  #checkpointTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(opts: KernelOptions) {
     if (opts.kernelAbiVersion === '') {
@@ -797,6 +827,7 @@ export class Kernel {
       trap('EINVAL', 'kernel', { reason: 'dir is required' });
     }
     this.#opts = opts;
+    this.#recovery = new RecoveryLog(join(opts.dir, 'recovery.wal'));
     this.kernelAbiVersion = opts.kernelAbiVersion;
     this.dir = opts.dir;
     this.#processesDir = opts.processesDir ?? join(opts.dir, 'processes');
@@ -1013,8 +1044,8 @@ export class Kernel {
       memory: this.memory,
       restoreContext,
       ...(opts.nextChainId !== undefined ? { nextChainId: opts.nextChainId } : {}),
-      ...(opts.cognitiveSource !== undefined ? { cognitiveSource: opts.cognitiveSource } : {}),
-      ...(opts.cognitiveSink !== undefined ? { cognitiveSink: opts.cognitiveSink } : {}),
+      cognitiveSource: (pid) => this.#readCognitive(pid),
+      cognitiveSink: (pid, snap) => this.#writeCognitive(pid, snap),
       ...(opts.driverStateSource !== undefined ? { driverStateSource: opts.driverStateSource } : {}),
       ...(opts.defaultMemoryBacking !== undefined
         ? { defaultMemoryBacking: opts.defaultMemoryBacking }
@@ -1029,8 +1060,8 @@ export class Kernel {
       memory: this.memory,
       ...(opts.nextChainId !== undefined ? { nextChainId: opts.nextChainId } : {}),
       ...(opts.nextCallId !== undefined ? { nextCallId: opts.nextCallId } : {}),
-      ...(opts.cognitiveSource !== undefined ? { cognitiveSource: opts.cognitiveSource } : {}),
-      ...(opts.cognitiveSink !== undefined ? { cognitiveSink: opts.cognitiveSink } : {}),
+      cognitiveSource: (pid) => this.#readCognitive(pid),
+      cognitiveSink: (pid, snap) => this.#writeCognitive(pid, snap),
     });
 
     // --- scheduler (resume = the agent runner) ------------------------------
@@ -1064,6 +1095,9 @@ export class Kernel {
       resolveTool: this.#resolveTool,
       ...(opts.random !== undefined ? { random: opts.random } : {}),
       ...(opts.nextCallId !== undefined ? { nextCallId: opts.nextCallId } : {}),
+      ...(opts.kernelCallCeilingMs !== undefined
+        ? { kernelCallCeilingMs: opts.kernelCallCeilingMs }
+        : {}),
       ...(opts.setTimeoutFn !== undefined ? { setTimeoutFn: opts.setTimeoutFn } : {}),
       ...(opts.clearTimeoutFn !== undefined ? { clearTimeoutFn: opts.clearTimeoutFn } : {}),
       ...(opts.onBudgetExhausted !== undefined ? { onBudgetExhausted: opts.onBudgetExhausted } : {}),
@@ -1132,6 +1166,8 @@ export class Kernel {
 
     this.#booted = true;
     openKernels.add(this);
+    await this.#recover();
+    this.#armCheckpointInterval();
 
     // 3f. Optionally start ticking.
     if (this.#opts.autoStart === true) {
@@ -1378,6 +1414,7 @@ export class Kernel {
       exitReason: meta.exitReason,
     };
     this.#exits.set(key, exit);
+    void this.#recovery.gone(key, this.#now()).catch(() => {});
 
     // Tell the watchers before releasing the waiters: a subscriber that sees
     // "pid 4 exited" and then asks `awaitExit(4)` must get the same answer
@@ -1516,6 +1553,8 @@ export class Kernel {
 
       // §4.3 Cognition
       llm_call: (r: LLMRequest) => d.invoke(pid, 'llm_call', r),
+      set_intent: (goal: string, doneWhen?: string | null) =>
+        d.invoke(pid, 'set_intent', goal, doneWhen),
       tool_call: (name: string, args: unknown, o?: ToolCallOptions) =>
         d.invoke(pid, 'tool_call', name, args, o),
 
@@ -1667,6 +1706,7 @@ export class Kernel {
         agent: entry.agent,
         memory: Object.fromEntries(entry.memoryRegions),
       });
+      void this.#recovery.live(key, entry.role, entry.agent, this.#now()).catch(() => {});
     }
 
     let agentFn = this.#agents.get(key);
@@ -1886,7 +1926,14 @@ export class Kernel {
   async shutdown(): Promise<ShutdownReport> {
     if (this.#shutdownReport !== null) return this.#shutdownReport;
     openKernels.delete(this);
+    if (this.#checkpointTimer !== null) {
+      clearInterval(this.#checkpointTimer);
+      this.#checkpointTimer = null;
+    }
     await this.scheduler.stop();
+    if (this.#opts.checkpointOnShutdown === true && this.#booted) {
+      await this.#checkpointBeforeStop();
+    }
     const report = this.#booted
       ? await this.init.shutdown()
       : {
@@ -1903,6 +1950,96 @@ export class Kernel {
     await this.table.closeAllRecorders();
     this.#shutdownReport = report;
     return report;
+  }
+
+  /**
+   * Snapshot every living agent before init signals it to die.
+   *
+   * Init itself is not an agent. A process that is only READY cannot enter
+   * CHECKPOINTING, and one that has already exited has nothing left to save.
+   * A snapshot that fails is skipped: stopping the kernel matters more than
+   * one process's file.
+   */
+  async #checkpointBeforeStop(): Promise<void> {
+    for (const pid of this.table.pids()) {
+      if (unbrand(pid) === 1) continue;
+      const state = this.table.get(pid)?.state;
+      if (state !== 'running' && state !== 'blocked') continue;
+      try {
+        await this.checkpoint.take(pid, { tag: 'shutdown', detach: false });
+      } catch {
+        // The stop continues. The operator still has the logs.
+      }
+    }
+  }
+
+  async #readCognitive(pid: ProcessId): Promise<CognitiveSnapshot> {
+    const base = this.#opts.cognitiveSource
+      ? await this.#opts.cognitiveSource(pid)
+      : { messages: [], intent: null, pendingCalls: [] };
+    if (base.intent !== null) return base;
+    const encoded = encodeIntent(this.table.intentOf(pid));
+    return encoded === null ? base : { ...base, intent: encoded };
+  }
+
+  async #writeCognitive(pid: ProcessId, snap: CognitiveSnapshot): Promise<void> {
+    const decoded = decodeIntent(snap.intent);
+    if (decoded !== null) this.table.setIntent(pid, decoded);
+    if (this.#opts.cognitiveSink !== undefined) await this.#opts.cognitiveSink(pid, snap);
+  }
+
+  #armCheckpointInterval(): void {
+    const every = this.#opts.checkpointIntervalMs;
+    if (every === undefined || every <= 0) return;
+    this.#checkpointTimer = setInterval(() => {
+      void this.#checkpointBeforeStop();
+    }, every);
+    this.#checkpointTimer.unref?.();
+  }
+
+  /**
+   * Bring back processes whose last recovery line says they were still
+   * alive. A checkpoint is restored when one exists. Otherwise the same
+   * agent starts again from the top, under a new PID.
+   */
+  async #recover(): Promise<void> {
+    const survivors = await this.#recovery.survivors();
+    for (const survivor of survivors) {
+      const chain = await this.#newestChain(survivor.pid);
+      try {
+        if (chain !== null) {
+          const newPid = await this.checkpoint.restoreAs(asChainId(chain), { parent: PID_INIT });
+          await this.table.setState(newPid, 'ready', { trigger: 'restore' }).catch(() => {});
+          this.scheduler.enqueue(newPid);
+        } else {
+          await this.spawn({ role: survivor.role, agent: survivor.agent });
+        }
+      } catch {
+        // One broken record must not stop the rest of the boot.
+      }
+      await this.#recovery.gone(survivor.pid, this.#now()).catch(() => {});
+    }
+  }
+
+  async #newestChain(pid: number): Promise<string | null> {
+    const dir = join(this.#processesDir, String(pid), 'checkpoints');
+    let names: string[] = [];
+    try {
+      names = await readdir(dir);
+    } catch {
+      return null;
+    }
+    let best: { mtime: number; chain: string } | null = null;
+    for (const name of names) {
+      if (!name.endsWith('.csnap')) continue;
+      const stem = name.slice(0, -'.csnap'.length);
+      const cut = stem.lastIndexOf('_');
+      if (cut < 0) continue;
+      const chain = stem.slice(cut + 1);
+      const info = await stat(join(dir, name));
+      if (best === null || info.mtimeMs > best.mtime) best = { mtime: info.mtimeMs, chain };
+    }
+    return best?.chain ?? null;
   }
 
   #assertBooted(op: string): void {

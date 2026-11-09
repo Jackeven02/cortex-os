@@ -411,7 +411,7 @@ function cellsFor(
   // delivered until the process runs again, so it belongs with the note that
   // says why the process is not running — and the wording is the same one
   // `cortex ps` uses, so the two views cannot disagree.
-  const noteWithSignals = describePendingSignals(waiting, m.pendingSignals);
+  const noteWithSignals = describePendingSignals(waiting, m.pendingSignals, m.pendingSignalFrom);
 
   // One cell, one order — the same order `cortex ps` prints: the ending
   // first, then the budget, then what the process is waiting on.

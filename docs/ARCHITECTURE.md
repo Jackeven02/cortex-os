@@ -3136,15 +3136,13 @@ Drivers are npm packages or local files. ESM-only or both?
 
 If the kernel Node.js process crashes, what happens on restart?
 
-**v0 answer:** all in-memory state is lost. Suspended processes can be restored from `.csnap` files. RUNNING/BLOCKED processes are gone. The supervisor (init) restarts daemons per their restart policies.
-
-Post-v0: write-ahead log on every state transition would let us recover non-suspended processes too. Big lift, not v0.
+**Decision:** `recovery.wal` records each agent that started and each one that exited. On the next boot, a process whose last line is still "live" is restored from its newest checkpoint, or started again from the top under a new PID when it has none. The in-flight call is lost. A log of every state transition is still not written.
 
 ### 12.6 How big can a `.crec` file get?
 
 A long-running daemon could produce gigabytes. Do we rotate?
 
-**v0 answer:** no rotation. User problem. Provide `cortex gc` to compact old logs (drop entries below the most recent checkpoint).
+**v0 answer:** no rotation. Logs stay, because a replay still reads them. `cortex gc` deletes checkpoint files older than the newest one for that process, and only with `--apply`.
 
 v1 may add automatic rotation with checkpoint anchors.
 

@@ -451,7 +451,7 @@ If two forked agents both write to a `shared` semantic memory region, what happe
 - **CRDT.** Correct. Heavy. Requires choosing a CRDT library and a data model.
 - **Lock.** Familiar. Forces coordination the agents may not want.
 
-**Decision:** last-write-wins. A CRDT is icebox, for if the logs show real pain.
+**Decision:** a shared key is merged, and two writers to it take turns. Text keeps every distinct line. Objects keep every key, and a key both sides changed is merged the same way. A number, or anything else that cannot be combined, is stored as `{ kept, also }` so the earlier value is still there. A lock the agent has to take, and a CRDT library, stay in the icebox.
 
 ### 8.2 Budget split semantics
 
@@ -476,13 +476,13 @@ We have a slot for it but no definition. Is it:
 - A free-form summary the agent writes to itself?
 - A structured task object with a schema?
 
-**v0 answer:** free-form string, agent's responsibility. v1 may standardize once we see how people use it.
+**Decision:** `set_intent(goal, doneWhen)`. `goal` is the outcome. `doneWhen` is how the agent will know it got there. A checkpoint stores that pair as JSON in the existing string field. A snapshot whose intent is a plain sentence is read as a goal with no done-when.
 
 ### 8.5 Checkpoint chain pruning
 
 Long-running daemons will produce thousands of checkpoints. Do we garbage-collect? On what policy?
 
-**Decision:** never prune. `cortex gc` and a retention policy are icebox.
+**Decision:** nothing is pruned on its own. `cortex gc` deletes checkpoint files older than the newest one for that process, and only when the operator passes `--apply`. Syscall logs stay, because a replay still reads them. A retention policy that runs by itself is icebox.
 
 ### 8.6 Driver state opt-in
 
@@ -492,7 +492,7 @@ A driver claiming `forkable: true` is making a strong promise. How do we test th
 - Trust the driver author?
 - Runtime detection (try to fork, see what breaks)?
 
-**Decision:** trust the driver's claim. `cortex doctor` is icebox. `cortex audit` already lists tools that never declared a tag.
+**Decision:** the kernel trusts the driver's claim when it forks. `cortex doctor` says whether a `forkable` driver also offers `serializeState` and `restoreState`. It does not call them. A claim with either method missing is unprovable. `cortex audit` still lists tools that never declared a reversibility tag.
 
 ### 8.7 What counts as a "side effect"?
 

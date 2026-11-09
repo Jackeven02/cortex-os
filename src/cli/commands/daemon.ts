@@ -549,6 +549,8 @@ export async function cmdDaemonRun(args: string[]): Promise<number> {
   // filled in below; the decisions themselves come later.
   const daemonNames = new Map<number, string>();
   const kernel = await bootCliKernel(dir, {
+    checkpointOnShutdown: true,
+    checkpointIntervalMs: 60_000,
     ...(maxRegionEntries !== undefined ? { maxRegionEntries } : {}),
     onDaemonDecision: (decision) => {
       const name = daemonNames.get(decision.daemonId) ?? decision.role;

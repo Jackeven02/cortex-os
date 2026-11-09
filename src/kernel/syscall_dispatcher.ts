@@ -157,6 +157,7 @@ export type SyscallName =
   | 'restore'
   | 'llm_call'
   | 'tool_call'
+  | 'set_intent'
   | 'memory_read'
   | 'memory_write'
   | 'send'
@@ -185,6 +186,7 @@ export const SYSCALL_NAMES: readonly SyscallName[] = Object.freeze([
   'restore',
   'llm_call',
   'tool_call',
+  'set_intent',
   'memory_read',
   'memory_write',
   'send',
@@ -219,6 +221,7 @@ export interface SyscallArgs {
   restore: [chainId: ChainId, opts?: RestoreOptions];
   llm_call: [req: LLMRequest];
   tool_call: [name: string, args: unknown, opts?: ToolCallOptions];
+  set_intent: [goal: string, doneWhen?: string | null];
   memory_read: [region: string, query: MemoryQuery];
   memory_write: [region: string, key: string, value: unknown, opts?: MemoryWriteOptions];
   send: [target: ProcessId | ChannelId, message: unknown, opts?: SendOptions];
@@ -248,6 +251,7 @@ export interface SyscallReturn {
   restore: { readonly pid: ProcessId };
   llm_call: LLMResponse;
   tool_call: ToolResult;
+  set_intent: { readonly goal: string; readonly doneWhen: string | null };
   memory_read: readonly MemoryEntry[];
   memory_write: void;
   send: void;
@@ -296,8 +300,9 @@ export const SYSCALL_ALLOWED_STATES: Readonly<Record<SyscallName, readonly Proce
     fork: ['running', 'blocked', 'stopped', 'suspended'],
     checkpoint: ['running', 'blocked', 'stopped'],
     restore: ['running'],
-    llm_call: ['running'],
-    tool_call: ['running'],
+    llm_call: ['running', 'blocked'],
+    tool_call: ['running', 'blocked'],
+    set_intent: ['running', 'blocked'],
     memory_read: ['running'],
     memory_write: ['running'],
     send: ['running'],
@@ -332,6 +337,7 @@ export const SYSCALL_REVERSIBILITY: Readonly<Record<SyscallName, Reversibility>>
   restore: 'reversible',
   llm_call: 'reversible',
   tool_call: 'reversible',
+  set_intent: 'idempotent',
   memory_read: 'idempotent',
   memory_write: 'reversible',
   send: 'idempotent',
@@ -538,6 +544,12 @@ export interface DispatcherOptions {
   readonly defaultLlmTimeoutMs?: number;
   /** Default tool timeout when the descriptor omits one. */
   readonly defaultToolTimeoutMs?: number;
+  /**
+   * The longest a model or tool call may stay parked, even if the caller
+   * asked for longer and even if the driver never returns. Defaults to
+   * `KERNEL_CALL_CEILING_MS`.
+   */
+  readonly kernelCallCeilingMs?: number;
 
   readonly resolveLLM?: ResolveLLMHook;
   readonly resolveTool?: ResolveToolHook;
@@ -579,6 +591,20 @@ export interface DispatcherOptions {
 export const DEFAULT_LLM_TIMEOUT_MS = 60_000;
 /** Default tool call timeout (docs/ABI.md §5). */
 export const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
+/**
+ * The kernel's own limit on a model or tool call.
+ *
+ * The driver's timeout still applies, and a caller may ask for less. The
+ * kernel will not leave the process parked longer than this, including when
+ * the driver ignores its abort and never comes back.
+ */
+export const KERNEL_CALL_CEILING_MS = 120_000;
+
+/** The wait the kernel will actually use: the ask, capped by the ceiling. */
+export function capCallTimeout(asked: number, ceiling: number = KERNEL_CALL_CEILING_MS): number {
+  if (!Number.isFinite(asked) || asked <= 0) return ceiling;
+  return Math.min(asked, ceiling);
+}
 
 // =============================================================================
 // §6. Waiter bookkeeping
@@ -650,6 +676,11 @@ export class SyscallDispatcher {
   #random: (opts?: RandomOptions) => number;
   #defaultLlmTimeoutMs: number;
   #defaultToolTimeoutMs: number;
+  #kernelCallCeilingMs: number;
+  /** How many model or tool calls this process has in flight. */
+  #driverCalls = new Map<number, number>();
+  /** Processes whose blocked state was entered for a driver call. */
+  #driverParked = new Set<number>();
   #resolveLLM: ResolveLLMHook | null;
   #resolveTool: ResolveToolHook | null;
   #setTimeoutFn: (cb: () => void, ms: number) => unknown;
@@ -722,6 +753,7 @@ export class SyscallDispatcher {
     this.#random = opts.random ?? (() => Math.random());
     this.#defaultLlmTimeoutMs = opts.defaultLlmTimeoutMs ?? DEFAULT_LLM_TIMEOUT_MS;
     this.#defaultToolTimeoutMs = opts.defaultToolTimeoutMs ?? DEFAULT_TOOL_TIMEOUT_MS;
+    this.#kernelCallCeilingMs = opts.kernelCallCeilingMs ?? KERNEL_CALL_CEILING_MS;
     this.#resolveLLM = opts.resolveLLM ?? null;
     this.#resolveTool = opts.resolveTool ?? null;
     this.#setTimeoutFn = opts.setTimeoutFn ?? ((cb, ms) => setTimeout(cb, ms) as unknown);
@@ -1220,6 +1252,8 @@ export class SyscallDispatcher {
           args[2] as ToolCallOptions | undefined,
           callId,
         );
+      case 'set_intent':
+        return this.#setIntent(pid, args[0] as string, args[1] as string | null | undefined);
       case 'memory_read':
         return await this.#memoryRead(pid, args[0] as string, args[1] as MemoryQuery);
       case 'memory_write':
@@ -1855,9 +1889,11 @@ export class SyscallDispatcher {
     }
     const driver = this.#resolveLLM(req.driver);
     return await this.#duringDriverCall(pid, 'llm', callId, async () => {
-    const timeoutMs = req.timeoutMs ?? this.#defaultLlmTimeoutMs;
+    const timeoutMs = capCallTimeout(
+      req.timeoutMs ?? this.#defaultLlmTimeoutMs,
+      this.#kernelCallCeilingMs,
+    );
     const abort = new AbortController();
-    const timer = this.#setTimeoutFn(() => abort.abort(), timeoutMs);
     const driverCtx: DriverContext = {
       pid,
       callId,
@@ -1865,13 +1901,7 @@ export class SyscallDispatcher {
       abortSignal: abort.signal,
       kernelAbiVersion: this.kernelAbiVersion,
     };
-    try {
-      const response = await driver.call(req, driverCtx);
-      // Token / USD accounting happens in #account via the returned usage.
-      return response;
-    } finally {
-      this.#clearTimeoutFn(timer);
-    }
+    return await this.#raceDriver('llm_call', timeoutMs, abort, () => driver.call(req, driverCtx));
     });
   }
 
@@ -1913,16 +1943,18 @@ export class SyscallDispatcher {
     }
 
     return await this.#duringDriverCall(pid, 'tool', callId, async () => {
-    const timeoutMs = opts?.timeoutMs ?? descriptor.timeoutMs ?? this.#defaultToolTimeoutMs;
+    const timeoutMs = capCallTimeout(
+      opts?.timeoutMs ?? descriptor.timeoutMs ?? this.#defaultToolTimeoutMs,
+      this.#kernelCallCeilingMs,
+    );
     const abort = new AbortController();
-    const timer = this.#setTimeoutFn(() => abort.abort(), timeoutMs);
     const invokeCtx: ToolInvokeContext = {
       pid,
       callId,
       deadline: this.#deadline(timeoutMs),
       abortSignal: abort.signal,
     };
-    try {
+    return await this.#raceDriver('tool_call', timeoutMs, abort, async () => {
       if (opts?.stageOnly === true) {
         if (driver.stage === undefined) {
           trap('EINVAL', 'tool_call', {
@@ -1939,10 +1971,68 @@ export class SyscallDispatcher {
         };
       }
       return await driver.invoke(name, args, invokeCtx);
-    } finally {
-      this.#clearTimeoutFn(timer);
-    }
     });
+    });
+  }
+
+  /**
+   * Wait for the driver, and stop waiting when the kernel's ceiling is up.
+   *
+   * Aborting the driver is a request. A driver that ignores it used to leave
+   * the process blocked for as long as it liked. The race returns
+   * `ETIMEDOUT` anyway, and a late answer from the driver is ignored.
+   */
+  async #raceDriver<T>(
+    syscall: 'llm_call' | 'tool_call',
+    timeoutMs: number,
+    abort: AbortController,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    let timer: unknown;
+    let settled = false;
+    try {
+      return await new Promise<T>((resolve, reject) => {
+        timer = this.#setTimeoutFn(() => {
+          if (settled) return;
+          settled = true;
+          abort.abort();
+          reject(new CortexError('ETIMEDOUT', syscall, {
+            message: `kernel stopped waiting after ${timeoutMs}ms`,
+            details: { timeoutMs, ceilingMs: this.#kernelCallCeilingMs },
+          }));
+        }, timeoutMs);
+        run().then(
+          (value) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+          },
+          (err) => {
+            if (settled) return;
+            settled = true;
+            reject(err);
+          },
+        );
+      });
+    } finally {
+      if (timer !== undefined) this.#clearTimeoutFn(timer);
+    }
+  }
+
+  #setIntent(
+    pid: ProcessId,
+    goal: string,
+    doneWhen: string | null | undefined,
+  ): { readonly goal: string; readonly doneWhen: string | null } {
+    if (typeof goal !== 'string' || goal.trim() === '') {
+      trap('EINVAL', 'set_intent', { reason: 'goal must be a non-empty string' });
+    }
+    if (doneWhen !== undefined && doneWhen !== null && typeof doneWhen !== 'string') {
+      trap('EINVAL', 'set_intent', { reason: 'doneWhen must be a string' });
+    }
+    const intent = { goal, doneWhen: doneWhen ?? null };
+    this.#table.setIntent(pid, intent);
+    return intent;
   }
 
   /**
@@ -1962,16 +2052,22 @@ export class SyscallDispatcher {
     callId: string,
     run: () => Promise<T>,
   ): Promise<T> {
+    const key = unbrand(pid);
+    const open = (this.#driverCalls.get(key) ?? 0) + 1;
+    this.#driverCalls.set(key, open);
     const before = this.#table.get(pid);
-    const park = before?.state === 'running';
+    const park = open === 1 && before?.state === 'running';
     if (park) {
+      this.#driverParked.add(key);
       this.#table.setBlockedOn(pid, { kind, callId });
       await this.#table.setState(pid, 'blocked', { trigger: kind === 'llm' ? 'llm-call' : 'tool-call' });
     }
+    let finished = false;
     try {
       const result = await run();
-      if (park) await this.#resumeDriver(pid);
-      if (park && this.#table.get(pid)?.state !== 'running') {
+      finished = true;
+      const last = await this.#finishDriverCall(pid);
+      if (last && this.#table.get(pid)?.state !== 'running') {
         trap('EINTR', kind === 'llm' ? 'llm_call' : 'tool_call', {
           pid: unbrand(pid),
           reason: 'interrupted by a signal',
@@ -1979,9 +2075,28 @@ export class SyscallDispatcher {
       }
       return result;
     } catch (err) {
-      if (park && this.#table.get(pid)?.state === 'blocked') await this.#resumeDriver(pid);
+      if (!finished) await this.#finishDriverCall(pid);
       throw err;
     }
+  }
+
+  /**
+   * One in-flight call finished. The process goes back to RUNNING only when
+   * the last one does, and only if a driver call is what parked it. A second
+   * call that started while the process was already blocked on something
+   * else must not wake that something.
+   */
+  async #finishDriverCall(pid: ProcessId): Promise<boolean> {
+    const key = unbrand(pid);
+    const left = (this.#driverCalls.get(key) ?? 1) - 1;
+    if (left <= 0) this.#driverCalls.delete(key);
+    else this.#driverCalls.set(key, left);
+    if (left > 0) return false;
+    const parked = this.#driverParked.delete(key);
+    if (parked && this.#table.get(pid)?.state === 'blocked') {
+      await this.#resumeDriver(pid);
+    }
+    return parked;
   }
 
   /** BLOCKED → RUNNING, then deliver anything that waited out the call. */

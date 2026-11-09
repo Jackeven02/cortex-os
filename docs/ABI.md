@@ -4,7 +4,7 @@
 >
 > **If a behavior is not in this document, it does not exist.**
 
-> ## 🔒 ABI status: **FROZEN** since `1.0.0` — currently `1.2.0` (additive)
+> ## 🔒 ABI status: **FROZEN** since `1.0.0` — currently `1.3.0` (additive)
 >
 > Before `1.0.0` the ABI was deliberately unsettled: the version line said
 > `0.x`, and a minor bump was allowed to change a syscall, its arguments, or
@@ -25,7 +25,7 @@
 >   `kernel_abi_version`, so a replay engine can tell which contract a log was
 >   written under (§9.6).
 >
-> **Current version: `1.2.0`.** `1.1.0` added the `renice` syscall (§4.10)
+> **Current version: `1.3.0`.** `1.3.0` adds `set_intent` (a goal and the condition that says it is done) and `pendingSignalFrom` on the process record, beside the signal names. `1.1.0` added the `renice` syscall (§4.10)
 > and the `renice` capability (§4.9): an agent can move a rank in its own
 > tree without a permission, and a rank across the tree with one. `1.2.0`
 > closes the birth-authority hole (§4.9): a narrowed parent that does not
@@ -381,7 +381,7 @@ Invoke an LLM via the configured driver. This is the syscall that makes cortex a
 
 - **Allowed states:** RUNNING → BLOCKED (`{kind: 'llm', callId}`) → READY → RUNNING
 - **Returns:** `LLMResponse` (text, tool calls, token usage, finish reason)
-- **Errors:** `EBUDGET` (insufficient tokens/USD), `ETIMEDOUT` (driver timeout), `EDRIVER` (malformed response), `EINTR` (signal during call)
+- **Errors:** `EBUDGET` (insufficient tokens/USD), `ETIMEDOUT` (the driver's timeout, or the kernel's own ceiling of 120 seconds — a call that never returns is cut off even if the driver ignores its abort), `EDRIVER` (malformed response), `EINTR` (signal during call)
 - **Reversibility:** `reversible` (it's just tokens; the response is recorded and replayable)
 - **Recording:** full request, full response, token counts, latency, model name, driver version
 
@@ -441,6 +441,24 @@ Invoke a tool by name. Tools are provided by `IToolDriver` implementations (typi
 const result = await ctx.tool_call('grep', { pattern: 'TypeError', path: 'src/' });
 ```
 
+A process may have two `llm_call` or `tool_call`s in flight. The second starts while the first has the process BLOCKED. The process stays BLOCKED until the last of them returns.
+
+#### `set_intent(goal: string, doneWhen?: string | null): Promise<Intent>`
+
+Say what this process is trying to do. Added in ABI `1.3.0`.
+
+- **Allowed states:** RUNNING, and BLOCKED (the body that is already waiting may say it)
+- **Returns:** `{ goal, doneWhen }`. `doneWhen` is `null` when the caller left it out.
+- **Errors:** `EINVAL` (the goal is empty, or `doneWhen` is not a string)
+- **Reversibility:** `idempotent`
+- **Recording:** the goal and the done-when
+
+A checkpoint stores the pair as JSON in the cognitive snapshot's existing `intent` string. A snapshot whose intent is a plain sentence is read as a goal with no done-when.
+
+```typescript
+await ctx.set_intent('ship the merge', 'both values survive');
+```
+
 ### 4.4 Memory
 
 #### `memory_read(region: string, query: MemoryQuery): Promise<readonly MemoryEntry[]>`
@@ -461,6 +479,7 @@ Write a value to a memory region.
 - **Returns:** nothing
 - **Errors:** `ENOENT` (no such region), `ENOMEM` (region reached its effective write-count ceiling — the region's own `maxEntries` if declared via `--memory`, else the kernel-wide `maxRegionEntries`; unlimited when neither is set, and a per-region `maxEntries: -1` opts that region out of a lower global cap), `EDRIVER`, `EPERM` (region is read-only)
 - **Reversibility:** `reversible` — every write is logged and can be undone from the log
+- **Shared regions:** two writers to the same key take turns. Text keeps every distinct line. Objects keep every key. A value that cannot be combined is stored as `{ kept, also }`, so the earlier write is still there. Private and copy-on-write regions are unchanged: one writer, the new value replaces the old.
 - **Recording:** region, key, value (or value hash if large), policy kind
 
 ### 4.5 IPC
@@ -1068,6 +1087,7 @@ export interface CortexContext {
   // 4.3 Cognition
   llm_call(req: LLMRequest): Promise<LLMResponse>;
   tool_call(name: string, args: unknown, opts?: ToolCallOptions): Promise<ToolResult>;
+  set_intent(goal: string, doneWhen?: string | null): Promise<{ goal: string; doneWhen: string | null }>;
 
   // 4.4 Memory
   memory_read(region: string, query: MemoryQuery): Promise<readonly MemoryEntry[]>;
