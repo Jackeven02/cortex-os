@@ -517,7 +517,10 @@ Round-robin over READY processes, weighted by `nice` value (-20 to 19, lower = h
 
 ```
 loop:
-  candidates = processes in READY whose budgets are not exhausted
+  candidates = processes in READY that can still run
+               (token or usd already at zero → stay parked in the queue;
+                wall-clock remainder already at zero → still a candidate,
+                so the dispatch can stop it with SIGXCPU)
   if candidates is empty:
     sleep until next wake event
     continue
@@ -702,15 +705,27 @@ agent spends its wall-clock budget exactly like one burning tokens, and the
 clock stops while the process is stopped or suspended (that time is not the
 agent's) and is exact at the exit.
 
-**The kernel cannot stop a process that is not running.** `SIGXCPU` is a
-signal, and a signal aimed at a process that is not RUNNING is queued until
-it runs again (PROCESS §7.2) — so a process whose wall-clock ceiling is
-reached while it is parked is *not* stopped by the kernel. It is left where
-it is, and the views say why (`cortex ps` prints "out of wallTime"), because
-a `ready` row that will never run again looks exactly like one that is
-merely waiting. The supervisor is what acts on it: `cortex supervise
---kill-after` stops an agent the kernel cannot. (How a process that never
-wakes should be stopped gracefully is BACKLOG #057, and it is still open.)
+**A wall-clock ceiling that has already hit zero is not a silent hang.**
+Token and usd only move when the process runs, so a READY process that has
+spent those stays in the queue until the supervisor raises the ceiling
+(`setBudget` / `cortex limit`). The wall clock is charged by the heartbeat,
+so it can hit zero while the process is only waiting for a turn. Leaving
+that process parked left it READY forever: never dispatched, never
+signalled, and with nothing in its log to say why. The scheduler still
+selects it. The budget gate fires `SIGXCPU` before the quantum (default
+disposition STOPPED) and the `__sched:sigxcpu(wallTime)` frame says which
+counter hit zero. If another counter is also at zero, the signal names the
+first one `checkBudget` finds: tokens, then usd, then wall time.
+
+**The kernel still cannot stop a process that is not running.** `SIGXCPU`
+is a signal, and a signal aimed at a process that is not RUNNING is queued
+until it runs again (PROCESS §7.2). A process that is BLOCKED — sitting in
+`recv()`, or inside a call — is left where it is when the ceiling is
+reached. The views say why (`cortex ps` prints "out of wallTime"). The next
+time that process becomes READY, the gate above stops it. A process that
+never wakes still never sees the signal: `cortex supervise --kill-after`
+is what stops an agent the kernel cannot. (How a process that never wakes
+should be stopped gracefully is BACKLOG #057, and it is still open.)
 
 **And the log says which counter hit zero.** "Your agent was stopped" and
 "your agent ran out of tokens" are different facts, and only one of them tells

@@ -2042,6 +2042,26 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **A wall-clock ceiling could park a READY process forever.** The heartbeat
+  charges `wallTimeMs` whether or not the process is running, so the counter
+  can hit zero while the process is only waiting for a turn. Selection then
+  treated it like a spent token budget: kept in the queue, never dispatched,
+  never signalled. A ceiling the operator asked for became a silent hang,
+  and the log had no `__sched:sigxcpu` frame to say why.
+
+  A READY process whose wall-clock remainder is already zero is now still
+  selected. The pre-dispatch budget gate fires `SIGXCPU` (default
+  disposition STOPPED) and records which counter hit zero. Token and usd
+  exhaustion still parks the process until the supervisor raises that
+  ceiling — those counters only move when the process runs. A process that
+  is BLOCKED is still not stopped in place: `SIGXCPU` is delivered when it
+  next runs (PROCESS.md §7.2, §8.3). A process that never wakes is still
+  BACKLOG #057.
+
+  No ABI change. The contract already said a counter at zero fires
+  `SIGXCPU`; this is the scheduler doing that for the one budget that can
+  expire between dispatches.
+
 - **A push made the window forget what the operator had loaded.** The event
   table is a window onto the history, and *"show me more, further back"* is
   part of that window's state. A push **replaced** the table with the newest

@@ -357,11 +357,18 @@ interface Scheduler {
    passed since the last tick. This is the kernel's heartbeat, and it is what
    makes a wall-clock ceiling a ceiling: an agent that is sitting in `recv()`
    spends its budget exactly like one burning tokens (PROCESS.md §8.3).
-1. Pop highest-priority READY process whose budgets are not exhausted.
+1. Pop the highest-priority READY process that can still run. A token or usd
+   remainder of zero stays parked in the queue. A wall-clock remainder of
+   zero is still chosen (PROCESS.md §8.3): the clock runs on the heartbeat,
+   so it can hit zero while the process is only waiting for a turn, and
+   parking it would leave a READY process that never runs and never says why.
 2. Transition to RUNNING.
-3. Resume its async function (the agent's `await` returns).
-4. When the agent next blocks or yields, transition back to READY/BLOCKED.
-5. If a budget hit zero during the syscall, fire `SIGXCPU` instead of returning to READY.
+3. If a budget is already zero, fire `SIGXCPU` before the quantum and do not
+   resume the agent. This is how a wall-clock ceiling that expired in the
+   queue becomes a stop instead of a hang.
+4. Otherwise resume its async function (the agent's `await` returns).
+5. When the agent next blocks or yields, transition back to READY/BLOCKED.
+6. If a budget hit zero during the syscall, fire `SIGXCPU` instead of returning to READY.
 
 **The queue is ordered by `(nice, enqueue_time)`, but only the second half is
 stored.** The rank is read **live** from the process table at selection time,

@@ -12,15 +12,23 @@
  * Round-robin over READY processes, weighted by `nice` (-20..19, lower =
  * higher priority), FIFO tiebreak by enqueue order:
  *
- *   candidates = processes in READY whose budgets are not exhausted
+ *   candidates = processes in READY that can still run
  *   pick the highest-priority candidate (lowest nice, earliest enqueue)
  *   dispatch to RUNNING
  *
- * A process whose budget is already exhausted at selection time is **not** a
- * candidate (§8.1). It stays in the run queue, parked, until the supervisor
- * tops its budget up via `setBudget()` — at which point the next tick picks it
- * up again. The scheduler never silently drops an exhausted process; it just
- * refuses to spend on it.
+ * A process whose **token or usd** budget is already exhausted at selection
+ * time is **not** a candidate (§8.1). It stays in the run queue, parked, until
+ * the supervisor tops that budget up via `setBudget()` — at which point the
+ * next tick picks it up again. Those counters only move when the process
+ * runs, so parking it spends nothing and loses nothing.
+ *
+ * The **wall clock** is the exception. It is charged by time passing, so it
+ * can hit zero while the process is merely waiting for a turn. Parking that
+ * process left it READY forever: never dispatched, never signalled. A
+ * wall-clock remainder of zero is therefore still a candidate. The budget
+ * gate below dispatches it only long enough to fire `SIGXCPU` (default:
+ * STOPPED) and to record which counter hit zero (§8.3). The scheduler never
+ * silently drops an exhausted process.
  *
  * ## Cooperative, not preemptive (§8.2)
  *
@@ -30,7 +38,7 @@
  * (awaits an external event). Only then does control come back to `tick()`.
  * The single exception is the budget system: if a counter hit zero during the
  * quantum, the scheduler fires `SIGXCPU` (default disposition: STOPPED)
- * *instead of* returning the process to READY (§8.3, ARCHITECTURE §4.8 step 5).
+ * *instead of* returning the process to READY (§8.3, ARCHITECTURE §4.8 step 6).
  *
  * ## Waking and re-queueing
  *
@@ -640,10 +648,11 @@ export class Scheduler {
       return { dispatched: pid, reason: 'signal' };
     }
 
-    // Budget gate *before* running: §8.1 excludes exhausted processes from the
-    // candidate set. #selectNext already skipped budget-exhausted READY
-    // processes, so reaching here means the budget was OK a moment ago. We
-    // re-check defensively (a concurrent setBudget(…,0) could have landed).
+    // Budget gate *before* running. Token and usd exhaustion is excluded at
+    // selection (§8.1). Wall-clock exhaustion is *not*: #selectNext still
+    // returns that process so this gate can fire SIGXCPU. Reaching here with
+    // a zero token or usd counter means the ceiling moved between the scan
+    // and the dispatch (a concurrent setBudget(…,0)).
     let budget = this.#table.checkBudget(pid);
     if (budget !== 'ok') {
       await this.#fireSigxcpu(pid, budget.kind, 'pre-dispatch');
@@ -666,7 +675,7 @@ export class Scheduler {
     if (state === 'running') {
       // The continuation returned with the process still runnable: it yielded.
       if (budget !== 'ok') {
-        // §8.3 / ARCHITECTURE §4.8 step 5: budget hit zero during the quantum →
+        // §8.3 / ARCHITECTURE §4.8 step 6: budget hit zero during the quantum →
         // SIGXCPU instead of returning to READY. Default disposition STOPs it.
         await this.#fireSigxcpu(pid, budget.kind, 'post-quantum');
         return { dispatched: pid, reason: 'sigxcpu' };
@@ -756,9 +765,11 @@ export class Scheduler {
    * gone). READY-but-exhausted and NEW entries are *kept* (they may become
    * schedulable later) but are not chosen.
    *
-   * Among runnable candidates (READY and budget OK), the winner is the lowest
-   * `nice`, ties broken by earliest `seq` (FIFO). Returns null if there is
-   * nothing to run this tick.
+ * Among runnable candidates, the winner is the lowest `nice`, ties broken by
+ * earliest `seq` (FIFO). A READY process whose token or usd budget is already
+ * zero is kept in the queue but not chosen. A READY process whose wall-clock
+ * remainder is already zero **is** chosen, so the pre-dispatch gate can stop
+ * it (§8.3). Returns null if there is nothing to run this tick.
    */
   #selectNext(): ProcessId | null {
     const kept: QueueNode[] = [];
@@ -779,7 +790,23 @@ export class Scheduler {
       kept.push(node);
 
       if (entry.state !== 'ready') continue; // 'new' → not schedulable yet
-      if (this.#table.checkBudget(node.pid) !== 'ok') continue; // exhausted → parked
+      // A process whose budget is exhausted is normally **parked**: it waits
+      // in the queue for the supervisor to raise its ceiling again
+      // (`cortex limit --tokens N`), and that promise is kept.
+      //
+      // The **wall clock** is the exception, because it is the one budget that
+      // runs out on its own — it is charged by time passing (the heartbeat),
+      // not by a syscall — so it can hit zero while the process is blocked or
+      // waiting for a turn, and nothing else would ever notice. Parking it
+      // left the process READY: never dispatched, never signalled, and with
+      // nothing in its log to say why. A ceiling the operator asked for turned
+      // into a silent hang. So a process whose wall clock ran out is still
+      // *selected* — the budget gate below stops it with SIGXCPU, which is the
+      // ending PROCESS.md §8.3 promises, and the frame says which budget ran
+      // out.
+      if (this.#table.checkBudget(node.pid) !== 'ok' && entry.budgetsRemaining.wallTimeMs !== 0) {
+        continue; // exhausted → parked
+      }
 
       // Runnable candidate.
       if (
