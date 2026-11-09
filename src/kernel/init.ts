@@ -64,6 +64,7 @@
 import {
   type AgentSpec,
   type BudgetLimits,
+  type Capability,
   type MemoryRegionPolicy,
   type ProcessId,
   type ProcessState,
@@ -123,6 +124,7 @@ export const INIT_ACTIONS = [
   'reap',
   'restart',
   'restart-gave-up',
+  'noticed',
   'shutdown',
 ] as const;
 
@@ -175,6 +177,14 @@ export interface DaemonSpec {
   readonly memory?: Readonly<Record<string, MemoryRegionPolicy>>;
   readonly signals?: Partial<Record<Signal, SignalDisposition>>;
   readonly exitTimeoutMs?: number;
+  /**
+   * The capabilities the daemon holds from birth. Omitted means full
+   * privilege, the same default as `spawn`. A restart reallocates from this
+   * spec, so the authority has to live here or the replacement comes back
+   * holding everything.
+   */
+  readonly capabilities?: readonly Capability[];
+  readonly grantable?: readonly Capability[];
   /**
    * Event names that should wake this daemon (docs/PROCESS.md §9.1
    * `--wake-on`). Metadata only in v0 — recorded with the registration so the
@@ -277,6 +287,14 @@ export interface DaemonState {
   readonly lastExitReason: string | null;
   /** Why the supervisor gave up, or `null` if it has not given up. */
   readonly gaveUpReason: DaemonGiveUpReason | null;
+  /**
+   * Whether an operator has acknowledged the situation this daemon is in
+   * now. A read of the row is not an acknowledgement. Cleared when the
+   * attempt ends, because that is a new situation.
+   */
+  readonly noticed: boolean;
+  /** Who acknowledged it, or `null` if nobody has. */
+  readonly noticedBy: string | null;
 }
 
 // =============================================================================
@@ -448,6 +466,9 @@ interface DaemonRecord {
    * is never coming back, which an operator has to be told about.
    */
   gaveUp: DaemonGiveUpReason | null;
+  /** Set by `acknowledge`, cleared when the attempt ends. */
+  noticed: boolean;
+  noticedBy: string | null;
   /** Epoch-ms of each restart, pruned to the sliding window. */
   restartTimestamps: number[];
   /** Pending backoff timer, if a restart is scheduled but not yet fired. */
@@ -574,6 +595,34 @@ export class InitProcess {
     return states;
   }
 
+  /**
+   * Record that someone acknowledged the situation this daemon is in.
+   *
+   * A read of the live state is not this. The journal records decisions and
+   * the live state records state; neither of those is "a person saw it".
+   * The acknowledgement is its own frame (`noticed`), and it names who.
+   *
+   * @throws CortexError ESRCH if no supervised daemon has that name.
+   */
+  async acknowledge(name: string, by = 'operator'): Promise<DaemonState> {
+    const rec = [...this.#daemons.values()].find((candidate) => candidate.spec.name === name);
+    if (rec === undefined) {
+      trap('ESRCH', 'init.acknowledge', { name, reason: 'no supervised daemon has that name' });
+    }
+    rec.noticed = true;
+    rec.noticedBy = by;
+    const state = this.#stateOf(rec);
+    await this.#record('noticed', {
+      daemonId: unbrand(rec.daemonId),
+      name,
+      role: rec.spec.role,
+      by,
+      pid: unbrand(rec.currentPid),
+      status: state.status,
+    });
+    return state;
+  }
+
   // ---------------------------------------------------------------------------
   // §6.1 Lifecycle
   // ---------------------------------------------------------------------------
@@ -639,6 +688,8 @@ export class InitProcess {
       lastExitCode: null,
       lastExitReason: null,
       gaveUp: null,
+      noticed: false,
+      noticedBy: null,
       restartTimestamps: [],
       restartTimer: null,
     };
@@ -899,6 +950,10 @@ export class InitProcess {
     const rec = this.#daemons.get(daemonIdNum);
     if (rec === undefined) return null;
     if (this.#shuttingDown) return null;
+    // The attempt ended. Whatever was acknowledged was the previous
+    // situation, and it is not this one.
+    rec.noticed = false;
+    rec.noticedBy = null;
 
     const policy: RestartPolicy = rec.spec.restart ?? { kind: 'never' };
     // Remember how this attempt ended: the restart may be deferred by a
@@ -1093,6 +1148,8 @@ export class InitProcess {
       ...(spec.memory !== undefined ? { memory: spec.memory } : {}),
       ...(spec.signals !== undefined ? { signals: spec.signals } : {}),
       ...(spec.exitTimeoutMs !== undefined ? { exitTimeoutMs: spec.exitTimeoutMs } : {}),
+      ...(spec.capabilities !== undefined ? { capabilities: spec.capabilities } : {}),
+      ...(spec.grantable !== undefined ? { grantable: spec.grantable } : {}),
     });
     // NEW → READY; the scheduler's reconcile() adopts it on the next tick.
     await this.#table.setState(pid, 'ready', { trigger: 'init-register-daemon' });
@@ -1152,6 +1209,8 @@ export class InitProcess {
       lastExitCode: rec.lastExitCode,
       lastExitReason: rec.lastExitReason,
       gaveUpReason: rec.gaveUp,
+      noticed: rec.noticed,
+      noticedBy: rec.noticedBy,
     };
   }
 

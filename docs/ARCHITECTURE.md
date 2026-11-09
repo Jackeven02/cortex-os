@@ -659,32 +659,35 @@ A complete trace of `await ctx.llm_call({messages: [...]})`:
 3. driver_registry.resolveLLM(req.driver) → ILLMDriver
    driver.call(req, driverCtx) → Promise<LLMResponse>
 
-4. Kernel suspends agent's async function.
+4. Dispatcher parks the process for the call:
    process_table.transition(pid, BLOCKED, {kind: 'llm', callId})
-   scheduler.dequeue(pid)
+   The await yields the event loop, so other READY processes run.
 
-5. Scheduler picks next READY process. Other agents run.
+5. ... time passes. A signal that arrives here is queued.
+   A default terminate is not an exception for a model call:
+   the call is already in flight, and aborting it would spend
+   the tokens and throw the answer away (PROCESS.md §7.2).
 
-6. ... time passes ...
+6. LLM driver's Promise resolves with response.
 
-7. LLM driver's Promise resolves with response.
+7. Dispatcher returns the process to RUNNING inline
+   (BLOCKED → RUNNING, trigger `driver-return`). The body never
+   left this call, so it does not pass through READY. Pending
+   signals are delivered before the result is handed back.
 
-8. Kernel wakes the agent:
-   process_table.transition(pid, READY)
-   scheduler.enqueue(pid)
-
-9. Scheduler eventually picks pid, transitions to RUNNING, resumes Promise.
-
-10. Dispatcher receives response:
+8. Dispatcher receives response:
     ├─ update budget counters (tokens, USD)
     ├─ check budgets: if exhausted, signals.send(pid, SIGXCPU)
     ├─ recorder.write(handle, {phase: 'exit', result: response, duration_ms, ...})
     └─ return response to agent code
 
-11. Agent code continues with `const response = await ...` resolved.
+9. Agent code continues with `const response = await ...` resolved.
 ```
 
-**Eleven steps for one syscall.** This is the cost of full observability and replayability. We think it's worth it.
+**Nine steps for one syscall.** The driver call parks the process and then
+returns it to RUNNING in the same call. `recv`, `wait` and `sleep` still
+wake through READY, because those bodies are not running until the
+scheduler dispatches them (PROCESS.md §3.7).
 
 ---
 
@@ -2964,14 +2967,14 @@ report would be telling the operator they do not.
   273–283 ms per view; the same view against the kernel cost 0–1 ms. So the
   cost of the operator's most frequent question still tracks the size of the
   agent's history when there is no kernel to ask.
-- **A driver call does not park the process.** The kernel does not preempt a
-  running process to mark it BLOCKED, so an agent in a slow `llm_call` reads
-  as `running` in `cortex ps`, and `blockedOn` is `null` (PROCESS.md §3.7).
-  `cortex top` finds the stall anyway — it asks the kernel which call the
-  process is inside — but `ps` is the flat table and does not, and a *host*
-  that only looks at the process table will not see it either. The reserved
-  `llm` / `tool` blocked reasons exist for exactly this and are not yet
-  produced; turning them on is a state-model change (BACKLOG #060).
+- **A driver call parks the process, and the signal waits.** `llm_call` and
+  `tool_call` move the process to BLOCKED with `blockedOn.kind` of `llm` or
+  `tool` for the duration, then back to RUNNING when the driver returns
+  (PROCESS.md §3.7). `cortex ps` therefore says `blocked`, not `running`.
+  A signal that arrives during the call is still queued until that return:
+  the request is already in flight. A default terminate on `recv` or `wait`
+  is the other case — those waits can last forever, so it is delivered
+  immediately (PROCESS.md §7.2).
 - **The supervisor cannot see a hang that never made a syscall.** Its signal
   is "this process is inside one syscall, and has been for too long". A
   process that stops calling the kernel altogether — spinning in plain
@@ -3027,18 +3030,16 @@ report would be telling the operator they do not.
   `cortex spawn --live` opts into the live one. Either way the two kernels
   can share a directory, which is why the PID claim exists (§7): the claim
   keeps them off each other's PIDs and off each other's logs.
-- **Only the supervisor's replacement inherits the authority.** The paths that
-  *create* a process are three, and only one of them now carries the
-  authority across: `cortex supervise --restart` replays it (this section), and
-  the kernel's own daemon restart re-allocates from the `DaemonSpec`, which
-  has no capabilities at all — harmless today only because
-  `cortex daemon install` has no `--cap` either. The other two are **open
-  questions, not bugs**: `ctx.spawn()` lets the caller choose the child's
-  capabilities without reference to its own (ABI §4.9 says a capability cannot
-  be delegated, but does not say what a child may hold), and a cognitive
-  `fork` allocates its child with no capabilities at all — so it comes back
-  fully privileged. Both are state-model questions, so they are written up
-  (BACKLOG #063) instead of being changed here.
+- **A child cannot outrank its parent.** A parent that holds `admin`, and an
+  unnarrowed parent, may still name any sets. A narrowed parent may only
+  give a child capabilities it holds; omitting the sets inherits them, and
+  naming a richer set is `EPERM` (ABI §4.9, since `1.2.0`). `fork` copies
+  the parent's held and grantable sets. A checkpoint carries them; a
+  snapshot written before the field existed restores unnarrowed.
+  `cortex daemon install --cap` writes the same sets onto the `DaemonSpec`,
+  and a restart allocates from that spec, so a daemon does not come back
+  fully privileged. `cortex supervise --restart` still replays the spec it
+  was given.
 - **A snapshot does not carry its agent's spec.** The `.csnap` body holds the
   process image — state, memory, budgets, lineage — and deliberately not the
   role/agent spec, which is why a restore needs a context (the kernel's

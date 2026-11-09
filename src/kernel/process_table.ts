@@ -171,6 +171,9 @@ export const STATE_TRIGGERS = [
   'wait',
   'wait-return',
   'sleep',
+  'llm-call',
+  'tool-call',
+  'driver-return',
   'exit',
   'signal',
   'kill',
@@ -200,6 +203,11 @@ const LEGAL_TRANSITIONS: ReadonlySet<string> = new Set([
   'running->ready', // syscall returned, more work pending
   'running->blocked', // syscall awaits external event
   'blocked->ready', // wake condition met
+  // A driver call parks the process, then the same syscall resolves inline.
+  // The body is still on the CPU, so the next line is a syscall. READY would
+  // trap ESTATE (the checkpointing->running edge exists for the same reason).
+  // recv / wait / sleep still wake through READY: those bodies are not running.
+  'blocked->running',
   'running->stopped', // SIGSTOP / SIGXCPU / budget exhaustion
   'stopped->ready', // SIGCONT
   'running->checkpointing', // SIGUSR2 or checkpoint() syscall

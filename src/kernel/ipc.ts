@@ -924,8 +924,15 @@ export class IpcManager {
       fn();
       return;
     }
-    this.#wakeGate.defer(pid, fn);
+    // A process that has already ended will never be dispatched again. Deferring
+    // the rejection until that dispatch strands the agent's `await` forever —
+    // which is exactly a graceful stop of a `recv` failing to be graceful.
     const state = this.#table.get(pid)?.state;
+    if (state === undefined || state === 'exiting' || state === 'zombie') {
+      fn();
+      return;
+    }
+    this.#wakeGate.defer(pid, fn);
     if (state !== 'running') return;
     void this.#table
       .setState(pid, 'ready', { trigger: 'recv-wake' })

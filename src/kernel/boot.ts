@@ -1043,6 +1043,14 @@ export class Kernel {
       },
       wakeGate: this.#gate,
     });
+
+    // A graceful stop of a channel wait or a child wait has already moved
+    // the process to ZOMBIE. Reject the syscall it is still awaiting, or
+    // the agent sits on a promise that will never settle.
+    this.signals.setInterruptHook((pid) => {
+      this.ipc.cancelWaitersFor(pid);
+      this.dispatcher.cancelWaitsFor(pid);
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -1305,6 +1313,16 @@ export class Kernel {
    */
   daemons(): DaemonState[] {
     return this.init.daemonStates();
+  }
+
+  /**
+   * Record that the operator acknowledged a daemon's current situation.
+   *
+   * Not a read: a read must not grow the log. This is the operator saying
+   * they saw it, and the supervision journal keeps that sentence.
+   */
+  acknowledgeDaemon(name: string, by = 'operator'): Promise<DaemonState> {
+    return this.init.acknowledge(name, by);
   }
 
   /**

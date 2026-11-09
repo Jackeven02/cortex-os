@@ -89,6 +89,8 @@ export interface SupervisionFacts {
   readonly reaped: readonly number[] | null;
   readonly restartsCancelled: number | null;
   readonly remaining: readonly number[] | null;
+  /** Who acknowledged a daemon, when the action is `noticed`. */
+  readonly by: string | null;
 }
 
 /** A read that is a string is a string. */
@@ -120,6 +122,7 @@ export const SUPERVISION_ACTIONS: readonly InitAction[] = [
   'reap',
   'restart',
   'restart-gave-up',
+  'noticed',
   'shutdown',
 ];
 
@@ -183,6 +186,7 @@ export function describeSupervision(record: SyscallRecord): SupervisionFacts | u
     reaped: asPidList(args['reaped']),
     restartsCancelled: asCount(args['restartsCancelled']),
     remaining: asPidList(args['remaining']),
+    by: asString(args['by']),
   };
 }
 
@@ -249,6 +253,10 @@ export function formatSupervision(facts: SupervisionFacts): string {
         return `${who} not restarted -> the restart policy says no${policy}`;
       }
       return `${who} not restarted`;
+    }
+    case 'noticed': {
+      const whoBy = facts.by === null ? 'someone' : facts.by;
+      return `${who} noticed by ${whoBy}`;
     }
     case 'shutdown': {
       const signalled = facts.signalled === null ? 0 : facts.signalled.length;

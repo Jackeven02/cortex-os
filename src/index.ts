@@ -68,8 +68,14 @@ export const VERSION = readPackageVersion();
  * (docs/ABI.md §4.10, §4.9). Nothing was removed, renamed or redefined, so
  * an agent written against `1.0.0` still runs — it just does not know it can
  * move a rank.
+ *
+ * `1.2.0` closes the authority hole around birth. A narrowed parent that
+ * does not hold `admin` can no longer mint a child with more authority than
+ * it holds, a fork keeps the parent's capabilities, and a checkpoint carries
+ * them. An agent that relied on the hole now gets `EPERM`. Drivers that
+ * declare `abiCompat: '^1.0.0'` still match.
  */
-export const KERNEL_ABI_VERSION = '1.1.0' as const;
+export const KERNEL_ABI_VERSION = '1.2.0' as const;
 
 // Re-export the kernel public surface (types + errors + boot).
 export * from './kernel/index.js';

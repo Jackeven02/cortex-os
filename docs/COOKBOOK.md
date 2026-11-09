@@ -159,10 +159,12 @@ cortex diff 2 3   # lines up the two branches from their shared causal past
 cortex daemon install watcher \
     --role inbox-watcher \
     --module ./examples/checkpoint-agent.ts \
-    --restart on-failure --max-restarts 5
+    --restart on-failure --max-restarts 5 \
+    --cap spawn
 
 cortex daemon list           # show the registry + the live state of each daemon
 cortex daemon run watcher    # run it as a supervised, long-lived process
+cortex daemon ack watcher    # record that an operator has seen this attempt
 cortex daemon uninstall watcher
 ```
 
@@ -183,6 +185,12 @@ cortex daemon uninstall watcher
   two do not match (the kernel remembers a give-up the journal never recorded,
   or the journal counts restarts the kernel does not), it says so in words
   rather than leaving you to find the difference by hand.
+- `--cap` and `--grantable` are written into the spec. Omitting them leaves
+  the daemon fully privileged, which is the same default `spawn` has. A
+  restart allocates from the spec, so the sets survive it (ABI.md §4.9).
+- `ack <name>` records that an operator has seen the daemon's current
+  attempt (`__init:noticed`). Reading the list does not. The next restart
+  clears the acknowledgement (PROCESS.md §9.1).
 - `run` boots a kernel, registers the daemon, and supervises restarts per the
   `RestartPolicy` (`always` / `on-failure` / `never`, exponential backoff capped
   at 60s, `maxRestarts` cap, restart-storm detection). It stays alive until

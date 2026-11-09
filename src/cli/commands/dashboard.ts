@@ -39,7 +39,7 @@ export async function cmdDashboard(args: string[]): Promise<number> {
 
 OPS
   Write operations are disabled unless opted in:
-    --allow-ops               enable every op (spawn, kill, restore, renice)
+    --allow-ops               enable every op (spawn, kill, restore, renice, ack)
     --ops spawn,kill          enable exactly the listed ops
   Ops are served as POST /api/ops/<op> from the same origin.
 

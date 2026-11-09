@@ -84,6 +84,7 @@ import { join } from 'node:path';
 import { encode, decode } from 'cborg';
 import {
   type AgentSpec,
+  type Capability,
   type ChainId,
   type Checkpoint,
   type CheckpointOptions,
@@ -313,6 +314,12 @@ function rebrandCheckpoint(raw: unknown, path: string, signature: Uint8Array): C
     ...(b.budgetsRemaining !== undefined
       ? { budgetsRemaining: b.budgetsRemaining as NonNullable<Checkpoint['budgetsRemaining']> }
       : {}),
+    ...(b.capabilities !== undefined
+      ? { capabilities: b.capabilities === null ? null : (b.capabilities as Capability[]) }
+      : {}),
+    ...(b.grantable !== undefined
+      ? { grantable: b.grantable === null ? null : (b.grantable as Capability[]) }
+      : {}),
     syscallLogOffset: asSyscallOffset(Number(b.syscallLogOffset)),
     driverStates: (b.driverStates as Record<string, Uint8Array | null>) ?? {},
     signature,
@@ -525,6 +532,8 @@ export class CheckpointManager {
         memoryDelta,
         budgets: { ...entry.budgetsSpent },
         budgetsRemaining: { ...entry.budgetsRemaining },
+        capabilities: entry.capabilities === null ? null : [...entry.capabilities],
+        grantable: entry.capabilities === null ? null : [...entry.grantable],
         syscallLogOffset,
         driverStates,
       };
@@ -743,6 +752,9 @@ export class CheckpointManager {
       memory: memoryPolicies,
       initialLogOffset: cp.syscallLogOffset,
       ...(opts?.budgets !== undefined ? { budgets: opts.budgets } : {}),
+      ...(Array.isArray(cp.capabilities)
+        ? { capabilities: cp.capabilities, grantable: cp.grantable ?? [] }
+        : {}),
     });
 
     // Re-hydrate memory (regions were declared at allocate; syncFromTable

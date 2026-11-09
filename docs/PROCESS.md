@@ -150,8 +150,8 @@ type BlockedReason =
   | { kind: 'recv';  channel: ChannelId }   // waiting on IPC
   | { kind: 'wait';  pid: ProcessId }       // waiting on child
   | { kind: 'sleep'; until: string }        // waiting on a timer
-  | { kind: 'tool';  callId: string }       // reserved — see below
-  | { kind: 'llm';   callId: string }       // reserved — see below
+  | { kind: 'tool';  callId: string }       // inside a tool call
+  | { kind: 'llm';   callId: string }       // inside a model call
   | { kind: 'budget'; until: string }       // reserved — see below
   | { kind: 'lock';  resource: string };    // reserved — see below
 ```
@@ -160,21 +160,17 @@ A blocked process is woken by the kernel when its condition is satisfied. Wake t
 
 Most of an agent's life is spent in BLOCKED. This is normal. It is also why cortex can run thousands of agents on a laptop: only RUNNING processes consume tokens; the rest are essentially free.
 
-**Which reasons the kernel actually sets.** Three, today: `recv` (parked on a
-channel), `wait` (parked on a child) and `sleep` (parked on a timer). The other
-four are in the type and reserved for reasons the kernel does not yet have a
-way to express — and, in particular, **a process is not parked while a driver
-call is in flight**. An agent in a slow `llm_call` is RUNNING, not BLOCKED,
-and `blockedOn` is `null`.
+**Which reasons the kernel actually sets.** Five: `recv` (parked on a
+channel), `wait` (parked on a child), `sleep` (parked on a timer), and `llm`
+/ `tool` for the duration of a driver call. `budget` and `lock` are still
+reserved.
 
-That is a deliberate consequence of the cooperative scheduler (§8.2): the
-agent's JavaScript is *awaiting* the driver, and the kernel does not preempt a
-running process to mark it. The consequence is that a process table alone
-cannot tell you that an agent is wedged in a model call. The syscall log can
-— the `llm_call`'s `enter` frame is there and its `exit` frame is not — and
-that is what `cortex top` reads (docs/ARCHITECTURE.md §12.1). Turning the
-reserved reasons on would change the state model, so it is a discussion
-rather than a change (BACKLOG #060).
+A driver call parks the process and then returns it to RUNNING inline. The
+body never left the CPU, so the edge is BLOCKED → RUNNING, not BLOCKED →
+READY. `recv`, `wait` and `sleep` still wake through READY: those bodies are
+not running until the scheduler dispatches them. A signal that arrives
+during a driver call waits until the call returns. Aborting the call would
+spend the tokens and throw the answer away.
 
 ### 3.8 `EXITING`
 
@@ -280,7 +276,8 @@ Every legal transition is listed here. Anything not in this table is illegal and
 | READY | RUNNING | scheduler dispatch | syscall execution begins |
 | RUNNING | READY | syscall returns, more work pending | re-enqueued |
 | RUNNING | BLOCKED | syscall awaits external event | `blockedOn` set; dequeued |
-| BLOCKED | READY | wake condition met | re-enqueued |
+| BLOCKED | READY | wake condition met (`recv`, `wait`, `sleep`) | re-enqueued |
+| BLOCKED | RUNNING | a driver call returns (`llm`, `tool`) | the same syscall continues |
 | RUNNING | STOPPED | SIGSTOP, SIGXCPU, or budget exhaustion | paused in memory |
 | STOPPED | READY | SIGCONT | re-enqueued |
 | RUNNING | CHECKPOINTING | SIGUSR2 or `checkpoint()` syscall | snapshot begins |
@@ -289,7 +286,7 @@ Every legal transition is listed here. Anything not in this table is illegal and
 | CHECKPOINTING | SUSPENDED | snapshot done with `--detach` | removed from scheduler |
 | SUSPENDED | (gone) | `restore <chain_id>` | new PID created in NEW; old entry reaped |
 | RUNNING | EXITING | `exit()` or terminating signal | cleanup begins |
-| BLOCKED | EXITING | SIGKILL or SIGTERM (with handler) | cleanup begins |
+| BLOCKED | EXITING | SIGKILL, or a default terminate on `recv` / `wait` | cleanup begins |
 | STOPPED | EXITING | SIGKILL or SIGTERM | cleanup begins |
 | EXITING | ZOMBIE | cleanup done or `exit_timeout_ms` elapsed | entry retained for parent |
 | ZOMBIE | (gone) | parent `wait()` or init reaping | entry removed |
@@ -437,22 +434,11 @@ Every signal has a disposition per process:
 
 If a signal arrives while the process is BLOCKED or STOPPED, it is queued. When the process next transitions to RUNNING, pending signals are delivered before the next syscall.
 
-This means an agent that is blocked waiting on an LLM response and receives SIGTERM will not interrupt the LLM call mid-flight (which would waste tokens) — it will be delivered the moment the call returns.
+This means an agent that is blocked inside an LLM or tool call and receives SIGTERM will not interrupt the call mid-flight (which would waste tokens) — it will be delivered the moment the call returns.
 
-`SIGUSR2` is no exception: a "checkpoint now" aimed at a parked agent waits for the agent to run again, and the snapshot is taken then. The snapshot is of the agent as it is *when it resumes*, not as it was when the signal arrived.
+A default **terminate** (`SIGTERM`, `SIGINT`, `SIGXFSZ`, `SIGSYS`) aimed at a process blocked on `recv` or `wait` is delivered immediately. Those waits can last forever, and a signal that waits with them never arrives. `SIGKILL` is unchanged: it is immediate from any state. A custom handler still queues, because running the handler needs the process to be RUNNING.
 
-**A queued signal waits for a wake-up that may never come.** The rule above
-is right for an agent that is waiting for something — an LLM response, a
-message — because it will wake up. But an agent parked in a `recv()` with no
-timeout, or one that never wakes at all, will never see the signal: it sits
-in the pending queue indefinitely. So `SIGTERM` alone cannot stop such an
-agent, and a graceful termination needs a fallback. `SIGKILL` is the
-fallback — it is applied immediately, whatever state the target is in — and
-`cortex supervise` uses exactly that: it reads the `outcome` of its own
-signal out of the target's `__signal` record (`queued` means "not running,
-not going to see it") and escalates at once instead of waiting out a grace
-period for a signal that will never be delivered. This is a known sharp edge
-of the queuing rule, tracked in BACKLOG.md.
+`SIGUSR2` is no exception to the queue for a model call: a "checkpoint now" waits until the call returns, and the snapshot is of the agent as it is *then*, not as it was when the signal arrived.
 
 **And the operator's views say so.** The queue is the kernel's own, and the
 kernel sends it in every process record it hands out — but the views used to
@@ -661,12 +647,11 @@ and `cortex top` print `1.2k (300 cached)`, `cortex limit` prints
 column of its own. The arithmetic and the wording live in one place
 (`src/token_usage.ts`), so the three views cannot drift apart.
 
-**Whether a cached token should be charged in full against the token ceiling
-is still open.** It is today — the money is charged at the cache price while
-the tokens are charged at the full count — and an agent that re-reads a
-cached prompt a thousand times drains its token ceiling while its dollar bill
-barely moves. That is a policy question, not an implementation detail, and it
-is tracked in BACKLOG.md (#092).
+**A cached token counts in full against the token ceiling.** The token
+ceiling bounds work: a prompt the provider served from cache was still part
+of the request. The money ceiling bounds the invoice, and the cache price
+is what the invoice uses. The two ceilings are allowed to disagree. Every
+view says how much of the spend was cached, so the disagreement is visible.
 
 **And a call's spend is a pair, where a process's is a total.** The counters
 above are what a *process* accumulated; one `llm_call` spent its own share of
@@ -723,9 +708,9 @@ until it runs again (PROCESS §7.2). A process that is BLOCKED — sitting in
 `recv()`, or inside a call — is left where it is when the ceiling is
 reached. The views say why (`cortex ps` prints "out of wallTime"). The next
 time that process becomes READY, the gate above stops it. A process that
-never wakes still never sees the signal: `cortex supervise --kill-after`
-is what stops an agent the kernel cannot. (How a process that never wakes
-should be stopped gracefully is BACKLOG #057, and it is still open.)
+never wakes still never sees a signal that was only queued. A default
+terminate aimed at `recv` or `wait` is not queued (§7.2): it stops the
+process. A model call still finishes first.
 
 **And the log says which counter hit zero.** "Your agent was stopped" and
 "your agent ran out of tokens" are different facts, and only one of them tells
@@ -802,8 +787,16 @@ unreadable in practice: every frame in it was called `__init`, so the log of
 a supervisor that restarted three times read as three identical lines, and
 the action that distinguished them was buried in `args`. The frames now
 carry their action in the view (`__init:restart`, `__init:restart-gave-up`,
-`__init:reap`), so `cortex trace 1` is a readable supervision journal
-(ABI.md §6.1 for the naming rule).
+`__init:reap`, `__init:noticed`), so `cortex trace 1` is a readable
+supervision journal (ABI.md §6.1 for the naming rule).
+
+**Seeing a daemon is not the same as having looked.** `cortex ps`,
+`cortex daemon list` and the dashboard read the live state and do not
+write a record. `cortex daemon ack <name>` does: init writes
+`__init:noticed` with who acknowledged it. The acknowledgement belongs to
+the current attempt. The next restart clears it. The dashboard's 「已看到」
+button is the same command, and it is only offered when the window was
+started with `--allow-ops`.
 
 ### 9.2 Supervision
 

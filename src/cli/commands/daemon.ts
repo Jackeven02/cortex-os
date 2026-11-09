@@ -68,7 +68,13 @@ import {
   readDaemonDecisions,
   type DaemonReceipt,
 } from '../daemon_view.js';
-import { type AgentSpec, type RestartPolicy, type MemoryRegionPolicy } from '../../kernel/types.js';
+import {
+  parseCapabilities,
+  type AgentSpec,
+  type Capability,
+  type RestartPolicy,
+  type MemoryRegionPolicy,
+} from '../../kernel/types.js';
 import { KERNEL_ABI_VERSION } from '../../index.js';
 import {
   listDaemons,
@@ -102,6 +108,8 @@ export async function cmdDaemon(args: string[]): Promise<number> {
       return await cmdDaemonRun(rest);
     case 'stop':
       return await cmdDaemonStop(rest);
+    case 'ack':
+      return await cmdDaemonAck(rest);
     case undefined:
     case '--help':
     case '-h':
@@ -136,6 +144,8 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
       restart: { type: 'string', default: 'never' },
       'max-restarts': { type: 'string' },
       'backoff-ms': { type: 'string' },
+      cap: { type: 'string' },
+      grantable: { type: 'string' },
       memory: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -252,6 +262,20 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
     regionPolicies = mergeRegionPolicies(DEFAULT_MEMORY_REGIONS, overrides);
   }
 
+  let capabilities: readonly Capability[] | undefined;
+  let grantable: readonly Capability[] | undefined;
+  try {
+    if (values.cap !== undefined) {
+      capabilities = parseCapabilities(String(values.cap).split(',').map((s) => s.trim()).filter((s) => s !== ''));
+    }
+    if (values.grantable !== undefined) {
+      grantable = parseCapabilities(String(values.grantable).split(',').map((s) => s.trim()).filter((s) => s !== ''));
+    }
+  } catch (err) {
+    console.error(`cortex daemon install: invalid capabilities: ${(err as Error).message}`);
+    return 1;
+  }
+
   const spec: DaemonSpec = {
     role: values.role,
     agent: agentSpec,
@@ -261,6 +285,8 @@ export async function cmdDaemonInstall(args: string[]): Promise<number> {
       ? { budgets: { tokens: parseInt(values['token-budget'], 10) } }
       : {}),
     ...(nice !== undefined ? { nice } : {}),
+    ...(capabilities !== undefined ? { capabilities } : {}),
+    ...(grantable !== undefined ? { grantable } : {}),
   };
 
   const dir = defaultKernelDir();
@@ -795,6 +821,45 @@ function createStopSignal(maxRuntimeMs = 0): StopSignal {
 }
 
 // =============================================================================
+// ack
+// =============================================================================
+
+/**
+ * Record that the operator has seen a daemon's current situation.
+ *
+ * A `list` is a read and is not recorded. This is the sentence the journal
+ * was missing: someone looked, and said so.
+ */
+export async function cmdDaemonAck(args: string[]): Promise<number> {
+  const name = args.find((arg) => !arg.startsWith('-'));
+  if (name === undefined || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+    console.error('cortex daemon ack: <name> is required and must match [a-zA-Z0-9_-]+');
+    return 1;
+  }
+  const dir = defaultKernelDir();
+  const probe = await probeKernel(dir);
+  if (probe.kind !== 'live') {
+    console.error('cortex daemon ack: no live kernel in this directory');
+    return 1;
+  }
+  const client = probe.client;
+  try {
+    const reply = (await client.request('daemon-ack', { name })) as { daemon?: { noticed?: boolean; noticedBy?: string | null } };
+    const by = reply.daemon?.noticedBy ?? 'operator';
+    console.log(`daemon ${name} noticed by ${by}`);
+    return 0;
+  } catch (err) {
+    if (err instanceof KernelCommandError) {
+      console.error(`cortex daemon ack: ${err.errno}: ${err.message}`);
+      return 1;
+    }
+    throw err;
+  } finally {
+    client.close();
+  }
+}
+
+// =============================================================================
 // Help
 // =============================================================================
 
@@ -807,6 +872,7 @@ USAGE
   cortex daemon uninstall <name>
   cortex daemon run [name]
   cortex daemon stop
+  cortex daemon ack <name>
 
 SUBCOMMANDS
   install     Persist a daemon spec and generate an OS service unit

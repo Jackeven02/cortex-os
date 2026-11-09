@@ -878,6 +878,16 @@ export interface Checkpoint {
   readonly memoryDelta: MemoryDelta;
   readonly budgets: BudgetCounters;
   readonly budgetsRemaining?: BudgetLimits;
+  /**
+   * The authority the process held when it was snapshotted.
+   *
+   * Absent on a checkpoint written before the field existed: restore leaves
+   * the process unnarrowed, which is what those snapshots always did.
+   * `null` is an unnarrowed process, said on purpose. An array is the held
+   * set, and `grantable` is what it may still acquire.
+   */
+  readonly capabilities?: readonly Capability[] | null;
+  readonly grantable?: readonly Capability[] | null;
   readonly syscallLogOffset: SyscallOffset;
   readonly driverStates: Readonly<Record<string, Uint8Array | null>>;
   readonly signature: Uint8Array;

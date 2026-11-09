@@ -742,7 +742,7 @@ function withCheckpointLabel<T extends { state: ProcessState; checkpointChain?: 
 }
 
 /** Every write operation the dashboard knows how to perform. */
-const DASHBOARD_OPS = ['spawn', 'kill', 'restore', 'renice'] as const;
+const DASHBOARD_OPS = ['spawn', 'kill', 'restore', 'renice', 'ack'] as const;
 
 const allowedOps = (option: DashboardOptions['allowOps']): readonly string[] =>
   option === true ? DASHBOARD_OPS : Array.isArray(option) ? DASHBOARD_OPS.filter((op) => option.includes(op)) : [];
@@ -809,6 +809,22 @@ async function handleRestore(request: IncomingMessage, response: ServerResponse,
  * short-lived-kernel model this marks the process as zombie in its on-disk
  * meta — no live kernel required, exactly like the CLI command.
  */
+async function handleAck(request: IncomingMessage, response: ServerResponse, dir: string): Promise<void> {
+  let body: { name?: unknown } = {};
+  try {
+    body = JSON.parse(await readBody(request) || '{}') as { name?: unknown };
+  } catch {
+    body = {};
+  }
+  const name = typeof body.name === 'string' ? body.name : '';
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+    json(response, 400, { error: 'missing or invalid "name" in request body' });
+    return;
+  }
+  const { cmdDaemonAck } = await import('../cli/commands/daemon.js');
+  json(response, 200, await runCliCommand(dir, () => cmdDaemonAck([name])));
+}
+
 async function handleKill(request: IncomingMessage, response: ServerResponse, dir: string): Promise<void> {
   let body: { pid?: unknown; signal?: unknown } = {};
   try {
@@ -957,6 +973,7 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         else if (op === 'kill') await handleKill(request, response, dir);
         else if (op === 'renice') await handleRenice(request, response, dir);
         else if (op === 'spawn') await handleSpawn(request, response, dir);
+        else if (op === 'ack') await handleAck(request, response, dir);
         else json(response, 404, { error: `unknown op: ${op}` });
         return;
       }

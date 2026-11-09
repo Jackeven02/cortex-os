@@ -2042,6 +2042,17 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **Five open decisions, closed.** A process blocked on `recv` or `wait` is
+  stopped by a default terminate instead of queueing the signal forever. A
+  process inside `llm_call` or `tool_call` is BLOCKED for the duration and
+  returns to RUNNING when the driver returns; a signal that arrived during
+  the call is delivered then. A narrowed parent that does not hold `admin`
+  cannot mint a more privileged child, a fork keeps the parent's
+  capabilities, and a checkpoint carries them (ABI `1.2.0`). Cached tokens
+  keep counting in full against the token ceiling; the money ceiling keeps
+  the cache price. `cortex daemon ack <name>` records that an operator saw
+  the daemon's current situation (`__init:noticed`). A read still does not.
+
 - **A wall-clock ceiling could park a READY process forever.** The heartbeat
   charges `wallTimeMs` whether or not the process is running, so the counter
   can hit zero while the process is only waiting for a turn. Selection then
@@ -2054,9 +2065,9 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
   disposition STOPPED) and records which counter hit zero. Token and usd
   exhaustion still parks the process until the supervisor raises that
   ceiling — those counters only move when the process runs. A process that
-  is BLOCKED is still not stopped in place: `SIGXCPU` is delivered when it
-  next runs (PROCESS.md §7.2, §8.3). A process that never wakes is still
-  BACKLOG #057.
+  is BLOCKED is still not stopped in place by `SIGXCPU`: that signal is
+  delivered when it next runs (PROCESS.md §7.2, §8.3). A default terminate
+  on `recv` or `wait` is the exception, and it is delivered immediately.
 
   No ABI change. The contract already said a counter at zero fires
   `SIGXCPU`; this is the scheduler doing that for the one budget that can

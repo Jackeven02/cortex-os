@@ -182,6 +182,9 @@ export interface DaemonFacts {
   readonly maxRestarts: number | null;
   /** Which agent it runs, or `null` when that is not known. */
   readonly agent: DaemonAgent | null;
+  /** Whether the current situation has been acknowledged. */
+  readonly noticed: boolean;
+  readonly noticedBy: string | null;
 }
 
 /**
@@ -236,6 +239,8 @@ export function joinDaemons(
         restart: receipt.restart,
         maxRestarts: receipt.maxRestarts,
         agent: receipt.agent,
+        noticed: false,
+        noticedBy: null,
       });
     }
     return rows;
@@ -271,6 +276,8 @@ export function joinDaemons(
         restart: receipt.restart,
         maxRestarts: receipt.maxRestarts,
         agent: receipt.agent,
+        noticed: false,
+        noticedBy: null,
       });
       continue;
     }
@@ -306,6 +313,8 @@ function factsOf(state: DaemonState, installed: boolean): DaemonFacts {
     restart: state.restart,
     maxRestarts: state.maxRestarts,
     agent: state.agent,
+    noticed: state.noticed,
+    noticedBy: state.noticedBy,
   };
 }
 
@@ -366,7 +375,11 @@ export function describeDaemonNote(facts: DaemonFacts): string | null {
   }
   if (facts.status === 'gave-up') {
     const reason = describeDaemonGiveUp(facts.gaveUpReason);
-    return reason === null ? 'the supervisor gave up on it' : `the supervisor gave up: ${reason}`;
+    const base = reason === null ? 'the supervisor gave up on it' : `the supervisor gave up: ${reason}`;
+    const seen = facts.noticed
+      ? `noticed by ${facts.noticedBy ?? 'operator'}`
+      : 'not noticed';
+    return `${base}; ${seen}`;
   }
   if (!facts.installed) {
     return 'the registry has no entry for it';

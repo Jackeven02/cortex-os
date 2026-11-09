@@ -296,6 +296,12 @@ export class SignalManager {
   #handlerInvoker: HandlerInvoker | null;
   #checkpointMediator: CheckpointMediator | null;
   #onZombie: OnZombieHook | null;
+  /**
+   * Fired after a graceful stop is delivered to a process that was parked on
+   * a channel or a child. The dispatcher and IPC use it to reject the parked
+   * syscall; the signal engine does not know those waiters.
+   */
+  #onInterrupt: ((pid: ProcessId) => void) | null = null;
 
   constructor(opts: SignalManagerOptions) {
     this.#table = opts.table;
@@ -304,6 +310,14 @@ export class SignalManager {
     this.#handlerInvoker = opts.handlerInvoker ?? null;
     this.#checkpointMediator = opts.checkpointMediator ?? null;
     this.#onZombie = opts.onZombie ?? null;
+  }
+
+  /**
+   * Register the hook that cancels a parked `recv` / `wait` after a graceful
+   * stop. Boot wires it once both IPC and the dispatcher exist.
+   */
+  setInterruptHook(hook: (pid: ProcessId) => void): void {
+    this.#onInterrupt = hook;
   }
 
   // ---------------------------------------------------------------------------
@@ -470,6 +484,21 @@ export class SignalManager {
         stateAtSend: state,
       });
       return 'queued';
+    }
+
+    // A channel wait and a child wait can last forever. A terminate signal
+    // queued there is a stop that never arrives (PROCESS.md §7.2). Deliver
+    // it now. An in-flight model or tool call stays queued: aborting it
+    // spends the tokens and throws the answer away. A sleep will wake.
+    if (
+      state === 'blocked' &&
+      (entry.blockedOn?.kind === 'recv' || entry.blockedOn?.kind === 'wait') &&
+      this.#table.getDisposition(pid, signal).kind === 'default' &&
+      DEFAULT_ACTIONS[signal] === 'terminate'
+    ) {
+      const outcome = await this.#applyDelivered(pid, signal, from);
+      if (outcome === 'delivered') this.#onInterrupt?.(pid);
+      return outcome;
     }
 
     // All other signals: queue if not RUNNING (§7.2).
@@ -685,10 +714,10 @@ export class SignalManager {
    * release, channel close, final budget write) belong here in v1; for now
    * we just walk the state machine and record. Exit code is 128+signum.
    *
-   * If the process is BLOCKED, this is reachable via the BLOCKED → EXITING
-   * transition (PROCESS.md §5). We do NOT call this from BLOCKED in v0 —
-   * SIGTERM queues until next RUNNING. SIGKILL is the only signal that
-   * pulls a BLOCKED process straight to EXITING.
+   * BLOCKED → EXITING is legal (PROCESS.md §5). A terminate aimed at a
+   * channel wait or a child wait is delivered here, so a process that will
+   * never wake can still be stopped without SIGKILL. A terminate aimed at
+   * any other non-RUNNING state is queued until the process runs.
    */
   async #applyTerminate(
     pid: ProcessId,

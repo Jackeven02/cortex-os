@@ -1068,6 +1068,57 @@ export class SyscallDispatcher {
     return entry.capabilities.has(cap);
   }
 
+  /**
+   * The authority a child is born with.
+   *
+   * An unnarrowed parent, and a parent that holds `admin`, may name any
+   * sets. Omitting them still means full privilege — that is the 1.0
+   * default, and `admin` is allowed to mint it.
+   *
+   * Everyone else inherits. Omitting the sets copies the parent's held and
+   * grantable sets, so "I didn't say" is not "my child holds everything".
+   * Naming a capability the parent does not hold, or a grant the parent
+   * cannot make, is `EPERM`.
+   */
+  #childAuthority(
+    parentPid: ProcessId,
+    opts: { readonly capabilities?: readonly Capability[]; readonly grantable?: readonly Capability[] },
+  ): { readonly capabilities?: readonly Capability[]; readonly grantable?: readonly Capability[] } {
+    if (this.hasCapability(parentPid, 'admin')) {
+      return {
+        ...(opts.capabilities !== undefined ? { capabilities: opts.capabilities } : {}),
+        ...(opts.grantable !== undefined ? { grantable: opts.grantable } : {}),
+      };
+    }
+    const entry = this.#table.mustGet(parentPid, 'spawn');
+    const held = entry.capabilities ?? new Set<Capability>();
+    const grantable = entry.grantable;
+    const capabilities = opts.capabilities ?? [...held];
+    const childGrant = opts.grantable ?? [...grantable];
+    for (const cap of capabilities) {
+      if (!held.has(cap)) {
+        trap('EPERM', 'spawn', {
+          pid: unbrand(parentPid),
+          capability: cap,
+          held: [...held],
+          reason: 'a child cannot hold a capability its parent does not hold',
+        });
+      }
+    }
+    for (const cap of childGrant) {
+      if (!held.has(cap) && !grantable.has(cap)) {
+        trap('EPERM', 'spawn', {
+          pid: unbrand(parentPid),
+          capability: cap,
+          held: [...held],
+          grantable: [...grantable],
+          reason: 'a child cannot be granted a capability its parent cannot grant',
+        });
+      }
+    }
+    return { capabilities, grantable: childGrant };
+  }
+
   /** Trap `EPERM` unless `pid` holds `cap`. */
   #requireCapability(pid: ProcessId, syscall: SyscallName, cap: Capability): void {
     if (this.hasCapability(pid, cap)) return;
@@ -1226,6 +1277,7 @@ export class SyscallDispatcher {
     if (typeof opts?.role !== 'string' || opts.agent === undefined) {
       trap('EINVAL', 'spawn', { reason: 'spawn requires { role, agent }' });
     }
+    const authority = this.#childAuthority(pid, opts);
     const childPid = await this.#table.allocate({
       ppid: pid,
       role: opts.role,
@@ -1240,9 +1292,10 @@ export class SyscallDispatcher {
       ...(opts.exitTimeoutMs !== undefined ? { exitTimeoutMs: opts.exitTimeoutMs } : {}),
       ...(opts.group !== undefined ? { pgid: opts.group } : {}),
       // Least privilege, when the spawner asked for it (docs/ABI.md §4.9).
-      // Both omitted ⇒ the child is unnarrowed, as before 1.0.
-      ...(opts.capabilities !== undefined ? { capabilities: opts.capabilities } : {}),
-      ...(opts.grantable !== undefined ? { grantable: opts.grantable } : {}),
+      // A narrowed parent that is not `admin` cannot omit this and mint a
+      // fully privileged child: #childAuthority inherits the parent's sets.
+      ...(authority.capabilities !== undefined ? { capabilities: authority.capabilities } : {}),
+      ...(authority.grantable !== undefined ? { grantable: authority.grantable } : {}),
     });
 
     // NEW → READY so the scheduler's reconcile adopts it. The agent module is
@@ -1801,6 +1854,7 @@ export class SyscallDispatcher {
       });
     }
     const driver = this.#resolveLLM(req.driver);
+    return await this.#duringDriverCall(pid, 'llm', callId, async () => {
     const timeoutMs = req.timeoutMs ?? this.#defaultLlmTimeoutMs;
     const abort = new AbortController();
     const timer = this.#setTimeoutFn(() => abort.abort(), timeoutMs);
@@ -1818,6 +1872,7 @@ export class SyscallDispatcher {
     } finally {
       this.#clearTimeoutFn(timer);
     }
+    });
   }
 
   async #toolCall(
@@ -1857,6 +1912,7 @@ export class SyscallDispatcher {
       this.#requireCapability(pid, 'tool_call', 'tool:dangerous');
     }
 
+    return await this.#duringDriverCall(pid, 'tool', callId, async () => {
     const timeoutMs = opts?.timeoutMs ?? descriptor.timeoutMs ?? this.#defaultToolTimeoutMs;
     const abort = new AbortController();
     const timer = this.#setTimeoutFn(() => abort.abort(), timeoutMs);
@@ -1886,6 +1942,89 @@ export class SyscallDispatcher {
     } finally {
       this.#clearTimeoutFn(timer);
     }
+    });
+  }
+
+  /**
+   * Park the process for the duration of a driver call, then resume it
+   * inline.
+   *
+   * The process table says BLOCKED (`llm` or `tool`) while the call is in
+   * flight, which is the truth: the agent is waiting, and it is not
+   * runnable. The body is still the continuation that issued the syscall,
+   * so when the driver returns the process goes straight back to RUNNING.
+   * A signal that arrived during the call is delivered then — a model call
+   * is not aborted mid-flight.
+   */
+  async #duringDriverCall<T>(
+    pid: ProcessId,
+    kind: 'llm' | 'tool',
+    callId: string,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const before = this.#table.get(pid);
+    const park = before?.state === 'running';
+    if (park) {
+      this.#table.setBlockedOn(pid, { kind, callId });
+      await this.#table.setState(pid, 'blocked', { trigger: kind === 'llm' ? 'llm-call' : 'tool-call' });
+    }
+    try {
+      const result = await run();
+      if (park) await this.#resumeDriver(pid);
+      if (park && this.#table.get(pid)?.state !== 'running') {
+        trap('EINTR', kind === 'llm' ? 'llm_call' : 'tool_call', {
+          pid: unbrand(pid),
+          reason: 'interrupted by a signal',
+        });
+      }
+      return result;
+    } catch (err) {
+      if (park && this.#table.get(pid)?.state === 'blocked') await this.#resumeDriver(pid);
+      throw err;
+    }
+  }
+
+  /** BLOCKED → RUNNING, then deliver anything that waited out the call. */
+  async #resumeDriver(pid: ProcessId): Promise<void> {
+    if (this.#table.get(pid)?.state !== 'blocked') return;
+    await this.#table.setState(pid, 'running', { trigger: 'driver-return' });
+    if (this.#table.get(pid)?.state === 'running') {
+      await this.#signals.deliverPending(pid);
+    }
+  }
+
+  /**
+   * Reject every `wait` this process is parked on. A graceful stop has
+   * already ended the process; the promise must not outlive it.
+   */
+  cancelWaitsFor(pid: ProcessId): number {
+    const target = unbrand(pid);
+    let cancelled = 0;
+    const reject = (waiter: Waiter): void => {
+      if (waiter.settled) return;
+      waiter.settled = true;
+      if (waiter.timer !== null) this.#clearTimeoutFn(waiter.timer);
+      waiter.reject(new CortexError('EINTR', 'wait', {
+        message: 'wait interrupted by a signal',
+        details: { parent: target },
+      }));
+      cancelled += 1;
+    };
+    for (const [key, list] of this.#waitersByChild) {
+      const keep: Waiter[] = [];
+      for (const waiter of list) {
+        if (unbrand(waiter.parentPid) === target) reject(waiter);
+        else keep.push(waiter);
+      }
+      if (keep.length === 0) this.#waitersByChild.delete(key);
+      else this.#waitersByChild.set(key, keep);
+    }
+    const any = this.#waitersAny.get(target);
+    if (any !== undefined) {
+      for (const waiter of any) reject(waiter);
+      this.#waitersAny.delete(target);
+    }
+    return cancelled;
   }
 
   // ---------------------------------------------------------------------------

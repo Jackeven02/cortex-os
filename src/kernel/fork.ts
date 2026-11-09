@@ -269,6 +269,15 @@ export class ForkManager {
       nice: parent.nice,
       memory: childPolicies,
       budgets: childLimits,
+      // A fork is the same agent. It keeps the parent's authority, including
+      // "unnarrowed". Omitting the sets on a narrowed parent would mint a
+      // fully privileged child (docs/ABI.md §4.9).
+      ...(parent.capabilities === null
+        ? {}
+        : {
+            capabilities: [...parent.capabilities],
+            grantable: [...parent.grantable],
+          }),
     });
 
     try {

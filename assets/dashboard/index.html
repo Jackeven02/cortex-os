@@ -1034,7 +1034,9 @@
         if (decision !== '') {
           decisions.push(`  ${esc(typeof daemon.name === 'string' && daemon.name !== '' ? daemon.name : '(unnamed)')}  ${esc(decision)}`);
         }
-        return `<tr><td class="role-cell">${name}</td><td>${esc(daemon.role ?? '—')}</td><td><span class="daemon-state ${tone}">${esc(label)}</span>${noteCell}${driftCell}</td><td class="pid-cell">${esc(daemon.pid ?? '—')}</td><td class="pid-cell">${esc(daemon.restarts ?? '—')}</td><td>${esc(daemon.exitLabel ?? '—')}</td><td>${esc(daemon.policyLabel ?? '—')}</td><td title="${esc(daemon.agentLabel ?? '')}">${esc(daemon.agentLabel ?? '—')}</td></tr>`;
+        const canAck = opsList.includes('ack') && daemon.status === 'gave-up' && typeof daemon.name === 'string' && daemon.name !== '';
+        const ack = canAck ? ` <button type="button" data-ack="${esc(daemon.name)}">已看到</button>` : '';
+        return `<tr><td class="role-cell">${name}${ack}</td><td>${esc(daemon.role ?? '—')}</td><td><span class="daemon-state ${tone}">${esc(label)}</span>${noteCell}${driftCell}</td><td class="pid-cell">${esc(daemon.pid ?? '—')}</td><td class="pid-cell">${esc(daemon.restarts ?? '—')}</td><td>${esc(daemon.exitLabel ?? '—')}</td><td>${esc(daemon.policyLabel ?? '—')}</td><td title="${esc(daemon.agentLabel ?? '')}">${esc(daemon.agentLabel ?? '—')}</td></tr>`;
       }).join('') : '<tr><td colspan="8" class="empty">没有守护进程。用 cortex daemon install 注册一个，这里会显示内核眼中的活状态。</td></tr>';
       $('daemonSummary').textContent = daemonSummary;
       $('daemonNote').textContent = shared.join(' · ');
@@ -1042,6 +1044,19 @@
       $('daemonDecisions').innerHTML = decisions.length
         ? `<div class="daemon-note-title">监管决定（内核的日志）</div>${decisions.join('<br>')}`
         : '';
+      $('daemonRows').querySelectorAll('button[data-ack]').forEach((button) => {
+        button.addEventListener('click', () => { void ackDaemon(button.dataset.ack); });
+      });
+    }
+
+    async function ackDaemon(name) {
+      const res = await fetch('/api/ops/ack', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name }),
+      });
+      if (!res.ok) return;
+      await pollOnce();
     }
 
     // What a snapshot holds.

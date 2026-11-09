@@ -18,9 +18,10 @@
  *   budget nobody can reason about.
  * - The **cached** part is worth saying out loud. It is billed at the cache
  *   price rather than the fresh one, so a process that spent 1,000 tokens for a
- *   fifth of the usual money was reading from the cache — and no view used to
- *   say so. The operator saw the tokens and the dollars and could not make
- *   them add up.
+ *   fifth of the usual money was reading from the cache. The token ceiling
+ *   counts those tokens in full (it bounds the work). The money ceiling uses
+ *   the cache price (it bounds the invoice). The cached part is what makes
+ *   the two numbers readable next to each other.
  *
  * ## Why it lives here
  *

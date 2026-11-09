@@ -119,6 +119,7 @@ export type KernelCommand =
   | 'openCalls'
   | 'drivers'
   | 'daemons'
+  | 'daemon-ack'
   | 'memory'
   | 'send'
   | 'kill'

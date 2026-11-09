@@ -4,7 +4,7 @@
 >
 > **If a behavior is not in this document, it does not exist.**
 
-> ## 🔒 ABI status: **FROZEN** since `1.0.0` — currently `1.1.0` (additive)
+> ## 🔒 ABI status: **FROZEN** since `1.0.0` — currently `1.2.0` (additive)
 >
 > Before `1.0.0` the ABI was deliberately unsettled: the version line said
 > `0.x`, and a minor bump was allowed to change a syscall, its arguments, or
@@ -25,12 +25,16 @@
 >   `kernel_abi_version`, so a replay engine can tell which contract a log was
 >   written under (§9.6).
 >
-> **Current version: `1.1.0`** — the first additive bump. It adds the
-> `renice` syscall (§4.10) and the `renice` capability (§4.9): an agent can
-> now move a rank in its own tree without a permission, and a rank across the
-> tree with one. Nothing was removed, renamed or redefined, so an agent
-> written against `1.0.0` still runs — it just does not know it can move a
-> rank.
+> **Current version: `1.2.0`.** `1.1.0` added the `renice` syscall (§4.10)
+> and the `renice` capability (§4.9): an agent can move a rank in its own
+> tree without a permission, and a rank across the tree with one. `1.2.0`
+> closes the birth-authority hole (§4.9): a narrowed parent that does not
+> hold `admin` can no longer hand a child capabilities it does not hold.
+> Omitting the sets inherits them. A fork copies them. A checkpoint carries
+> them, and a snapshot written before the field existed still restores.
+> Nothing was removed or renamed. An agent written against `1.0.0` still
+> runs, unless it was minting a child richer than itself — that call is now
+> `EPERM`. Drivers that declare `abiCompat: '^1.0.0'` still match.
 >
 > The freeze is why `1.0` also had to settle the questions §9 had deferred to
 > "v1" — capabilities (§9.2) and the channel lifecycle (§9.3). Both are in.
@@ -641,6 +645,8 @@ A process has two sets:
 - **grantable** — what it may raise later with `acquire()`, but does not hold yet.
 
 `spawn` seeds both. `acquire` moves a capability from grantable to held. `release` drops one. There is no way to delegate a capability to another process — that is a marketplace, and it is in the icebox.
+
+**A child cannot outrank its parent.** Since ABI `1.2.0`, a parent that does not hold `admin` may only give a child capabilities it holds, and grants it can make. Omitting the sets inherits them; it does not mean full privilege. A parent that holds `admin`, and an unnarrowed parent, may still name any sets, and omitting them is still full privilege. `fork` copies the parent's held and grantable sets. A checkpoint carries them; a snapshot written before the field existed restores unnarrowed. `cortex daemon install --cap` records the same sets on the spec, so a restart does not drop them.
 
 **Default is full privilege, not least privilege.** A process whose spawner said nothing holds every capability. This is the compatibility decision, stated plainly: every agent, example and smoke check written before `1.0` predates capabilities, and defaulting to empty would turn all of them into `EPERM` traps on upgrade. Least privilege is opt-in — pass `capabilities` (and optionally `grantable`) to `spawn`.
 

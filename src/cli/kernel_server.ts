@@ -541,6 +541,16 @@ async function dispatch(
       return { surface };
     }
 
+    case 'daemon-ack': {
+      const name = args['name'];
+      if (typeof name !== 'string' || name.length === 0) {
+        throw new WireError('EINVAL', 'daemon-ack requires a name');
+      }
+      const by = typeof args['by'] === 'string' && args['by'].length > 0 ? args['by'] : 'operator';
+      const daemon = await kernel.acknowledgeDaemon(name, by);
+      return { daemon };
+    }
+
     case 'daemons': {
       // A read, like `ps`, `openCalls` and `drivers`: the operator asking how
       // the supervised daemons are doing is not something a daemon did, so it
