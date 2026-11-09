@@ -145,6 +145,7 @@ import {
   type Message,
   Kernel,
   bootKernel,
+  shutdownOpenKernels,
   PROMPT_AGENT_MAX_TURNS,
   type AgentFn,
   type KernelOptions,
@@ -5129,7 +5130,7 @@ async function runReniceSyscallChecks(): Promise<void> {
       // written against `1.0.0` still runs.
       assert(SYSCALL_NAMES.includes('renice'), "the syscall is in the ABI's list");
       assert(CAPABILITIES.includes('renice'), "the capability is in the ABI's list");
-      assert(KERNEL_ABI_VERSION === '1.1.0', `the ABI version moved, got ${KERNEL_ABI_VERSION}`);
+      assert(KERNEL_ABI_VERSION === '1.2.0', `the ABI version moved, got ${KERNEL_ABI_VERSION}`);
     });
   } finally {
     await kernel.shutdown();
@@ -13095,8 +13096,8 @@ async function runDashboardStoreChecks(): Promise<void> {
       // workspace: 6,000 events on the disk, 「共 5,000 条」 under the table.
       //
       // The server knows which it has: the store remembers the oldest event
-      // it dropped. So the answer carries that, and a view can say 「至少
-      // N 条」 instead of claiming a total.
+      // it dropped. The page calls that window 「窗口内 N 条」, which is what
+      // paging can reach.
       const root = join(tmp, 'overflow');
       const dir = join(root, 'processes', '2');
       mkdirSync(dir, { recursive: true });
@@ -13166,8 +13167,8 @@ async function runDashboardStoreChecks(): Promise<void> {
 
     await checkAsync('the page says a lower bound as a lower bound', async () => {
       // The number under the table says one thing, and that thing is true:
-      // 「共 N 条」 when the count is the whole of the history, 「至少 N 条」
-      // when it is only a lower bound on it.
+      // 「共 N 条」 when the count is the whole of the history, 「窗口内 N 条」
+      // when the history is longer than the window the button can reach.
       const root = join(tmp, 'wording');
       const rec = await writeFrame(root, 'memory_read', 'w1', 'exit', '2026-09-28T00:00:02.000Z', {
         durationMs: 1,
@@ -13182,8 +13183,8 @@ async function runDashboardStoreChecks(): Promise<void> {
           `a count that is the whole of it says 共, got ${String(eventCountText(5000, true))}`,
         );
         assert(
-          eventCountText(5000, false) === '至少 5,000 条',
-          `a count that is only a lower bound says 至少, got ${String(eventCountText(5000, false))}`,
+          eventCountText(5000, false) === '窗口内 5,000 条',
+          `a count of the window says 窗口内, got ${String(eventCountText(5000, false))}`,
         );
         assert(eventCountText(0, true) === '', 'an empty feed says nothing');
         // **And the panel prints it through that rule** — one wording, one
@@ -25387,6 +25388,11 @@ await runBootChecks();
 await runReplayChecks();
 await runOutcomeChecks();
 await runRecordChecks();
+
+// Stop every kernel this run booted and did not stop. A scheduler that is
+// still started keeps re-arming its 10 ms tick, and that tick is what keeps
+// the process alive after the summary.
+await shutdownOpenKernels();
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

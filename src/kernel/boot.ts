@@ -650,6 +650,40 @@ function makePromptAgent(spec: {
  * `tick()`, and `shutdown()` are async but not re-entrant; the scheduler's
  * auto-loop already serialises its own ticks.
  */
+/**
+ * Kernels this process has booted and not yet stopped.
+ *
+ * A scheduler that is still started keeps re-arming its tick, and that tick
+ * keeps the process alive. The smoke run boots a kernel per check; one that
+ * is never stopped is why the run keeps going after it has said everything
+ * it has to say. {@link shutdownOpenKernels} is how a host stops the ones
+ * it still holds.
+ */
+const openKernels = new Set<Kernel>();
+
+/** How many kernels this process has booted and not yet stopped. */
+export function openKernelCount(): number {
+  return openKernels.size;
+}
+
+/**
+ * Stop every kernel this process booted and has not stopped.
+ *
+ * Idempotent, and a kernel that fails to stop does not keep the others
+ * running. Returns how many it stopped.
+ */
+export async function shutdownOpenKernels(): Promise<number> {
+  const pending = [...openKernels];
+  for (const kernel of pending) {
+    try {
+      await kernel.shutdown();
+    } catch {
+      openKernels.delete(kernel);
+    }
+  }
+  return pending.length;
+}
+
 export class Kernel {
   readonly kernelAbiVersion: string;
   readonly dir: string;
@@ -1097,6 +1131,7 @@ export class Kernel {
     }
 
     this.#booted = true;
+    openKernels.add(this);
 
     // 3f. Optionally start ticking.
     if (this.#opts.autoStart === true) {
@@ -1850,6 +1885,7 @@ export class Kernel {
    */
   async shutdown(): Promise<ShutdownReport> {
     if (this.#shutdownReport !== null) return this.#shutdownReport;
+    openKernels.delete(this);
     await this.scheduler.stop();
     const report = this.#booted
       ? await this.init.shutdown()

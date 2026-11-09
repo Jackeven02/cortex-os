@@ -438,9 +438,10 @@ export interface ForkResult {
 
 ---
 
-## 8. Open questions
+## 8. Decisions
 
-These we have not decided. Each gets an issue.
+Decided. The answer under each heading is what this version does. Anything
+named as later work is in the icebox (BACKLOG.md), not an open question.
 
 ### 8.1 Concurrency on shared memory
 
@@ -450,13 +451,13 @@ If two forked agents both write to a `shared` semantic memory region, what happe
 - **CRDT.** Correct. Heavy. Requires choosing a CRDT library and a data model.
 - **Lock.** Familiar. Forces coordination the agents may not want.
 
-**Instinct:** start with last-write-wins, log every conflict, add CRDT later if the logs show real pain. Do not over-engineer v0.
+**Decision:** last-write-wins. A CRDT is icebox, for if the logs show real pain.
 
 ### 8.2 Budget split semantics
 
 If parent has $5 budget and forks, does child get $0 (reset), $5 (inherit), or $2.50 (split)?
 
-Default `reset` is opinionated. It treats fork as "new attempt" rather than "parallel exploration." For Demo C (compare two branches), `split` may be more honest. We may need to make this a per-fork option, with `reset` as default.
+**Decision:** `reset`. A fork is a new attempt, and the parent's sunk cost does not move with it. A caller can ask for `inherit` or `split`; neither is the default.
 
 ### 8.3 Syscall log branching
 
@@ -465,7 +466,7 @@ After fork, do both processes append to the same log file with PID tags, or do t
 - **Same file** makes "diff the two branches" tooling trivial.
 - **Separate files** are simpler to implement and reason about.
 
-**Instinct:** separate files, plus a small index that knows the branch point. Easier to GC, easier to ship to disk.
+**Decision:** separate files, one per process. The branch point is the parent's log. This is what the kernel writes.
 
 ### 8.4 What is "intent"?
 
@@ -481,8 +482,7 @@ We have a slot for it but no definition. Is it:
 
 Long-running daemons will produce thousands of checkpoints. Do we garbage-collect? On what policy?
 
-**v0:** never prune; user problem; provide `cortex gc` as a manual command.
-**v1:** configurable retention (keep last N, keep tagged, keep daily).
+**Decision:** never prune. `cortex gc` and a retention policy are icebox.
 
 ### 8.6 Driver state opt-in
 
@@ -492,7 +492,7 @@ A driver claiming `forkable: true` is making a strong promise. How do we test th
 - Trust the driver author?
 - Runtime detection (try to fork, see what breaks)?
 
-**Instinct:** trust + warn for v0. Add a `cortex doctor` command in v1 that probes drivers.
+**Decision:** trust the driver's claim. `cortex doctor` is icebox. `cortex audit` already lists tools that never declared a tag.
 
 ### 8.7 What counts as a "side effect"?
 

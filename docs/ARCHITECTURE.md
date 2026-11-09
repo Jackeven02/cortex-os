@@ -968,7 +968,10 @@ src/
 
 ---
 
-## 12. Open questions
+## 12. Decisions
+
+Decided. The answer under each heading is what this version does. Anything
+named as later work is in the icebox (BACKLOG.md), not an open question.
 
 ### 12.1 Kernel ↔ CLI transport
 
@@ -2426,9 +2429,9 @@ state belongs to the window.**
   a claim about a history nobody had counted. Both readers know when they
   dropped something, so the answer carries that: `totalExact` in the push, the
   `x-total-exact` header in the read. The page words it accordingly — 「共 N 条」
-  when the count is the whole of it, 「至少 N 条」 when it is only a lower bound —
-  and the two paths always answer the same way, because the count and what it
-  is travel together.
+  when the count is the whole of the history, 「窗口内 N 条」 when the history
+  is longer than the window 「加载更多」 can reach — and the two paths always
+  answer the same way, because the count and what it is travel together.
 - The stream answers about the **window it was asked about**: it takes the
   same range the read takes. The read took a range and the push ignored it, so
   a window filtered to one hour was fed the whole history and the filter was a

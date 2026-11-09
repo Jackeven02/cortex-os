@@ -52,6 +52,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       model: { type: 'string' },
       'max-tokens': { type: 'string' },
       'token-budget': { type: 'string' },
+      'wall-time-budget': { type: 'string' },
       nice: { type: 'string' },
       'max-region-entries': { type: 'string' },
       memory: { type: 'string' },
@@ -160,6 +161,21 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       return 1;
     }
   }
+  let wallTimeBudget: number | undefined;
+  if (values['wall-time-budget'] !== undefined) {
+    wallTimeBudget = parseInt(values['wall-time-budget'], 10);
+    if (!Number.isFinite(wallTimeBudget) || wallTimeBudget <= 0) {
+      console.error(`cortex spawn: invalid --wall-time-budget: '${values['wall-time-budget']}'`);
+      return 1;
+    }
+  }
+  const budgets =
+    tokenBudget === undefined && wallTimeBudget === undefined
+      ? undefined
+      : {
+          ...(tokenBudget !== undefined ? { tokens: tokenBudget } : {}),
+          ...(wallTimeBudget !== undefined ? { wallTimeMs: wallTimeBudget } : {}),
+        };
 
   // The priority the process runs at: the kernel's `nice`, -20..19, and
   // **lower runs first** (docs/PROCESS.md section 8.1). The range is the
@@ -228,7 +244,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       role: values.role,
       agent: agentSpec,
       memory: regionPolicies,
-      ...(tokenBudget !== undefined ? { tokenBudget } : {}),
+      ...(budgets !== undefined ? { budgets } : {}),
       ...(nice !== undefined ? { nice } : {}),
       ...(capabilities !== undefined ? { capabilities } : {}),
       ...(grantable !== undefined ? { grantable } : {}),
@@ -245,7 +261,7 @@ export async function cmdSpawn(args: string[]): Promise<number> {
       role: values.role,
       agent: agentSpec,
       memory: regionPolicies,
-      ...(tokenBudget !== undefined ? { budgets: { tokens: tokenBudget } } : {}),
+      ...(budgets !== undefined ? { budgets } : {}),
       ...(nice !== undefined ? { nice } : {}),
       ...(capabilities !== undefined ? { capabilities } : {}),
       ...(grantable !== undefined ? { grantable } : {}),
@@ -350,6 +366,9 @@ export async function cmdSpawn(args: string[]): Promise<number> {
     console.log(
       `tokens: ${formatTokenBudget({ spent, remaining }, (n) => String(n))} — in ${spent.tokensIn}, out ${spent.tokensOut}`,
     );
+    if (wallTimeBudget !== undefined) {
+      console.log(`wall time: ${spent.wallTimeMs}ms of ${wallTimeBudget}ms`);
+    }
 
     // Write the record so ps/trace can see this process later.
     //
@@ -420,7 +439,7 @@ async function spawnLive(opts: {
   readonly role: string;
   readonly agent: AgentSpec;
   readonly memory: Record<string, MemoryRegionPolicy>;
-  readonly tokenBudget?: number;
+  readonly budgets?: { readonly tokens?: number; readonly wallTimeMs?: number };
   readonly nice?: number;
   readonly capabilities?: readonly Capability[];
   readonly grantable?: readonly Capability[];
@@ -445,12 +464,15 @@ async function spawnLive(opts: {
       role: opts.role,
       agent: opts.agent,
       memory: opts.memory,
-      ...(opts.tokenBudget !== undefined ? { budgets: { tokens: opts.tokenBudget } } : {}),
+      ...(opts.budgets !== undefined ? { budgets: opts.budgets } : {}),
       ...(opts.nice !== undefined ? { nice: opts.nice } : {}),
       ...(opts.capabilities !== undefined ? { capabilities: opts.capabilities } : {}),
       ...(opts.grantable !== undefined ? { grantable: opts.grantable } : {}),
     });
     console.log(`[pid ${result.pid}]`);
+    if (opts.budgets?.wallTimeMs !== undefined) {
+      console.log(`  wall time: ${opts.budgets.wallTimeMs}ms`);
+    }
     if (opts.nice !== undefined) {
       // The kernel's own answer, not the flag: the number printed is the
       // number the process is actually running at.
@@ -492,6 +514,9 @@ OPTIONS
   --model <string>      Model name to pass to the driver (prompt agent only)
   --max-tokens <n>      Max output tokens per LLM call (prompt agent only)
   --token-budget <n>    Total token budget for the process
+  --wall-time-budget <ms>  How long the process may live, in milliseconds.
+                        The clock runs while it waits, and hitting zero
+                        fires SIGXCPU. Omit for no wall-clock ceiling.
   --nice <n>            Scheduling priority: -20..19, and LOWER RUNS FIRST.
                         The kernel's own number -- the same one the NICE
                         column of 'cortex ps' prints. Two ready processes

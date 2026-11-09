@@ -3,7 +3,9 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { writeFile } from 'node:fs/promises';
 import { bootKernel, KERNEL_ABI_VERSION, isCortexError, type ILLMDriver } from '../src/index.js';
+import { cmdSpawn } from '../src/cli/commands/spawn.js';
 import { asProcessId, type CortexContext } from '../src/kernel/types.js';
 
 const waitFor = async (condition: () => boolean, message: string): Promise<void> => {
@@ -190,6 +192,38 @@ test('acknowledging a daemon records who noticed', async () => {
     assert.equal(after.noticedBy, 'operator');
   } finally {
     await kernel.shutdown();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('spawn can set a wall-clock ceiling', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'cortex-wall-'));
+  const modulePath = join(dir, 'agent.mjs');
+  await writeFile(modulePath, 'export default async function agent() {}\n');
+  const previousHome = process.env['CORTEX_HOME'];
+  const previousLog = console.log;
+  const lines: string[] = [];
+  process.env['CORTEX_HOME'] = dir;
+  console.log = (...parts: unknown[]) => {
+    lines.push(parts.map((part) => String(part)).join(' '));
+  };
+  try {
+    const refused = await cmdSpawn(['--role', 'timed', '--wall-time-budget', 'soon']);
+    assert.equal(refused, 1);
+    const code = await cmdSpawn([
+      '--role',
+      'timed',
+      '--module',
+      modulePath,
+      '--wall-time-budget',
+      '60000',
+    ]);
+    assert.equal(code, 0, lines.join('\n'));
+    assert.match(lines.join('\n'), /wall time: \d+ms of 60000ms/);
+  } finally {
+    console.log = previousLog;
+    if (previousHome === undefined) delete process.env['CORTEX_HOME'];
+    else process.env['CORTEX_HOME'] = previousHome;
     await rm(dir, { recursive: true, force: true });
   }
 });

@@ -4,11 +4,11 @@ This directory holds the technical specifications. **Read them in this order:**
 
 1. **[STATE.md](./STATE.md)** — the agent state model. What gets copied on fork. What cannot be copied at all. The irreversible-action doctrine. **This is the hardest and most important document in the project.** Everything else depends on it.
 
-2. **[PROCESS.md](./PROCESS.md)** — the agent process lifecycle. Nine states, the legal-transition table, full signal table, scheduling policy, daemon/supervision posture, TypeScript types, seven open questions.
+2. **[PROCESS.md](./PROCESS.md)** — the agent process lifecycle. Nine states, the legal-transition table, full signal table, scheduling policy, daemon/supervision posture, TypeScript types. §11 records the decisions.
 
 3. **[ABI.md](./ABI.md)** — the syscall contract. **Twenty-five syscalls**, full TypeScript types, error model, recording format, three driver interfaces (LLM, Tool, Memory), seven open questions. If a behavior is not in the ABI, it does not exist.
 
-4. **[ARCHITECTURE.md](./ARCHITECTURE.md)** — kernel modules and data flow. **Eleven modules** (recorder, process_table, signals, ipc, memory, checkpoint, fork, scheduler, init, syscall_dispatcher, driver_registry), the full syscall lifecycle trace, driver model, persistence layout (`.cortex/`), boot sequence, concurrency model, file layout, six open questions, and an honest "what we will get wrong" prediction section.
+4. **[ARCHITECTURE.md](./ARCHITECTURE.md)** — kernel modules and data flow. **Eleven modules** (recorder, process_table, signals, ipc, memory, checkpoint, fork, scheduler, init, syscall_dispatcher, driver_registry), the full syscall lifecycle trace, driver model, persistence layout (`.cortex/`), boot sequence, concurrency model, file layout. §12 records the decisions, and the prediction section says what we still expect to get wrong.
 
 5. **[CRITIQUE.md](./CRITIQUE.md)** — the running log of external critique and what we changed (or didn't) because of it.
 
@@ -26,15 +26,15 @@ This directory holds the technical specifications. **Read them in this order:**
 
 | Document | State |
 |---|---|
-| STATE.md | **drafted v0** — open questions logged in §8 |
-| PROCESS.md | **drafted v0** — open questions logged in §11 |
-| ABI.md | **FROZEN since 1.0.0** — 24 syscalls; §9.2 and §9.3 resolved in 1.0 |
-| ARCHITECTURE.md | **drafted v0** — open questions logged in §12 |
+| STATE.md | **drafted v0** — §8 decided |
+| PROCESS.md | **drafted v0** — §11 decided |
+| ABI.md | **FROZEN since 1.0.0**, currently `1.2.0` — 25 syscalls; §9.2 and §9.3 resolved in 1.0 |
+| ARCHITECTURE.md | **drafted v0** — §12 decided |
 | CRITIQUE.md | live, 1 entry |
 | HACKING.md | drafted (Phase 5) |
 | COOKBOOK.md | drafted (Phase 5) |
 
-**Phases 0–5 are complete.** The kernel, all seven drivers, the CLI (including `attach` and `daemon`), the three killer demos, and the launch material are all in. The syscall ABI **froze at `1.0.0`**: breaking changes now require a major bump, additive ones land in a minor. ABI.md §9.2 (capabilities) and §9.3 (explicit channels) were the two open questions that had to be settled before the freeze could happen; both shipped in 1.0. The remaining open questions in each document are still intentionally rolling.
+**Phases 0–5 are complete.** The kernel, all seven drivers, the CLI (including `attach` and `daemon`), the three killer demos, and the launch material are all in. The syscall ABI **froze at `1.0.0`**: breaking changes now require a major bump, additive ones land in a minor. ABI.md §9.2 (capabilities) and §9.3 (explicit channels) were the two open questions that had to be settled before the freeze could happen; both shipped in 1.0. STATE §8, PROCESS §11 and ARCHITECTURE §12 are decided. What was named as later work is in the icebox.
 
 Track progress in [BACKLOG.md](../BACKLOG.md).
 

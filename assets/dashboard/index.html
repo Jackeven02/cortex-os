@@ -164,10 +164,12 @@
        tell which of the nodes the filter meant. */
     .tree-node.match { background: var(--blue-soft); }
     .tree-node.match .tree-role { color: var(--blue); }
-    .tree-role { color: #273244; font-size: 11px; font-weight: 570; }
+    .tree-role { color: #273244; font-size: 11px; font-weight: 570; flex: none; white-space: nowrap; }
+    .tree-pid, .tree-node > .state, .tree-nice { flex: none; white-space: nowrap; }
     .tree-pid { color: #53627a; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; }
-    .tree-meta { margin-left: auto; display: flex; align-items: center; gap: 10px; color: #77808e; font-size: 9px; }
-    .tree-inside { color: #5b6577; font-size: 9px; }
+    .tree-meta { margin-left: auto; min-width: 0; flex: 1 1 auto; display: flex; align-items: center; gap: 10px; color: #77808e; font-size: 9px; overflow: hidden; }
+    .tree-meta > span { flex: none; white-space: nowrap; }
+    .tree-inside { color: #5b6577; font-size: 9px; flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
     /* The priority the process runs at: the kernel's `nice`, lower first. */
     .tree-nice { color: #77808e; font-size: 9px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .budgets-panel { margin-bottom: 14px; }
@@ -284,7 +286,7 @@
         <div class="columns">
           <section class="panel" id="processes">
             <div class="panel-head"><div><div class="panel-title">Agent 进程 <span class="nav-count" id="processCountLabel"></span></div><div class="panel-note">进程状态、最近资源使用 · 停在哪个调用、怎么结束的</div></div><div class="table-tools"><div class="view-toggle"><button id="viewTable" class="active" type="button">表格</button><button id="viewTree" type="button">监督树</button></div><input class="search" id="processSearch" type="search" placeholder="筛选进程…" aria-label="筛选进程"><button class="icon-button" id="processRefresh" title="刷新进程">↻</button></div></div>
-            <div class="spawn-bar" id="spawnBar" hidden><input type="text" id="spawnRole" placeholder="角色（必填，如 coder）" aria-label="角色"><input type="text" id="spawnModule" placeholder="模块路径（可选，如 ./examples/hello.js）" aria-label="模块路径"><input type="text" id="spawnTask" placeholder="任务（可选）" aria-label="任务"><button class="button" id="spawnGo" type="button">启动机器人</button></div>
+            <div class="spawn-bar" id="spawnBar" hidden><input type="text" id="spawnRole" placeholder="角色（必填，如 coder）" aria-label="角色"><input type="text" id="spawnModule" placeholder="模块路径（可选，如 ./examples/hello.js）" aria-label="模块路径"><input type="text" id="spawnTask" placeholder="任务（可选）" aria-label="任务"><input type="number" id="spawnWall" min="1" placeholder="存活上限 ms（可选）" aria-label="存活时间上限"><button class="button" id="spawnGo" type="button">启动机器人</button></div>
             <div id="processTableWrap" class="table-scroll"><table><thead><tr><th>角色</th><th>状态</th><th id="niceHead" hidden title="调度优先级：数值越小越优先">优先级</th><th id="insideHead" hidden>备注</th><th>PID</th><th>PPID</th><th>Token</th><th>USD</th><th>权限</th><th>启动时间</th><th>存活时长</th><th></th></tr></thead><tbody id="processRows"><tr><td colspan="10" class="empty">正在读取进程…</td></tr></tbody></table></div>
             <div id="processTreeWrap" class="tree-wrap" hidden><div id="processTree"></div></div>
           </section>
@@ -534,12 +536,13 @@
     // not tell 5,000 from 6,000 — the number claimed a history nobody had
     // counted.
     //
-    // The server now says whether its number is the whole of it, and the page
-    // words it: 「共 N 条」 when it is, 「至少 N 条」 when it is only a lower
-    // bound. One rule, and the number is never more than it is.
+    // The server now says whether its number is the whole of the history.
+    // When it is, the page says 「共 N 条」. When the history is longer than
+    // the window, the page says 「窗口内 N 条」: N is what 「加载更多」 can
+    // reach, and the older rows are not in this window.
     function eventCountText(total, exact) {
       if (typeof total !== 'number' || !Number.isFinite(total) || total === 0) return '';
-      return exact === true ? `共 ${total.toLocaleString()} 条` : `至少 ${total.toLocaleString()} 条`;
+      return exact === true ? `共 ${total.toLocaleString()} 条` : `窗口内 ${total.toLocaleString()} 条`;
     }
 
     // **The count and what it is, read together.** The server sends the
@@ -742,6 +745,7 @@
     function renderEvents() {
       const rows = eventData;
       $('eventTotal').textContent = eventCountText(eventsTotal, eventsExact);
+      $('eventTotal').title = eventsExact ? '' : '更早的记录不在这个窗口里';
       $('eventMore').disabled = eventData.length >= eventsTotal;
       $('eventRows').innerHTML = rows.length ? rows.map((event) => {
         const label = eventLabel(event);
@@ -846,7 +850,7 @@
         // order, one rule. The tree used to leave the park out, so a process
         // stopped at a checkpoint read the same in both views.
         const detail = processDetail(process);
-        const insideSpan = detail ? `<span class="tree-inside">${esc(detail)}</span>` : '';
+        const insideSpan = detail ? `<span class="tree-inside" title="${esc(detail)}">${esc(detail)}</span>` : '';
         // The priority, when the server reported one — the same number the
         // table prints in its 优先级 column, so the two views cannot say
         // different things about how a process is ranked.
@@ -1292,6 +1296,8 @@
       if (modulePath) payload.module = modulePath;
       const task = $('spawnTask').value.trim();
       if (task) payload.task = task;
+      const wall = $('spawnWall').value.trim();
+      if (wall) payload.wallTimeBudget = Number(wall);
       $('traceTitle').textContent = '启动结果';
       $('traceBody').innerHTML = '<div class="empty">正在启动机器人…（会等到它跑完或超时）</div>';
       $('traceDialog').showModal();

@@ -16,7 +16,7 @@ This document is the source of truth for "what we work on next." When an item is
 
 The point of this phase is to lock the abstractions before writing serious code. A wrong syscall is a thousand rewrites later. A wrong **state model** is a kernel that cannot be implemented at all.
 
-> **Status as of this commit:** 10 of 11 items done. The four core documents (`STATE.md`, `PROCESS.md`, `ABI.md`, `ARCHITECTURE.md`) are drafted v0. `#011` is intentionally rolling — the open questions in each doc's final section will resolve as Phase 1 implementation forces decisions. **Exit criteria are met; Phase 1 is unblocked.**
+> **Status as of this commit:** 11 of 11 items done. The four core documents (`STATE.md`, `PROCESS.md`, `ABI.md`, `ARCHITECTURE.md`) are drafted v0. `#011` is decided: the answer under each heading is what this version does, and the later work is in the icebox. **Exit criteria are met; Phase 1 is unblocked.**
 
 - [x] **#001** Write `MANIFESTO.md` — the why → `8a2bb3c`
 - [x] **#002** Initialize repo skeleton (package.json, tsconfig, dirs) → `8a2bb3c`
@@ -29,7 +29,7 @@ The point of this phase is to lock the abstractions before writing serious code.
 - [x] **#008** Decide driver interface for tools (`IToolDriver`, MCP-compatible) → ABI.md §7.2 (two-phase stage/commit)
 - [x] **#009** Decide driver interface for memory backends (`IMemoryDriver`) → ABI.md §7.3 (snapshotRegion/restoreRegion)
 - [x] **#010** Decide on-disk format details (CBOR vs MessagePack vs JSON for `.csnap`; raw append vs framed for `.crec`) → STATE.md §4 (CBOR, content-addressed `.csnap` + length-prefixed CBOR `.crec`)
-- [ ] **#011** Resolve open questions from STATE.md §8, PROCESS.md §11, ABI.md §9, ARCHITECTURE.md §12 (concurrency, budget split, log branching, intent, GC, driver opt-in, side-effect tagging, kernel module boundaries)
+- [x] **#011** Resolve open questions from STATE.md §8, PROCESS.md §11, ABI.md §9, ARCHITECTURE.md §12 → **decided.** The v0 answer already written under each heading is the decision: shared memory is last-write-wins, a fork resets its budget unless the caller asks otherwise, each process has its own log, intent is a free-form string, checkpoints and logs are not pruned, a driver's `forkable` claim is trusted, a side effect is whatever the driver tags `irreversible`, a driver timeout is the only timeout, group kill follows Unix, restore mints a new pid, a process has no threads, a kernel is single-tenant, a crash drops everything that was not suspended, `SIGCHLD` coalesces, the CLI talks over localhost TCP, agent modules are ESM. CRDT memory, `cortex gc`, `cortex doctor`, threads, PID namespaces, a write-ahead crash log and log rotation stay in the icebox.
 
 **Exit criteria:** a stranger reads STATE.md, ABI.md, PROCESS.md, ARCHITECTURE.md and can predict what the kernel does in any scenario we have not yet coded.
 
@@ -1968,7 +1968,7 @@ The user-facing surface. Should feel like a real OS shell.
   **Exit criteria:** the number under the table says one thing, and that thing
   is true. — met.
 
-- [ ] **#124** The events window cannot reach past the newest 10,000 → **open.**
+- [x] **#124** The events window cannot reach past the newest 10,000 → **decided: say what the window is.**
   Found while fixing #115. The count under the table now says 「至少 N 条」 when
   the window holds only part of the history — which is true, and it is also a
   promise the window cannot keep: the store keeps the newest 5,000 of each
@@ -2032,7 +2032,7 @@ The user-facing surface. Should feel like a real OS shell.
   The smoke now also **says what is holding it open** if it lingers, so a run
   that does not end ends in a name instead of in silence.
 
-- [ ] **#117** The smoke run keeps going for a while after its summary → **open.**
+- [x] **#117** The smoke run keeps going for a while after its summary → **fixed.** The run stops every kernel it booted before it prints the summary, so a scheduler tick cannot keep the process alive afterwards.
   The run prints its summary and then does not end for a while — it takes about
   a minute and a quarter all told, and the tail is the part after the summary.
   The handles it is holding are the **kernel scheduler's 10 ms tick**, from the
@@ -2500,8 +2500,8 @@ The user-facing surface. Should feel like a real OS shell.
   **Exit criteria:** the number next to the table says one thing, and that thing
   is true of the table it sits on. — met.
 
-- [ ] **#123** The supervision tree's role name wraps when the note is long →
-  **open.**
+- [x] **#123** The supervision tree's role name wraps when the note is long →
+  **fixed.** The role name does not wrap. The note shrinks, and the full note is on the row's title.
   Found while verifying #121, on the same window. A tree node is one flex row:
   the role, the PID, the state, and the note the server put on the row. The
   note is the long one — `checkpointed — 'cortex restore --chain …' brings it
@@ -2517,8 +2517,8 @@ The user-facing surface. Should feel like a real OS shell.
   way it goes, the note must not push the role out of shape — a name split
   across two lines is a name the operator has to read twice.
 
-- [ ] **#122** A spawned agent cannot be given a wall-clock ceiling →
-  **open.**
+- [x] **#122** A spawned agent cannot be given a wall-clock ceiling →
+  **fixed.** `cortex spawn --wall-time-budget <ms>` sets it, beside `--token-budget`. The dashboard's 启动机器人 form has the same field.
   Found while fixing #099: the ceiling now reaches the operator's tables, but
   there is almost nothing to give one. `cortex spawn` has `--token-budget` and
   **no wall-clock knob**, and the dashboard's spawn endpoint takes a

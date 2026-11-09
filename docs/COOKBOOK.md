@@ -211,7 +211,7 @@ console.log(`spent ${after.tokensIn + after.tokensOut} tokens`);
 ```
 
 ```bash
-cortex spawn --role coder --task "..." --token-budget 20000
+cortex spawn --role coder --task "..." --token-budget 20000 --wall-time-budget 60000
 cortex limit 1234 --tokens 10000 --usd 0.50 --wall-time 60000
 cortex limit 1234                      # show current limits
 cortex spawn --role hoarder --task "..." --max-region-entries 500  # global cap: every region stops at 500 writes (ENOMEM beyond it; omit = unlimited)

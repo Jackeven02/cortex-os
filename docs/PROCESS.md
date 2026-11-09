@@ -690,6 +690,12 @@ agent spends its wall-clock budget exactly like one burning tokens, and the
 clock stops while the process is stopped or suspended (that time is not the
 agent's) and is exact at the exit.
 
+The operator sets that ceiling on the command that starts the agent:
+`cortex spawn --wall-time-budget <ms>`, beside `--token-budget`. The
+dashboard's spawn form has the same field. `cortex limit <pid> --wall-time`
+can still change it afterwards, and that needs a kernel that is still
+running.
+
 **A wall-clock ceiling that has already hit zero is not a silent hang.**
 Token and usd only move when the process runs, so a READY process that has
 spent those stays in the queue until the supervisor raises the ceiling
@@ -918,9 +924,10 @@ export interface KernelProcess {
 
 ---
 
-## 11. Open questions
+## 11. Decisions
 
-Each of these gets an issue. None of them block writing ABI.md, but several will block writing the kernel.
+Decided. The answer under each heading is what this version does. Anything
+named as later work is in the icebox (BACKLOG.md), not an open question.
 
 ### 11.1 Cooperative scheduling and runaway LLM calls
 
@@ -928,7 +935,7 @@ If an LLM driver hangs (no response, no timeout), the process is BLOCKED forever
 
 **Default answer:** every LLM and tool call has a driver-level timeout (default 60s, configurable). On timeout, the syscall returns `ETIMEDOUT`. The agent decides what to do.
 
-**Open:** should the kernel impose a hard ceiling regardless of driver timeout?
+**Decision:** no second ceiling. The driver's timeout is the timeout. A call that hangs past it returns `ETIMEDOUT`, and the agent decides what to do.
 
 ### 11.2 SIGKILL semantics for groups
 
@@ -936,7 +943,7 @@ If an LLM driver hangs (no response, no timeout), the process is BLOCKED forever
 
 But this means a "kill all my agents" operation needs to walk the tree, not just the group. Should `cortex kill --tree <pid>` exist?
 
-**Instinct:** yes, as a CLI sugar over a recursive walk. Not as a kernel concept.
+**Decision:** follow Unix. The signal reaches the members the group has now. There is no `cortex kill --tree`. Walking a tree is the caller's job, built from `kill` on each pid.
 
 ### 11.3 Restore semantics and identity
 

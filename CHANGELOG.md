@@ -2042,6 +2042,15 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Fixed
 
+- **The five open checklist items.** The event table says 「窗口内 N 条」 when
+  the history is longer than the rows 「加载更多」 can reach, so the number
+  and the button describe the same window. `cortex spawn --wall-time-budget`
+  sets a wall-clock ceiling, and the dashboard's spawn form has the same
+  field. A long note in the supervision tree no longer wraps the role name.
+  The smoke run stops every kernel it booted before it prints the summary.
+  The open questions at the end of STATE, PROCESS and ARCHITECTURE are
+  decided as the answers already written there.
+
 - **Five open decisions, closed.** A process blocked on `recv` or `wait` is
   stopped by a default terminate instead of queueing the signal forever. A
   process inside `llm_call` or `tool_call` is BLOCKED for the duration and

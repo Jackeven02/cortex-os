@@ -909,6 +909,7 @@ async function handleSpawn(request: IncomingMessage, response: ServerResponse, d
   if (body['model'] !== undefined) argv.push('--model', String(body['model']));
   if (body['args'] !== undefined) argv.push('--args', JSON.stringify(body['args']));
   if (body['tokenBudget'] !== undefined) argv.push('--token-budget', String(Number(body['tokenBudget'])));
+  if (body['wallTimeBudget'] !== undefined) argv.push('--wall-time-budget', String(Number(body['wallTimeBudget'])));
   const timeoutMs = Number(body['timeoutMs'] ?? SPAWN_DEFAULT_TIMEOUT_MS);
   argv.push('--timeout', String(Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : SPAWN_DEFAULT_TIMEOUT_MS));
   const { cmdSpawn } = await import('../cli/commands/spawn.js');
@@ -1019,8 +1020,9 @@ export async function startDashboard(options: DashboardOptions = {}): Promise<Ru
         // **Whether the number is the whole of it.** The count is the size of
         // the window the server holds, and a window that keeps only the
         // newest events can be a lower bound on the history. The header says
-        // which, so the view can say 「共 N 条」 or 「至少 N 条」 — and never
-        // claim a history nobody counted.
+        // which, so the view can say 「共 N 条」 or 「窗口内 N 条」. The
+        // second is the window the 「加载更多」 button can reach. It is not
+        // a promise that older rows exist behind it.
         response.setHeader('x-total-exact', exact ? '1' : '0');
         json(response, 200, merged.slice(offset, offset + limit));
         return;
