@@ -4,7 +4,7 @@
 >
 > **If a behavior is not in this document, it does not exist.**
 
-> ## 🔒 ABI status: **FROZEN** since `1.0.0` — currently `1.3.0` (additive)
+> ## 🔒 ABI status: **FROZEN** since `1.0.0` — currently `1.4.0` (additive)
 >
 > Before `1.0.0` the ABI was deliberately unsettled: the version line said
 > `0.x`, and a minor bump was allowed to change a syscall, its arguments, or
@@ -25,7 +25,7 @@
 >   `kernel_abi_version`, so a replay engine can tell which contract a log was
 >   written under (§9.6).
 >
-> **Current version: `1.3.0`.** `1.3.0` adds `set_intent` (a goal and the condition that says it is done) and `pendingSignalFrom` on the process record, beside the signal names. `1.1.0` added the `renice` syscall (§4.10)
+> **Current version: `1.4.0`.** `1.4.0` adds a shadow fork (`kind: 'shadow'`) and ranks a memory scan by `extra.text` or by `extra.vector` when the stored value carries a `vector`. `1.3.0` adds `set_intent` (a goal and the condition that says it is done) and `pendingSignalFrom` on the process record, beside the signal names. `1.1.0` added the `renice` syscall (§4.10)
 > and the `renice` capability (§4.9): an agent can move a rank in its own
 > tree without a permission, and a rank across the tree with one. `1.2.0`
 > closes the birth-authority hole (§4.9): a narrowed parent that does not
@@ -329,12 +329,12 @@ Inspect the process table. Read-only.
 
 #### `fork(opts?: ForkOptions): Promise<ForkResult>`
 
-Duplicate the calling process per STATE.md §3.1 (cognitive fork).
+Duplicate the calling process per STATE.md §3.1 (cognitive fork). `kind: 'shadow'` keeps that copy and runs it against another driver, model, temperature, or system prompt (STATE.md §3.4). The caller names at least one of those. A model call that already names its own driver, model, or temperature keeps it. `kind: 'sandbox'` is refused: file and network tools do not share one gate.
 
 - **Allowed states:** RUNNING, BLOCKED, STOPPED, SUSPENDED (the last via `restore`)
 - **State effect:** caller unchanged; child enters NEW
 - **Returns:** `ForkResult` with child PID, child chain ID, shared causal past offset, list of irreversible actions already in past
-- **Errors:** `EBUDGET` (cannot allocate child budgets), `EDRIVER` (a driver refused to close cleanly)
+- **Errors:** `EINVAL` (unknown kind, or a shadow fork that names nothing), `EBUDGET` (cannot allocate child budgets), `EDRIVER` (a driver refused to close cleanly)
 - **Reversibility:** `reversible` — the child can be killed
 - **Recording:** options, child PID, shared causal past offset
 
@@ -343,6 +343,10 @@ const { childPid, irreversibleInPast } = await ctx.fork({ budgets: 'split' });
 if (irreversibleInPast.includes('send_email')) {
   console.warn('Both branches remember sending the email.');
 }
+await ctx.fork({
+  kind: 'shadow',
+  shadow: { model: 'other', system: 'be brief' },
+});
 ```
 
 #### `checkpoint(opts?: CheckpointOptions): Promise<{ chainId: ChainId }>`
@@ -470,6 +474,7 @@ Read entries from a named memory region. Regions are configured at `spawn()` per
 - **Errors:** `ENOENT` (no such region), `EDRIVER`
 - **Reversibility:** `idempotent`
 - **Recording:** region, query, count returned, hash of returned values (full values would bloat logs)
+- **A scan can rank.** `extra.text` ranks by shared words. `extra.vector` ranks by cosine when the stored value has a `vector`. The kernel does not compute embeddings. A key lookup stays exact.
 
 #### `memory_write(region: string, key: string, value: unknown, opts?: MemoryWriteOptions): Promise<void>`
 
@@ -726,7 +731,7 @@ out. See docs/ARCHITECTURE.md §7.
 | `spawn` | creating any child process | — |
 | `kill` | signalling a process that is not your descendant and not in your group | **killing your own children** |
 | `renice` | moving a process that is not your descendant and not in your group | **moving your own processes** |
-| `fork` | cognitive fork | — |
+| `fork` | cognitive fork, or a shadow fork onto another model | — |
 | `tool:dangerous` | calling a tool the driver tagged `irreversible` | every reversible tool |
 | `ipc:any` | `send` to a process that is not yours | your children, your group, any channel |
 | `admin` | lets `acquire` ignore the grantable pool | — |

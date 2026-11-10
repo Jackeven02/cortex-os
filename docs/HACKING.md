@@ -211,8 +211,10 @@ interface IMemoryDriver {
 must serialize a region without reaching into your internals. A region is
 usually a `Map<string, Entry>`; `restoreRegion` replaces it wholesale.
 **Copy-on-write is the kernel's job** (`memory.ts`), not yours — a driver just
-stores and snapshots. `read` supports `{ key }`, `{ prefix }`, `{ limit }`;
-drivers may add fields via `query.extra` for vector/semantic search (post-v0).
+stores and snapshots. `read` supports `{ key }`, `{ prefix }`, `{ limit }`. A scan
+with `query.extra.text` is ranked by shared words, and `query.extra.vector`
+is ranked by cosine when the stored value has a `vector`. The kernel ranks
+those; a driver does not have to. The kernel does not compute embeddings.
 See `src/drivers/memory/inmem.ts` (simplest) and `sqlite.ts`.
 
 ---

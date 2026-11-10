@@ -2042,6 +2042,12 @@ minor. The full rule is in [docs/ABI.md](./docs/ABI.md) under "ABI status".
 
 ### Added
 
+- **A shadow fork and a ranked memory scan.** `fork({ kind: 'shadow' })`
+  runs the same state on another model or another system prompt (ABI
+  `1.4.0`). A memory scan ranks by `extra.text`, or by cosine against
+  `extra.vector` when the stored value has a `vector`. The kernel does
+  not compute embeddings. The backlog now says what stays later, and why.
+
 - **Shared memory merges, intent has a shape, and a crash can come back.**
   Two writes to one shared key are combined: lines and object keys are
   kept, and a value that cannot be combined is stored as both sides.

@@ -27,6 +27,9 @@ export async function cmdFork(args: string[]): Promise<number> {
     options: {
       tag: { type: 'string' },
       budgets: { type: 'string', default: 'reset' },
+      'shadow-driver': { type: 'string' },
+      'shadow-model': { type: 'string' },
+      'shadow-system': { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
     allowPositionals: true,
@@ -40,7 +43,10 @@ USAGE
 
 OPTIONS
   --tag <string>          Human-readable label for the fork
-  --budgets <policy>     Budget policy: reset (default), inherit, or split
+      --budgets <policy>     Budget policy: reset (default), inherit, or split
+  --shadow-driver <name>  Fork a shadow that calls this model driver
+  --shadow-model <name>   Model name for that shadow
+  --shadow-system <text>  System prompt for that shadow
   -h, --help              Show this help
 
 NOTES
@@ -87,6 +93,9 @@ EXAMPLES
       pid: unbrand(pid),
       ...(values.tag !== undefined ? { tag: values.tag } : {}),
       ...(values.budgets !== undefined ? { budgets: values.budgets } : {}),
+      ...(values['shadow-driver'] !== undefined ? { shadowDriver: values['shadow-driver'] } : {}),
+      ...(values['shadow-model'] !== undefined ? { shadowModel: values['shadow-model'] } : {}),
+      ...(values['shadow-system'] !== undefined ? { shadowSystem: values['shadow-system'] } : {}),
     });
     console.log(`forked pid ${unbrand(pid)} → child pid ${result.childPid}`);
     console.log(`  chain: ${result.childChainId}`);

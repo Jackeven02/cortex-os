@@ -30,8 +30,9 @@
  *   a state-machine transition.
  * - It does not run the child. The child lands in READY; the scheduler (#013)
  *   or init (#021) dispatches it.
- * - Sandbox fork (§3.2) and shadow process (§3.4) are post-v0; only
- *   `kind: 'cognitive'` is accepted in v0.
+ * - Sandbox fork (§3.2) and shadow process (§3.4): shadow is `kind: 'shadow'`.
+ *   Sandbox stays out until file and network tools share one gate. Only
+ *   `kind: 'cognitive'` and `kind: 'shadow'` are accepted.
  *
  * ## Dependencies / injection
  *
@@ -58,6 +59,7 @@ import {
   type ForkOptions,
   type ForkResult,
   type MemoryRegionPolicy,
+  type Message,
   type ProcessId,
   type SyscallOffset,
   type Timestamp,
@@ -77,7 +79,7 @@ import { readRecords, type SyscallRecordInput } from './recorder.js';
 /** States a process may be in to fork (ABI.md §4.2). */
 export const FORK_ALLOWED_STATES = ['running', 'blocked', 'stopped', 'suspended'] as const;
 
-/** The only fork kind in v0 (STATE.md §3.1; §3.2/§3.4 are post-v0). */
+/** Cognitive fork is the default. Shadow is the other accepted kind. */
 export const DEFAULT_FORK_KIND: ForkKind = 'cognitive';
 
 /** Default budget policy: the fork is a fresh attempt (STATE.md §2.4). */
@@ -212,11 +214,22 @@ export class ForkManager {
     ctx?: ForkContext,
   ): Promise<ForkResult> {
     const kind = opts?.kind ?? DEFAULT_FORK_KIND;
-    if (kind !== 'cognitive') {
-      // Sandbox fork (§3.2) and shadow process (§3.4) are post-v0.
+    if (kind !== 'cognitive' && kind !== 'shadow') {
       trap('EINVAL', 'fork', {
         kind,
-        reason: `fork kind '${kind}' is not supported in v0 (only 'cognitive')`,
+        reason: `fork kind '${String(kind)}' is not supported`,
+      });
+    }
+    if (kind === 'shadow' && !hasShadow(opts?.shadow)) {
+      trap('EINVAL', 'fork', {
+        kind,
+        reason: 'a shadow fork names a driver, a model, a temperature, or a system prompt',
+      });
+    }
+    if (kind !== 'shadow' && opts?.shadow !== undefined) {
+      trap('EINVAL', 'fork', {
+        kind,
+        reason: 'shadow options belong on a shadow fork',
       });
     }
 
@@ -312,7 +325,15 @@ export class ForkManager {
       // parent's — mutating one branch must never perturb the other.
       if (this.#cognitiveSource !== undefined && this.#cognitiveSink !== undefined) {
         const snap = await this.#cognitiveSource(parentPid);
-        await this.#cognitiveSink(childPid, structuredClone(snap));
+        const copied = structuredClone(snap);
+        const shadowed =
+          kind === 'shadow' && opts?.shadow?.system !== undefined
+            ? withSystem(copied, opts.shadow.system)
+            : copied;
+        await this.#cognitiveSink(childPid, shadowed);
+      }
+      if (kind === 'shadow' && opts?.shadow !== undefined) {
+        this.#table.setLlmPin(childPid, opts.shadow);
       }
 
       // --- step 6: close driver state in BOTH processes (STATE.md §2.5) -----
@@ -474,4 +495,26 @@ export class ForkManager {
       });
     }
   }
+}
+
+function hasShadow(shadow: ForkOptions['shadow']): boolean {
+  if (shadow === undefined) return false;
+  return (
+    shadow.driver !== undefined ||
+    shadow.model !== undefined ||
+    shadow.temperature !== undefined ||
+    (typeof shadow.system === 'string' && shadow.system.trim() !== '')
+  );
+}
+
+function withSystem(snap: CognitiveSnapshot, system: string): CognitiveSnapshot {
+  const messages: Message[] = snap.messages.map((message) => ({ ...message }));
+  const index = messages.findIndex((message) => message.role === 'system');
+  if (index >= 0) {
+    const current = messages[index]!;
+    messages[index] = { ...current, content: system };
+  } else {
+    messages.unshift({ role: 'system', content: system });
+  }
+  return { ...snap, messages };
 }

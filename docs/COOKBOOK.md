@@ -221,6 +221,7 @@ await Promise.all([
 ```bash
 cortex spawn --role coder --task "..." --token-budget 20000 --wall-time-budget 60000
 cortex fork 2 --budgets split          # the child gets half of what the parent has left
+cortex fork 2 --shadow-model other --shadow-system "be brief"
 cortex gc                              # print old checkpoints; nothing is deleted
 cortex gc --apply                      # keep each process's newest checkpoint, delete the older ones
 cortex doctor                          # say which forkable drivers can show their state

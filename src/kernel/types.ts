@@ -833,10 +833,20 @@ export function parseCapabilities(
 // =============================================================================
 
 /**
- * v0 ships only `cognitive`. `sandbox` and `shadow` are post-v0; see
- * docs/STATE.md §3.2 and §3.4.
+ * v0 shipped `cognitive`. `shadow` compares the same state under another
+ * model or another system prompt (STATE.md §3.4). `sandbox` stays out: a
+ * file overlay only works if every tool that touches the disk or the
+ * network goes through one gate, and they do not.
  */
-export type ForkKind = 'cognitive';
+export type ForkKind = 'cognitive' | 'shadow';
+
+/** The other model or prompt a shadow fork runs. At least one field is set. */
+export interface ShadowSpec {
+  readonly driver?: string;
+  readonly model?: string;
+  readonly temperature?: number;
+  readonly system?: string;
+}
 
 /**
  * Arguments to `fork`. Defaults are opinionated: cognitive fork, budgets
@@ -846,6 +856,8 @@ export type ForkKind = 'cognitive';
  */
 export interface ForkOptions {
   readonly kind?: ForkKind;
+  /** Set when `kind` is `shadow`. The child calls the model with these. */
+  readonly shadow?: ShadowSpec;
   readonly budgets?: BudgetForkPolicy;
   readonly memoryOverrides?: Partial<Record<string, MemoryRegionPolicy>>;
   readonly closeDriverState?: boolean;

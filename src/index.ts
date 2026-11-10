@@ -78,8 +78,12 @@ export const VERSION = readPackageVersion();
  * `1.3.0` adds `set_intent`, names the sender of a queued signal on the
  * process record, and caps a model or tool call at the kernel ceiling.
  * Nothing was removed. Drivers that declare `abiCompat: '^1.0.0'` still match.
+ *
+ * `1.4.0` adds a shadow fork and a memory scan that ranks by words or by a
+ * vector the caller supplies. Drivers that declare `abiCompat: '^1.0.0'`
+ * still match.
  */
-export const KERNEL_ABI_VERSION = '1.3.0' as const;
+export const KERNEL_ABI_VERSION = '1.4.0' as const;
 
 // Re-export the kernel public surface (types + errors + boot).
 export * from './kernel/index.js';

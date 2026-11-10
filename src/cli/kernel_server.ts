@@ -1028,12 +1028,21 @@ async function dispatch(
       }
       const tag = typeof args['tag'] === 'string' ? args['tag'] : undefined;
       const budgets = args['budgets'];
-      // The target is the *caller* of the fork, exactly as in the local path:
-      // the fork frame lands in the target's log, and the shared causal past
-      // it records is what `cortex diff` cuts the two branches at.
+      const shadowDriver = typeof args['shadowDriver'] === 'string' ? args['shadowDriver'] : undefined;
+      const shadowModel = typeof args['shadowModel'] === 'string' ? args['shadowModel'] : undefined;
+      const shadowSystem = typeof args['shadowSystem'] === 'string' ? args['shadowSystem'] : undefined;
+      const shadow =
+        shadowDriver !== undefined || shadowModel !== undefined || shadowSystem !== undefined
+          ? {
+              ...(shadowDriver !== undefined ? { driver: shadowDriver } : {}),
+              ...(shadowModel !== undefined ? { model: shadowModel } : {}),
+              ...(shadowSystem !== undefined ? { system: shadowSystem } : {}),
+            }
+          : undefined;
       const result = await kernel.dispatcher.invoke(target, 'fork', {
         ...(tag !== undefined ? { tag } : {}),
         ...(budgets === 'reset' || budgets === 'inherit' || budgets === 'split' ? { budgets } : {}),
+        ...(shadow !== undefined ? { kind: 'shadow' as const, shadow } : {}),
       });
       return {
         childPid: unbrand(result.childPid),

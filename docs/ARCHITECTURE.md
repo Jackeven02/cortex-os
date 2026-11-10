@@ -887,7 +887,7 @@ A list of things we know we'll need eventually but are refusing to build now.
 | **Explicit channel creation** | Implicit is fine for v0 workloads | v0.2 (predicted in ABI.md §10) |
 | **Capability / permission system** | Demoted from Phase 1 | v1, when there's demand |
 | **GUI process inspector** | CLI is enough for v0 | Post-v0, separate project |
-| **CRDT-backed shared memory** | Last-write-wins is fine until it isn't | Post-v0, after telemetry shows pain |
+| **CRDT-backed shared memory** | Lines and object keys already merge. A library for every JSON value waits until a real value needs it | Later |
 | **Hot code reloading** | Erlang does this; we'd need to think hard | Post-v0 |
 
 The discipline of writing this list is the point. Every "we'll add it later" is a "we promise not to add it now."

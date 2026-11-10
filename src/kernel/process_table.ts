@@ -61,6 +61,7 @@ import {
   type RestartPolicy,
   type Signal,
   type SignalDisposition,
+  type ShadowSpec,
   type SyscallOffset,
   type Timestamp,
   type WaitResult,
@@ -295,6 +296,11 @@ export interface ProcessEntry {
   pendingSignalFrom: (ProcessId | null)[];
   /** What this process is trying to do. Null until `set_intent`. */
   intent: Intent | null;
+  /**
+   * Model defaults for a shadow fork. Absent on every other process.
+   * A call that names its own driver, model, or temperature keeps that.
+   */
+  llmPin: ShadowSpec | null;
   signalDispositions: Map<Signal, SignalDisposition>;
   daemon: boolean;
   autoReap: boolean;
@@ -650,6 +656,7 @@ export class ProcessTable {
       pendingSignals: [],
       pendingSignalFrom: [],
       intent: null,
+      llmPin: null,
       signalDispositions: new Map(Object.entries(opts.signals ?? {}) as [Signal, SignalDisposition][]),
       daemon: opts.daemon ?? false,
       autoReap: opts.autoReap ?? false,
@@ -1120,6 +1127,16 @@ export class ProcessTable {
   /** Replace the intent. The caller has already checked the shape. */
   setIntent(pid: ProcessId, intent: Intent): void {
     this.mustGet(pid, 'set_intent').intent = intent;
+  }
+
+  /** Model defaults pinned by a shadow fork. Null for every other process. */
+  llmPinOf(pid: ProcessId): ShadowSpec | null {
+    return this.mustGet(pid, 'fork').llmPin;
+  }
+
+  /** Pin the model a shadow child will call. */
+  setLlmPin(pid: ProcessId, pin: ShadowSpec): void {
+    this.mustGet(pid, 'fork').llmPin = pin;
   }
 
   /** The sender recorded when `signal` was queued, if one was named. */

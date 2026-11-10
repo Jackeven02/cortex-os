@@ -297,6 +297,8 @@ That is 24 syscalls, up from 19. **From here:** breaking changes need a major bu
 
 **`1.2.0` closes the birth-authority hole.** A narrowed parent that does not hold `admin` can no longer hand a child capabilities it does not hold; omitting the sets inherits them. A fork copies them, a checkpoint carries them, and `cortex daemon install --cap` writes them onto the daemon so a restart does not drop them. An agent that was minting a richer child now gets `EPERM`. No syscall was added.
 
+**`1.4.0` adds a shadow fork.** The same state can run on another model or another system prompt. A memory scan can rank by words, or by a vector the caller already has. Still 26 syscalls.
+
 **`1.3.0` adds `set_intent`.** An agent names a goal and the condition that says it is done. A queued signal's sender is on the process record. A model or tool call that never returns is cut off by the kernel. That is 26 syscalls.
 
 **Phase 0 — Design (complete).** Four documents drafted v0: `STATE.md` (the hard part), `PROCESS.md` (lifecycle), `ABI.md` (syscall contract), `ARCHITECTURE.md` (kernel modules). The questions those documents left open are decided; what was named as later work is in the icebox.

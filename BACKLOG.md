@@ -29,7 +29,7 @@ The point of this phase is to lock the abstractions before writing serious code.
 - [x] **#008** Decide driver interface for tools (`IToolDriver`, MCP-compatible) → ABI.md §7.2 (two-phase stage/commit)
 - [x] **#009** Decide driver interface for memory backends (`IMemoryDriver`) → ABI.md §7.3 (snapshotRegion/restoreRegion)
 - [x] **#010** Decide on-disk format details (CBOR vs MessagePack vs JSON for `.csnap`; raw append vs framed for `.crec`) → STATE.md §4 (CBOR, content-addressed `.csnap` + length-prefixed CBOR `.crec`)
-- [x] **#011** Resolve open questions from STATE.md §8, PROCESS.md §11, ABI.md §9, ARCHITECTURE.md §12 → **decided.** The v0 answer already written under each heading is the decision: shared memory is last-write-wins, a fork resets its budget unless the caller asks otherwise, each process has its own log, intent is a free-form string, checkpoints and logs are not pruned, a driver's `forkable` claim is trusted, a side effect is whatever the driver tags `irreversible`, a driver timeout is the only timeout, group kill follows Unix, restore mints a new pid, a process has no threads, a kernel is single-tenant, a crash drops everything that was not suspended, `SIGCHLD` coalesces, the CLI talks over localhost TCP, agent modules are ESM. CRDT memory, `cortex gc`, `cortex doctor`, threads, PID namespaces, a write-ahead crash log and log rotation stay in the icebox.
+- [x] **#011** Resolve open questions from STATE.md §8, PROCESS.md §11, ABI.md §9, ARCHITECTURE.md §12 → **decided.** Shared memory merges. A fork resets its budget unless the caller asks otherwise, and a shadow fork runs the same state on another model. Each process has its own log. Intent is `set_intent`. Checkpoints are pruned only by `cortex gc --apply`. A driver's `forkable` claim is trusted, and `cortex doctor` checks that the methods exist. A side effect is whatever the driver tags `irreversible`. The kernel caps a model or tool call at 120 seconds. Group kill follows Unix. Restore mints a new pid. A process has one body. A kernel is single-tenant. A crash recovers who was alive from `recovery.wal`, not the call that was in flight. `SIGCHLD` coalesces. The CLI talks over localhost TCP. Agent modules are ESM. The icebox at the bottom of this file is what stays later, and why.
 
 **Exit criteria:** a stranger reads STATE.md, ABI.md, PROCESS.md, ARCHITECTURE.md and can predict what the kernel does in any scenario we have not yet coded.
 
@@ -2670,35 +2670,25 @@ shell's view of it (see #055).
 
 ---
 
-## Icebox (post-v0.1)
+## Icebox
 
-Things we want, but not yet:
+Still later. Each line says why it is not this version.
 
-**From the v0 design:**
-- ~~Capability / permission system (was Phase 1, demoted)~~ → **shipped in `1.0.0`** as `acquire` / `release` / `caps` over six capabilities (ABI §4.9). Demoting it in v0 was right — nobody had a workload that needed it yet — and §9.2's "v1 may introduce it" is now closed.
-- Sandbox fork (STATE.md §3.2) — copy-on-write filesystem overlay
-- Shadow process (STATE.md §3.4) — same state, different driver config
-- Two-phase tool pattern (`stage` / `commit`) for irreversible actions
-- ~~`cortex doctor` to probe driver fork-safety claims~~ → **shipped** as a check that a `forkable` driver offers serialize and restore. It does not execute them.
-- CRDT-backed shared memory regions (if last-write-wins hurts)
+**The kernel stays one event loop.** A process has one body. It may have two model or tool calls in flight, and it does not grow a second body while it waits on a message. Threads and a second core would make the syscall log an interleaving instead of the order things happened. There is no PID namespace: one kernel, one tenant, PIDs count up from 2. The kernel does not preempt a running body. An agent is a function in the kernel's process, so a tight loop stalls every agent; isolating that means a worker thread or WebAssembly, which is a different kernel. A model reply is one complete response. Streaming would make every reader of an `llm_call` frame learn a new shape. `cortex kill` reaches the group members that exist now; it does not walk the tree, because a second kill would disagree with that. Shared memory merges lines and object keys, and keeps both sides when a value cannot be merged. A CRDT library and a lock an agent can hold across a model call stay here. A crash writes `recovery.wal` with who was alive and who exited. It does not write every state transition, and it cannot rebuild the call that was in flight, because that stack was only in memory. `cortex gc` deletes old checkpoints when asked. It does not rotate syscall logs, because a replay reads them from the start.
 
-**From the long-term vision:**
-- Distributed cortex (multi-host process tree)
-- WebAssembly driver sandbox
-- GUI process inspector (think `htop` for agents)
-- Time-travel debugger UI on top of `.crec` files
-- Capability marketplace (signed, versioned skill packages)
-- Erlang-style hot code reloading for running agents
-- Plan 9-style "everything is a file" — expose every syscall as a file in a virtual filesystem (`/proc/<pid>/llm_call` you can `echo` into)
-- Formal model of the syscall ABI in TLA+ or Alloy
-- Optional Temporal-backed persistence driver (prove our "you can build cortex on Temporal" claim)
+**Forks that need a gate the tools do not share.** Sandbox fork (a copy-on-write filesystem and a network recorder, committed only if the branch wins) waits until every file tool and every network tool goes through one driver. An overlay nothing is required to use would not hold the side effect.
 
-**From the live-kernel transport:**
-- A **queued** signal loses its sender: the pending queue holds the signal
-  only (`pendingSignals` is part of `ProcessInfo`, and the ABI is frozen), so
-  a `SIGUSR2` that had to wait for its target to run again is recorded
-  without a `from`. Preserving the sender needs a `ProcessInfo` change —
-  a `2.0` conversation, not a `1.1` one.
+**A different deployment, not a missing syscall.**
+- A process tree across machines.
+- A WebAssembly sandbox around drivers.
+- A marketplace of signed capabilities.
+- Replacing an agent's code while it is running.
+- A time-travel debugger as its own interface. `cortex replay` already re-runs a log.
+- Every syscall as a file under a virtual filesystem.
+- A TLA+ or Alloy model of the ABI.
+- A Temporal persistence driver. The kernel already restores from checkpoints and the recovery log.
+
+**Search that needs a model.** A memory scan can rank by the words in `query.extra.text`, or by cosine against `query.extra.vector` when the stored value has a `vector`. The kernel does not compute embeddings. A scan that means "close in meaning" without a vector the caller supplied is still here.
 
 ---
 

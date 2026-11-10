@@ -88,6 +88,7 @@ import {
   type LLMRequest,
   type LLMResponse,
   type MemoryEntry,
+  type Message,
   type MemoryQuery,
   type MemoryWriteOptions,
   type NiceChange,
@@ -1887,10 +1888,11 @@ export class SyscallDispatcher {
         reason: 'no LLM driver resolver configured',
       });
     }
-    const driver = this.#resolveLLM(req.driver);
+    const pinned = this.#pinRequest(pid, req);
+    const driver = this.#resolveLLM(pinned.driver);
     return await this.#duringDriverCall(pid, 'llm', callId, async () => {
     const timeoutMs = capCallTimeout(
-      req.timeoutMs ?? this.#defaultLlmTimeoutMs,
+      pinned.timeoutMs ?? this.#defaultLlmTimeoutMs,
       this.#kernelCallCeilingMs,
     );
     const abort = new AbortController();
@@ -1901,8 +1903,28 @@ export class SyscallDispatcher {
       abortSignal: abort.signal,
       kernelAbiVersion: this.kernelAbiVersion,
     };
-    return await this.#raceDriver('llm_call', timeoutMs, abort, () => driver.call(req, driverCtx));
+    return await this.#raceDriver('llm_call', timeoutMs, abort, () => driver.call(pinned, driverCtx));
     });
+  }
+
+  /**
+   * A shadow child calls the model the fork named. A field the request
+   * already set is left alone.
+   */
+  #pinRequest(pid: ProcessId, req: LLMRequest): LLMRequest {
+    const pin = this.#table.llmPinOf(pid);
+    if (pin === null) return req;
+    const messages =
+      pin.system === undefined ? req.messages : applySystem(req.messages, pin.system);
+    return {
+      ...req,
+      messages,
+      ...(req.driver === undefined && pin.driver !== undefined ? { driver: pin.driver } : {}),
+      ...(req.model === undefined && pin.model !== undefined ? { model: pin.model } : {}),
+      ...(req.temperature === undefined && pin.temperature !== undefined
+        ? { temperature: pin.temperature }
+        : {}),
+    };
   }
 
   async #toolCall(
@@ -2713,6 +2735,18 @@ function isToolResult(v: unknown): v is ToolResult {
     'reversibility' in v &&
     typeof (v as { reversibility?: unknown }).reversibility === 'string'
   );
+}
+
+function applySystem(messages: readonly Message[], system: string): Message[] {
+  const next = messages.map((message) => ({ ...message }));
+  const index = next.findIndex((message) => message.role === 'system');
+  if (index >= 0) {
+    const current = next[index]!;
+    next[index] = { ...current, content: system };
+  } else {
+    next.unshift({ role: 'system', content: system });
+  }
+  return next;
 }
 
 // Re-export the memory-driver type so consumers wiring a kernel from this

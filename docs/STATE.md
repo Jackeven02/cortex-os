@@ -115,13 +115,13 @@ Copy categories 1–4 and 7. Close category 5. Acknowledge category 6 as shared 
 
 **Use case:** explore an alternative reasoning path from a decision point. *"What if I had asked the LLM differently?"*
 
-### 3.2 Sandbox fork (post-v0)
+### 3.2 Sandbox fork
 
-Cognitive fork **plus** a copy-on-write filesystem overlay and a network egress recorder. Side effects in the sandbox do not escape to the host until committed.
+Cognitive fork plus a copy-on-write filesystem overlay and a network egress recorder. Side effects in the sandbox do not escape to the host until committed.
 
-**Use case:** let an agent try a risky edit without committing it. The branch that wins gets `commit()`-ed; the loser gets discarded along with its overlay.
+**Use case:** let an agent try a risky edit without committing it.
 
-Requires a sandbox driver. Not in v0.
+**Decision:** not in this version. File tools and network tools do not share one gate, so an overlay directory nothing is required to use would not contain the side effect. It waits until every tool that touches the disk or the network goes through one driver.
 
 ### 3.3 Replay (not really a fork)
 
@@ -131,15 +131,15 @@ Do not fork a live process. Reconstruct from a checkpoint and run forward.
 
 This is the bread-and-butter of agent debugging and it is in v0.
 
-### 3.4 Shadow process (post-v0)
+### 3.4 Shadow process
 
 Spawn a new process with the same cognitive snapshot but a different driver config — different LLM, different temperature, different system prompt.
 
 **Use case:** A/B comparing model behavior on identical state.
 
-Cheap to add once cognitive fork works. Not in v0.
+**Decision:** `fork({ kind: 'shadow', shadow: { driver, model, temperature, system } })`. The child keeps the copied state. A model call that does not name its own driver, model, or temperature uses the shadow's. A system prompt replaces the one on the call. The caller has to name at least one of those. `cortex fork --shadow-model` is the same request.
 
-**v0 ships cognitive fork and replay.** Sandbox fork and shadow process are post-v0.
+**This version ships cognitive fork, shadow fork, and replay.** Sandbox fork stays out until file and network tools share one gate.
 
 ("Replay" here means re-running a *recorded* run against its recording — the
 deterministic replay of §5.5, `cortex replay`. It is not the "seek the
@@ -416,7 +416,7 @@ export interface Checkpoint {
   readonly signature: Uint8Array;   // sha256
 }
 
-export type ForkKind = 'cognitive';   // v0; sandbox/shadow added later
+export type ForkKind = 'cognitive' | 'shadow';
 
 export type BudgetForkPolicy = 'reset' | 'inherit' | 'split';
 

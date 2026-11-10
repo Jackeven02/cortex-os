@@ -5130,7 +5130,7 @@ async function runReniceSyscallChecks(): Promise<void> {
       // written against `1.0.0` still runs.
       assert(SYSCALL_NAMES.includes('renice'), "the syscall is in the ABI's list");
       assert(CAPABILITIES.includes('renice'), "the capability is in the ABI's list");
-      assert(KERNEL_ABI_VERSION === '1.3.0', `the ABI version moved, got ${KERNEL_ABI_VERSION}`);
+      assert(KERNEL_ABI_VERSION === '1.4.0', `the ABI version moved, got ${KERNEL_ABI_VERSION}`);
     });
   } finally {
     await kernel.shutdown();

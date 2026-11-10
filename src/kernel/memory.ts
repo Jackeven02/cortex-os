@@ -112,6 +112,7 @@ import {
 } from './types.js';
 import { CortexError, isCortexError, trap, wrapDriverError } from './errors.js';
 import { mergeValues } from './memory_merge.js';
+import { rankMemory } from './memory_search.js';
 import type { ProcessTable } from './process_table.js';
 import type { SyscallRecordInput } from './recorder.js';
 
@@ -508,9 +509,19 @@ export class MemoryManager {
       throw err;
     }
 
+    const searching =
+      query.key === undefined &&
+      (typeof query.extra?.['text'] === 'string' || Array.isArray(query.extra?.['vector']));
+    const driverQuery: MemoryQuery = searching
+      ? {
+          ...(query.key !== undefined ? { key: query.key } : {}),
+          ...(query.prefix !== undefined ? { prefix: query.prefix } : {}),
+          ...(query.extra !== undefined ? { extra: query.extra } : {}),
+        }
+      : query;
     let raw: readonly MemoryEntry[];
     try {
-      raw = await driver.read(binding.physical, query);
+      raw = await driver.read(binding.physical, driverQuery);
     } catch (err) {
       const wrapped = wrapDriverError('memory_read', binding.policy.backing, err);
       throw wrapped;
@@ -518,8 +529,8 @@ export class MemoryManager {
 
     // Remap physical region names back to the logical name the agent used.
     const entries = raw.map((e) => ({ ...e, region }));
-
-    return entries;
+    if (query.key !== undefined) return entries;
+    return rankMemory(entries, query);
   }
 
   // ---------------------------------------------------------------------------
